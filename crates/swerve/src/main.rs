@@ -32,12 +32,17 @@ use std::thread;
 
 use euclid::Scale;
 use euclid::default::{Point2D, Rect, Size2D};
-use servo::{
-    DevicePoint, InputEvent, Key, KeyState, KeyboardEvent, NamedKey as ServoNamedKey,
+// Everything from the engine comes through swerve-engine, the only crate that
+// touches the Servo fork (ROADMAP §R2; docs/FORK.md). The IPC wire types come from
+// the servo-free swerve-protocol crate.
+use swerve_engine::{
+    DevicePoint, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent,
     MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
-    NavigationRequest, OffscreenRenderingContext, RenderingContext, Servo, ServoBuilder, WebView,
-    WebViewBuilder, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
+    NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, RenderingContext,
+    Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent,
+    WheelMode, WindowRenderingContext,
 };
+use swerve_protocol::IpcCommand;
 use url::Url;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
@@ -458,7 +463,7 @@ impl AppState {
     }
 }
 
-impl servo::WebViewDelegate for AppState {
+impl WebViewDelegate for AppState {
     fn notify_new_frame_ready(&self, _webview: WebView) {
         self.window.request_redraw();
     }
@@ -714,45 +719,13 @@ enum WakeUp {
     Ipc(IpcCommand),
 }
 
-impl embedder_traits::EventLoopWaker for Waker {
-    fn clone_box(&self) -> Box<dyn embedder_traits::EventLoopWaker> {
+impl EventLoopWaker for Waker {
+    fn clone_box(&self) -> Box<dyn EventLoopWaker> {
         Box::new(self.clone())
     }
 
     fn wake(&self) {
         let _ = self.0.send_event(WakeUp::Wake);
-    }
-}
-
-/// A command from an external process over the IPC control socket — the seed of
-/// the "Servo as an external engine" goal (M5): other apps drive the engine.
-#[derive(Debug)]
-enum IpcCommand {
-    Navigate(String),
-    NewTab,
-    Reload,
-    Back,
-    Forward,
-    SelectTab(usize),
-    CloseTab(usize),
-}
-
-impl IpcCommand {
-    /// Parse one line of the text protocol, e.g. `navigate https://servo.org`.
-    fn parse(line: &str) -> Option<Self> {
-        let mut parts = line.trim().splitn(2, ' ');
-        let verb = parts.next()?;
-        let arg = parts.next().unwrap_or("").trim();
-        Some(match verb {
-            "navigate" => IpcCommand::Navigate(arg.to_string()),
-            "new-tab" => IpcCommand::NewTab,
-            "reload" => IpcCommand::Reload,
-            "back" => IpcCommand::Back,
-            "forward" => IpcCommand::Forward,
-            "select-tab" => IpcCommand::SelectTab(arg.parse().ok()?),
-            "close-tab" => IpcCommand::CloseTab(arg.parse().ok()?),
-            _ => return None,
-        })
     }
 }
 

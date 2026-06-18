@@ -1,0 +1,20 @@
+[package]
+name = "swerve-engine"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MPL-2.0"
+description = "The only swerve crate that touches the Servo fork — quarantines the engine."
+
+[dependencies]
+# ── Servo embedding (our maintained fork; see docs/FORK.md, ROADMAP §R2) ──────
+# This is the ONLY crate that depends on the engine, so engine churn is isolated
+# here. `servo` is the high-level embedding crate; rev ed1af70 is upstream-identical
+# until our first fork patch lands. DEFAULT features stay on (baked-in-resources,
+# clipboard, js_jit); media-gstreamer is NOT default (no gstreamer needed). The stylo
+# and webrender forks are wired via the workspace-root `[patch]` tables.
+servo = { git = "https://github.com/airgap/swervo", rev = "ed1af70e712aa7ae0df4611241f10f6204389b70" }
+
+# servo-embedder-traits (lib name `embedder_traits`): EventLoopWaker lives here and
+# isn't re-exported by `servo`. Same rev as `servo`.
+embedder_traits = { git = "https://github.com/airgap/swervo", rev = "ed1af70e712aa7ae0df4611241f10f6204389b70", package = "servo-embedder-traits" }

@@ -1,0 +1,24 @@
+[package]
+name = "swerve"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MPL-2.0"
+description = "A web browser whose UI (chrome) is HTML rendered by the Servo engine"
+repository = "https://github.com/airgap/swerve"
+
+[[bin]]
+name = "swerve"
+path = "src/main.rs"
+
+[dependencies]
+swerve-engine = { path = "../swerve-engine" }
+swerve-protocol = { path = "../swerve-protocol" }
+
+# Windowing / geometry (versions matched to the engine's workspace).
+winit = "0.30.13"
+euclid = "0.22"
+url = "2.5"
+
+# Servo does TLS through rustls; a crypto provider is installed at startup.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }

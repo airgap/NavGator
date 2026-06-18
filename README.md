@@ -96,18 +96,21 @@ cargo build
 ## Project layout
 
 ```
-swerve/
-├── Cargo.toml            # libservo pinned to an exact rev (see ARCHITECTURE)
-├── rust-toolchain.toml   # stable 1.95.0, matched to servo
-├── src/
-│   ├── main.rs           # M1: winit + libservo, single webview (verified API)
-│   └── chrome/           # the browser UI — HTML/CSS/JS, rendered by Servo
-│       ├── index.html
-│       ├── chrome.css
-│       └── chrome.js
-├── docs/
-│   └── ARCHITECTURE.md   # the design, the compositing model, the roadmap
-└── reference/verso/      # vendored Verso source as reference (gitignored)
+swerve/                       # Cargo workspace
+├── Cargo.toml                # [workspace] + engine [patch] tables (see docs/FORK.md)
+├── rust-toolchain.toml       # stable 1.95.0
+├── Jenkinsfile               # tri-platform CI (Linux/macOS/Windows runners)
+├── scripts/sync-forks.sh     # maintained-fork merge tooling (--check / --merge)
+├── crates/
+│   ├── swerve-protocol/      # servo-free IPC wire types
+│   ├── swerve-engine/        # the ONLY crate that touches the Servo fork
+│   └── swerve/               # the browser binary
+│       └── src/
+│           ├── main.rs       # winit app, compositor, chrome↔engine bridge, tabs, IPC
+│           ├── chrome/       # the browser UI (HTML/CSS/JS, rendered by Servo)
+│           └── content/      # home / about pages
+├── docs/                     # ROADMAP.md, FORK.md, ARCHITECTURE.md, plan/*
+└── reference/verso/          # vendored Verso source (gitignored)
 ```
 
 ## Reference: Verso

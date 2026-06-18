@@ -1,44 +1,14 @@
-[package]
-name = "swerve"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.95"
-license = "MPL-2.0"
-description = "A web browser whose UI (chrome) is HTML rendered by the Servo engine"
-repository = "https://github.com/airgap/swerve"
-
-[dependencies]
-# ── Servo embedding (the libservo umbrella crate) ─────────────────────────────
-# We build on our MAINTAINED FORK of Servo: github.com/airgap/swervo (fork of
-# servo/servo). We merge upstream on a cadence and carry our patches on top — we do
-# not file upstream. See docs/FORK.md. Pin an exact rev and bump deliberately.
-# `servo` is the high-level embedding crate (`use servo::...`); rev ed1af70 is still
-# identical to upstream until our first fork patch lands.
+# swerve — Cargo workspace.
 #
-# Keep DEFAULT features on. They are `baked-in-resources` (registers Servo's
-# resource reader for UA stylesheets / error pages — WITHOUT it the Constellation
-# panics at startup with "No resource reader registered"), `clipboard`, and
-# `js_jit`. The `media-gstreamer` feature is NOT a default, so no gstreamer system
-# libs are pulled in; enable it explicitly only if you install gstreamer and want
-# audio/video.
-servo = { git = "https://github.com/airgap/swervo", rev = "ed1af70e712aa7ae0df4611241f10f6204389b70" }
+# The engine dependency is quarantined in the `swerve-engine` crate (the only crate
+# that touches the Servo fork). `swerve-protocol` holds servo-free wire types. The
+# `swerve` crate is the browser binary. See docs/ARCHITECTURE.md, docs/FORK.md,
+# ROADMAP §R2.
+[workspace]
+resolver = "3"
+members = ["crates/swerve-protocol", "crates/swerve-engine", "crates/swerve"]
 
-# Not re-exported by `servo`: EventLoopWaker lives here. At this rev the crate was
-# renamed — the PACKAGE is `servo-embedder-traits` but its lib is still
-# `embedder_traits` (so `use embedder_traits::...` keeps working). Must track the
-# same rev as `servo` above.
-embedder_traits = { git = "https://github.com/airgap/swervo", rev = "ed1af70e712aa7ae0df4611241f10f6204389b70", package = "servo-embedder-traits" }
-
-# ── Windowing / geometry (versions matched to servo's workspace @ pinned rev) ──
-winit = "0.30.13"
-euclid = "0.22"
-dpi = "0.1"
-url = "2.5"
-
-# Servo does TLS through rustls; a crypto provider must be installed at startup.
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
-
-# Speed up the (enormous) dependency compile in dev builds.
+# Speed up the (enormous) engine dependency compile in dev builds.
 [profile.dev.package."*"]
 opt-level = 2
 
@@ -49,7 +19,7 @@ lto = "thin"
 # Redirect Servo's stylo (CSS engine) and webrender (GPU renderer) deps to our
 # maintained forks, so the whole engine surface is under github.com/airgap. Same
 # code as upstream for now — identical until our first fork patch lands. Cargo
-# honours these top-level patches across the entire (swervo-transitive) graph.
+# honours these workspace-root patches across the entire (swervo-transitive) graph.
 [patch."https://github.com/servo/stylo"]
 selectors            = { git = "https://github.com/airgap/stylo", rev = "49e912cf401a7f867d33d61baa2389bb3d6f73e0" }
 servo_arc            = { git = "https://github.com/airgap/stylo", rev = "49e912cf401a7f867d33d61baa2389bb3d6f73e0" }

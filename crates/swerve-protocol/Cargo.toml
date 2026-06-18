@@ -1,0 +1,9 @@
+[package]
+name = "swerve-protocol"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MPL-2.0"
+description = "Servo-free wire types for swerve's IPC control surface."
+
+[dependencies]

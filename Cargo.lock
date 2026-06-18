@@ -7534,14 +7534,25 @@ checksum = "e454d048db5527d000bfddb77bd072bbf3a1e2ae785f16d9bd116e07c2ab45eb"
 name = "swerve"
 version = "0.1.0"
 dependencies = [
- "dpi",
  "euclid",
  "rustls",
- "servo",
- "servo-embedder-traits",
+ "swerve-engine",
+ "swerve-protocol",
  "url",
  "winit",
 ]
+
+[[package]]
+name = "swerve-engine"
+version = "0.1.0"
+dependencies = [
+ "servo",
+ "servo-embedder-traits",
+]
+
+[[package]]
+name = "swerve-protocol"
+version = "0.1.0"
 
 [[package]]
 name = "syn"

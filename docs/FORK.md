@@ -50,6 +50,9 @@ Bump `rev` after each upstream merge or patch; the canary CI lane (below) must b
 Target: merge upstream on a **fixed cadence** (≈monthly, or aligned to Servo's
 crates.io LTS train — see [`plan/sustainability.md`](plan/sustainability.md)).
 
+`scripts/sync-forks.sh --check` reports drift across all three forks; `--merge` performs
+the merge (clones into `$SWERVE_FORKS_DIR`, fetches upstream, merges, pushes). Per repo it does:
+
 ```bash
 git remote add upstream https://github.com/servo/servo   # once
 git fetch upstream
@@ -93,6 +96,7 @@ toolchain and the mozjs/SpiderMonkey + ANGLE native deps.
   macOS/Windows build quirks apply and several sandboxing pieces are weak/absent
   upstream — expect fork patches.
 
-CI (`.github/workflows/ci.yml`) builds all three; macOS/Windows start as
-`continue-on-error` until green, then become required. A scheduled **canary** lane
-builds `main` against the latest `upstream` to surface merge breakage early.
+CI is **Jenkins** (`Jenkinsfile`, on the Linux/macOS/Windows runners): a matrix builds
+all three; Linux is the required gate, macOS/Windows run non-blocking (UNSTABLE) until
+green, then flip to required. A scheduled **Upstream canary** stage runs
+`scripts/sync-forks.sh --check` to surface fork drift early.
