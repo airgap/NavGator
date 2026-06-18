@@ -38,6 +38,8 @@ rm -rf "$TH"
 export REGISTER_URL="${REGISTER_URL:-https://api.lyku.org/register-app-release}"
 
 # wrangler@3 supports Node 18 (the agent's node); wrangler@4 needs Node 20+.
+# In v3 `r2 object put` writes to the real bucket by default (no `--remote` flag; the
+# opt-in for local is `--local`), unlike v4 which needs `--remote`.
 wr() { parabun x wrangler@3 "$@"; }
 
 published=0
@@ -52,7 +54,7 @@ for f in "$DIST"/swerve-*.tar.gz "$DIST"/swerve-*.AppImage "$DIST"/swerve-*.dmg;
     esac
     for chan in "v$VERSION" "dev-$SHA" "latest"; do
         wr r2 object put "$R2_BUCKET/swerve/$chan/$name" \
-            --file "$f" --content-type application/octet-stream --remote
+            --file "$f" --content-type application/octet-stream
     done
     # Register the versioned release so it surfaces at lyku.org/apps.
     python3 scripts/register-release.py swerve "$plat" "$VERSION" "swerve/v$VERSION/$name" "$size" "$SHA" \
