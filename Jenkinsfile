@@ -57,16 +57,30 @@ pipeline {
                                 if (isUnix()) {
                                     sh '''
                                         set -e
-                                        rustup show
-                                        if command -v apt-get >/dev/null; then
-                                            sudo apt-get update -q
-                                            sudo apt-get install -y llvm clang libclang-dev cmake pkg-config python3 xvfb
-                                            echo "LIBCLANG_PATH=$(llvm-config --libdir)" > .ci-env
-                                        elif command -v brew >/dev/null; then
-                                            brew install llvm cmake pkg-config || true
-                                            echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" > .ci-env
-                                            echo "PATH=$(brew --prefix llvm)/bin:$PATH" >> .ci-env
+                                        # Jenkins `sh` is a non-login shell: it does NOT source the profile that
+                                        # puts ~/.cargo/bin (or Homebrew) on PATH, so an installed rustup/brew is
+                                        # invisible. Put the toolchains on PATH ourselves; bootstrap rustup only
+                                        # if it is truly absent.
+                                        export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/lib/llvm-18/bin:$PATH"
+                                        . "$HOME/.cargo/env" 2>/dev/null || true
+                                        command -v rustup >/dev/null || \
+                                          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none
+                                        export PATH="$HOME/.cargo/bin:$PATH"
+                                        rustup show   # installs the toolchain pinned by rust-toolchain.toml
+
+                                        # LLVM for mozjs/bindgen (needs llvm-objdump + a matching libclang). Best-effort.
+                                        LIBCLANG=""
+                                        if command -v brew >/dev/null; then
+                                            brew list llvm >/dev/null 2>&1 || brew install llvm cmake pkg-config || true
+                                            P="$(brew --prefix llvm 2>/dev/null)"
+                                            [ -n "$P" ] && { export PATH="$P/bin:$PATH"; LIBCLANG="$P/lib"; }
+                                        elif command -v apt-get >/dev/null; then
+                                            sudo -n apt-get update -q && sudo -n apt-get install -y llvm clang libclang-dev cmake pkg-config python3 xvfb || true
+                                            LIBCLANG="$(llvm-config --libdir 2>/dev/null || echo /usr/lib/llvm-18/lib)"
                                         fi
+                                        # Persist PATH (+ LIBCLANG_PATH) for the Build/Test/smoke stages (same workspace).
+                                        { echo "PATH=$PATH"; [ -n "$LIBCLANG" ] && echo "LIBCLANG_PATH=$LIBCLANG"; } > .ci-env
+                                        rustc --version && cargo --version
                                     '''
                                 } else {
                                     // Windows agent: LLVM + Rust assumed pre-provisioned on the runner.
@@ -104,8 +118,13 @@ pipeline {
                         steps {
                             script {
                                 // Pure unit tests (servo-free); cross-platform.
-                                def t = { isUnix() ? sh('cargo test --locked -p swerve-protocol')
-                                                   : bat('cargo test --locked -p swerve-protocol') }
+                                def t = {
+                                    if (isUnix()) {
+                                        sh 'set -a; [ -f .ci-env ] && . ./.ci-env; set +a; cargo test --locked -p swerve-protocol'
+                                    } else {
+                                        bat 'cargo test --locked -p swerve-protocol'
+                                    }
+                                }
                                 if (env.PLATFORM == 'linux') { t() }
                                 else { catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') { t() } }
                             }
