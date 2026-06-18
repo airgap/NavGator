@@ -1,46 +1,57 @@
 //! swerve — a web browser whose UI ("chrome") is HTML rendered by Servo.
 //!
-//! ## Milestone 1 (this file)
-//! Stand up libservo in a winit window and render a SINGLE webview. By default it
-//! loads the local HTML chrome (`src/chrome/index.html`) so you can watch Servo
-//! paint your own UI. Pass a URL as the first CLI arg to load a page instead:
+//! ## Milestone 2 (this file): chrome + content compositing
+//! Two webviews in one window:
+//!   * **chrome** — our HTML UI, rendered into the window's `WindowRenderingContext`
+//!     (fills the window).
+//!   * **content** — the web page, rendered into an `OffscreenRenderingContext`
+//!     (an FBO), then composited into the content region *below* the chrome via
+//!     `OffscreenRenderingContext::render_to_parent_callback()` (a scissor-clear +
+//!     `blit_framebuffer`, GL bottom-left coords).
 //!
-//! ```text
-//! cargo run -- https://servo.org
-//! ```
+//! This is the pattern servoshell's `Gui`/minibrowser uses for its egui toolbar —
+//! we just swap egui for a second Servo webview. API verified against servo rev
+//! `ed1af70` (`winit_minimal` + `ports/servoshell/desktop/gui.rs` +
+//! `components/shared/paint/rendering_context.rs`).
 //!
-//! The point of Milestone 1 is to get the Servo build, the toolchain, and the
-//! event loop GREEN before taking on compositing. Getting Servo to build and run
-//! at all is the step that historically sinks Servo-embedding projects (see
-//! `docs/ARCHITECTURE.md` — "the Verso lesson").
+//! ### The chrome/content split
+//! Until M3's chrome↔embedder bridge lets the chrome report its own content rect,
+//! Rust and the chrome agree on a fixed split: [`CHROME_HEIGHT_CSS`] here must equal
+//! the chrome header height in `src/chrome/chrome.css` (`.chrome { height: ... }`).
 //!
-//! ## Milestone 2 (not here yet)
-//! Two regions in one window — HTML chrome on top, web content below — composited
-//! via an `OffscreenRenderingContext`, the same mechanism servoshell's Minibrowser
-//! uses for its toolbar. See `docs/ARCHITECTURE.md`.
-//!
-//! API verified against servo rev `ed1af70` (its `winit_minimal` example).
+//! ### Input
+//! Mouse (move/button/wheel) is routed by region: chrome owns `y < CHROME_HEIGHT`,
+//! content owns the rest (point shifted up by the chrome height). Clicking a region
+//! focuses it. Keyboard is deferred until the M3 navigation bridge (it needs the
+//! winit→keyboard_types mapping servoshell keeps in `keyutils.rs`).
+//! Pass a URL arg to choose the content page: `cargo run -- https://servo.org`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::env;
 use std::error::Error;
 use std::path::Path;
 use std::rc::Rc;
 
 use euclid::Scale;
+use euclid::default::{Point2D, Rect, Size2D};
 use servo::{
-    RenderingContext, Servo, ServoBuilder, WebView, WebViewBuilder, WindowRenderingContext,
+    DevicePoint, InputEvent, MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent,
+    MouseMoveEvent, OffscreenRenderingContext, RenderingContext, Servo, ServoBuilder, WebView,
+    WebViewBuilder, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
 };
 use url::Url;
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::{Window, WindowId};
 
+/// Logical-pixel height of the HTML chrome (tabstrip + toolbar). MUST match
+/// `.chrome { height: ... }` in `src/chrome/chrome.css`. See module docs.
+const CHROME_HEIGHT_CSS: u32 = 84;
+
 fn main() -> Result<(), Box<dyn Error>> {
-    // Servo speaks TLS through rustls; a crypto provider must be installed before
-    // any network activity.
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");
@@ -51,35 +62,115 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Where the (single, Milestone-1) webview points on startup.
-fn startup_url() -> Url {
+fn file_url(rel: &str) -> Url {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+    Url::from_file_path(&p).unwrap_or_else(|_| Url::parse("about:blank").unwrap())
+}
+
+/// The chrome UI document.
+fn chrome_url() -> Url {
+    file_url("src/chrome/index.html")
+}
+
+/// The content page: a CLI arg if given, else swerve's local new-tab page.
+fn content_url() -> Url {
     if let Some(arg) = env::args().nth(1) {
         if let Ok(url) = Url::parse(&arg) {
             return url;
         }
-        eprintln!("swerve: '{arg}' is not a valid URL, loading chrome instead");
+        eprintln!("swerve: '{arg}' is not a valid URL, loading the home page instead");
     }
-    // Default: render our own HTML chrome, so M1 demonstrates "Servo paints our UI".
-    let chrome = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/chrome/index.html");
-    Url::from_file_path(&chrome).unwrap_or_else(|_| Url::parse("about:blank").unwrap())
+    file_url("src/content/home.html")
 }
 
-/// Everything the running app needs. Shared (via `Rc`) so it can also serve as the
-/// per-webview delegate.
+/// Physical-pixel size of the content region (window minus the chrome strip).
+fn content_size(window: PhysicalSize<u32>, chrome_h: u32) -> PhysicalSize<u32> {
+    PhysicalSize::new(
+        window.width.max(1),
+        window.height.saturating_sub(chrome_h).max(1),
+    )
+}
+
 struct AppState {
     window: Window,
     servo: Servo,
-    rendering_context: Rc<WindowRenderingContext>,
-    webviews: RefCell<Vec<WebView>>,
+    /// The OS-window surface; the chrome renders here and we composite into it.
+    window_context: Rc<WindowRenderingContext>,
+    /// The content webview's offscreen FBO; blitted into the window each frame.
+    content_context: Rc<OffscreenRenderingContext>,
+    chrome: RefCell<Option<WebView>>,
+    content: RefCell<Option<WebView>>,
+    /// Physical-pixel chrome height (logical * hidpi scale).
+    chrome_height: Cell<u32>,
+    /// Last known cursor position in physical window coordinates.
+    cursor: Cell<(f64, f64)>,
 }
 
-// Servo drives the embedder through delegate callbacks. The default `WebViewDelegate`
-// already does the sensible thing (e.g. allows navigation), so we override only what
-// we need. The big set of hooks we'll implement in M2 lives here too: title/URL
-// changes (to update the chrome), new-window/popup requests, prompts, context menus.
+impl AppState {
+    /// Paint chrome → window FBO, content → offscreen FBO, then blit content into
+    /// the window's content region and present.
+    fn render(&self) {
+        let chrome = self.chrome.borrow();
+        let content = self.content.borrow();
+        let (Some(chrome), Some(content)) = (chrome.as_ref(), content.as_ref()) else {
+            return;
+        };
+
+        // Content into its own offscreen framebuffer.
+        let _ = self.content_context.make_current();
+        content.paint();
+
+        // Chrome into the window framebuffer (fills the window).
+        let _ = self.window_context.make_current();
+        self.window_context.prepare_for_rendering();
+        chrome.paint();
+
+        // Composite the content FBO into the window's content region. The callback
+        // scissor-clears `target_rect` then blits the offscreen FBO into it. Coords
+        // are GL bottom-left, so the content region (the lower part of the window,
+        // below the chrome strip) sits at origin (0, 0).
+        if let Some(blit) = self.content_context.render_to_parent_callback() {
+            let win = self.window.inner_size();
+            let w = win.width.max(1) as i32;
+            let h = win.height.saturating_sub(self.chrome_height.get()).max(1) as i32;
+            let target = Rect::new(Point2D::new(0, 0), Size2D::new(w, h));
+            let gl = self.window_context.glow_gl_api();
+            blit(&*gl, target);
+        }
+
+        self.window_context.present();
+    }
+
+    fn resize(&self, size: PhysicalSize<u32>) {
+        self.window_context.resize(size);
+        if let Some(chrome) = self.chrome.borrow().as_ref() {
+            chrome.resize(size);
+        }
+        let csize = content_size(size, self.chrome_height.get());
+        self.content_context.resize(csize);
+        if let Some(content) = self.content.borrow().as_ref() {
+            content.resize(csize);
+        }
+        self.window.request_redraw();
+    }
+
+    /// The webview under a window-space point, plus that point translated into the
+    /// webview's own coordinate space. Chrome owns `y < chrome_height`; content owns
+    /// the rest (shifted up by the chrome height).
+    fn route(&self, x: f64, y: f64) -> Option<(WebView, DevicePoint)> {
+        let chrome_h = self.chrome_height.get() as f64;
+        if y < chrome_h {
+            let webview = self.chrome.borrow().clone()?;
+            Some((webview, DevicePoint::new(x as f32, y as f32)))
+        } else {
+            let webview = self.content.borrow().clone()?;
+            Some((webview, DevicePoint::new(x as f32, (y - chrome_h) as f32)))
+        }
+    }
+}
+
 impl servo::WebViewDelegate for AppState {
     fn notify_new_frame_ready(&self, _webview: WebView) {
-        // A new frame is ready to paint — ask winit to redraw.
         self.window.request_redraw();
     }
 }
@@ -101,17 +192,26 @@ impl ApplicationHandler<WakeUp> for App {
 
         let display_handle = event_loop.display_handle().expect("no display handle");
         let window = event_loop
-            .create_window(Window::default_attributes().with_title("swerve"))
+            .create_window(
+                Window::default_attributes()
+                    .with_title("swerve")
+                    .with_inner_size(LogicalSize::new(1280.0, 800.0)),
+            )
             .expect("failed to create window");
         let window_handle = window.window_handle().expect("no window handle");
 
-        // One rendering context bound to the OS window. In M2, content webviews get
-        // their own OffscreenRenderingContext instead and we composite into this one.
-        let rendering_context = Rc::new(
-            WindowRenderingContext::new(display_handle, window_handle, window.inner_size())
+        let inner = window.inner_size();
+        let scale = window.scale_factor();
+        let chrome_h = (CHROME_HEIGHT_CSS as f64 * scale).round() as u32;
+
+        let window_context = Rc::new(
+            WindowRenderingContext::new(display_handle, window_handle, inner)
                 .expect("failed to create WindowRenderingContext"),
         );
-        let _ = rendering_context.make_current();
+        let _ = window_context.make_current();
+
+        // Offscreen FBO for the content webview, sized to the content region.
+        let content_context = Rc::new(window_context.offscreen_context(content_size(inner, chrome_h)));
 
         let servo = ServoBuilder::default()
             .event_loop_waker(Box::new(waker.clone()))
@@ -121,22 +221,32 @@ impl ApplicationHandler<WakeUp> for App {
         let state = Rc::new(AppState {
             window,
             servo,
-            rendering_context,
-            webviews: RefCell::new(Vec::new()),
+            window_context,
+            content_context,
+            chrome: RefCell::new(None),
+            content: RefCell::new(None),
+            chrome_height: Cell::new(chrome_h),
+            cursor: Cell::new((0.0, 0.0)),
         });
 
-        let webview = WebViewBuilder::new(&state.servo, state.rendering_context.clone())
-            .url(startup_url())
-            .hidpi_scale_factor(Scale::new(state.window.scale_factor() as f32))
+        let chrome = WebViewBuilder::new(&state.servo, state.window_context.clone())
+            .url(chrome_url())
+            .hidpi_scale_factor(Scale::new(scale as f32))
             .delegate(state.clone())
             .build();
-        webview.focus();
-        state.webviews.borrow_mut().push(webview);
 
+        let content = WebViewBuilder::new(&state.servo, state.content_context.clone())
+            .url(content_url())
+            .hidpi_scale_factor(Scale::new(scale as f32))
+            .delegate(state.clone())
+            .build();
+        content.focus();
+
+        *state.chrome.borrow_mut() = Some(chrome);
+        *state.content.borrow_mut() = Some(content);
         *self = App::Running(state);
     }
 
-    /// Servo woke us up (new frame, network I/O, timer, …) — let it make progress.
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: WakeUp) {
         if let App::Running(state) = self {
             state.servo.spin_event_loop();
@@ -145,29 +255,71 @@ impl ApplicationHandler<WakeUp> for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let App::Running(state) = self else { return };
-
-        // Servo needs a chance to process the latest messages on every wake.
         state.servo.spin_event_loop();
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::RedrawRequested => {
-                if let Some(webview) = state.webviews.borrow().last() {
-                    webview.paint();
-                }
-                state.rendering_context.present();
-            }
-            WindowEvent::Resized(size) => {
-                // NOTE: the verified winit_minimal example resizes only the webview.
-                // A WindowRenderingContext likely also wants `.resize(size)` here;
-                // confirm against the pinned rev once it builds.
-                if let Some(webview) = state.webviews.borrow().last() {
-                    webview.resize(size);
+            WindowEvent::RedrawRequested => state.render(),
+            WindowEvent::Resized(size) => state.resize(size),
+
+            WindowEvent::CursorMoved { position, .. } => {
+                state.cursor.set((position.x, position.y));
+                if let Some((webview, point)) = state.route(position.x, position.y) {
+                    webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(
+                        point.into(),
+                    )));
                 }
             }
-            // M2: route mouse/keyboard via `webview.notify_input_event(..)`, deciding
-            // chrome-vs-content by which region the pointer is in. winit_minimal shows
-            // the wheel-event shape.
+
+            WindowEvent::MouseInput {
+                state: button_state,
+                button,
+                ..
+            } => {
+                let (x, y) = state.cursor.get();
+                if let Some((webview, point)) = state.route(x, y) {
+                    let action = match button_state {
+                        ElementState::Pressed => MouseButtonAction::Down,
+                        ElementState::Released => MouseButtonAction::Up,
+                    };
+                    let button = match button {
+                        MouseButton::Left => ServoMouseButton::Left,
+                        MouseButton::Right => ServoMouseButton::Right,
+                        MouseButton::Middle => ServoMouseButton::Middle,
+                        MouseButton::Back => ServoMouseButton::Back,
+                        MouseButton::Forward => ServoMouseButton::Forward,
+                        MouseButton::Other(v) => ServoMouseButton::Other(v),
+                    };
+                    // Clicking a region gives it keyboard focus.
+                    if matches!(button_state, ElementState::Pressed) {
+                        webview.focus();
+                    }
+                    webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+                        action, button, point.into(),
+                    )));
+                }
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (x, y) = state.cursor.get();
+                if let Some((webview, point)) = state.route(x, y) {
+                    let (dx, dy, mode) = match delta {
+                        MouseScrollDelta::LineDelta(lx, ly) => {
+                            ((lx * 76.0) as f64, (ly * 76.0) as f64, WheelMode::DeltaLine)
+                        }
+                        MouseScrollDelta::PixelDelta(p) => (p.x, p.y, WheelMode::DeltaPixel),
+                    };
+                    let delta = WheelDelta { x: dx, y: dy, z: 0.0, mode };
+                    webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
+                        delta,
+                        point.into(),
+                    )));
+                }
+            }
+
+            // Keyboard is deferred: winit KeyEvent → keyboard_types::KeyboardEvent needs the
+            // mapping servoshell keeps in keyutils.rs, and isn't useful until the M3
+            // navigation bridge lets the omnibox act on typed input.
             _ => {}
         }
     }
@@ -177,7 +329,6 @@ impl ApplicationHandler<WakeUp> for App {
 #[derive(Clone)]
 struct Waker(EventLoopProxy<WakeUp>);
 
-/// The user event we post to wake winit. (Unit struct — it only signals "spin".)
 #[derive(Debug)]
 struct WakeUp;
 
@@ -187,7 +338,6 @@ impl embedder_traits::EventLoopWaker for Waker {
     }
 
     fn wake(&self) {
-        // If the loop is already gone, dropping the event is fine.
         let _ = self.0.send_event(WakeUp);
     }
 }

@@ -39,6 +39,11 @@ body {
 /* ── Chrome bar ─────────────────────────────────────────────────────────── */
 .chrome {
   flex: 0 0 auto;
+  /* Fixed height: must equal CHROME_HEIGHT_CSS in src/main.rs, which is where the
+     content webview is composited below. (M3 will make this dynamic via the bridge.) */
+  height: 84px;
+  box-sizing: border-box;
+  overflow: hidden;
   background: var(--bar);
   border-bottom: 1px solid var(--line);
 }

@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<!--
+  swerve's new-tab / home page. This is *content* — rendered by the content webview
+  into an offscreen buffer and composited below the chrome. Deliberately styled
+  distinctly from the chrome so the two composited regions are obvious.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>New tab</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 22px;
+        background: radial-gradient(120% 120% at 50% 0%, #14233a 0%, #0b1220 60%, #080d16 100%);
+        color: #e9eef6;
+        font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      .wordmark {
+        font-size: 64px;
+        font-weight: 600;
+        letter-spacing: -0.03em;
+        /* `background-clip: text` is unsupported by Servo at this rev (it fills the
+           box instead of clipping to glyphs), so we use a solid color. */
+        color: #9fc1ff;
+      }
+      .tagline {
+        color: #9fb0c8;
+        margin-top: -10px;
+      }
+      .search {
+        width: min(560px, 80vw);
+        height: 46px;
+        padding: 0 18px;
+        border-radius: 999px;
+        border: 1px solid #2a3a55;
+        background: #0d1626;
+        color: #e9eef6;
+        font: inherit;
+        outline: none;
+      }
+      .search::placeholder {
+        color: #6f819b;
+      }
+      .row {
+        display: flex;
+        gap: 10px;
+        color: #7f93b0;
+        font-size: 13px;
+      }
+      .pill {
+        padding: 6px 12px;
+        border: 1px solid #243246;
+        border-radius: 999px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wordmark">swerve</div>
+    <div class="tagline">content webview · composited below the chrome</div>
+    <input class="search" type="text" placeholder="This is the content region — a separate Servo webview" />
+    <div class="row">
+      <span class="pill">offscreen FBO</span>
+      <span class="pill">blit into window</span>
+      <span class="pill">Milestone 2</span>
+    </div>
+  </body>
+</html>

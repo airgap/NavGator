@@ -90,11 +90,17 @@ toolchain, and event loop work end-to-end** before any compositing. This is the 
 that sinks projects — de-risked first. Confirmed on Linux via a headless Xvfb +
 software-GL run that loaded `src/chrome/index.html` and painted the UI.
 
-### M2 — chrome + content compositing
-- Content webview → `OffscreenRenderingContext`.
-- Reserve a chrome region; composite chrome texture (top) + content texture (below).
-- Input routing by region; resize recomputes both rects.
-- The chrome `.viewport` becomes the hole the content texture fills.
+### M2 — chrome + content compositing ✅ compositing + mouse input; ⏳ keyboard
+- Content webview → `OffscreenRenderingContext`; chrome webview → the window context.
+- Each frame: paint both, then `render_to_parent_callback()` scissor-clears + blits
+  the content FBO into the region below the chrome (GL bottom-left coords), then present.
+- Input: mouse move/button/wheel routed by region (chrome if `y < CHROME_HEIGHT`, else
+  content with the point shifted up by the chrome height); clicking a region focuses it.
+- **Verified** (headless Xvfb + synthetic `xdotool` input): two webviews / two rendering
+  contexts composite in one Servo instance; the `CHROME_HEIGHT_CSS` split aligns; clicking
+  the omnibox focuses it and nav buttons hover — i.e. mouse routes to the right region.
+- TODO: keyboard (deferred to M3 — needs the winit→keyboard_types mapping in servoshell's
+  `keyutils.rs`); verify resize interactively.
 
 ### M3 — chrome ↔ embedder bridge
 Wire `window.swerve` (see `src/chrome/chrome.js`) to the embedder so the toolbar can
