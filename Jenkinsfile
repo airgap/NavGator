@@ -20,6 +20,9 @@ pipeline {
     }
 
     triggers {
+        // Poll GitHub for new `dev` commits (a localhost Jenkins can't receive a
+        // GitHub push webhook); GenericTrigger remains for when a webhook is wired.
+        pollSCM('H/5 * * * *')
         GenericTrigger(
             genericVariables: [
                 [key: 'ref', value: '$.ref'],
