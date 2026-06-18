@@ -99,8 +99,11 @@ software-GL run that loaded `src/chrome/index.html` and painted the UI.
 - **Verified** (headless Xvfb + synthetic `xdotool` input): two webviews / two rendering
   contexts composite in one Servo instance; the `CHROME_HEIGHT_CSS` split aligns; clicking
   the omnibox focuses it and nav buttons hover — i.e. mouse routes to the right region.
-- TODO: keyboard (deferred to M3 — needs the winit→keyboard_types mapping in servoshell's
-  `keyutils.rs`); verify resize interactively.
+- Keyboard landed in M3; dynamic content-rect (retiring fixed `CHROME_HEIGHT`) landed
+  in M4. Resize: code-complete (the `Resized` handler resizes window + offscreen +
+  every tab), and the same content-resize path is exercised by the layout handshake,
+  but a true window-resize event can't be triggered headlessly without a WM, so it's
+  not yet interactively verified.
 
 ### M3 — chrome ↔ engine bridge ✅ keyboard + navigation (verified)
 A single-process bridge — **no `ipc-channel`** (Verso needed that only because
@@ -123,9 +126,24 @@ versoview is a separate process):
 - TODO: dynamic content-rect reporting (retire fixed `CHROME_HEIGHT`); IME/composition;
   a less hacky command channel than `swerve:` navigation; popup/prompt/context-menu hooks.
 
-### M4 — tabs / multi-content
-Multiple content webviews (one per tab), one chrome. Show/hide + composite the
-active tab's texture.
+### M4 — tabs / multi-content ✅ (verified) + dynamic content-rect (M3 polish)
+- **Tabs**: content is a `Vec<Tab>` of webviews sharing the one
+  `OffscreenRenderingContext`; only the active tab is `show()`n and painted. The
+  engine pushes a tab model (`{tabs:[{title}], active, url, canGoBack/Forward}`) to
+  the chrome via `swerve:state`; the chrome renders the strip and sends
+  `swerve:tab?new|select=i|close=i` back. Per-tab URL/title are attributed by
+  matching the delegate's `WebView` against the tab list (`WebView: PartialEq`).
+  A `Weak<AppState>` self-ref lets `&self` delegate callbacks build new tab webviews.
+- **Dynamic content-rect** (retires fixed `CHROME_HEIGHT`): on load/resize the chrome
+  reports its `.viewport` top (CSS px) via `swerve:ready?top=` / `swerve:layout?top=`;
+  the engine scales it to device px and derives the content rect, resizing the
+  offscreen context + tabs.
+- **Verified** (headless Xvfb + `xdotool`): new tab, per-tab navigation (active tab →
+  about page, that tab's title updates while the other stays "New tab"), and switching
+  tabs swaps the composited content + address bar. Tab strip is rendered from the model.
+
+### M4b — left for later
+Drag-reorder tabs, tab overflow/scroll, favicons, keyboard tab shortcuts.
 
 ### M5 — external engine (the Tauri goal)
 Factor the engine + a stable IPC surface into a reusable `versoview`-style component

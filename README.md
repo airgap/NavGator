@@ -10,7 +10,7 @@ but as a separate webview composited into the window.
 
 ## Status
 
-✅ **Milestones 1–3 complete — verified end-to-end** (headless Xvfb + software GL +
+✅ **Milestones 1–4 complete — verified end-to-end** (headless Xvfb + software GL +
 synthetic `xdotool` input). On Linux, `cargo build` succeeds (stable Rust 1.95,
 848-package graph, `Cargo.lock` committed); the binary boots Servo and:
 
@@ -21,6 +21,11 @@ synthetic `xdotool` input). On Linux, `cargo build` succeeds (stable Rust 1.95,
   (`swerve:` command URLs intercepted in `request_navigation`), and content state
   (URL/title/back-forward) is pushed back into the chrome via `evaluate_javascript`.
   Typing a URL + Enter navigates the content webview and updates the address bar.
+- **M4** — tabs: multiple content webviews sharing one offscreen context (only the
+  active one shown/painted); the chrome renders a tab strip from an engine-pushed
+  model; new/select/close work, with per-tab title and navigation. Plus dynamic
+  content-rect (the chrome reports its content-region top; no more hardcoded chrome
+  height).
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and the roadmap.
 

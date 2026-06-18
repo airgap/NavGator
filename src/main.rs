@@ -1,40 +1,38 @@
 //! swerve — a web browser whose UI ("chrome") is HTML rendered by Servo.
 //!
-//! ## Milestone 3 (this file): the chrome ↔ engine bridge
-//! Builds on M2's two-webview compositing to make swerve an actual browser:
+//! ## Milestone 4 (this file): tabs, + dynamic content rect (M3 polish)
+//! Builds on the M2 compositor and M3 bridge.
 //!
-//! * **Keyboard** — winit key events are mapped to Servo `KeyboardEvent`s and routed
-//!   to the focused webview (so you can type in the omnibox).
-//! * **Chrome → engine** — chrome JS navigates to a `swerve:` command URL
-//!   (`swerve:nav#<url>`, `swerve:back`, `swerve:forward`, `swerve:reload`); the
-//!   chrome webview's `request_navigation` delegate intercepts it, `deny()`s the
-//!   chrome navigation, and drives the content webview. No IPC channel needed —
-//!   this is a single process (Verso needed `ipc-channel` only because versoview is
-//!   a separate process).
-//! * **Engine → chrome** — the content webview's delegate notifications
-//!   (`notify_url_changed`, `notify_page_title_changed`, `notify_history_changed`)
-//!   are pushed into the chrome via `WebView::evaluate_javascript`, dispatching the
-//!   `swerve:state` event that chrome.js listens for (URL bar, tab title, back/fwd).
+//! * **Tabs** — the content area is a `Vec<Tab>` of webviews that all share the one
+//!   `OffscreenRenderingContext`; only the active tab is shown and painted. The
+//!   engine pushes a tab model (`{tabs:[{title}], active, url, canGoBack/Forward}`)
+//!   to the chrome via the `swerve:state` event, and the chrome renders the tab
+//!   strip from it. Tab actions come back as `swerve:tab?new|select=i|close=i`.
+//! * **Dynamic content rect (retires fixed `CHROME_HEIGHT`)** — on load/resize the
+//!   chrome reports its content region's top (CSS px) via `swerve:ready?top=` /
+//!   `swerve:layout?top=`; the engine derives the content rect from that, so the
+//!   chrome/engine split is whatever the chrome actually lays out.
 //!
-//! API verified against servo rev `ed1af70`. Compositing/input details: see M2 notes.
+//! A `Weak<AppState>` self-reference lets `&self` delegate callbacks build new tab
+//! webviews (which need the `Rc<AppState>` as their delegate).
 //!
-//! Still TODO: dynamic content-rect reporting (retire the fixed `CHROME_HEIGHT`),
-//! IME/composition, and a less hacky command channel than `swerve:` navigation.
+//! API verified against servo rev `ed1af70`. Bridge/compositing: see M2/M3 notes.
+//! TODO: IME/composition; popup/prompt/context-menu hooks; a less hacky command
+//! channel than `swerve:` navigation.
 
 use std::cell::{Cell, RefCell};
 use std::env;
 use std::error::Error;
 use std::path::Path;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use euclid::Scale;
 use euclid::default::{Point2D, Rect, Size2D};
 use servo::{
     DevicePoint, InputEvent, Key, KeyState, KeyboardEvent, NamedKey as ServoNamedKey,
-    MouseButton as ServoMouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NavigationRequest, OffscreenRenderingContext,
-    RenderingContext, Servo, ServoBuilder, WebView, WebViewBuilder, WheelDelta, WheelEvent,
-    WheelMode, WindowRenderingContext,
+    MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
+    NavigationRequest, OffscreenRenderingContext, RenderingContext, Servo, ServoBuilder, WebView,
+    WebViewBuilder, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
 };
 use url::Url;
 use winit::application::ApplicationHandler;
@@ -45,9 +43,9 @@ use winit::keyboard::{Key as WinitKey, NamedKey};
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::{Window, WindowId};
 
-/// Logical-pixel height of the HTML chrome. MUST match `.chrome { height: ... }`
-/// in `src/chrome/chrome.css`.
-const CHROME_HEIGHT_CSS: u32 = 84;
+/// Fallback chrome height (logical px) used until the chrome reports its real
+/// content-region top via the `swerve:ready`/`swerve:layout` bridge command.
+const CHROME_HEIGHT_FALLBACK: u32 = 84;
 
 fn main() -> Result<(), Box<dyn Error>> {
     rustls::crypto::aws_lc_rs::default_provider()
@@ -79,15 +77,14 @@ fn content_url() -> Url {
     file_url("src/content/home.html")
 }
 
-fn content_size(window: PhysicalSize<u32>, chrome_h: u32) -> PhysicalSize<u32> {
+fn content_size(window: PhysicalSize<u32>, top: u32) -> PhysicalSize<u32> {
     PhysicalSize::new(
         window.width.max(1),
-        window.height.saturating_sub(chrome_h).max(1),
+        window.height.saturating_sub(top).max(1),
     )
 }
 
-/// Escape a string into a JS double-quoted string literal, for safe interpolation
-/// into an `evaluate_javascript` snippet.
+/// Escape a string into a JS double-quoted string literal.
 fn js_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -105,9 +102,7 @@ fn js_string(s: &str) -> String {
     out
 }
 
-/// Map a winit logical key to a Servo key. Minimal: printable characters plus the
-/// editing/navigation keys needed in the omnibox. (Full coverage would adapt
-/// servoshell's `keyutils.rs`.)
+/// Minimal winit→Servo key mapping (printable + editing/nav keys).
 fn winit_key_to_servo(key: &WinitKey) -> Option<Key> {
     Some(match key {
         WinitKey::Character(s) => Key::Character(s.to_string()),
@@ -133,29 +128,54 @@ enum Focused {
     Content,
 }
 
+/// One browser tab: a content webview plus the state we mirror into the chrome.
+struct Tab {
+    webview: WebView,
+    url: String,
+    title: String,
+    can_back: bool,
+    can_forward: bool,
+}
+
 struct AppState {
     window: Window,
     servo: Servo,
     window_context: Rc<WindowRenderingContext>,
     content_context: Rc<OffscreenRenderingContext>,
     chrome: RefCell<Option<WebView>>,
-    content: RefCell<Option<WebView>>,
-    chrome_height: Cell<u32>,
+    tabs: RefCell<Vec<Tab>>,
+    active: Cell<usize>,
+    /// Device-px y where the content region starts (reported by the chrome).
+    content_top: Cell<u32>,
+    scale: Cell<f64>,
     cursor: Cell<(f64, f64)>,
-    /// Which webview receives keyboard input.
     focused: Cell<Focused>,
+    /// Self-reference so `&self` delegate callbacks can build webviews (which need
+    /// the `Rc<AppState>` as their delegate).
+    weak_self: RefCell<Weak<AppState>>,
 }
 
 impl AppState {
+    fn content_phys_size(&self) -> PhysicalSize<u32> {
+        content_size(self.window.inner_size(), self.content_top.get())
+    }
+
+    fn active_tab(&self) -> Option<WebView> {
+        self.tabs.borrow().get(self.active.get()).map(|t| t.webview.clone())
+    }
+
+    fn tab_index(&self, webview: &WebView) -> Option<usize> {
+        self.tabs.borrow().iter().position(|t| &t.webview == webview)
+    }
+
     fn render(&self) {
         let chrome = self.chrome.borrow();
-        let content = self.content.borrow();
-        let (Some(chrome), Some(content)) = (chrome.as_ref(), content.as_ref()) else {
+        let (Some(chrome), Some(active)) = (chrome.as_ref(), self.active_tab()) else {
             return;
         };
 
         let _ = self.content_context.make_current();
-        content.paint();
+        active.paint();
 
         let _ = self.window_context.make_current();
         self.window_context.prepare_for_rendering();
@@ -164,7 +184,7 @@ impl AppState {
         if let Some(blit) = self.content_context.render_to_parent_callback() {
             let win = self.window.inner_size();
             let w = win.width.max(1) as i32;
-            let h = win.height.saturating_sub(self.chrome_height.get()).max(1) as i32;
+            let h = win.height.saturating_sub(self.content_top.get()).max(1) as i32;
             let target = Rect::new(Point2D::new(0, 0), Size2D::new(w, h));
             let gl = self.window_context.glow_gl_api();
             blit(&*gl, target);
@@ -178,71 +198,207 @@ impl AppState {
         if let Some(chrome) = self.chrome.borrow().as_ref() {
             chrome.resize(size);
         }
-        let csize = content_size(size, self.chrome_height.get());
+        let csize = self.content_phys_size();
         self.content_context.resize(csize);
-        if let Some(content) = self.content.borrow().as_ref() {
-            content.resize(csize);
+        for tab in self.tabs.borrow().iter() {
+            tab.webview.resize(csize);
         }
         self.window.request_redraw();
     }
 
-    /// The webview under a window-space point, plus that point translated into the
-    /// webview's own coordinate space. Chrome owns `y < chrome_height`.
     fn route(&self, x: f64, y: f64) -> Option<(WebView, DevicePoint)> {
-        let chrome_h = self.chrome_height.get() as f64;
-        if y < chrome_h {
-            let webview = self.chrome.borrow().clone()?;
-            Some((webview, DevicePoint::new(x as f32, y as f32)))
+        let top = self.content_top.get() as f64;
+        if y < top {
+            Some((self.chrome.borrow().clone()?, DevicePoint::new(x as f32, y as f32)))
         } else {
-            let webview = self.content.borrow().clone()?;
-            Some((webview, DevicePoint::new(x as f32, (y - chrome_h) as f32)))
+            Some((self.active_tab()?, DevicePoint::new(x as f32, (y - top) as f32)))
         }
     }
 
     fn focused_webview(&self) -> Option<WebView> {
         match self.focused.get() {
             Focused::Chrome => self.chrome.borrow().clone(),
-            Focused::Content => self.content.borrow().clone(),
+            Focused::Content => self.active_tab(),
         }
-    }
-
-    fn is_content(&self, webview: &WebView) -> bool {
-        self.content.borrow().as_ref() == Some(webview)
     }
 
     fn is_chrome(&self, webview: &WebView) -> bool {
         self.chrome.borrow().as_ref() == Some(webview)
     }
 
-    /// Run JS in the chrome webview (used to push engine state into the UI).
     fn chrome_eval(&self, js: String) {
         if let Some(chrome) = self.chrome.borrow().as_ref() {
             chrome.evaluate_javascript(js, |_| {});
         }
     }
 
-    /// Act on a `swerve:` command URL emitted by the chrome JS.
-    fn handle_chrome_command(&self, url: &Url) {
-        let content = self.content.borrow();
-        let Some(content) = content.as_ref() else {
+    // ── Tab management ────────────────────────────────────────────────────────
+    fn new_tab(&self, url: Url) {
+        let Some(me) = self.weak_self.borrow().upgrade() else {
             return;
         };
+        let webview = WebViewBuilder::new(&self.servo, self.content_context.clone())
+            .url(url)
+            .hidpi_scale_factor(Scale::new(self.scale.get() as f32))
+            .delegate(me)
+            .build();
+        webview.resize(self.content_phys_size());
+        let idx = {
+            let mut tabs = self.tabs.borrow_mut();
+            tabs.push(Tab {
+                webview,
+                url: String::new(),
+                title: "New tab".to_string(),
+                can_back: false,
+                can_forward: false,
+            });
+            tabs.len() - 1
+        };
+        self.select_tab(idx);
+    }
+
+    fn select_tab(&self, i: usize) {
+        {
+            let tabs = self.tabs.borrow();
+            if i >= tabs.len() {
+                return;
+            }
+            for (j, tab) in tabs.iter().enumerate() {
+                if j == i {
+                    tab.webview.show();
+                } else {
+                    tab.webview.hide();
+                }
+            }
+            tabs[i].webview.focus();
+        }
+        self.active.set(i);
+        self.focused.set(Focused::Content);
+        self.push_model();
+        self.window.request_redraw();
+    }
+
+    fn close_tab(&self, i: usize) {
+        {
+            let mut tabs = self.tabs.borrow_mut();
+            if i >= tabs.len() {
+                return;
+            }
+            tabs.remove(i); // dropping the WebView handle closes the webview
+        }
+        if self.tabs.borrow().is_empty() {
+            self.new_tab(content_url());
+            return;
+        }
+        let len = self.tabs.borrow().len();
+        let active = self.active.get();
+        let new_active = if active >= len {
+            len - 1
+        } else if active > i {
+            active - 1
+        } else {
+            active
+        };
+        self.select_tab(new_active);
+    }
+
+    /// Push the full tab model to the chrome UI.
+    fn push_model(&self) {
+        let (tabs_json, active, url, can_back, can_forward) = {
+            let tabs = self.tabs.borrow();
+            let active = self.active.get();
+            let mut j = String::from("[");
+            for (i, t) in tabs.iter().enumerate() {
+                if i > 0 {
+                    j.push(',');
+                }
+                j.push_str(&format!("{{title:{}}}", js_string(&t.title)));
+            }
+            j.push(']');
+            let (url, cb, cf) = tabs
+                .get(active)
+                .map(|t| (t.url.clone(), t.can_back, t.can_forward))
+                .unwrap_or_default();
+            (j, active, url, cb, cf)
+        };
+        self.chrome_eval(format!(
+            "window.dispatchEvent(new CustomEvent('swerve:state',{{detail:{{tabs:{tabs_json},active:{active},url:{},canGoBack:{can_back},canGoForward:{can_forward}}}}}))",
+            js_string(&url)
+        ));
+    }
+
+    // ── Bridge command handling ───────────────────────────────────────────────
+    fn handle_chrome_command(&self, url: &Url) {
         match url.path() {
             "nav" => {
-                if let Some(target) = url.fragment().and_then(|f| Url::parse(f).ok()) {
-                    content.load(target);
+                if let (Some(target), Some(tab)) = (
+                    url.fragment().and_then(|f| Url::parse(f).ok()),
+                    self.active_tab(),
+                ) {
+                    tab.load(target);
                 }
             }
             "back" => {
-                content.go_back(1);
+                if let Some(tab) = self.active_tab() {
+                    tab.go_back(1);
+                }
             }
             "forward" => {
-                content.go_forward(1);
+                if let Some(tab) = self.active_tab() {
+                    tab.go_forward(1);
+                }
             }
             "reload" => {
-                content.reload();
+                if let Some(tab) = self.active_tab() {
+                    tab.reload();
+                }
             }
+            "tab" => self.handle_tab_command(url),
+            "ready" => {
+                self.apply_layout(url);
+                self.push_model();
+            }
+            "layout" => self.apply_layout(url),
             other => eprintln!("swerve: unknown chrome command '{other}'"),
+        }
+    }
+
+    fn handle_tab_command(&self, url: &Url) {
+        for (key, value) in url.query_pairs() {
+            match key.as_ref() {
+                "new" => self.new_tab(content_url()),
+                "select" => {
+                    if let Ok(i) = value.parse::<usize>() {
+                        self.select_tab(i);
+                    }
+                }
+                "close" => {
+                    if let Ok(i) = value.parse::<usize>() {
+                        self.close_tab(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Update the content-region top from a chrome-reported CSS-px value.
+    fn apply_layout(&self, url: &Url) {
+        for (key, value) in url.query_pairs() {
+            if key == "top" {
+                if let Ok(css_top) = value.parse::<f64>() {
+                    let dev = (css_top * self.scale.get()).round().max(0.0) as u32;
+                    if dev != self.content_top.get() && dev < self.window.inner_size().height {
+                        self.content_top.set(dev);
+                        let csize = self.content_phys_size();
+                        self.content_context.resize(csize);
+                        for tab in self.tabs.borrow().iter() {
+                            tab.webview.resize(csize);
+                        }
+                        self.window.request_redraw();
+                    }
+                }
+            }
         }
     }
 }
@@ -253,30 +409,27 @@ impl servo::WebViewDelegate for AppState {
     }
 
     fn notify_url_changed(&self, webview: WebView, url: Url) {
-        if self.is_content(&webview) {
-            self.chrome_eval(format!(
-                "window.dispatchEvent(new CustomEvent('swerve:state',{{detail:{{url:{}}}}}))",
-                js_string(url.as_str())
-            ));
+        if let Some(i) = self.tab_index(&webview) {
+            self.tabs.borrow_mut()[i].url = url.to_string();
+            self.push_model();
         }
     }
 
     fn notify_page_title_changed(&self, webview: WebView, title: Option<String>) {
-        if self.is_content(&webview) {
-            self.chrome_eval(format!(
-                "window.dispatchEvent(new CustomEvent('swerve:state',{{detail:{{title:{}}}}}))",
-                js_string(title.as_deref().unwrap_or(""))
-            ));
+        if let Some(i) = self.tab_index(&webview) {
+            self.tabs.borrow_mut()[i].title = title.unwrap_or_else(|| "New tab".to_string());
+            self.push_model();
         }
     }
 
     fn notify_history_changed(&self, webview: WebView, entries: Vec<Url>, current: usize) {
-        if self.is_content(&webview) {
-            let can_back = current > 0;
-            let can_forward = current + 1 < entries.len();
-            self.chrome_eval(format!(
-                "window.dispatchEvent(new CustomEvent('swerve:state',{{detail:{{canGoBack:{can_back},canGoForward:{can_forward}}}}}))"
-            ));
+        if let Some(i) = self.tab_index(&webview) {
+            {
+                let mut tabs = self.tabs.borrow_mut();
+                tabs[i].can_back = current > 0;
+                tabs[i].can_forward = current + 1 < entries.len();
+            }
+            self.push_model();
         }
     }
 
@@ -319,7 +472,7 @@ impl ApplicationHandler<WakeUp> for App {
 
         let inner = window.inner_size();
         let scale = window.scale_factor();
-        let chrome_h = (CHROME_HEIGHT_CSS as f64 * scale).round() as u32;
+        let content_top = (CHROME_HEIGHT_FALLBACK as f64 * scale).round() as u32;
 
         let window_context = Rc::new(
             WindowRenderingContext::new(display_handle, window_handle, inner)
@@ -328,7 +481,7 @@ impl ApplicationHandler<WakeUp> for App {
         let _ = window_context.make_current();
 
         let content_context =
-            Rc::new(window_context.offscreen_context(content_size(inner, chrome_h)));
+            Rc::new(window_context.offscreen_context(content_size(inner, content_top)));
 
         let servo = ServoBuilder::default()
             .event_loop_waker(Box::new(waker.clone()))
@@ -341,27 +494,26 @@ impl ApplicationHandler<WakeUp> for App {
             window_context,
             content_context,
             chrome: RefCell::new(None),
-            content: RefCell::new(None),
-            chrome_height: Cell::new(chrome_h),
+            tabs: RefCell::new(Vec::new()),
+            active: Cell::new(0),
+            content_top: Cell::new(content_top),
+            scale: Cell::new(scale),
             cursor: Cell::new((0.0, 0.0)),
             focused: Cell::new(Focused::Content),
+            weak_self: RefCell::new(Weak::new()),
         });
+        *state.weak_self.borrow_mut() = Rc::downgrade(&state);
 
         let chrome = WebViewBuilder::new(&state.servo, state.window_context.clone())
             .url(chrome_url())
             .hidpi_scale_factor(Scale::new(scale as f32))
             .delegate(state.clone())
             .build();
-
-        let content = WebViewBuilder::new(&state.servo, state.content_context.clone())
-            .url(content_url())
-            .hidpi_scale_factor(Scale::new(scale as f32))
-            .delegate(state.clone())
-            .build();
-        content.focus();
-
         *state.chrome.borrow_mut() = Some(chrome);
-        *state.content.borrow_mut() = Some(content);
+
+        // First tab.
+        state.new_tab(content_url());
+
         *self = App::Running(state);
     }
 
@@ -396,10 +548,10 @@ impl ApplicationHandler<WakeUp> for App {
             } => {
                 let (x, y) = state.cursor.get();
                 if matches!(button_state, ElementState::Pressed) {
-                    let chrome_h = state.chrome_height.get() as f64;
+                    let top = state.content_top.get() as f64;
                     state
                         .focused
-                        .set(if y < chrome_h { Focused::Chrome } else { Focused::Content });
+                        .set(if y < top { Focused::Chrome } else { Focused::Content });
                 }
                 if let Some((webview, point)) = state.route(x, y) {
                     let action = match button_state {

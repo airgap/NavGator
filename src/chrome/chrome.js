@@ -1,69 +1,43 @@
 // swerve chrome behaviour.
 //
-// Right now this runs entirely inside the chrome webview and only logs intent.
-// The chrome cannot yet *drive* the content webview, because that needs a bridge
-// from this JS into the Rust embedder. Designing that bridge is Milestone 2.
-//
-// Planned bridge (see docs/ARCHITECTURE.md):
-//   chrome JS  --(command)-->  embedder  --(libservo API)-->  content WebView
-//   content WebView  --(title/url/load events)-->  embedder  --(event)-->  chrome JS
-//
-// Verso did this with ipc-channel + a small injected JS API. We'll likely expose a
-// `window.swerve` object backed by a custom URL scheme or a postMessage channel the
-// embedder intercepts via WebViewDelegate.
+// The chrome talks to the embedder by navigating to `swerve:` command URLs, which
+// the Rust side intercepts in `request_navigation` (and denies, so the chrome stays
+// put). The embedder pushes UI state back via the `swerve:state` CustomEvent (tab
+// model, active URL, back/forward). Single-process bridge — to be replaced by a
+// proper channel later.
 
-// Commands to the embedder are sent by navigating the chrome webview to a
-// `swerve:` command URL, which the Rust side intercepts in `request_navigation`
-// (denying the actual navigation). The target URL for `navigate` rides in the
-// fragment to avoid percent-encoding fuss. Single-process bridge — to be replaced
-// by a proper channel later.
 const swerve = {
-  navigate(input) {
-    window.location.href = "swerve:nav#" + input;
-  },
-  back() {
-    window.location.href = "swerve:back";
-  },
-  forward() {
-    window.location.href = "swerve:forward";
-  },
-  reload() {
-    window.location.href = "swerve:reload";
-  },
-  newTab() {
-    console.log("[swerve] newTab (not wired yet)");
-  },
+  navigate(input) { go("swerve:nav#" + input); },
+  back() { go("swerve:back"); },
+  forward() { go("swerve:forward"); },
+  reload() { go("swerve:reload"); },
+  newTab() { go("swerve:tab?new=1"); },
+  selectTab(i) { go("swerve:tab?select=" + i); },
+  closeTab(i) { go("swerve:tab?close=" + i); },
 };
-
-// Expose for the eventual native bridge to hook / replace.
 window.swerve = swerve;
 
+// Each command is a one-shot navigation the embedder denies.
+function go(url) {
+  window.location.href = url;
+}
+
+const $ = (id) => document.getElementById(id);
+const ELLIPSIS = "…";
+
 // ── Non-selectable chrome ─────────────────────────────────────────────────────
-// Servo's CSS `user-select` is an inert stub at this rev (parses but nothing
-// honors it), so we can't get `user-select: none` from CSS. But Servo DOES fire a
-// cancellable `selectstart`, so we suppress selection on the chrome ourselves and
-// keep editable fields (the address bar) selectable.
+// Servo's CSS `user-select` is an inert stub, but it fires cancellable `selectstart`.
 document.addEventListener("selectstart", (e) => {
   if (e.target.closest("input, textarea, [contenteditable]")) return;
   e.preventDefault();
 });
 
-const $ = (id) => document.getElementById(id);
-
-// ── Tab-title ellipsis ────────────────────────────────────────────────────────
-// Servo doesn't implement `text-overflow: ellipsis` yet (it's gated behind the
-// `layout.unimplemented` pref and rejected as an unknown property). So we truncate
-// to fit the element's box ourselves and append a real ellipsis, binary-searching
-// the widest prefix that fits. Reading scrollWidth forces layout, so each probe
-// reflects the current font/width.
-const ELLIPSIS = "…";
-
+// ── Tab-title ellipsis (Servo lacks `text-overflow: ellipsis`) ────────────────
 function truncateToFit(el) {
   const full = el.dataset.fullTitle ?? el.textContent;
   el.dataset.fullTitle = full;
   el.textContent = full;
-  if (el.scrollWidth <= el.clientWidth) return; // fits as-is
-
+  if (el.scrollWidth <= el.clientWidth) return;
   let lo = 0;
   let hi = full.length;
   while (lo < hi) {
@@ -75,54 +49,78 @@ function truncateToFit(el) {
   el.textContent = lo > 0 ? full.slice(0, lo).trimEnd() + ELLIPSIS : ELLIPSIS;
 }
 
-function setTabTitle(titleEl, title) {
-  if (!titleEl) return;
-  titleEl.dataset.fullTitle = title;
-  truncateToFit(titleEl);
+// ── Tab strip, rendered from the engine's tab model ───────────────────────────
+function renderTabs(tabs, active) {
+  const strip = $("tabstrip");
+  strip.innerHTML = "";
+  tabs.forEach((tab, i) => {
+    const el = document.createElement("div");
+    el.className = "tab" + (i === active ? " is-active" : "");
+    el.addEventListener("click", () => swerve.selectTab(i));
+
+    const title = document.createElement("span");
+    title.className = "tab-title";
+    title.textContent = tab.title || "New tab";
+
+    const close = document.createElement("button");
+    close.className = "tab-close";
+    close.setAttribute("aria-label", "Close tab");
+    close.textContent = "×";
+    close.addEventListener("click", (e) => {
+      e.stopPropagation();
+      swerve.closeTab(i);
+    });
+
+    el.appendChild(title);
+    el.appendChild(close);
+    strip.appendChild(el);
+    truncateToFit(title);
+  });
+
+  const add = document.createElement("button");
+  add.className = "tab-new";
+  add.setAttribute("aria-label", "New tab");
+  add.textContent = "+";
+  add.addEventListener("click", () => swerve.newTab());
+  strip.appendChild(add);
 }
 
-function retruncateAllTabs() {
-  document.querySelectorAll(".tab-title").forEach(truncateToFit);
-}
+// ── State pushed from the engine ──────────────────────────────────────────────
+window.addEventListener("swerve:state", (e) => {
+  const d = e.detail ?? {};
+  if (Array.isArray(d.tabs)) renderTabs(d.tabs, d.active ?? 0);
+  // Don't clobber what the user is actively typing in the address bar.
+  if (typeof d.url === "string" && document.activeElement !== $("address")) {
+    $("address").value = d.url;
+  }
+  if (typeof d.canGoBack === "boolean") $("back").disabled = !d.canGoBack;
+  if (typeof d.canGoForward === "boolean") $("forward").disabled = !d.canGoForward;
+});
 
-// Initial pass (script runs at end of <body>, so the tabs exist) and on resize,
-// since available tab width changes with the window.
-retruncateAllTabs();
-window.addEventListener("resize", retruncateAllTabs);
-
+// ── Toolbar wiring (acts on the active tab) ───────────────────────────────────
 $("omnibox").addEventListener("submit", (e) => {
   e.preventDefault();
   const raw = $("address").value.trim();
   if (!raw) return;
-  // Bare query vs. URL heuristic — refine later.
   const looksLikeUrl = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) || /\.[a-z]{2,}/i.test(raw);
   const target = looksLikeUrl
     ? raw.includes("://")
       ? raw
-      : `https://${raw}`
-    : `https://duckduckgo.com/?q=${encodeURIComponent(raw)}`;
+      : "https://" + raw
+    : "https://duckduckgo.com/?q=" + encodeURIComponent(raw);
   swerve.navigate(target);
 });
-
 $("back").addEventListener("click", () => swerve.back());
 $("forward").addEventListener("click", () => swerve.forward());
 $("reload").addEventListener("click", () => swerve.reload());
-$("tab-new").addEventListener("click", () => swerve.newTab());
-
-// Select all when the address bar gains focus, so typing replaces the URL
-// (standard browser behavior) instead of appending to the pushed value.
+// Select-all on focus so typing replaces the URL instead of appending.
 $("address").addEventListener("focus", (e) => e.target.select());
 
-// The embedder will call these to push content-webview state into the chrome.
-window.addEventListener("swerve:state", (e) => {
-  const { url, title, canGoBack, canGoForward } = e.detail ?? {};
-  // Don't clobber what the user is actively typing in the address bar.
-  if (typeof url === "string" && document.activeElement !== $("address")) {
-    $("address").value = url;
-  }
-  if (typeof title === "string") {
-    setTabTitle(document.querySelector(".tab.is-active .tab-title"), title || "New tab");
-  }
-  if (typeof canGoBack === "boolean") $("back").disabled = !canGoBack;
-  if (typeof canGoForward === "boolean") $("forward").disabled = !canGoForward;
-});
+// ── Layout reporting (tells the engine where the content region starts) ───────
+function contentTopCss() {
+  return Math.round($("viewport").getBoundingClientRect().top);
+}
+window.addEventListener("resize", () => go("swerve:layout?top=" + contentTopCss()));
+
+// Announce readiness + initial layout; the engine replies with the tab model.
+go("swerve:ready?top=" + contentTopCss());
