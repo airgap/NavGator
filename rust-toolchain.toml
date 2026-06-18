@@ -1,0 +1,12 @@
+# Matches servo @ ed1af70 (the pinned rev in Cargo.toml).
+# Servo now builds on STABLE Rust — no nightly required. Keep this in lockstep
+# with servo's own rust-toolchain.toml whenever you bump the pinned rev.
+[toolchain]
+channel = "1.95.0"
+components = [
+    "clippy",
+    "llvm-tools",
+    "rustc-dev",
+    "rustfmt",
+    "rust-src",
+]

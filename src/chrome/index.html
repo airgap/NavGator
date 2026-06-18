@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<!--
+  swerve chrome — the browser UI itself, as an HTML document rendered by Servo.
+
+  In Milestone 1 this fills the whole window (so you can see Servo painting it).
+  In Milestone 2 only the .chrome bar is drawn by this document; the .viewport
+  region becomes a hole where the *content* webview is composited underneath.
+  See docs/ARCHITECTURE.md.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>swerve</title>
+    <link rel="stylesheet" href="chrome.css" />
+  </head>
+  <body>
+    <header class="chrome">
+      <div class="tabstrip" id="tabstrip">
+        <div class="tab is-active">
+          <span class="tab-title">Servo — the parallel browser engine project</span>
+          <button class="tab-close" aria-label="Close tab">×</button>
+        </div>
+        <div class="tab">
+          <span class="tab-title">New tab</span>
+          <button class="tab-close" aria-label="Close tab">×</button>
+        </div>
+        <button class="tab-new" id="tab-new" aria-label="New tab">+</button>
+      </div>
+
+      <div class="toolbar">
+        <div class="nav">
+          <button class="btn" id="back" aria-label="Back" disabled>‹</button>
+          <button class="btn" id="forward" aria-label="Forward" disabled>›</button>
+          <button class="btn" id="reload" aria-label="Reload">⟳</button>
+        </div>
+
+        <form class="omnibox" id="omnibox">
+          <span class="omnibox-scheme" id="scheme">swerve</span>
+          <input
+            id="address"
+            class="address"
+            type="text"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="Search or enter address"
+          />
+        </form>
+
+        <div class="actions">
+          <button class="btn" id="menu" aria-label="Menu">≡</button>
+        </div>
+      </div>
+    </header>
+
+    <!-- M1: this shows a placeholder. M2: the content webview is composited here. -->
+    <main class="viewport" id="viewport">
+      <div class="placeholder">
+        <h1>swerve</h1>
+        <p>This UI is HTML, rendered by Servo.</p>
+        <p class="hint">
+          Milestone&nbsp;2 composites a live web page into this region.
+        </p>
+      </div>
+    </main>
+
+    <script src="chrome.js"></script>
+  </body>
+</html>

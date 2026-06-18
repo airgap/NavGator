@@ -1,0 +1,45 @@
+[package]
+name = "swerve"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MPL-2.0"
+description = "A web browser whose UI (chrome) is HTML rendered by the Servo engine"
+repository = "https://github.com/airgap/swerve"
+
+[dependencies]
+# ── Servo embedding (the libservo umbrella crate) ─────────────────────────────
+# Servo is UNVERSIONED and fast-moving — that churn is what killed Verso. Pin an
+# exact rev and bump it deliberately. `servo` is the modern high-level embedding
+# crate (imported as `use servo::...`); on some revs the package is named
+# `libservo`, in which case add `package = "libservo"`.
+#
+# Keep DEFAULT features on. They are `baked-in-resources` (registers Servo's
+# resource reader for UA stylesheets / error pages — WITHOUT it the Constellation
+# panics at startup with "No resource reader registered"), `clipboard`, and
+# `js_jit`. The `media-gstreamer` feature is NOT a default, so no gstreamer system
+# libs are pulled in; enable it explicitly only if you install gstreamer and want
+# audio/video.
+servo = { git = "https://github.com/servo/servo", rev = "ed1af70e712aa7ae0df4611241f10f6204389b70" }
+
+# Not re-exported by `servo`: EventLoopWaker lives here. At this rev the crate was
+# renamed — the PACKAGE is `servo-embedder-traits` but its lib is still
+# `embedder_traits` (so `use embedder_traits::...` keeps working). Must track the
+# same rev as `servo` above.
+embedder_traits = { git = "https://github.com/servo/servo", rev = "ed1af70e712aa7ae0df4611241f10f6204389b70", package = "servo-embedder-traits" }
+
+# ── Windowing / geometry (versions matched to servo's workspace @ pinned rev) ──
+winit = "0.30.13"
+euclid = "0.22"
+dpi = "0.1"
+url = "2.5"
+
+# Servo does TLS through rustls; a crypto provider must be installed at startup.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+
+# Speed up the (enormous) dependency compile in dev builds.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"

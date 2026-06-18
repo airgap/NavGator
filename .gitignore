@@ -1,0 +1,16 @@
+# Rust build output (Servo deps make this many GB)
+/target
+
+# Vendored Verso source — archived upstream, ~hundreds of MB, NOT our code.
+# Re-fetch with: git clone --depth 1 https://github.com/versotile-org/verso.git reference/verso
+/reference
+
+# Servo's lockfile, copied in during setup if needed (see docs/ARCHITECTURE.md).
+# Comment this out if you decide to commit a pinned lockfile.
+# /Cargo.lock
+
+# Editor / OS noise
+.DS_Store
+*.swp
+/.idea
+/.vscode
