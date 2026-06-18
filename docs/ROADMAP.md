@@ -5,10 +5,32 @@ Read this first; each section links the deep-dive it condenses. Written 2026-06-
 against Servo rev `ed1af70`, stable Rust 1.95, an ~848-package dep graph, and a
 788-line single-binary prototype at M1–M5.
 
-This document is deliberately unhyped. swerve is a ~1-person project standing on a
-~8–9-core-dev engine that is itself a rounding error against Chrome's thousands of
-engineers. Where a thing is multi-year or not feasible, it says so. Several earlier
-claims have been re-baselined or downgraded in this revision — see §0.
+This document is deliberately unhyped: where a thing is multi-year or not feasible it
+says so. **§R2 below (owner decisions, 2026-06-18) overrides the resourcing, scope,
+platform, and engine-strategy assumptions in §0–§10.** Those sections were written for a
+resource-constrained, upstream-first, Linux-first, "second browser" posture; the owner
+has since chosen the opposite on every axis. Read §R2 first; treat §0–§10 as still-valid
+*technical* analysis whose *strategic framing* is superseded.
+
+---
+
+## R2. Owner decisions — locked 2026-06-18 (authoritative; overrides §0–§10 framing)
+
+Self-funded, with staffing resources, the owner chose the maximal-ambition path. The six
+locked decisions and their honest consequences:
+
+| # | Decision | Overrides | Consequence (straight) |
+|---|----------|-----------|------------------------|
+| D1 | **Fork Servo; implement everything ourselves; do NOT file upstream.** | §7 upstream-first; risk #1 framing | We become an **engine vendor**, not an embedder. The "keep-up-with-upstream treadmill" is replaced by **owning the whole web platform** (layout, SpiderMonkey/JS, net, media, security patches) — the single largest cost in the plan; it dwarfs the browser-UI work. Legitimate with real resources (it's what a browser *company* is), but eyes-open. **Sub-decision (D1a):** *hard fork* (permanent divergence; forgo all future Servo work) vs *maintained fork* (rebase on upstream Servo on a cadence + carry our patches). **Recommend maintained fork** — pure divergence rots and forfeits Servo/Igalia's ongoing engine output. "No upstreaming" is a fine *policy*; a periodic **merge-from-upstream cadence is still required** or the fork becomes unmaintainable. |
+| D2 | **Linux, macOS, Windows all first-class from day one.** | §2 Linux-x86-64-first + the Phase-5 fallback | All three sandboxes (Linux seccomp+userns, macOS Seatbelt, Windows AppContainer + job objects) and tri-platform GPU/`surfman`/ANGLE bring-up are on the critical path from the start. ~**3× the platform/security/CI surface**; Servo's macOS/Windows sandboxing is weak/absent, so most of it we build in the fork (consistent with D1). |
+| D3 | **Drop the encrypted credential vault / "crypto wallet".** *(my reading of "86 the crypto wallet" — confirm)* | §6 sync vault; risk #8; the sync-passphrase decision | Removes the separate-passphrase UX and the catastrophic lost-key risk. **Sub-decision (D3a):** *no synced password manager at all*, or *passwords sync but server-trusted (encrypted under the account, not zero-knowledge)*? I read it as **drop the zero-knowledge secrets vault**; non-secret data (settings/bookmarks/history/tabs/themes) still syncs. (If you meant a literal crypto/web3 wallet — it was never in the plan.) |
+| D4 | **Self-funded.** | §2/§7a funding gate; "labeled-preview-only"; risk #2 | Funding gate **satisfied** — a public, safety-claiming 1.0 is no longer grant-blocked. Caveat: money ≠ instant expertise; the pool of *Servo-fork + SpiderMonkey + browser-internals* engineers is narrow, so **hiring becomes the critical-path constraint** and bus-factor persists until the team exists. |
+| D5 | **Target full web rendering (Chrome-ish parity).** | §1/§2 "non-DRM mainstream web, not parity"; most §2 non-goals | The de-scoped engine-blocked features — passkeys/WebAuthn, state-partitioning, real downloads/find APIs, IndexedDB, WebGL2/WebGPU, service workers, WebRTC — all move **in-scope, built in our fork**. Reality check: Servo is ~62% WPT / ~20% Baseline-Widely-Available today; closing to Chrome parity is historically **thousands of engineer-years** (only Google/Apple/Mozilla have done it). With sustained resources it's a *multi-year company mission*, not a release. Still **sequence** it (most-used features first, measured vs a real top-sites corpus) rather than chase 100% WPT. **Sub-decision (D5a):** does "full" include **DRM/EME (Widevine)**? That needs a proprietary CDM partnership and *cannot* be implemented in-fork. |
+| D6 | **Resources available (funding + staffing).** | the "~1-person project" framing | Re-frames the plan from solo-constrained to team-scaled. Phase *sequencing* holds; durations compress with headcount — but the **engine-ownership (D1) + parity (D5) + tri-platform (D2)** combination is the defining, dominating cost. |
+
+**Net:** these turn swerve from "a themeable independent *second* browser" into **"build an independent full web platform + browser + browser company, on a Servo fork, across three OSes."** The most ambitious undertaking in consumer software — internally coherent *given real, sustained resources*. The dominating work item is now **the engine fork**; the gating constraint is now **hiring engine-capable engineers**, not money or upstream cooperation.
+
+**Confirm to finalize the re-point:** **D1a** (hard vs maintained fork), **D3a** (no password sync, or non-E2EE password sync), **D5a** (is DRM/EME in scope?).
 
 ---
 
