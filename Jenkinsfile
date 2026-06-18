@@ -132,19 +132,19 @@ pipeline {
                         }
                     }
 
-                    stage('Package & Publish') {
-                        // Package the release build (reused from Build) into tarball +
-                        // AppImage (linux) / dmg (macos), upload to R2, and register with
-                        // lyku.org/apps. Wrapped so a packaging/publish hiccup is UNSTABLE,
-                        // not a gate failure; publish.sh no-ops if R2/Doppler creds absent.
+                    stage('Package') {
+                        // Build the release artifacts (reusing the release build above) and
+                        // stash them per platform. The post-matrix Publish stage uploads
+                        // everything from the linux agent (the only one with the Doppler
+                        // token). Wrapped UNSTABLE so a packaging hiccup isn't a gate failure.
                         steps {
                             catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
                                 sh '''
                                     set -a; [ -f .ci-env ] && . ./.ci-env; set +a
                                     bash scripts/package.sh
-                                    bash scripts/publish.sh
                                 '''
                             }
+                            stash name: "dist-${env.PLATFORM}", includes: 'dist/**', allowEmpty: true
                         }
                     }
 
@@ -159,6 +159,28 @@ pipeline {
                             '''
                         }
                     }
+                }
+            }
+        }
+
+        // Collect each platform's stashed artifacts on the linux agent (which has the
+        // Doppler token) and publish them all to R2 + lyku.org/apps. macOS can't publish
+        // from its own agent (no token there), so we mirror lyku's desktop job: the mac
+        // builds/packages, the linux agent publishes.
+        stage('Publish to lyku.org/apps') {
+            agent { label 'linux' }
+            steps {
+                checkout scm
+                script {
+                    ['dist-linux', 'dist-macos'].each { s ->
+                        try { unstash s } catch (err) { echo "no stash ${s} (platform may have failed)" }
+                    }
+                }
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    sh '''
+                        ls -lh dist/ 2>/dev/null || true
+                        bash scripts/publish.sh
+                    '''
                 }
             }
         }

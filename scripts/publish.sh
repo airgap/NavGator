@@ -1,48 +1,63 @@
 #!/usr/bin/env bash
 # Upload dist/ artifacts to R2 and register them with lyku.org/apps.
-# Mirrors lyku/jenkins/Jenkinsfile.zoid-desktop: same versioning (v<ver>/dev-<sha>/latest),
-# same Doppler ci-deploy/prd creds on the Jenkins host. Requires parabun (for wrangler),
-# the Doppler CLI, and python3. No-ops gracefully if creds/tools are missing.
+#
+# Runs ONCE on the linux Jenkins agent (the only one with the Doppler token at
+# /etc/default/jenkins-doppler). The matrix cells stash their dist/ per platform and the
+# Publish stage unstashes everything here, so this single invocation publishes both the
+# linux and macOS artifacts — mirroring lyku's desktop job (mac builds, linux publishes).
+# Versioning matches lyku/jenkins/Jenkinsfile.zoid-desktop: v<ver> / dev-<sha> / latest.
+# No-ops gracefully if creds are unavailable.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 VERSION="$(grep '^version' crates/swerve/Cargo.toml | head -1 | sed 's/.*"\([^"]*\)".*/\1/')"
-SHA="$(git rev-parse --short HEAD)"
-case "$(uname -s)" in Linux) PLATFORM=linux ;; Darwin) PLATFORM=macos ;; *) echo "unsupported OS"; exit 0 ;; esac
+SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 DIST="$ROOT/dist"
-[ -d "$DIST" ] || { echo "no dist/ — run scripts/package.sh first"; exit 1; }
+[ -d "$DIST" ] || { echo "no dist/ to publish"; exit 0; }
 
-# parabun (provides `parabun x wrangler`), as lyku/jenkins/build-desktop.sh does.
+# parabun provides `parabun x wrangler`, as lyku/jenkins/build-desktop.sh does.
 export PATH="$HOME/.parabun/bin:$PATH"
-command -v parabun >/dev/null || curl -fsSL https://raw.githubusercontent.com/airgap/parabun/main/install.sh | bash -s parabun-68d367fda3
+command -v parabun >/dev/null || {
+    curl -fsSL https://raw.githubusercontent.com/airgap/parabun/main/install.sh | bash -s parabun-68d367fda3 || true
+}
 
 # Doppler ci-deploy/prd creds — piggyback on lyku's CI creds on this Jenkins host.
 if [ -f /etc/default/jenkins-doppler ]; then
     export DOPPLER_TOKEN="$(grep '^DOPPLER_TOKEN_CI_DEPLOY=' /etc/default/jenkins-doppler | cut -d= -f2)"
 fi
 if ! command -v doppler >/dev/null || [ -z "${DOPPLER_TOKEN:-}" ]; then
-    echo "doppler/creds unavailable — skipping R2 publish (artifacts still in dist/ + archived)"; exit 0
+    echo "doppler/creds unavailable — skipping R2 publish (artifacts archived in Jenkins)"; exit 0
 fi
 TH="$(mktemp -d)"
 export CLOUDFLARE_ACCOUNT_ID="$(HOME=$TH doppler secrets get CLOUDFLARE_ACCOUNT_ID --project ci-deploy --config prd --plain)"
 export CLOUDFLARE_API_TOKEN="$(HOME=$TH doppler secrets get CLOUDFLARE_API_TOKEN --project ci-deploy --config prd --plain)"
 R2_BUCKET="$(HOME=$TH doppler secrets get R2_BUCKET --project ci-deploy --config prd --plain)"
-export CI_RELEASE_TOKEN="$(HOME=$TH doppler secrets get CI_RELEASE_TOKEN --project ci-deploy --config prd --plain)"
+export CI_RELEASE_TOKEN="$(HOME=$TH doppler secrets get CI_RELEASE_TOKEN --project ci-deploy --config prd --plain 2>/dev/null || true)"
 rm -rf "$TH"
 export REGISTER_URL="${REGISTER_URL:-https://api.lyku.org/register-app-release}"
 
+# wrangler@3 supports Node 18 (the agent's node); wrangler@4 needs Node 20+.
+wr() { parabun x wrangler@3 "$@"; }
+
+published=0
 for f in "$DIST"/swerve-*.tar.gz "$DIST"/swerve-*.AppImage "$DIST"/swerve-*.dmg; do
     [ -f "$f" ] || continue
     name="$(basename "$f")"
     size="$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")"
+    case "$name" in
+        *-linux-*) plat=linux ;;
+        *-macos-*) plat=macos ;;
+        *) plat=linux ;;
+    esac
     for chan in "v$VERSION" "dev-$SHA" "latest"; do
-        parabun x wrangler r2 object put "$R2_BUCKET/swerve/$chan/$name" \
+        wr r2 object put "$R2_BUCKET/swerve/$chan/$name" \
             --file "$f" --content-type application/octet-stream --remote
     done
     # Register the versioned release so it surfaces at lyku.org/apps.
-    python3 scripts/register-release.py swerve "$PLATFORM" "$VERSION" "swerve/v$VERSION/$name" "$size" "$SHA" \
-        || echo "WARN: registerAppRelease failed for $name"
-    echo "✓ published $name"
+    python3 scripts/register-release.py swerve "$plat" "$VERSION" "swerve/v$VERSION/$name" "$size" "$SHA" \
+        || echo "WARN: registerAppRelease failed for $name (is CI_RELEASE_TOKEN set in Doppler?)"
+    echo "✓ published $name ($plat)"
+    published=$((published + 1))
 done
-echo "✓ swerve $PLATFORM artifacts uploaded to R2 + registered"
+echo "✓ published $published artifact(s) to R2 + registered with lyku.org/apps"
