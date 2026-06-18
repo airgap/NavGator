@@ -108,3 +108,11 @@ CI is **Jenkins** (`Jenkinsfile`, on the Linux/macOS/Windows runners): a matrix 
 all three; Linux is the required gate, macOS/Windows run non-blocking (UNSTABLE) until
 green, then flip to required. A scheduled **Upstream canary** stage runs
 `scripts/sync-forks.sh --check` to surface fork drift early.
+
+The `swerve-ci` Pipeline job is **job-as-code** (`jenkins/job-configs/swerve-ci.xml`,
+created/updated via `jenkins/setup-jenkins.sh`): it builds `dev` from
+`github.com/airgap/swerve.git` via the root `Jenkinsfile` and polls every 5 min (a
+localhost Jenkins can't receive a GitHub push webhook). Agents: `linux` (Built-In),
+`macos` (mac-mini), `windows` (windows-strix). Runner provisioning (a single LLVM, Rust,
+sccache, warm `~/.cargo`) is the gating factor for the first green build — provision a
+`swerve-ci-base` image as lyku does with `lyku-ci-base`.
