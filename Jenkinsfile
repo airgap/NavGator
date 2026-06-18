@@ -45,7 +45,9 @@ pipeline {
         stage('Build & Test') {
             matrix {
                 axes {
-                    axis { name 'PLATFORM'; values 'linux', 'macos', 'windows' }
+                    // 'windows' temporarily disabled (windows-strix offline) — re-add it
+                    // here when the runner is online; the windows build branches remain below.
+                    axis { name 'PLATFORM'; values 'linux', 'macos' }
                 }
                 agent { label "${PLATFORM}" }
                 stages {
