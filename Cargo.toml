@@ -44,3 +44,24 @@ opt-level = 2
 
 [profile.release]
 lto = "thin"
+
+# ── Engine fork patches (ROADMAP §R2/D1; see docs/FORK.md) ────────────────────
+# Redirect Servo's stylo (CSS engine) and webrender (GPU renderer) deps to our
+# maintained forks, so the whole engine surface is under github.com/airgap. Same
+# code as upstream for now — identical until our first fork patch lands. Cargo
+# honours these top-level patches across the entire (swervo-transitive) graph.
+[patch."https://github.com/servo/stylo"]
+selectors            = { git = "https://github.com/airgap/stylo", rev = "49e912cf401a7f867d33d61baa2389bb3d6f73e0" }
+servo_arc            = { git = "https://github.com/airgap/stylo", rev = "49e912cf401a7f867d33d61baa2389bb3d6f73e0" }
+stylo                = { git = "https://github.com/airgap/stylo", rev = "49e912cf401a7f867d33d61baa2389bb3d6f73e0" }
+stylo_atoms          = { git = "https://github.com/airgap/stylo", rev = "49e912cf401a7f867d33d61baa2389bb3d6f73e0" }
+stylo_dom            = { git = "https://github.com/airgap/stylo", rev = "49e912cf401a7f867d33d61baa2389bb3d6f73e0" }
+stylo_malloc_size_of = { git = "https://github.com/airgap/stylo", rev = "49e912cf401a7f867d33d61baa2389bb3d6f73e0" }
+stylo_static_prefs   = { git = "https://github.com/airgap/stylo", rev = "49e912cf401a7f867d33d61baa2389bb3d6f73e0" }
+stylo_traits         = { git = "https://github.com/airgap/stylo", rev = "49e912cf401a7f867d33d61baa2389bb3d6f73e0" }
+
+# webrender is consumed from crates.io (0.69 / 0.2.2); redirect to our fork's 0.69-branch HEAD.
+[patch.crates-io]
+webrender         = { git = "https://github.com/airgap/webrender", rev = "dcfd5424deab751280e34a39220a7e1562263294" }
+webrender_api     = { git = "https://github.com/airgap/webrender", rev = "dcfd5424deab751280e34a39220a7e1562263294" }
+wr_malloc_size_of = { git = "https://github.com/airgap/webrender", rev = "dcfd5424deab751280e34a39220a7e1562263294" }

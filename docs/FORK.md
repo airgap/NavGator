@@ -11,6 +11,23 @@ and filing requests.
 > it forfeits Servo/Igalia's ongoing engine work and makes every later merge
 > exponentially harder. The discipline below keeps the merge cost bounded.
 
+## Engine repositories (all under github.com/airgap)
+
+We fork the **entire** Servo engine surface, not just the umbrella crate:
+
+| Fork | Upstream | swerve pins | Consumed via |
+| --- | --- | --- | --- |
+| [`airgap/swervo`](https://github.com/airgap/swervo) | `servo/servo` | `ed1af70` (`main`) | `Cargo.toml` git deps (`servo`, `embedder_traits`) |
+| [`airgap/stylo`](https://github.com/airgap/stylo) | `servo/stylo` | `49e912cf` | `[patch."…/servo/stylo"]` (8 crates) |
+| [`airgap/webrender`](https://github.com/airgap/webrender) | `servo/webrender` | `dcfd5424` (branch `0.69`) | `[patch.crates-io]` (webrender / webrender_api / wr_malloc_size_of) |
+
+`stylo` is consumed by swervo over **git**, so a top-level `[patch."https://github.com/servo/stylo"]`
+in swerve's `Cargo.toml` redirects all 8 stylo crates to our fork at the same rev. `webrender` is
+consumed from **crates.io** (`0.69`/`0.2.2`), so a `[patch.crates-io]` redirects it to our fork's
+`0.69` branch HEAD. Cargo honours top-level patches across the whole (swervo-transitive) graph, so
+neither requires editing the swervo fork. All three are pinned to upstream-identical revs today;
+bump them as fork patches land. Each fork follows the same maintained-fork discipline below.
+
 ## Repository model
 
 | Branch / remote | Role |
