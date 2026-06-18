@@ -67,11 +67,18 @@ engine are Milestones 2–5 in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## Build & run
 
 ```bash
-# Render the HTML chrome (Servo painting our own UI):
+# Launch the browser (chrome + a home tab):
 cargo run
 
-# Or load a page in the (single, M1) webview:
+# Open a specific page in the first tab:
 cargo run -- https://servo.org
+
+# Expose an IPC control socket so another process can drive the engine (M5):
+SWERVE_IPC=/tmp/swerve.sock cargo run
+#   …then from anywhere:
+#   printf 'navigate https://servo.org\n' | socat - UNIX-CONNECT:/tmp/swerve.sock
+#   printf 'new-tab\n'                     | socat - UNIX-CONNECT:/tmp/swerve.sock
+#   stream events:  socat UNIX-CONNECT:/tmp/swerve.sock -
 ```
 
 ### If the first build fails to resolve dependencies

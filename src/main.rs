@@ -23,8 +23,12 @@
 use std::cell::{Cell, RefCell};
 use std::env;
 use std::error::Error;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::rc::{Rc, Weak};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use euclid::Scale;
 use euclid::default::{Point2D, Rect, Size2D};
@@ -53,7 +57,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         .expect("failed to install rustls crypto provider");
 
     let event_loop = EventLoop::with_user_event().build()?;
-    let mut app = App::new(&event_loop);
+
+    // Optional IPC control socket (M5): when SWERVE_IPC is set, an external process
+    // can drive the engine over it. `ipc_clients` holds connected clients' write
+    // halves so the UI thread can push state events to them.
+    let ipc_clients: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
+    if let Ok(path) = env::var("SWERVE_IPC") {
+        start_ipc(path, event_loop.create_proxy(), ipc_clients.clone());
+    }
+
+    let mut app = App::Initial {
+        waker: Waker(event_loop.create_proxy()),
+        ipc_clients,
+    };
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -153,6 +169,8 @@ struct AppState {
     /// Self-reference so `&self` delegate callbacks can build webviews (which need
     /// the `Rc<AppState>` as their delegate).
     weak_self: RefCell<Weak<AppState>>,
+    /// Connected IPC clients' write halves, for pushing state events.
+    ipc_clients: Arc<Mutex<Vec<UnixStream>>>,
 }
 
 impl AppState {
@@ -382,6 +400,41 @@ impl AppState {
         }
     }
 
+    /// Execute a command received over the IPC control socket.
+    fn handle_ipc(&self, cmd: IpcCommand) {
+        match cmd {
+            IpcCommand::Navigate(url) => {
+                if let (Ok(target), Some(tab)) = (Url::parse(&url), self.active_tab()) {
+                    tab.load(target);
+                }
+            }
+            IpcCommand::NewTab => self.new_tab(content_url()),
+            IpcCommand::Reload => {
+                if let Some(tab) = self.active_tab() {
+                    tab.reload();
+                }
+            }
+            IpcCommand::Back => {
+                if let Some(tab) = self.active_tab() {
+                    tab.go_back(1);
+                }
+            }
+            IpcCommand::Forward => {
+                if let Some(tab) = self.active_tab() {
+                    tab.go_forward(1);
+                }
+            }
+            IpcCommand::SelectTab(i) => self.select_tab(i),
+            IpcCommand::CloseTab(i) => self.close_tab(i),
+        }
+    }
+
+    /// Send a line to every connected IPC client, dropping any that error.
+    fn ipc_emit(&self, line: &str) {
+        let mut clients = self.ipc_clients.lock().unwrap();
+        clients.retain_mut(|c| writeln!(c, "{line}").is_ok());
+    }
+
     /// Update the content-region top from a chrome-reported CSS-px value.
     fn apply_layout(&self, url: &Url) {
         for (key, value) in url.query_pairs() {
@@ -411,13 +464,16 @@ impl servo::WebViewDelegate for AppState {
     fn notify_url_changed(&self, webview: WebView, url: Url) {
         if let Some(i) = self.tab_index(&webview) {
             self.tabs.borrow_mut()[i].url = url.to_string();
+            self.ipc_emit(&format!("url {i} {url}"));
             self.push_model();
         }
     }
 
     fn notify_page_title_changed(&self, webview: WebView, title: Option<String>) {
         if let Some(i) = self.tab_index(&webview) {
-            self.tabs.borrow_mut()[i].title = title.unwrap_or_else(|| "New tab".to_string());
+            let title = title.unwrap_or_else(|| "New tab".to_string());
+            self.ipc_emit(&format!("title {i} {title}"));
+            self.tabs.borrow_mut()[i].title = title;
             self.push_model();
         }
     }
@@ -446,19 +502,19 @@ impl servo::WebViewDelegate for AppState {
 }
 
 enum App {
-    Initial(Waker),
+    Initial {
+        waker: Waker,
+        ipc_clients: Arc<Mutex<Vec<UnixStream>>>,
+    },
     Running(Rc<AppState>),
-}
-
-impl App {
-    fn new(event_loop: &EventLoop<WakeUp>) -> Self {
-        App::Initial(Waker(event_loop.create_proxy()))
-    }
 }
 
 impl ApplicationHandler<WakeUp> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let App::Initial(waker) = self else { return };
+        let (waker, ipc_clients) = match self {
+            App::Initial { waker, ipc_clients } => (waker.clone(), ipc_clients.clone()),
+            App::Running(_) => return,
+        };
 
         let display_handle = event_loop.display_handle().expect("no display handle");
         let window = event_loop
@@ -484,7 +540,7 @@ impl ApplicationHandler<WakeUp> for App {
             Rc::new(window_context.offscreen_context(content_size(inner, content_top)));
 
         let servo = ServoBuilder::default()
-            .event_loop_waker(Box::new(waker.clone()))
+            .event_loop_waker(Box::new(waker))
             .build();
         servo.setup_logging();
 
@@ -501,6 +557,7 @@ impl ApplicationHandler<WakeUp> for App {
             cursor: Cell::new((0.0, 0.0)),
             focused: Cell::new(Focused::Content),
             weak_self: RefCell::new(Weak::new()),
+            ipc_clients,
         });
         *state.weak_self.borrow_mut() = Rc::downgrade(&state);
 
@@ -517,8 +574,11 @@ impl ApplicationHandler<WakeUp> for App {
         *self = App::Running(state);
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: WakeUp) {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: WakeUp) {
         if let App::Running(state) = self {
+            if let WakeUp::Ipc(cmd) = event {
+                state.handle_ipc(cmd);
+            }
             state.servo.spin_event_loop();
         }
     }
@@ -617,8 +677,14 @@ impl ApplicationHandler<WakeUp> for App {
 #[derive(Clone)]
 struct Waker(EventLoopProxy<WakeUp>);
 
+/// Events posted to the winit loop from other threads.
 #[derive(Debug)]
-struct WakeUp;
+enum WakeUp {
+    /// Servo asked us to wake and pump its event loop.
+    Wake,
+    /// A command arrived on the IPC control socket.
+    Ipc(IpcCommand),
+}
 
 impl embedder_traits::EventLoopWaker for Waker {
     fn clone_box(&self) -> Box<dyn embedder_traits::EventLoopWaker> {
@@ -626,6 +692,69 @@ impl embedder_traits::EventLoopWaker for Waker {
     }
 
     fn wake(&self) {
-        let _ = self.0.send_event(WakeUp);
+        let _ = self.0.send_event(WakeUp::Wake);
     }
+}
+
+/// A command from an external process over the IPC control socket — the seed of
+/// the "Servo as an external engine" goal (M5): other apps drive the engine.
+#[derive(Debug)]
+enum IpcCommand {
+    Navigate(String),
+    NewTab,
+    Reload,
+    Back,
+    Forward,
+    SelectTab(usize),
+    CloseTab(usize),
+}
+
+impl IpcCommand {
+    /// Parse one line of the text protocol, e.g. `navigate https://servo.org`.
+    fn parse(line: &str) -> Option<Self> {
+        let mut parts = line.trim().splitn(2, ' ');
+        let verb = parts.next()?;
+        let arg = parts.next().unwrap_or("").trim();
+        Some(match verb {
+            "navigate" => IpcCommand::Navigate(arg.to_string()),
+            "new-tab" => IpcCommand::NewTab,
+            "reload" => IpcCommand::Reload,
+            "back" => IpcCommand::Back,
+            "forward" => IpcCommand::Forward,
+            "select-tab" => IpcCommand::SelectTab(arg.parse().ok()?),
+            "close-tab" => IpcCommand::CloseTab(arg.parse().ok()?),
+            _ => return None,
+        })
+    }
+}
+
+/// Bind the IPC control socket and accept connections on a background thread.
+/// Each line read is parsed into an [`IpcCommand`] and posted to the UI loop; the
+/// connection's write half is registered to receive state events. Unix-only for now
+/// (Windows would use a named pipe).
+fn start_ipc(path: String, proxy: EventLoopProxy<WakeUp>, clients: Arc<Mutex<Vec<UnixStream>>>) {
+    let _ = std::fs::remove_file(&path); // clear a stale socket
+    let listener = match UnixListener::bind(&path) {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("swerve: could not bind IPC socket {path}: {e}");
+            return;
+        }
+    };
+    eprintln!("swerve: IPC control socket listening on {path}");
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            if let Ok(writer) = stream.try_clone() {
+                clients.lock().unwrap().push(writer);
+            }
+            let proxy = proxy.clone();
+            thread::spawn(move || {
+                for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                    if let Some(cmd) = IpcCommand::parse(&line) {
+                        let _ = proxy.send_event(WakeUp::Ipc(cmd));
+                    }
+                }
+            });
+        }
+    });
 }

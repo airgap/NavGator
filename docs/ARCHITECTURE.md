@@ -145,11 +145,24 @@ versoview is a separate process):
 ### M4b — left for later
 Drag-reorder tabs, tab overflow/scroll, favicons, keyboard tab shortcuts.
 
-### M5 — external engine (the Tauri goal)
-Factor the engine + a stable IPC surface into a reusable `versoview`-style component
-so other apps can depend on it out-of-process — the original Verso/tauri-runtime-verso
-goal. **Commit to this only after feeling M1–M4's maintenance cost**, because the
-external contract multiplies the sync-with-Servo burden that ended Verso.
+### M5 — external engine (the Tauri goal) — ⚙️ v0: IPC control surface (verified)
+**Done (v0):** an opt-in IPC control socket (`SWERVE_IPC=/path`; Unix socket, text
+protocol, no deps) lets an external process drive the engine and receive state:
+- commands in: `navigate <url>`, `new-tab`, `reload`, `back`, `forward`,
+  `select-tab <i>`, `close-tab <i>`
+- events out: `url <tab> <url>`, `title <tab> <title>`
+
+The IPC thread parses each line and posts `WakeUp::Ipc(cmd)` to the winit loop
+(winit's `EventLoopProxy` is `Send`); the UI thread runs it and writes events back to
+connected clients (`Arc<Mutex<Vec<UnixStream>>>`). **Verified**: drove navigation +
+a new tab from `socat` with no window input, and read the emitted events.
+
+**Not done (the big lift):** this is a *control plane* for a standalone swerve
+window. The full Verso/`tauri-runtime-verso` model also renders the engine *into the
+host app's own window/surface* (host passes a window/surface handle; the engine
+composites into it), plus a client crate and a stable, versioned protocol. That
+surface-sharing + protocol-stability work is where the sync-with-Servo maintenance
+cost concentrates — scope it deliberately. Windows would need a named pipe.
 
 ---
 
