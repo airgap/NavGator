@@ -9,10 +9,11 @@ repository = "https://github.com/airgap/swerve"
 
 [dependencies]
 # ── Servo embedding (the libservo umbrella crate) ─────────────────────────────
-# Servo is UNVERSIONED and fast-moving — that churn is what killed Verso. Pin an
-# exact rev and bump it deliberately. `servo` is the modern high-level embedding
-# crate (imported as `use servo::...`); on some revs the package is named
-# `libservo`, in which case add `package = "libservo"`.
+# We build on our MAINTAINED FORK of Servo: github.com/airgap/swervo (fork of
+# servo/servo). We merge upstream on a cadence and carry our patches on top — we do
+# not file upstream. See docs/FORK.md. Pin an exact rev and bump deliberately.
+# `servo` is the high-level embedding crate (`use servo::...`); rev ed1af70 is still
+# identical to upstream until our first fork patch lands.
 #
 # Keep DEFAULT features on. They are `baked-in-resources` (registers Servo's
 # resource reader for UA stylesheets / error pages — WITHOUT it the Constellation
@@ -20,13 +21,13 @@ repository = "https://github.com/airgap/swerve"
 # `js_jit`. The `media-gstreamer` feature is NOT a default, so no gstreamer system
 # libs are pulled in; enable it explicitly only if you install gstreamer and want
 # audio/video.
-servo = { git = "https://github.com/servo/servo", rev = "ed1af70e712aa7ae0df4611241f10f6204389b70" }
+servo = { git = "https://github.com/airgap/swervo", rev = "ed1af70e712aa7ae0df4611241f10f6204389b70" }
 
 # Not re-exported by `servo`: EventLoopWaker lives here. At this rev the crate was
 # renamed — the PACKAGE is `servo-embedder-traits` but its lib is still
 # `embedder_traits` (so `use embedder_traits::...` keeps working). Must track the
 # same rev as `servo` above.
-embedder_traits = { git = "https://github.com/servo/servo", rev = "ed1af70e712aa7ae0df4611241f10f6204389b70", package = "servo-embedder-traits" }
+embedder_traits = { git = "https://github.com/airgap/swervo", rev = "ed1af70e712aa7ae0df4611241f10f6204389b70", package = "servo-embedder-traits" }
 
 # ── Windowing / geometry (versions matched to servo's workspace @ pinned rev) ──
 winit = "0.30.13"

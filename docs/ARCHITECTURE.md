@@ -170,9 +170,18 @@ cost concentrates — scope it deliberately. Windows would need a named pipe.
 
 ## Pinned versions (keep in lockstep)
 
+> **Engine strategy update (per [`ROADMAP.md` §R2](ROADMAP.md), [`FORK.md`](FORK.md)):**
+> swerve now builds on our **maintained fork** `github.com/airgap/swervo`, not upstream
+> `servo/servo`. We own the engine and implement features in the fork; we merge upstream
+> on a cadence but do not file upstream. The "high-level `libservo` + track-upstream"
+> stance in *The Verso lesson* above is superseded — though using the umbrella `servo`
+> crate and pinning an exact rev still hold. `rev` below is still upstream-identical
+> until our first fork patch lands.
+
 | Thing            | Value                                      |
 | ---------------- | ------------------------------------------ |
-| servo rev        | `ed1af70e712aa7ae0df4611241f10f6204389b70` |
+| engine source    | `github.com/airgap/swervo` (fork of `servo/servo`) |
+| pinned rev       | `ed1af70e712aa7ae0df4611241f10f6204389b70` |
 | Rust toolchain   | `1.95.0` (stable — no nightly)             |
 | edition          | 2024                                       |
 

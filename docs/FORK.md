@@ -1,0 +1,81 @@
+# The swervo engine fork
+
+swerve builds on **[`airgap/swervo`](https://github.com/airgap/swervo)** — our
+**maintained fork** of [`servo/servo`](https://github.com/servo/servo). This is the
+engine-strategy decision locked in [`ROADMAP.md` §R2 / D1](ROADMAP.md): we own the
+engine and implement web-platform features ourselves, rather than embedding upstream
+and filing requests.
+
+> **Maintained fork, not hard fork.** We never file changes *upstream*, but we *do*
+> merge *from* upstream on a cadence. A hard fork that stops tracking upstream rots:
+> it forfeits Servo/Igalia's ongoing engine work and makes every later merge
+> exponentially harder. The discipline below keeps the merge cost bounded.
+
+## Repository model
+
+| Branch / remote | Role |
+| --- | --- |
+| `airgap/swervo` `main` | Our **integration line**. Starts identical to upstream `ed1af70`; our patches land here. swerve's `Cargo.toml` pins a commit on this branch. |
+| `upstream` = `servo/servo` | Tracked read-only. We `git fetch upstream` and merge on a cadence; we never push to it. |
+| `patches/<feature>` | Topic branches for each fork patch (one concern each), merged into `main`. Keeps the diff legible and rebasable. |
+
+swerve consumes the fork through `Cargo.toml`:
+
+```toml
+servo           = { git = "https://github.com/airgap/swervo", rev = "<commit on main>" }
+embedder_traits = { git = "https://github.com/airgap/swervo", rev = "<same commit>", package = "servo-embedder-traits" }
+```
+
+Bump `rev` after each upstream merge or patch; the canary CI lane (below) must be green first.
+
+## Merge cadence
+
+Target: merge upstream on a **fixed cadence** (≈monthly, or aligned to Servo's
+crates.io LTS train — see [`plan/sustainability.md`](plan/sustainability.md)).
+
+```bash
+git remote add upstream https://github.com/servo/servo   # once
+git fetch upstream
+git switch main
+git merge upstream/main            # resolve conflicts in OUR patches only
+# run the full build + headless smoke + top-sites compat corpus
+# then bump swerve's Cargo.toml rev to the new main commit
+```
+
+**Diff-minimization is the merge-cost lever:** keep each patch small, isolated, and
+behind the narrowest change that works; prefer additive modules over edits to
+upstream files; record every patch in `PATCHES.md` (feature, files touched, why, merge
+hazards). The smaller and better-isolated the diff, the cheaper every future merge.
+
+## Fork patch backlog (toward D5 "full web rendering")
+
+The features upstream Servo gates or lacks become **our** engine work (sequenced by
+real-world site usage, not WPT %). Each is a `patches/<feature>` branch:
+
+- **Layout-gated CSS** (`layout.unimplemented`): `text-overflow`, `user-select`,
+  masks, `backdrop-filter`, anchor positioning, view-transitions, …
+- **Engine-blocked product features:** streaming **downloads** API, **find-in-page**
+  API, **IndexedDB** hardening, **service workers**, **WebRTC**.
+- **Graphics:** WebGL2, WebGPU maturation.
+- **Auth:** **WebAuthn / passkeys** (`PublicKeyCredential` is absent today).
+- **Privacy:** state partitioning / anti-fingerprinting (cookie partitioning is a stub).
+- **DRM:** **EME plumbing** to host a licensed Widevine/PlayReady CDM (the binary is
+  proprietary — the one allowed external dependency; build-flag gated). See §R2/D5a.
+- **Sandboxing:** a pluggable sandbox (Servo's spawn lives in the constellation) for
+  Linux seccomp+userns, macOS Seatbelt, Windows AppContainer — all first-class (§R2/D2).
+
+## Build notes per platform
+
+All three OSes are first-class (§R2/D2). The engine build needs a consistent LLVM
+toolchain and the mozjs/SpiderMonkey + ANGLE native deps.
+
+- **Linux (validated):** stable Rust 1.95 (via `rust-toolchain.toml`); a single LLVM
+  version on `PATH` + `LIBCLANG_PATH` (mozjs needs bare `llvm-objdump`; bindgen needs a
+  matching `libclang`). See the README troubleshooting section.
+- **macOS / Windows (to validate in CI):** same toolchain discipline; Servo's own
+  macOS/Windows build quirks apply and several sandboxing pieces are weak/absent
+  upstream — expect fork patches.
+
+CI (`.github/workflows/ci.yml`) builds all three; macOS/Windows start as
+`continue-on-error` until green, then become required. A scheduled **canary** lane
+builds `main` against the latest `upstream` to surface merge breakage early.
