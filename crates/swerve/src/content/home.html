@@ -63,6 +63,13 @@
         border: 1px solid #243246;
         border-radius: 999px;
       }
+      .ua {
+        margin-top: 14px;
+        max-width: 80vw;
+        color: #5b6b82;
+        font-size: 11px;
+        text-align: center;
+      }
     </style>
   </head>
   <body>
@@ -74,5 +81,10 @@
       <span class="pill">blit into window</span>
       <span class="pill">Milestone 2</span>
     </div>
+    <div class="ua" id="ua"></div>
+    <script>
+      // Shows the engine User-Agent — should include our "Swerve/0.1.0" fork token.
+      document.getElementById("ua").textContent = navigator.userAgent;
+    </script>
   </body>
 </html>

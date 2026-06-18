@@ -67,6 +67,14 @@ behind the narrowest change that works; prefer additive modules over edits to
 upstream files; record every patch in `PATCHES.md` (feature, files touched, why, merge
 hazards). The smaller and better-isolated the diff, the cheaper every future merge.
 
+## Applied fork patches
+
+| Branch | Repo | Commit | What |
+| --- | --- | --- | --- |
+| `patches/swerve-ua` | swervo | `e559b12` | Brands the default User-Agent — appends a `Swerve/0.1.0` token to all 6 per-OS UA strings in `components/config/prefs.rs` (keeps the Firefox/Servo compat tokens). The **first fork patch**: proves the patch → pin → build → ship pipeline end-to-end. swerve-engine pins this commit. |
+
+(In-repo ledger; the canonical per-patch detail lives on each `patches/*` branch in the fork.)
+
 ## Fork patch backlog (toward D5 "full web rendering")
 
 The features upstream Servo gates or lacks become **our** engine work (sequenced by
