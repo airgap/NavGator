@@ -25,7 +25,7 @@ use std::env;
 use std::error::Error;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -79,13 +79,29 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Resolve swerve's bundled web assets. A packaged build keeps them next to the
+/// executable in `<exe_dir>/resources/{chrome,content}`; `cargo run` (no such dir)
+/// falls back to the source tree. Without this, `env!("CARGO_MANIFEST_DIR")` would
+/// point at the build machine's path and a distributed binary couldn't find its UI.
+fn resources_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let res = dir.join("resources");
+            if res.join("chrome/index.html").exists() {
+                return res;
+            }
+        }
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+}
+
 fn file_url(rel: &str) -> Url {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+    let p = resources_dir().join(rel);
     Url::from_file_path(&p).unwrap_or_else(|_| Url::parse("about:blank").unwrap())
 }
 
 fn chrome_url() -> Url {
-    file_url("src/chrome/index.html")
+    file_url("chrome/index.html")
 }
 
 fn content_url() -> Url {
@@ -95,7 +111,7 @@ fn content_url() -> Url {
         }
         eprintln!("swerve: '{arg}' is not a valid URL, loading the home page instead");
     }
-    file_url("src/content/home.html")
+    file_url("content/home.html")
 }
 
 fn content_size(window: PhysicalSize<u32>, top: u32) -> PhysicalSize<u32> {

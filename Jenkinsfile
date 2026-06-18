@@ -99,10 +99,10 @@ pipeline {
                                         sh '''
                                             set -e
                                             [ -f .ci-env ] && set -a && . ./.ci-env && set +a
-                                            cargo build --locked --workspace
+                                            cargo build --release --locked --workspace
                                         '''
                                     } else {
-                                        bat 'cargo build --locked --workspace'
+                                        bat 'cargo build --release --locked --workspace'
                                     }
                                 }
                                 // Linux is the gate; macOS/Windows are non-blocking until green.
@@ -132,6 +132,22 @@ pipeline {
                         }
                     }
 
+                    stage('Package & Publish') {
+                        // Package the release build (reused from Build) into tarball +
+                        // AppImage (linux) / dmg (macos), upload to R2, and register with
+                        // lyku.org/apps. Wrapped so a packaging/publish hiccup is UNSTABLE,
+                        // not a gate failure; publish.sh no-ops if R2/Doppler creds absent.
+                        steps {
+                            catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                                sh '''
+                                    set -a; [ -f .ci-env ] && . ./.ci-env; set +a
+                                    bash scripts/package.sh
+                                    bash scripts/publish.sh
+                                '''
+                            }
+                        }
+                    }
+
                     stage('Headless smoke') {
                         when { expression { env.PLATFORM == 'linux' } }
                         steps {
@@ -139,7 +155,7 @@ pipeline {
                                 [ -f .ci-env ] && set -a && . ./.ci-env && set +a
                                 xvfb-run -a -s "-screen 0 1280x800x24" \
                                   env LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe \
-                                  timeout --signal=KILL 30 ./target/debug/swerve || true
+                                  timeout --signal=KILL 30 ./target/release/swerve || true
                             '''
                         }
                     }

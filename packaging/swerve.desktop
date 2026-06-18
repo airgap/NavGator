@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=swerve
+Comment=A web browser whose UI is HTML rendered by the Servo engine
+Exec=swerve
+Icon=swerve
+Categories=Network;WebBrowser;
+Terminal=false
