@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<!--
+  swerve settings. This is *content*, but the engine trusts this specific page (its URL
+  ends with content/settings.html) and honors its `swerve:` bridge commands — so it can
+  read and write persisted settings. The engine pushes current values via the
+  `swerve:settings` event; changes are sent back via `swerve:settings-set`.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Settings · swerve</title>
+    <style>
+      :root {
+        --accent: #5b8cff;
+        --bg: #0b1220;
+        --card: #0f1a2e;
+        --line: #233146;
+        --ink: #e9eef6;
+        --dim: #8295b0;
+      }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; height: 100%; }
+      body {
+        background: var(--bg);
+        color: var(--ink);
+        font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      .wrap {
+        max-width: 640px;
+        margin: 0 auto;
+        padding: 48px 24px 64px;
+      }
+      h1 {
+        font-size: 26px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+        margin: 0 0 4px;
+      }
+      .sub { color: var(--dim); margin: 0 0 32px; }
+      section {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 18px 20px;
+        margin-bottom: 18px;
+      }
+      h2 { font-size: 14px; font-weight: 600; margin: 0 0 4px; }
+      .hint { color: var(--dim); font-size: 12px; margin: 0 0 14px; }
+      .opts { display: flex; flex-wrap: wrap; gap: 8px; }
+      .opt {
+        padding: 9px 14px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: transparent;
+        color: var(--ink);
+        font: inherit;
+        cursor: pointer;
+      }
+      .opt:hover { border-color: var(--accent); }
+      .opt.is-active {
+        border-color: var(--accent);
+        background: color-mix(in srgb, var(--accent) 18%, transparent);
+      }
+      .swatches { display: flex; gap: 10px; flex-wrap: wrap; }
+      .swatch {
+        width: 34px;
+        height: 34px;
+        border-radius: 50%;
+        border: 2px solid transparent;
+        cursor: pointer;
+        padding: 0;
+      }
+      .swatch.is-active { border-color: var(--ink); }
+      .saved { color: var(--dim); font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>Settings</h1>
+      <p class="sub">Changes save automatically.</p>
+
+      <section>
+        <h2>Search engine</h2>
+        <p class="hint">Used by the address bar.</p>
+        <div class="opts" id="engines"></div>
+      </section>
+
+      <section>
+        <h2>Accent color</h2>
+        <p class="hint">Tints the browser chrome.</p>
+        <div class="swatches" id="accents"></div>
+      </section>
+
+      <p class="saved" id="saved"></p>
+    </div>
+
+    <script>
+      const go = (u) => { window.location.href = u; };
+
+      const ENGINES = [
+        { name: "DuckDuckGo", tpl: "https://duckduckgo.com/?q=%s" },
+        { name: "Google", tpl: "https://www.google.com/search?q=%s" },
+        { name: "Bing", tpl: "https://www.bing.com/search?q=%s" },
+        { name: "Startpage", tpl: "https://www.startpage.com/sp/search?query=%s" },
+      ];
+      const ACCENTS = ["#5b8cff", "#3fb950", "#a371f7", "#f0883e", "#f778ba", "#e5484d"];
+
+      let current = { search: ENGINES[0].tpl, accent: ACCENTS[0] };
+
+      const enginesEl = document.getElementById("engines");
+      const accentsEl = document.getElementById("accents");
+
+      ENGINES.forEach((e) => {
+        const b = document.createElement("button");
+        b.className = "opt";
+        b.textContent = e.name;
+        b.dataset.tpl = e.tpl;
+        b.addEventListener("click", () =>
+          go("swerve:settings-set?search=" + encodeURIComponent(e.tpl)),
+        );
+        enginesEl.appendChild(b);
+      });
+
+      ACCENTS.forEach((c) => {
+        const b = document.createElement("button");
+        b.className = "swatch";
+        b.style.background = c;
+        b.dataset.color = c;
+        b.setAttribute("aria-label", c);
+        b.addEventListener("click", () =>
+          go("swerve:settings-set?accent=" + encodeURIComponent(c)),
+        );
+        accentsEl.appendChild(b);
+      });
+
+      function render() {
+        document.documentElement.style.setProperty("--accent", current.accent);
+        for (const b of enginesEl.children) {
+          b.classList.toggle("is-active", b.dataset.tpl === current.search);
+        }
+        for (const b of accentsEl.children) {
+          b.classList.toggle("is-active", b.dataset.color === current.accent);
+        }
+      }
+
+      window.addEventListener("swerve:settings", (e) => {
+        const d = e.detail ?? {};
+        if (typeof d.search === "string") current.search = d.search;
+        if (typeof d.accent === "string") current.accent = d.accent;
+        document.getElementById("saved").textContent = "Saved.";
+        render();
+      });
+
+      render();
+      // Engine also pushes settings when this page loads; this is a backup request.
+      go("swerve:settings-get");
+    </script>
+  </body>
+</html>

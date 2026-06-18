@@ -1,10 +1,10 @@
 // swerve chrome behaviour.
 //
-// The chrome talks to the embedder by navigating to `swerve:` command URLs, which
-// the Rust side intercepts in `request_navigation` (and denies, so the chrome stays
-// put). The embedder pushes UI state back via the `swerve:state` CustomEvent (tab
-// model, active URL, back/forward). Single-process bridge — to be replaced by a
-// proper channel later.
+// The chrome talks to the embedder by navigating to `swerve:` command URLs, which the
+// Rust side intercepts in `request_navigation` (and denies, so the chrome stays put).
+// The embedder pushes UI state back via the `swerve:state` CustomEvent (tab model,
+// active URL, back/forward) and user settings via `swerve:settings`. Single-process
+// bridge — to be replaced by a proper channel later.
 
 const swerve = {
   navigate(input) { go("swerve:nav#" + input); },
@@ -14,6 +14,8 @@ const swerve = {
   newTab() { go("swerve:tab?new=1"); },
   selectTab(i) { go("swerve:tab?select=" + i); },
   closeTab(i) { go("swerve:tab?close=" + i); },
+  openSettings() { go("swerve:settings"); },
+  window(action) { go("swerve:window?action=" + action); },
 };
 window.swerve = swerve;
 
@@ -24,6 +26,9 @@ function go(url) {
 
 const $ = (id) => document.getElementById(id);
 const ELLIPSIS = "…";
+
+// Default search template until the engine pushes the configured one (see settings).
+let searchTemplate = "https://duckduckgo.com/?q=%s";
 
 // ── Non-selectable chrome ─────────────────────────────────────────────────────
 // Servo's CSS `user-select` is an inert stub, but it fires cancellable `selectstart`.
@@ -97,6 +102,15 @@ window.addEventListener("swerve:state", (e) => {
   if (typeof d.canGoForward === "boolean") $("forward").disabled = !d.canGoForward;
 });
 
+// ── Settings pushed from the engine ───────────────────────────────────────────
+window.addEventListener("swerve:settings", (e) => {
+  const d = e.detail ?? {};
+  if (typeof d.search === "string" && d.search.includes("%s")) searchTemplate = d.search;
+  if (typeof d.accent === "string") {
+    document.documentElement.style.setProperty("--accent", d.accent);
+  }
+});
+
 // ── Toolbar wiring (acts on the active tab) ───────────────────────────────────
 $("omnibox").addEventListener("submit", (e) => {
   e.preventDefault();
@@ -107,14 +121,30 @@ $("omnibox").addEventListener("submit", (e) => {
     ? raw.includes("://")
       ? raw
       : "https://" + raw
-    : "https://duckduckgo.com/?q=" + encodeURIComponent(raw);
+    : searchTemplate.replace("%s", encodeURIComponent(raw));
   swerve.navigate(target);
 });
 $("back").addEventListener("click", () => swerve.back());
 $("forward").addEventListener("click", () => swerve.forward());
 $("reload").addEventListener("click", () => swerve.reload());
+$("menu").addEventListener("click", () => swerve.openSettings());
 // Select-all on focus so typing replaces the URL instead of appending.
 $("address").addEventListener("focus", (e) => e.target.select());
+
+// ── Window controls (OS decorations are disabled) ─────────────────────────────
+$("win-min").addEventListener("click", () => swerve.window("minimize"));
+$("win-max").addEventListener("click", () => swerve.window("maximize"));
+$("win-close").addEventListener("click", () => swerve.window("close"));
+
+// Drag the window from empty titlebar space; double-click toggles maximize.
+const titlebar = $("titlebar");
+const isInteractive = (t) => t.closest("button, input, .tab");
+titlebar.addEventListener("mousedown", (e) => {
+  if (e.button === 0 && !isInteractive(e.target)) swerve.window("drag");
+});
+titlebar.addEventListener("dblclick", (e) => {
+  if (!isInteractive(e.target)) swerve.window("maximize");
+});
 
 // ── Layout reporting (tells the engine where the content region starts) ───────
 function contentTopCss() {
@@ -122,5 +152,5 @@ function contentTopCss() {
 }
 window.addEventListener("resize", () => go("swerve:layout?top=" + contentTopCss()));
 
-// Announce readiness + initial layout; the engine replies with the tab model.
+// Announce readiness + initial layout; the engine replies with the tab model + settings.
 go("swerve:ready?top=" + contentTopCss());

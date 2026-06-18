@@ -2,10 +2,10 @@
 <!--
   swerve chrome — the browser UI itself, as an HTML document rendered by Servo.
 
-  In Milestone 1 this fills the whole window (so you can see Servo painting it).
-  In Milestone 2 only the .chrome bar is drawn by this document; the .viewport
-  region becomes a hole where the *content* webview is composited underneath.
-  See docs/ARCHITECTURE.md.
+  The OS window decorations are disabled (main.rs `with_decorations(false)`), so this
+  document draws its own titlebar, window controls, and drag region. Only the .chrome
+  bar is painted by this document; the .viewport region is a hole where the content
+  webview is composited underneath. See docs/ARCHITECTURE.md.
 -->
 <html lang="en">
   <head>
@@ -16,8 +16,15 @@
   </head>
   <body>
     <header class="chrome">
-      <!-- Populated by chrome.js from the engine's tab model. -->
-      <div class="tabstrip" id="tabstrip"></div>
+      <!-- Titlebar: drag region (empty space) + tabs + window controls. -->
+      <div class="titlebar" id="titlebar">
+        <div class="tabstrip" id="tabstrip"></div>
+        <div class="wincontrols">
+          <button class="wbtn" id="win-min" aria-label="Minimize" title="Minimize">&#x2212;</button>
+          <button class="wbtn" id="win-max" aria-label="Maximize" title="Maximize">&#x25A1;</button>
+          <button class="wbtn wclose" id="win-close" aria-label="Close" title="Close">&#x2715;</button>
+        </div>
+      </div>
 
       <div class="toolbar">
         <div class="nav">
@@ -39,21 +46,13 @@
         </form>
 
         <div class="actions">
-          <button class="btn" id="menu" aria-label="Menu">≡</button>
+          <button class="btn" id="menu" aria-label="Settings" title="Settings">⚙</button>
         </div>
       </div>
     </header>
 
-    <!-- M1: this shows a placeholder. M2: the content webview is composited here. -->
-    <main class="viewport" id="viewport">
-      <div class="placeholder">
-        <h1>swerve</h1>
-        <p>This UI is HTML, rendered by Servo.</p>
-        <p class="hint">
-          Milestone&nbsp;2 composites a live web page into this region.
-        </p>
-      </div>
-    </main>
+    <!-- The content webview is composited into this region. -->
+    <main class="viewport" id="viewport"></main>
 
     <script src="chrome.js"></script>
   </body>

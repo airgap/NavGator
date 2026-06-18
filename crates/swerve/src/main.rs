@@ -114,6 +114,60 @@ fn content_url() -> Url {
     file_url("content/home.html")
 }
 
+/// User settings, persisted to a small `key=value` config file.
+#[derive(Clone)]
+struct Settings {
+    /// Search URL template; `%s` is replaced with the URL-encoded query.
+    search: String,
+    /// Chrome accent color (any CSS color).
+    accent: String,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            search: "https://duckduckgo.com/?q=%s".to_string(),
+            accent: "#5b8cff".to_string(),
+        }
+    }
+}
+
+fn settings_path() -> Option<PathBuf> {
+    let base = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("swerve").join("settings.conf"))
+}
+
+fn load_settings() -> Settings {
+    let mut s = Settings::default();
+    if let Some(text) = settings_path().and_then(|p| std::fs::read_to_string(p).ok()) {
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                match k.trim() {
+                    "search" => s.search = v.trim().to_string(),
+                    "accent" => s.accent = v.trim().to_string(),
+                    _ => {}
+                }
+            }
+        }
+    }
+    s
+}
+
+fn save_settings(s: &Settings) {
+    if let Some(path) = settings_path() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, format!("search={}\naccent={}\n", s.search, s.accent));
+    }
+}
+
+fn settings_url() -> Url {
+    file_url("content/settings.html")
+}
+
 fn content_size(window: PhysicalSize<u32>, top: u32) -> PhysicalSize<u32> {
     PhysicalSize::new(
         window.width.max(1),
@@ -194,6 +248,10 @@ struct AppState {
     weak_self: RefCell<Weak<AppState>>,
     /// Connected IPC clients' write halves, for pushing state events.
     ipc_clients: Arc<Mutex<Vec<UnixStream>>>,
+    /// User settings (search engine, accent), persisted to disk.
+    settings: RefCell<Settings>,
+    /// Proxy onto the winit loop, used to request app exit from `&self` callbacks.
+    event_proxy: EventLoopProxy<WakeUp>,
 }
 
 impl AppState {
@@ -327,8 +385,9 @@ impl AppState {
             }
             tabs.remove(i); // dropping the WebView handle closes the webview
         }
+        // Closing the last tab closes the window (request exit on the winit loop).
         if self.tabs.borrow().is_empty() {
-            self.new_tab(content_url());
+            let _ = self.event_proxy.send_event(WakeUp::Exit);
             return;
         }
         let len = self.tabs.borrow().len();
@@ -395,9 +454,12 @@ impl AppState {
                 }
             }
             "tab" => self.handle_tab_command(url),
+            "window" => self.handle_window_command(url),
+            "settings" => self.new_tab(settings_url()),
             "ready" => {
                 self.apply_layout(url);
                 self.push_model();
+                self.apply_settings_to_chrome();
             }
             "layout" => self.apply_layout(url),
             other => eprintln!("swerve: unknown chrome command '{other}'"),
@@ -421,6 +483,71 @@ impl AppState {
                 _ => {}
             }
         }
+    }
+
+    /// Window controls — we draw our own, the OS titlebar is disabled.
+    fn handle_window_command(&self, url: &Url) {
+        for (key, value) in url.query_pairs() {
+            if key == "action" {
+                match value.as_ref() {
+                    "minimize" => self.window.set_minimized(true),
+                    "maximize" => self.window.set_maximized(!self.window.is_maximized()),
+                    "close" => {
+                        let _ = self.event_proxy.send_event(WakeUp::Exit);
+                    }
+                    "drag" => {
+                        let _ = self.window.drag_window();
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn is_settings_page(&self, webview: &WebView) -> bool {
+        self.tab_index(webview)
+            .map(|i| self.tabs.borrow()[i].url.ends_with("content/settings.html"))
+            .unwrap_or(false)
+    }
+
+    /// Settings-page bridge: our trusted settings page can read/write settings.
+    fn handle_settings_command(&self, webview: &WebView, url: &Url) {
+        match url.path() {
+            "settings-get" => self.push_settings_to(webview),
+            "settings-set" => {
+                {
+                    let mut s = self.settings.borrow_mut();
+                    for (k, v) in url.query_pairs() {
+                        match k.as_ref() {
+                            "search" => s.search = v.to_string(),
+                            "accent" => s.accent = v.to_string(),
+                            _ => {}
+                        }
+                    }
+                    save_settings(&s);
+                }
+                self.apply_settings_to_chrome();
+                self.push_settings_to(webview);
+            }
+            _ => {}
+        }
+    }
+
+    fn settings_event_js(&self) -> String {
+        let s = self.settings.borrow();
+        format!(
+            "window.dispatchEvent(new CustomEvent('swerve:settings',{{detail:{{search:{},accent:{}}}}}))",
+            js_string(&s.search),
+            js_string(&s.accent)
+        )
+    }
+
+    fn push_settings_to(&self, webview: &WebView) {
+        webview.evaluate_javascript(self.settings_event_js(), |_| {});
+    }
+
+    fn apply_settings_to_chrome(&self) {
+        self.chrome_eval(self.settings_event_js());
     }
 
     /// Execute a command received over the IPC control socket.
@@ -489,6 +616,10 @@ impl WebViewDelegate for AppState {
             self.tabs.borrow_mut()[i].url = url.to_string();
             self.ipc_emit(&format!("url {i} {url}"));
             self.push_model();
+            // Hand the settings page its current values once it loads.
+            if url.as_str().ends_with("content/settings.html") {
+                self.push_settings_to(&webview);
+            }
         }
     }
 
@@ -513,11 +644,17 @@ impl WebViewDelegate for AppState {
     }
 
     fn request_navigation(&self, webview: WebView, navigation_request: NavigationRequest) {
-        // Chrome navigations to the `swerve:` scheme are commands, not real loads.
-        if self.is_chrome(&webview) && navigation_request.url.scheme() == "swerve" {
+        // `swerve:` navigations are bridge commands, not real loads. Honored from the
+        // chrome and from our own (trusted) settings page; ignored from any other web
+        // content so a random site can't drive the browser.
+        if navigation_request.url.scheme() == "swerve" {
             let url = navigation_request.url.clone();
             navigation_request.deny();
-            self.handle_chrome_command(&url);
+            if self.is_chrome(&webview) {
+                self.handle_chrome_command(&url);
+            } else if self.is_settings_page(&webview) {
+                self.handle_settings_command(&webview, &url);
+            }
         } else {
             navigation_request.allow();
         }
@@ -538,12 +675,15 @@ impl ApplicationHandler<WakeUp> for App {
             App::Initial { waker, ipc_clients } => (waker.clone(), ipc_clients.clone()),
             App::Running(_) => return,
         };
+        // A proxy for requesting app exit from `&self` callbacks (window close, last tab).
+        let event_proxy = waker.0.clone();
 
         let display_handle = event_loop.display_handle().expect("no display handle");
         let window = event_loop
             .create_window(
                 Window::default_attributes()
                     .with_title("swerve")
+                    .with_decorations(false)
                     .with_inner_size(LogicalSize::new(1280.0, 800.0)),
             )
             .expect("failed to create window");
@@ -582,6 +722,8 @@ impl ApplicationHandler<WakeUp> for App {
             ctrl: Cell::new(false),
             weak_self: RefCell::new(Weak::new()),
             ipc_clients,
+            settings: RefCell::new(load_settings()),
+            event_proxy,
         });
         *state.weak_self.borrow_mut() = Rc::downgrade(&state);
 
@@ -598,10 +740,15 @@ impl ApplicationHandler<WakeUp> for App {
         *self = App::Running(state);
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: WakeUp) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WakeUp) {
         if let App::Running(state) = self {
-            if let WakeUp::Ipc(cmd) = event {
-                state.handle_ipc(cmd);
+            match event {
+                WakeUp::Exit => {
+                    event_loop.exit();
+                    return;
+                }
+                WakeUp::Ipc(cmd) => state.handle_ipc(cmd),
+                WakeUp::Wake => {}
             }
             state.servo.spin_event_loop();
         }
@@ -733,6 +880,8 @@ enum WakeUp {
     Wake,
     /// A command arrived on the IPC control socket.
     Ipc(IpcCommand),
+    /// A window-control/close request; exit the event loop.
+    Exit,
 }
 
 impl EventLoopWaker for Waker {

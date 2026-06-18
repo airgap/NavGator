@@ -1,6 +1,7 @@
 /* swerve chrome styling.
-   Deliberately restrained: a single dark surface, one accent, a typographic
-   address pill. Tuned to read as a real browser shell, not a demo page. */
+   A single dark surface, one accent, a typographic address pill. The OS titlebar is
+   off, so we draw our own titlebar/window-controls. `--accent` is overridden at runtime
+   from user settings (chrome.js sets it on :root from the `swerve:settings` event). */
 
 :root {
   --bg: #1b1d21;
@@ -31,16 +32,13 @@ body {
   color: var(--ink);
   font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
   -webkit-font-smoothing: antialiased;
-  /* Non-selectable chrome is enforced in chrome.js via `selectstart`, because
-     Servo's CSS `user-select` is an inert stub at this rev (parses, affects
-     nothing). The address input stays selectable. */
+  /* Non-selectable chrome is enforced in chrome.js via `selectstart` (Servo's CSS
+     `user-select` is an inert stub at this rev). The address input stays selectable. */
 }
 
 /* ── Chrome bar ─────────────────────────────────────────────────────────── */
 .chrome {
   flex: 0 0 auto;
-  /* Fixed height: must equal CHROME_HEIGHT_CSS in src/main.rs, which is where the
-     content webview is composited below. (M3 will make this dynamic via the bridge.) */
   height: 84px;
   box-sizing: border-box;
   overflow: hidden;
@@ -48,11 +46,48 @@ body {
   border-bottom: 1px solid var(--line);
 }
 
+/* ── Titlebar (drag region + tabs + window controls) ──────────────────────── */
+.titlebar {
+  display: flex;
+  align-items: stretch;
+}
+
 .tabstrip {
+  flex: 1;
+  min-width: 0;
   display: flex;
   align-items: flex-end;
   gap: 2px;
   padding: 6px 8px 0;
+}
+
+.wincontrols {
+  display: flex;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 5px 5px 0;
+}
+
+.wbtn {
+  width: 34px;
+  height: 26px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-dim);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.wbtn:hover {
+  background: var(--bar-hi);
+  color: var(--ink);
+}
+
+.wclose:hover {
+  background: #e5484d;
+  color: #fff;
 }
 
 .tab {
@@ -75,8 +110,7 @@ body {
   max-width: 160px;
   overflow: hidden;
   white-space: nowrap;
-  /* Servo doesn't implement `text-overflow: ellipsis` yet (it's gated behind the
-     `layout.unimplemented` pref), so chrome.js truncates with a real ellipsis. */
+  /* Servo lacks `text-overflow: ellipsis` at this rev; chrome.js truncates manually. */
 }
 
 .tab-close,
@@ -176,39 +210,10 @@ body {
   color: var(--ink-dim);
 }
 
-/* ── Viewport (content region) ──────────────────────────────────────────── */
+/* ── Viewport (content region; the content webview is composited here) ────── */
 .viewport {
   flex: 1;
   position: relative;
   background: #0f1012;
   overflow: hidden;
-}
-
-.placeholder {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  color: var(--ink-dim);
-  text-align: center;
-}
-
-.placeholder h1 {
-  margin: 0;
-  font-size: 40px;
-  font-weight: 600;
-  letter-spacing: -0.02em;
-  color: var(--ink);
-}
-
-.placeholder p {
-  margin: 0;
-}
-
-.placeholder .hint {
-  font-size: 12px;
-  opacity: 0.7;
 }
