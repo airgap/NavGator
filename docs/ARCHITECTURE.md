@@ -143,7 +143,9 @@ versoview is a separate process):
   tabs swaps the composited content + address bar. Tab strip is rendered from the model.
 
 ### M4b — left for later
-Drag-reorder tabs, tab overflow/scroll, favicons, keyboard tab shortcuts.
+Drag-reorder tabs, tab overflow/scroll, favicons. (Keyboard tab shortcuts — Ctrl+T
+new, Ctrl+W close, Ctrl+Tab next — are done, tracking a `ctrl` modifier flag from
+`ModifiersChanged` and consuming those keys before forwarding to the webview.)
 
 ### M5 — external engine (the Tauri goal) — ⚙️ v0: IPC control surface (verified)
 **Done (v0):** an opt-in IPC control socket (`SWERVE_IPC=/path`; Unix socket, text

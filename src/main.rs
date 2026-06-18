@@ -166,6 +166,8 @@ struct AppState {
     scale: Cell<f64>,
     cursor: Cell<(f64, f64)>,
     focused: Cell<Focused>,
+    /// Whether a Ctrl modifier is currently held (for tab shortcuts).
+    ctrl: Cell<bool>,
     /// Self-reference so `&self` delegate callbacks can build webviews (which need
     /// the `Rc<AppState>` as their delegate).
     weak_self: RefCell<Weak<AppState>>,
@@ -556,6 +558,7 @@ impl ApplicationHandler<WakeUp> for App {
             scale: Cell::new(scale),
             cursor: Cell::new((0.0, 0.0)),
             focused: Cell::new(Focused::Content),
+            ctrl: Cell::new(false),
             weak_self: RefCell::new(Weak::new()),
             ipc_clients,
         });
@@ -654,7 +657,32 @@ impl ApplicationHandler<WakeUp> for App {
                 }
             }
 
+            WindowEvent::ModifiersChanged(modifiers) => {
+                state.ctrl.set(modifiers.state().control_key());
+            }
+
             WindowEvent::KeyboardInput { event: key_event, .. } => {
+                // Ctrl-based tab shortcuts are handled here and not forwarded.
+                if matches!(key_event.state, ElementState::Pressed) && state.ctrl.get() {
+                    match &key_event.logical_key {
+                        WinitKey::Character(c) if c.eq_ignore_ascii_case("t") => {
+                            state.new_tab(content_url());
+                            return;
+                        }
+                        WinitKey::Character(c) if c.eq_ignore_ascii_case("w") => {
+                            state.close_tab(state.active.get());
+                            return;
+                        }
+                        WinitKey::Named(NamedKey::Tab) => {
+                            let len = state.tabs.borrow().len();
+                            if len > 1 {
+                                state.select_tab((state.active.get() + 1) % len);
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 if let Some(key) = winit_key_to_servo(&key_event.logical_key) {
                     let key_state = match key_event.state {
                         ElementState::Pressed => KeyState::Down,
