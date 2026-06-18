@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<!-- A second local content page, used to verify navigation through the bridge. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>About swerve</title>
+    <style>
+      html,
+      body { margin: 0; height: 100%; }
+      body {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 14px;
+        background: radial-gradient(120% 120% at 50% 0%, #2a1430 0%, #1a0e1f 60%, #120a16 100%);
+        color: #f3e9f6;
+        font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      h1 { font-size: 44px; font-weight: 600; letter-spacing: -0.02em; color: #e9b8ff; margin: 0; }
+      p { color: #c2a8cc; margin: 0; }
+    </style>
+  </head>
+  <body>
+    <h1>About swerve</h1>
+    <p>You navigated here through the chrome → engine bridge.</p>
+    <p>A second content page, loaded by the content webview.</p>
+  </body>
+</html>

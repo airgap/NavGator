@@ -102,11 +102,26 @@ software-GL run that loaded `src/chrome/index.html` and painted the UI.
 - TODO: keyboard (deferred to M3 — needs the winit→keyboard_types mapping in servoshell's
   `keyutils.rs`); verify resize interactively.
 
-### M3 — chrome ↔ embedder bridge
-Wire `window.swerve` (see `src/chrome/chrome.js`) to the embedder so the toolbar can
-drive navigation, and push content state (URL/title/back-forward) back to the chrome
-via the `swerve:state` event. Implement the relevant `WebViewDelegate` hooks
-(title/URL change, popups, prompts, context menus). Reference Verso's IPC design.
+### M3 — chrome ↔ engine bridge ✅ keyboard + navigation (verified)
+A single-process bridge — **no `ipc-channel`** (Verso needed that only because
+versoview is a separate process):
+- **Keyboard**: winit key events → Servo `KeyboardEvent` (`winit_key_to_servo` +
+  `KeyboardEvent::from_state_and_key`), routed to the focused webview. Minimal key
+  map (printable + editing/nav keys); full coverage would adapt servoshell's
+  `keyutils.rs`.
+- **Chrome → engine**: chrome JS sets `location.href` to a `swerve:` command URL
+  (`swerve:nav#<url>`, `swerve:{back,forward,reload}`); the chrome webview's
+  `request_navigation` delegate intercepts the `swerve:` scheme, `deny()`s it, and
+  drives the content webview (`load`/`reload`/`go_back`/`go_forward`).
+- **Engine → chrome**: the content webview's `notify_url_changed` /
+  `notify_page_title_changed` / `notify_history_changed` → `WebView::evaluate_javascript`
+  dispatching the `swerve:state` event (chrome.js updates the URL bar, tab title,
+  back/forward state). chrome.js select-all-on-focus + don't-clobber-while-typing.
+- **Verified** (headless Xvfb + `xdotool`): type a URL in the omnibox → Enter →
+  content navigates and the address bar + tab title update. Note: synthetic keys
+  need `xdotool windowfocus` first (no WM under Xvfb to assign X input focus).
+- TODO: dynamic content-rect reporting (retire fixed `CHROME_HEIGHT`); IME/composition;
+  a less hacky command channel than `swerve:` navigation; popup/prompt/context-menu hooks.
 
 ### M4 — tabs / multi-content
 Multiple content webviews (one per tab), one chrome. Show/hide + composite the

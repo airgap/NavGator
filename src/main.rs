@@ -1,30 +1,25 @@
 //! swerve — a web browser whose UI ("chrome") is HTML rendered by Servo.
 //!
-//! ## Milestone 2 (this file): chrome + content compositing
-//! Two webviews in one window:
-//!   * **chrome** — our HTML UI, rendered into the window's `WindowRenderingContext`
-//!     (fills the window).
-//!   * **content** — the web page, rendered into an `OffscreenRenderingContext`
-//!     (an FBO), then composited into the content region *below* the chrome via
-//!     `OffscreenRenderingContext::render_to_parent_callback()` (a scissor-clear +
-//!     `blit_framebuffer`, GL bottom-left coords).
+//! ## Milestone 3 (this file): the chrome ↔ engine bridge
+//! Builds on M2's two-webview compositing to make swerve an actual browser:
 //!
-//! This is the pattern servoshell's `Gui`/minibrowser uses for its egui toolbar —
-//! we just swap egui for a second Servo webview. API verified against servo rev
-//! `ed1af70` (`winit_minimal` + `ports/servoshell/desktop/gui.rs` +
-//! `components/shared/paint/rendering_context.rs`).
+//! * **Keyboard** — winit key events are mapped to Servo `KeyboardEvent`s and routed
+//!   to the focused webview (so you can type in the omnibox).
+//! * **Chrome → engine** — chrome JS navigates to a `swerve:` command URL
+//!   (`swerve:nav#<url>`, `swerve:back`, `swerve:forward`, `swerve:reload`); the
+//!   chrome webview's `request_navigation` delegate intercepts it, `deny()`s the
+//!   chrome navigation, and drives the content webview. No IPC channel needed —
+//!   this is a single process (Verso needed `ipc-channel` only because versoview is
+//!   a separate process).
+//! * **Engine → chrome** — the content webview's delegate notifications
+//!   (`notify_url_changed`, `notify_page_title_changed`, `notify_history_changed`)
+//!   are pushed into the chrome via `WebView::evaluate_javascript`, dispatching the
+//!   `swerve:state` event that chrome.js listens for (URL bar, tab title, back/fwd).
 //!
-//! ### The chrome/content split
-//! Until M3's chrome↔embedder bridge lets the chrome report its own content rect,
-//! Rust and the chrome agree on a fixed split: [`CHROME_HEIGHT_CSS`] here must equal
-//! the chrome header height in `src/chrome/chrome.css` (`.chrome { height: ... }`).
+//! API verified against servo rev `ed1af70`. Compositing/input details: see M2 notes.
 //!
-//! ### Input
-//! Mouse (move/button/wheel) is routed by region: chrome owns `y < CHROME_HEIGHT`,
-//! content owns the rest (point shifted up by the chrome height). Clicking a region
-//! focuses it. Keyboard is deferred until the M3 navigation bridge (it needs the
-//! winit→keyboard_types mapping servoshell keeps in `keyutils.rs`).
-//! Pass a URL arg to choose the content page: `cargo run -- https://servo.org`.
+//! Still TODO: dynamic content-rect reporting (retire the fixed `CHROME_HEIGHT`),
+//! IME/composition, and a less hacky command channel than `swerve:` navigation.
 
 use std::cell::{Cell, RefCell};
 use std::env;
@@ -35,20 +30,23 @@ use std::rc::Rc;
 use euclid::Scale;
 use euclid::default::{Point2D, Rect, Size2D};
 use servo::{
-    DevicePoint, InputEvent, MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent,
-    MouseMoveEvent, OffscreenRenderingContext, RenderingContext, Servo, ServoBuilder, WebView,
-    WebViewBuilder, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
+    DevicePoint, InputEvent, Key, KeyState, KeyboardEvent, NamedKey as ServoNamedKey,
+    MouseButton as ServoMouseButton,
+    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NavigationRequest, OffscreenRenderingContext,
+    RenderingContext, Servo, ServoBuilder, WebView, WebViewBuilder, WheelDelta, WheelEvent,
+    WheelMode, WindowRenderingContext,
 };
 use url::Url;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::keyboard::{Key as WinitKey, NamedKey};
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::{Window, WindowId};
 
-/// Logical-pixel height of the HTML chrome (tabstrip + toolbar). MUST match
-/// `.chrome { height: ... }` in `src/chrome/chrome.css`. See module docs.
+/// Logical-pixel height of the HTML chrome. MUST match `.chrome { height: ... }`
+/// in `src/chrome/chrome.css`.
 const CHROME_HEIGHT_CSS: u32 = 84;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -67,12 +65,10 @@ fn file_url(rel: &str) -> Url {
     Url::from_file_path(&p).unwrap_or_else(|_| Url::parse("about:blank").unwrap())
 }
 
-/// The chrome UI document.
 fn chrome_url() -> Url {
     file_url("src/chrome/index.html")
 }
 
-/// The content page: a CLI arg if given, else swerve's local new-tab page.
 fn content_url() -> Url {
     if let Some(arg) = env::args().nth(1) {
         if let Ok(url) = Url::parse(&arg) {
@@ -83,7 +79,6 @@ fn content_url() -> Url {
     file_url("src/content/home.html")
 }
 
-/// Physical-pixel size of the content region (window minus the chrome strip).
 fn content_size(window: PhysicalSize<u32>, chrome_h: u32) -> PhysicalSize<u32> {
     PhysicalSize::new(
         window.width.max(1),
@@ -91,24 +86,67 @@ fn content_size(window: PhysicalSize<u32>, chrome_h: u32) -> PhysicalSize<u32> {
     )
 }
 
+/// Escape a string into a JS double-quoted string literal, for safe interpolation
+/// into an `evaluate_javascript` snippet.
+fn js_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '<' => out.push_str("\\u003c"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Map a winit logical key to a Servo key. Minimal: printable characters plus the
+/// editing/navigation keys needed in the omnibox. (Full coverage would adapt
+/// servoshell's `keyutils.rs`.)
+fn winit_key_to_servo(key: &WinitKey) -> Option<Key> {
+    Some(match key {
+        WinitKey::Character(s) => Key::Character(s.to_string()),
+        WinitKey::Named(NamedKey::Space) => Key::Character(" ".to_string()),
+        WinitKey::Named(NamedKey::Enter) => Key::Named(ServoNamedKey::Enter),
+        WinitKey::Named(NamedKey::Backspace) => Key::Named(ServoNamedKey::Backspace),
+        WinitKey::Named(NamedKey::Delete) => Key::Named(ServoNamedKey::Delete),
+        WinitKey::Named(NamedKey::Tab) => Key::Named(ServoNamedKey::Tab),
+        WinitKey::Named(NamedKey::Escape) => Key::Named(ServoNamedKey::Escape),
+        WinitKey::Named(NamedKey::ArrowLeft) => Key::Named(ServoNamedKey::ArrowLeft),
+        WinitKey::Named(NamedKey::ArrowRight) => Key::Named(ServoNamedKey::ArrowRight),
+        WinitKey::Named(NamedKey::ArrowUp) => Key::Named(ServoNamedKey::ArrowUp),
+        WinitKey::Named(NamedKey::ArrowDown) => Key::Named(ServoNamedKey::ArrowDown),
+        WinitKey::Named(NamedKey::Home) => Key::Named(ServoNamedKey::Home),
+        WinitKey::Named(NamedKey::End) => Key::Named(ServoNamedKey::End),
+        _ => return None,
+    })
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Focused {
+    Chrome,
+    Content,
+}
+
 struct AppState {
     window: Window,
     servo: Servo,
-    /// The OS-window surface; the chrome renders here and we composite into it.
     window_context: Rc<WindowRenderingContext>,
-    /// The content webview's offscreen FBO; blitted into the window each frame.
     content_context: Rc<OffscreenRenderingContext>,
     chrome: RefCell<Option<WebView>>,
     content: RefCell<Option<WebView>>,
-    /// Physical-pixel chrome height (logical * hidpi scale).
     chrome_height: Cell<u32>,
-    /// Last known cursor position in physical window coordinates.
     cursor: Cell<(f64, f64)>,
+    /// Which webview receives keyboard input.
+    focused: Cell<Focused>,
 }
 
 impl AppState {
-    /// Paint chrome → window FBO, content → offscreen FBO, then blit content into
-    /// the window's content region and present.
     fn render(&self) {
         let chrome = self.chrome.borrow();
         let content = self.content.borrow();
@@ -116,19 +154,13 @@ impl AppState {
             return;
         };
 
-        // Content into its own offscreen framebuffer.
         let _ = self.content_context.make_current();
         content.paint();
 
-        // Chrome into the window framebuffer (fills the window).
         let _ = self.window_context.make_current();
         self.window_context.prepare_for_rendering();
         chrome.paint();
 
-        // Composite the content FBO into the window's content region. The callback
-        // scissor-clears `target_rect` then blits the offscreen FBO into it. Coords
-        // are GL bottom-left, so the content region (the lower part of the window,
-        // below the chrome strip) sits at origin (0, 0).
         if let Some(blit) = self.content_context.render_to_parent_callback() {
             let win = self.window.inner_size();
             let w = win.width.max(1) as i32;
@@ -155,8 +187,7 @@ impl AppState {
     }
 
     /// The webview under a window-space point, plus that point translated into the
-    /// webview's own coordinate space. Chrome owns `y < chrome_height`; content owns
-    /// the rest (shifted up by the chrome height).
+    /// webview's own coordinate space. Chrome owns `y < chrome_height`.
     fn route(&self, x: f64, y: f64) -> Option<(WebView, DevicePoint)> {
         let chrome_h = self.chrome_height.get() as f64;
         if y < chrome_h {
@@ -167,11 +198,97 @@ impl AppState {
             Some((webview, DevicePoint::new(x as f32, (y - chrome_h) as f32)))
         }
     }
+
+    fn focused_webview(&self) -> Option<WebView> {
+        match self.focused.get() {
+            Focused::Chrome => self.chrome.borrow().clone(),
+            Focused::Content => self.content.borrow().clone(),
+        }
+    }
+
+    fn is_content(&self, webview: &WebView) -> bool {
+        self.content.borrow().as_ref() == Some(webview)
+    }
+
+    fn is_chrome(&self, webview: &WebView) -> bool {
+        self.chrome.borrow().as_ref() == Some(webview)
+    }
+
+    /// Run JS in the chrome webview (used to push engine state into the UI).
+    fn chrome_eval(&self, js: String) {
+        if let Some(chrome) = self.chrome.borrow().as_ref() {
+            chrome.evaluate_javascript(js, |_| {});
+        }
+    }
+
+    /// Act on a `swerve:` command URL emitted by the chrome JS.
+    fn handle_chrome_command(&self, url: &Url) {
+        let content = self.content.borrow();
+        let Some(content) = content.as_ref() else {
+            return;
+        };
+        match url.path() {
+            "nav" => {
+                if let Some(target) = url.fragment().and_then(|f| Url::parse(f).ok()) {
+                    content.load(target);
+                }
+            }
+            "back" => {
+                content.go_back(1);
+            }
+            "forward" => {
+                content.go_forward(1);
+            }
+            "reload" => {
+                content.reload();
+            }
+            other => eprintln!("swerve: unknown chrome command '{other}'"),
+        }
+    }
 }
 
 impl servo::WebViewDelegate for AppState {
     fn notify_new_frame_ready(&self, _webview: WebView) {
         self.window.request_redraw();
+    }
+
+    fn notify_url_changed(&self, webview: WebView, url: Url) {
+        if self.is_content(&webview) {
+            self.chrome_eval(format!(
+                "window.dispatchEvent(new CustomEvent('swerve:state',{{detail:{{url:{}}}}}))",
+                js_string(url.as_str())
+            ));
+        }
+    }
+
+    fn notify_page_title_changed(&self, webview: WebView, title: Option<String>) {
+        if self.is_content(&webview) {
+            self.chrome_eval(format!(
+                "window.dispatchEvent(new CustomEvent('swerve:state',{{detail:{{title:{}}}}}))",
+                js_string(title.as_deref().unwrap_or(""))
+            ));
+        }
+    }
+
+    fn notify_history_changed(&self, webview: WebView, entries: Vec<Url>, current: usize) {
+        if self.is_content(&webview) {
+            let can_back = current > 0;
+            let can_forward = current + 1 < entries.len();
+            self.chrome_eval(format!(
+                "window.dispatchEvent(new CustomEvent('swerve:state',{{detail:{{canGoBack:{can_back},canGoForward:{can_forward}}}}}))"
+            ));
+        }
+    }
+
+    fn request_navigation(&self, webview: WebView, navigation_request: NavigationRequest) {
+        // Chrome navigations to the `swerve:` scheme are commands, not real loads.
+        if self.is_chrome(&webview) && navigation_request.url.scheme() == "swerve" {
+            let url = navigation_request.url.clone();
+            navigation_request.deny();
+            self.handle_chrome_command(&url);
+        } else {
+            navigation_request.allow();
+        }
     }
 }
 
@@ -210,8 +327,8 @@ impl ApplicationHandler<WakeUp> for App {
         );
         let _ = window_context.make_current();
 
-        // Offscreen FBO for the content webview, sized to the content region.
-        let content_context = Rc::new(window_context.offscreen_context(content_size(inner, chrome_h)));
+        let content_context =
+            Rc::new(window_context.offscreen_context(content_size(inner, chrome_h)));
 
         let servo = ServoBuilder::default()
             .event_loop_waker(Box::new(waker.clone()))
@@ -227,6 +344,7 @@ impl ApplicationHandler<WakeUp> for App {
             content: RefCell::new(None),
             chrome_height: Cell::new(chrome_h),
             cursor: Cell::new((0.0, 0.0)),
+            focused: Cell::new(Focused::Content),
         });
 
         let chrome = WebViewBuilder::new(&state.servo, state.window_context.clone())
@@ -277,12 +395,18 @@ impl ApplicationHandler<WakeUp> for App {
                 ..
             } => {
                 let (x, y) = state.cursor.get();
+                if matches!(button_state, ElementState::Pressed) {
+                    let chrome_h = state.chrome_height.get() as f64;
+                    state
+                        .focused
+                        .set(if y < chrome_h { Focused::Chrome } else { Focused::Content });
+                }
                 if let Some((webview, point)) = state.route(x, y) {
                     let action = match button_state {
                         ElementState::Pressed => MouseButtonAction::Down,
                         ElementState::Released => MouseButtonAction::Up,
                     };
-                    let button = match button {
+                    let servo_button = match button {
                         MouseButton::Left => ServoMouseButton::Left,
                         MouseButton::Right => ServoMouseButton::Right,
                         MouseButton::Middle => ServoMouseButton::Middle,
@@ -290,12 +414,13 @@ impl ApplicationHandler<WakeUp> for App {
                         MouseButton::Forward => ServoMouseButton::Forward,
                         MouseButton::Other(v) => ServoMouseButton::Other(v),
                     };
-                    // Clicking a region gives it keyboard focus.
                     if matches!(button_state, ElementState::Pressed) {
                         webview.focus();
                     }
                     webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
-                        action, button, point.into(),
+                        action,
+                        servo_button,
+                        point.into(),
                     )));
                 }
             }
@@ -317,9 +442,20 @@ impl ApplicationHandler<WakeUp> for App {
                 }
             }
 
-            // Keyboard is deferred: winit KeyEvent → keyboard_types::KeyboardEvent needs the
-            // mapping servoshell keeps in keyutils.rs, and isn't useful until the M3
-            // navigation bridge lets the omnibox act on typed input.
+            WindowEvent::KeyboardInput { event: key_event, .. } => {
+                if let Some(key) = winit_key_to_servo(&key_event.logical_key) {
+                    let key_state = match key_event.state {
+                        ElementState::Pressed => KeyState::Down,
+                        ElementState::Released => KeyState::Up,
+                    };
+                    if let Some(webview) = state.focused_webview() {
+                        webview.notify_input_event(InputEvent::Keyboard(
+                            KeyboardEvent::from_state_and_key(key_state, key),
+                        ));
+                    }
+                }
+            }
+
             _ => {}
         }
     }

@@ -10,12 +10,19 @@ but as a separate webview composited into the window.
 
 ## Status
 
-✅ **Milestone 1 complete — verified end-to-end.** swerve builds, links, launches,
-and renders its HTML chrome via Servo. On Linux: `cargo build` succeeds (stable Rust
-1.95, 848-package graph, `Cargo.lock` committed); the binary boots Servo's
-constellation, loads `src/chrome/index.html`, and paints the tabs/toolbar/omnibox —
-confirmed by a headless Xvfb + software-GL screenshot. The code mirrors Servo's
-maintained `winit_minimal` example at the pinned rev.
+✅ **Milestones 1–3 complete — verified end-to-end** (headless Xvfb + software GL +
+synthetic `xdotool` input). On Linux, `cargo build` succeeds (stable Rust 1.95,
+848-package graph, `Cargo.lock` committed); the binary boots Servo and:
+
+- **M1** — renders the HTML chrome via Servo.
+- **M2** — composites two webviews in one window (HTML chrome on top, web content
+  below via an `OffscreenRenderingContext`), and routes mouse input by region.
+- **M3** — a chrome ↔ engine bridge: keyboard input, the omnibox drives navigation
+  (`swerve:` command URLs intercepted in `request_navigation`), and content state
+  (URL/title/back-forward) is pushed back into the chrome via `evaluate_javascript`.
+  Typing a URL + Enter navigates the content webview and updates the address bar.
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and the roadmap.
 
 Building Servo is still a multi-GB, long, system-dependency-heavy job — install
 Servo's native build deps first (below), including the LLVM toolchain note.

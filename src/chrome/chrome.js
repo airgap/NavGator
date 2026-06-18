@@ -12,22 +12,26 @@
 // `window.swerve` object backed by a custom URL scheme or a postMessage channel the
 // embedder intercepts via WebViewDelegate.
 
+// Commands to the embedder are sent by navigating the chrome webview to a
+// `swerve:` command URL, which the Rust side intercepts in `request_navigation`
+// (denying the actual navigation). The target URL for `navigate` rides in the
+// fragment to avoid percent-encoding fuss. Single-process bridge — to be replaced
+// by a proper channel later.
 const swerve = {
-  // Commands the chrome will eventually send to the embedder. No-ops for now.
   navigate(input) {
-    console.log("[swerve] navigate:", input);
+    window.location.href = "swerve:nav#" + input;
   },
   back() {
-    console.log("[swerve] back");
+    window.location.href = "swerve:back";
   },
   forward() {
-    console.log("[swerve] forward");
+    window.location.href = "swerve:forward";
   },
   reload() {
-    console.log("[swerve] reload");
+    window.location.href = "swerve:reload";
   },
   newTab() {
-    console.log("[swerve] newTab");
+    console.log("[swerve] newTab (not wired yet)");
   },
 };
 
@@ -105,10 +109,17 @@ $("forward").addEventListener("click", () => swerve.forward());
 $("reload").addEventListener("click", () => swerve.reload());
 $("tab-new").addEventListener("click", () => swerve.newTab());
 
+// Select all when the address bar gains focus, so typing replaces the URL
+// (standard browser behavior) instead of appending to the pushed value.
+$("address").addEventListener("focus", (e) => e.target.select());
+
 // The embedder will call these to push content-webview state into the chrome.
 window.addEventListener("swerve:state", (e) => {
   const { url, title, canGoBack, canGoForward } = e.detail ?? {};
-  if (typeof url === "string") $("address").value = url;
+  // Don't clobber what the user is actively typing in the address bar.
+  if (typeof url === "string" && document.activeElement !== $("address")) {
+    $("address").value = url;
+  }
   if (typeof title === "string") {
     setTabTitle(document.querySelector(".tab.is-active .tab-title"), title || "New tab");
   }
