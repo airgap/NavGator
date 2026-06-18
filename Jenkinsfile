@@ -37,8 +37,9 @@ pipeline {
 
     environment {
         CARGO_TERM_COLOR = 'always'
-        RUSTC_WRAPPER = 'sccache'
-        CARGO_INCREMENTAL = '0' // sccache + incremental don't mix
+        // sccache is opt-in: the Toolchain stage enables RUSTC_WRAPPER=sccache (via
+        // .ci-env) only if sccache is installed on the agent, so an agent without it
+        // still builds (just without the compile cache).
     }
 
     stages {
@@ -79,7 +80,7 @@ pipeline {
                                             LIBCLANG="$(llvm-config --libdir 2>/dev/null || echo /usr/lib/llvm-18/lib)"
                                         fi
                                         # Persist PATH (+ LIBCLANG_PATH) for the Build/Test/smoke stages (same workspace).
-                                        { echo "PATH=$PATH"; [ -n "$LIBCLANG" ] && echo "LIBCLANG_PATH=$LIBCLANG"; } > .ci-env
+                                        { echo "PATH=$PATH"; [ -n "$LIBCLANG" ] && echo "LIBCLANG_PATH=$LIBCLANG"; command -v sccache >/dev/null && echo "RUSTC_WRAPPER=sccache"; } > .ci-env
                                         rustc --version && cargo --version
                                     '''
                                 } else {
