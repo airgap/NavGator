@@ -23,4 +23,4 @@ pub use servo::{
     SelectElementOption, SelectElementOptionOrOptgroup, SimpleDialog,
 };
 
-pub use embedder_traits::EventLoopWaker;
+pub use embedder_traits::{EventLoopWaker, JSValue};

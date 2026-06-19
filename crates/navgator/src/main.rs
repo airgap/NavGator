@@ -37,8 +37,8 @@ use euclid::default::{Point2D, Rect, Size2D};
 // the Servo fork (ROADMAP §R2; docs/FORK.md). IPC wire types come from navgator-protocol.
 use navgator_engine::{
     AuthenticationRequest, ColorPicker, CreateNewWebViewRequest, DevicePoint, EmbedderControl,
-    EmbedderControlId, EventLoopWaker, FilePicker, FilterPattern, Image, InputEvent, Key, KeyState,
-    KeyboardEvent, LoadStatus,
+    EmbedderControlId, EventLoopWaker, FilePicker, FilterPattern, Image, InputEvent, JSValue, Key,
+    KeyState, KeyboardEvent, LoadStatus,
     MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
     NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, PermissionRequest,
     PixelFormat, Preferences, RenderingContext,
@@ -398,6 +398,40 @@ fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
     }
 }
 
+/// Escape a string into a JS double-quoted string literal.
+fn js_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '<' => out.push_str("\\u003c"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Find-in-page highlighter (no native find API in the fork): wraps matches of `q` in
+/// `<span data-ngf>` (first match orange, rest yellow), scrolls to the first, returns the
+/// match count. Re-run on each query change; `find-step`/`find-clear` JS handle nav/cleanup.
+const FIND_JS: &str = r#"function(q){
+document.querySelectorAll('span[data-ngf]').forEach(function(s){var p=s.parentNode;if(p){p.replaceChild(document.createTextNode(s.textContent),s);p.normalize();}});
+if(!q)return 0;
+var rx;try{rx=new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'gi');}catch(e){return 0;}
+var w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null);
+var nodes=[],n;while(n=w.nextNode()){var pn=n.parentNode;if(!pn)continue;if(/SCRIPT|STYLE|NOSCRIPT/.test(pn.nodeName))continue;rx.lastIndex=0;if(rx.test(n.nodeValue))nodes.push(n);}
+var count=0;
+nodes.forEach(function(node){var s=node.nodeValue,frag=document.createDocumentFragment(),last=0,m;rx.lastIndex=0;while(m=rx.exec(s)){if(m[0].length===0){rx.lastIndex++;continue;}if(m.index>last)frag.appendChild(document.createTextNode(s.slice(last,m.index)));var sp=document.createElement('span');sp.setAttribute('data-ngf','');sp.style.background=(count===0?'#ff9632':'#ffe45e');sp.style.color='#000';sp.textContent=m[0];frag.appendChild(sp);last=m.index+m[0].length;count++;}if(last<s.length)frag.appendChild(document.createTextNode(s.slice(last)));node.parentNode.replaceChild(frag,node);});
+window.__ngfActive=0;
+var f=document.querySelector('span[data-ngf]');if(f)f.scrollIntoView({block:'center'});
+return count;
+}"#;
+
 /// Minimal winit→Servo key mapping (printable + editing/nav keys).
 fn winit_key_to_servo(key: &WinitKey) -> Option<Key> {
     Some(match key {
@@ -507,6 +541,12 @@ struct AppState {
     dialogs: RefCell<Vec<Dialog>>,
     /// URLs of recently-closed tabs, for Ctrl+Shift+T (reopen most-recent).
     closed_tabs: RefCell<Vec<String>>,
+    /// Find-in-page (Ctrl+F) state.
+    find_open: Cell<bool>,
+    find_query: RefCell<String>,
+    find_matches: Cell<usize>,
+    find_active: Cell<usize>,
+    find_focus: Cell<bool>,
     fullscreen: Cell<bool>,
     scale: Cell<f64>,
     cursor: Cell<(f64, f64)>,
@@ -602,6 +642,52 @@ impl AppState {
                     .show(ctx, |ui| {
                         egui::Frame::popup(ui.style()).show(ui, |ui| {
                             ui.label(status);
+                        });
+                    });
+            }
+
+            // Find-in-page bar (Ctrl+F), floating top-right under the chrome.
+            if self.find_open.get() {
+                egui::Area::new(egui::Id::new("findbar"))
+                    .order(egui::Order::Foreground)
+                    .anchor(
+                        egui::Align2::RIGHT_TOP,
+                        egui::vec2(-10.0, self.toolbar_height.get() + 8.0),
+                    )
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let mut q = self.find_query.borrow_mut();
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut *q)
+                                        .hint_text("Find in page")
+                                        .desired_width(200.0)
+                                        .id(egui::Id::new("find_input")),
+                                );
+                                if self.find_focus.take() {
+                                    resp.request_focus();
+                                }
+                                let changed = resp.changed();
+                                let query = q.clone();
+                                drop(q);
+                                if changed {
+                                    self.find_run(&query);
+                                }
+                                ui.label(format!(
+                                    "{}/{}",
+                                    self.find_active.get(),
+                                    self.find_matches.get()
+                                ));
+                                if ui.button("▲").clicked() {
+                                    self.find_step(-1);
+                                }
+                                if ui.button("▼").clicked() {
+                                    self.find_step(1);
+                                }
+                                if ui.button("✕").clicked() {
+                                    self.find_close();
+                                }
+                            });
                         });
                     });
             }
@@ -1380,6 +1466,56 @@ impl AppState {
         save_bookmarks(&p);
     }
 
+    /// Run the find highlighter for `query`; the async JS result updates find_matches.
+    fn find_run(&self, query: &str) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let js = format!("({FIND_JS})({})", js_string(query));
+        let me = self.weak_self.borrow().clone();
+        tab.evaluate_javascript(js, move |res| {
+            if let Some(me) = me.upgrade() {
+                if let Ok(JSValue::Number(n)) = res {
+                    me.find_matches.set(n.max(0.0) as usize);
+                    me.find_active.set(if n > 0.0 { 1 } else { 0 });
+                    me.window.request_redraw();
+                }
+            }
+        });
+    }
+
+    /// Move the active match forward (+1) or back (-1), scrolling it into view.
+    fn find_step(&self, dir: i32) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let js = format!(
+            "(function(d){{var ns=document.querySelectorAll('span[data-ngf]');if(!ns.length)return 0;var a=(window.__ngfActive||0)+d;if(a<0)a=ns.length-1;if(a>=ns.length)a=0;window.__ngfActive=a;ns.forEach(function(s,i){{s.style.background=(i===a?'#ff9632':'#ffe45e');}});ns[a].scrollIntoView({{block:'center'}});return a+1;}})({dir})"
+        );
+        let me = self.weak_self.borrow().clone();
+        tab.evaluate_javascript(js, move |res| {
+            if let Some(me) = me.upgrade() {
+                if let Ok(JSValue::Number(n)) = res {
+                    me.find_active.set(n as usize);
+                    me.window.request_redraw();
+                }
+            }
+        });
+    }
+
+    /// Close the find bar and remove all highlights.
+    fn find_close(&self) {
+        self.find_open.set(false);
+        self.find_matches.set(0);
+        if let Some(tab) = self.active_tab() {
+            tab.evaluate_javascript(
+                "document.querySelectorAll('span[data-ngf]').forEach(function(s){var p=s.parentNode;if(p){p.replaceChild(document.createTextNode(s.textContent),s);p.normalize();}});",
+                |_| {},
+            );
+        }
+        self.window.request_redraw();
+    }
+
     fn handle_ipc(&self, cmd: IpcCommand) {
         match cmd {
             IpcCommand::Navigate(url) => {
@@ -1707,6 +1843,11 @@ impl ApplicationHandler<WakeUp> for App {
             show_settings: Cell::new(false),
             dialogs: RefCell::new(Vec::new()),
             closed_tabs: RefCell::new(Vec::new()),
+            find_open: Cell::new(false),
+            find_query: RefCell::new(String::new()),
+            find_matches: Cell::new(0),
+            find_active: Cell::new(0),
+            find_focus: Cell::new(false),
             fullscreen: Cell::new(false),
             scale: Cell::new(scale),
             cursor: Cell::new((0.0, 0.0)),
@@ -1921,6 +2062,12 @@ impl ApplicationHandler<WakeUp> for App {
                             state.toggle_bookmark_active();
                             return;
                         }
+                        WinitKey::Character(c) if c.eq_ignore_ascii_case("f") => {
+                            state.find_open.set(true);
+                            state.find_focus.set(true);
+                            state.window.request_redraw();
+                            return;
+                        }
                         WinitKey::Character(c) if c == "=" || c == "+" => {
                             state.zoom_in();
                             return;
@@ -1964,6 +2111,10 @@ impl ApplicationHandler<WakeUp> for App {
                 if matches!(key_event.state, ElementState::Pressed)
                     && matches!(key_event.logical_key, WinitKey::Named(NamedKey::Escape))
                 {
+                    if state.find_open.get() {
+                        state.find_close();
+                        return;
+                    }
                     if !state.dialogs.borrow().is_empty() {
                         state.dialogs.borrow_mut().clear();
                         state.window.request_redraw();
