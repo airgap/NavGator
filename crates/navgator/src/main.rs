@@ -256,8 +256,12 @@ struct AppState {
     chrome: RefCell<Option<WebView>>,
     tabs: RefCell<Vec<Tab>>,
     active: Cell<usize>,
-    /// Device-px y where the content region starts (reported by the chrome).
+    /// Device-px y where the content region starts (effective; forced to 0 in fullscreen).
     content_top: Cell<u32>,
+    /// The chrome's last reported content top; restored when leaving fullscreen.
+    chrome_top: Cell<u32>,
+    /// Whether the active page is in fullscreen (chrome hidden, content fills the window).
+    fullscreen: Cell<bool>,
     scale: Cell<f64>,
     cursor: Cell<(f64, f64)>,
     focused: Cell<Focused>,
@@ -667,19 +671,32 @@ impl AppState {
     }
 
     /// Update the content-region top from a chrome-reported CSS-px value.
+    /// Set the effective content-region top and resize the content webviews to match.
+    fn set_content_top(&self, dev: u32) {
+        if dev == self.content_top.get() {
+            return;
+        }
+        self.content_top.set(dev);
+        let csize = self.content_phys_size();
+        self.content_context.resize(csize);
+        for tab in self.tabs.borrow().iter() {
+            tab.webview.resize(csize);
+        }
+        self.window.request_redraw();
+    }
+
     fn apply_layout(&self, url: &Url) {
         for (key, value) in url.query_pairs() {
             if key == "top" {
                 if let Ok(css_top) = value.parse::<f64>() {
                     let dev = (css_top * self.scale.get()).round().max(0.0) as u32;
-                    if dev != self.content_top.get() && dev < self.window.inner_size().height {
-                        self.content_top.set(dev);
-                        let csize = self.content_phys_size();
-                        self.content_context.resize(csize);
-                        for tab in self.tabs.borrow().iter() {
-                            tab.webview.resize(csize);
+                    if dev < self.window.inner_size().height {
+                        self.chrome_top.set(dev);
+                        // In fullscreen the content covers the chrome (top forced to 0);
+                        // just remember the chrome's top so we can restore it on exit.
+                        if !self.fullscreen.get() {
+                            self.set_content_top(dev);
                         }
-                        self.window.request_redraw();
                     }
                 }
             }
@@ -722,6 +739,12 @@ impl WebViewDelegate for AppState {
             }
             self.push_model();
         }
+    }
+
+    fn notify_fullscreen_state_changed(&self, _webview: WebView, is_fullscreen: bool) {
+        self.fullscreen.set(is_fullscreen);
+        let top = if is_fullscreen { 0 } else { self.chrome_top.get() };
+        self.set_content_top(top);
     }
 
     fn request_navigation(&self, webview: WebView, navigation_request: NavigationRequest) {
@@ -797,6 +820,8 @@ impl ApplicationHandler<WakeUp> for App {
             tabs: RefCell::new(Vec::new()),
             active: Cell::new(0),
             content_top: Cell::new(content_top),
+            chrome_top: Cell::new(content_top),
+            fullscreen: Cell::new(false),
             scale: Cell::new(scale),
             cursor: Cell::new((0.0, 0.0)),
             focused: Cell::new(Focused::Content),
@@ -999,6 +1024,16 @@ impl ApplicationHandler<WakeUp> for App {
                         }
                         _ => {}
                     }
+                }
+                // Esc exits page fullscreen (the engine then restores the chrome).
+                if state.fullscreen.get()
+                    && matches!(key_event.state, ElementState::Pressed)
+                    && matches!(key_event.logical_key, WinitKey::Named(NamedKey::Escape))
+                {
+                    if let Some(tab) = state.active_tab() {
+                        tab.exit_fullscreen();
+                    }
+                    return;
                 }
                 if let Some(key) = winit_key_to_servo(&key_event.logical_key) {
                     let key_state = match key_event.state {
