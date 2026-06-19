@@ -3,9 +3,9 @@
 #   linux : navgator-<ver>-linux-x86_64.tar.gz  +  navgator-<ver>-x86_64.AppImage
 #   macos : navgator-<ver>-macos-<arch>.tar.gz  +  navgator-<ver>-macos-<arch>.dmg
 #
-# The web assets (chrome/content) ship in resources/ NEXT TO the binary; navgator resolves
-# them via current_exe() (crates/navgator/src/main.rs::resources_dir), so a distributed
-# binary finds its UI. AppImage/dmg formats are produced only if their tools are present.
+# The web content pages (home/about) ship in resources/content/ NEXT TO the binary; navgator
+# resolves them via current_exe() (crates/navgator/src/main.rs::resources_dir). The chrome is
+# native (egui), not web assets. AppImage/dmg formats are produced only if their tools exist.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -21,10 +21,9 @@ cargo build --release -p navgator --locked
 BIN="$ROOT/target/release/navgator"
 [ -f "$BIN" ] || { echo "release binary not found at $BIN"; exit 1; }
 
-# Copy the web assets into <dir>/resources/{chrome,content}.
+# Copy the web content pages into <dir>/resources/content.
 stage_resources() {
     mkdir -p "$1/resources"
-    cp -R crates/navgator/src/chrome "$1/resources/chrome"
     cp -R crates/navgator/src/content "$1/resources/content"
 }
 

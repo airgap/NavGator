@@ -73,6 +73,7 @@ pipeline {
                                         LIBCLANG=""
                                         if command -v brew >/dev/null; then
                                             brew list llvm >/dev/null 2>&1 || brew install llvm cmake pkg-config || true
+                                            brew list gstreamer >/dev/null 2>&1 || brew install gstreamer || true
                                             P="$(brew --prefix llvm 2>/dev/null)"
                                             [ -n "$P" ] && { export PATH="$P/bin:$PATH"; LIBCLANG="$P/lib"; }
                                         elif command -v apt-get >/dev/null; then
