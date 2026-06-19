@@ -1,15 +1,15 @@
 <!DOCTYPE html>
 <!--
-  swerve settings. This is *content*, but the engine trusts this specific page (its URL
-  ends with content/settings.html) and honors its `swerve:` bridge commands — so it can
+  navgator settings. This is *content*, but the engine trusts this specific page (its URL
+  ends with content/settings.html) and honors its `navgator:` bridge commands — so it can
   read and write persisted settings. The engine pushes current values via the
-  `swerve:settings` event; changes are sent back via `swerve:settings-set`.
+  `navgator:settings` event; changes are sent back via `navgator:settings-set`.
 -->
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Settings · swerve</title>
+    <title>Settings · NavGator</title>
     <style>
       :root {
         --accent: #5b8cff;
@@ -118,7 +118,7 @@
         b.textContent = e.name;
         b.dataset.tpl = e.tpl;
         b.addEventListener("click", () =>
-          go("swerve:settings-set?search=" + encodeURIComponent(e.tpl)),
+          go("navgator:settings-set?search=" + encodeURIComponent(e.tpl)),
         );
         enginesEl.appendChild(b);
       });
@@ -130,7 +130,7 @@
         b.dataset.color = c;
         b.setAttribute("aria-label", c);
         b.addEventListener("click", () =>
-          go("swerve:settings-set?accent=" + encodeURIComponent(c)),
+          go("navgator:settings-set?accent=" + encodeURIComponent(c)),
         );
         accentsEl.appendChild(b);
       });
@@ -145,7 +145,7 @@
         }
       }
 
-      window.addEventListener("swerve:settings", (e) => {
+      window.addEventListener("navgator:settings", (e) => {
         const d = e.detail ?? {};
         if (typeof d.search === "string") current.search = d.search;
         if (typeof d.accent === "string") current.accent = d.accent;
@@ -155,7 +155,7 @@
 
       render();
       // Engine also pushes settings when this page loads; this is a backup request.
-      go("swerve:settings-get");
+      go("navgator:settings-get");
     </script>
   </body>
 </html>

@@ -1,4 +1,4 @@
-//! swerve-protocol — servo-free wire types for swerve's IPC control surface.
+//! navgator-protocol — servo-free wire types for navgator's IPC control surface.
 //!
 //! Kept deliberately independent of the engine (no `servo` dependency) so the
 //! external-control protocol stays stable across engine churn. See `docs/FORK.md`

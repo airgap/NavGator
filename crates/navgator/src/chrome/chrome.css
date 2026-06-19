@@ -1,7 +1,7 @@
-/* swerve chrome styling.
+/* navgator chrome styling.
    A single dark surface, one accent, a typographic address pill. The OS titlebar is
    off, so we draw our own titlebar/window-controls. `--accent` is overridden at runtime
-   from user settings (chrome.js sets it on :root from the `swerve:settings` event). */
+   from user settings (chrome.js sets it on :root from the `navgator:settings` event). */
 
 :root {
   --bg: #1b1d21;

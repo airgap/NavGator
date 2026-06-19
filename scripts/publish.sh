@@ -11,7 +11,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-VERSION="$(grep '^version' crates/swerve/Cargo.toml | head -1 | sed 's/.*"\([^"]*\)".*/\1/')"
+VERSION="$(grep '^version' crates/navgator/Cargo.toml | head -1 | sed 's/.*"\([^"]*\)".*/\1/')"
 SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 DIST="$ROOT/dist"
 [ -d "$DIST" ] || { echo "no dist/ to publish"; exit 0; }
@@ -43,7 +43,7 @@ export REGISTER_URL="${REGISTER_URL:-https://api.lyku.org/register-app-release}"
 wr() { parabun x wrangler@3 "$@"; }
 
 published=0
-for f in "$DIST"/swerve-*.tar.gz "$DIST"/swerve-*.AppImage "$DIST"/swerve-*.dmg; do
+for f in "$DIST"/navgator-*.tar.gz "$DIST"/navgator-*.AppImage "$DIST"/navgator-*.dmg; do
     [ -f "$f" ] || continue
     name="$(basename "$f")"
     size="$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")"
@@ -53,11 +53,11 @@ for f in "$DIST"/swerve-*.tar.gz "$DIST"/swerve-*.AppImage "$DIST"/swerve-*.dmg;
         *) plat=linux ;;
     esac
     for chan in "v$VERSION" "dev-$SHA" "latest"; do
-        wr r2 object put "$R2_BUCKET/swerve/$chan/$name" \
+        wr r2 object put "$R2_BUCKET/navgator/$chan/$name" \
             --file "$f" --content-type application/octet-stream
     done
     # Register the versioned release so it surfaces at lyku.org/apps.
-    python3 scripts/register-release.py swerve "$plat" "$VERSION" "swerve/v$VERSION/$name" "$size" "$SHA" \
+    python3 scripts/register-release.py navgator "$plat" "$VERSION" "navgator/v$VERSION/$name" "$size" "$SHA" \
         || echo "WARN: registerAppRelease failed for $name (is CI_RELEASE_TOKEN set in Doppler?)"
     echo "✓ published $name ($plat)"
     published=$((published + 1))

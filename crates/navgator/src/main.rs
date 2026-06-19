@@ -1,4 +1,4 @@
-//! swerve — a web browser whose UI ("chrome") is HTML rendered by Servo.
+//! navgator — a web browser whose UI ("chrome") is HTML rendered by Servo.
 //!
 //! ## Milestone 4 (this file): tabs, + dynamic content rect (M3 polish)
 //! Builds on the M2 compositor and M3 bridge.
@@ -6,11 +6,11 @@
 //! * **Tabs** — the content area is a `Vec<Tab>` of webviews that all share the one
 //!   `OffscreenRenderingContext`; only the active tab is shown and painted. The
 //!   engine pushes a tab model (`{tabs:[{title}], active, url, canGoBack/Forward}`)
-//!   to the chrome via the `swerve:state` event, and the chrome renders the tab
-//!   strip from it. Tab actions come back as `swerve:tab?new|select=i|close=i`.
+//!   to the chrome via the `navgator:state` event, and the chrome renders the tab
+//!   strip from it. Tab actions come back as `navgator:tab?new|select=i|close=i`.
 //! * **Dynamic content rect (retires fixed `CHROME_HEIGHT`)** — on load/resize the
-//!   chrome reports its content region's top (CSS px) via `swerve:ready?top=` /
-//!   `swerve:layout?top=`; the engine derives the content rect from that, so the
+//!   chrome reports its content region's top (CSS px) via `navgator:ready?top=` /
+//!   `navgator:layout?top=`; the engine derives the content rect from that, so the
 //!   chrome/engine split is whatever the chrome actually lays out.
 //!
 //! A `Weak<AppState>` self-reference lets `&self` delegate callbacks build new tab
@@ -18,7 +18,7 @@
 //!
 //! API verified against servo rev `ed1af70`. Bridge/compositing: see M2/M3 notes.
 //! TODO: IME/composition; popup/prompt/context-menu hooks; a less hacky command
-//! channel than `swerve:` navigation.
+//! channel than `navgator:` navigation.
 
 use std::cell::{Cell, RefCell};
 use std::env;
@@ -32,17 +32,17 @@ use std::thread;
 
 use euclid::Scale;
 use euclid::default::{Point2D, Rect, Size2D};
-// Everything from the engine comes through swerve-engine, the only crate that
+// Everything from the engine comes through navgator-engine, the only crate that
 // touches the Servo fork (ROADMAP §R2; docs/FORK.md). The IPC wire types come from
-// the servo-free swerve-protocol crate.
-use swerve_engine::{
+// the servo-free navgator-protocol crate.
+use navgator_engine::{
     DevicePoint, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent,
     MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
     NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, RenderingContext,
     Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent,
     WheelMode, WindowRenderingContext,
 };
-use swerve_protocol::IpcCommand;
+use navgator_protocol::IpcCommand;
 use url::Url;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
@@ -53,7 +53,7 @@ use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::{Window, WindowId};
 
 /// Fallback chrome height (logical px) used until the chrome reports its real
-/// content-region top via the `swerve:ready`/`swerve:layout` bridge command.
+/// content-region top via the `navgator:ready`/`navgator:layout` bridge command.
 const CHROME_HEIGHT_FALLBACK: u32 = 84;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -63,11 +63,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let event_loop = EventLoop::with_user_event().build()?;
 
-    // Optional IPC control socket (M5): when SWERVE_IPC is set, an external process
+    // Optional IPC control socket (M5): when NAVGATOR_IPC is set, an external process
     // can drive the engine over it. `ipc_clients` holds connected clients' write
     // halves so the UI thread can push state events to them.
     let ipc_clients: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
-    if let Ok(path) = env::var("SWERVE_IPC") {
+    if let Ok(path) = env::var("NAVGATOR_IPC") {
         start_ipc(path, event_loop.create_proxy(), ipc_clients.clone());
     }
 
@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Resolve swerve's bundled web assets. A packaged build keeps them next to the
+/// Resolve navgator's bundled web assets. A packaged build keeps them next to the
 /// executable in `<exe_dir>/resources/{chrome,content}`; `cargo run` (no such dir)
 /// falls back to the source tree. Without this, `env!("CARGO_MANIFEST_DIR")` would
 /// point at the build machine's path and a distributed binary couldn't find its UI.
@@ -109,7 +109,7 @@ fn content_url() -> Url {
         if let Ok(url) = Url::parse(&arg) {
             return url;
         }
-        eprintln!("swerve: '{arg}' is not a valid URL, loading the home page instead");
+        eprintln!("navgator: '{arg}' is not a valid URL, loading the home page instead");
     }
     file_url("content/home.html")
 }
@@ -136,7 +136,7 @@ fn settings_path() -> Option<PathBuf> {
     let base = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("swerve").join("settings.conf"))
+    Some(base.join("navgator").join("settings.conf"))
 }
 
 fn load_settings() -> Settings {
@@ -422,7 +422,7 @@ impl AppState {
             (j, active, url, cb, cf)
         };
         self.chrome_eval(format!(
-            "window.dispatchEvent(new CustomEvent('swerve:state',{{detail:{{tabs:{tabs_json},active:{active},url:{},canGoBack:{can_back},canGoForward:{can_forward}}}}}))",
+            "window.dispatchEvent(new CustomEvent('navgator:state',{{detail:{{tabs:{tabs_json},active:{active},url:{},canGoBack:{can_back},canGoForward:{can_forward}}}}}))",
             js_string(&url)
         ));
     }
@@ -462,7 +462,7 @@ impl AppState {
                 self.apply_settings_to_chrome();
             }
             "layout" => self.apply_layout(url),
-            other => eprintln!("swerve: unknown chrome command '{other}'"),
+            other => eprintln!("navgator: unknown chrome command '{other}'"),
         }
     }
 
@@ -536,7 +536,7 @@ impl AppState {
     fn settings_event_js(&self) -> String {
         let s = self.settings.borrow();
         format!(
-            "window.dispatchEvent(new CustomEvent('swerve:settings',{{detail:{{search:{},accent:{}}}}}))",
+            "window.dispatchEvent(new CustomEvent('navgator:settings',{{detail:{{search:{},accent:{}}}}}))",
             js_string(&s.search),
             js_string(&s.accent)
         )
@@ -644,10 +644,10 @@ impl WebViewDelegate for AppState {
     }
 
     fn request_navigation(&self, webview: WebView, navigation_request: NavigationRequest) {
-        // `swerve:` navigations are bridge commands, not real loads. Honored from the
+        // `navgator:` navigations are bridge commands, not real loads. Honored from the
         // chrome and from our own (trusted) settings page; ignored from any other web
         // content so a random site can't drive the browser.
-        if navigation_request.url.scheme() == "swerve" {
+        if navigation_request.url.scheme() == "navgator" {
             let url = navigation_request.url.clone();
             navigation_request.deny();
             if self.is_chrome(&webview) {
@@ -682,7 +682,7 @@ impl ApplicationHandler<WakeUp> for App {
         let window = event_loop
             .create_window(
                 Window::default_attributes()
-                    .with_title("swerve")
+                    .with_title("NavGator")
                     .with_decorations(false)
                     .with_inner_size(LogicalSize::new(1280.0, 800.0)),
             )
@@ -903,11 +903,11 @@ fn start_ipc(path: String, proxy: EventLoopProxy<WakeUp>, clients: Arc<Mutex<Vec
     let listener = match UnixListener::bind(&path) {
         Ok(listener) => listener,
         Err(e) => {
-            eprintln!("swerve: could not bind IPC socket {path}: {e}");
+            eprintln!("navgator: could not bind IPC socket {path}: {e}");
             return;
         }
     };
-    eprintln!("swerve: IPC control socket listening on {path}");
+    eprintln!("navgator: IPC control socket listening on {path}");
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             if let Ok(writer) = stream.try_clone() {

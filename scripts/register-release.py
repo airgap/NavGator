@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Register a swerve release with lyku.org/apps via the registerAppRelease mapi route.
+"""Register a navgator release with lyku.org/apps via the registerAppRelease mapi route.
 
 Lyku's gateway speaks MessagePack; this hand-encodes the small request map (no deps) and
 POSTs it with the X-CI-Token header the handler validates against CI_RELEASE_TOKEN.

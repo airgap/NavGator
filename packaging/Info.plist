@@ -2,12 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>swerve</string>
-  <key>CFBundleDisplayName</key><string>swerve</string>
-  <key>CFBundleIdentifier</key><string>org.lyku.swerve</string>
+  <key>CFBundleName</key><string>NavGator</string>
+  <key>CFBundleDisplayName</key><string>NavGator</string>
+  <key>CFBundleIdentifier</key><string>org.lyku.navgator</string>
   <key>CFBundleVersion</key><string>0.1.0</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
-  <key>CFBundleExecutable</key><string>swerve</string>
+  <key>CFBundleExecutable</key><string>navgator</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>

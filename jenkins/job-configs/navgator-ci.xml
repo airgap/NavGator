@@ -1,14 +1,14 @@
 <?xml version='1.1' encoding='UTF-8'?>
-<!-- swerve CI pipeline job. Created via jenkins/setup-jenkins.sh. The triggers and
+<!-- navgator CI pipeline job. Created via jenkins/setup-jenkins.sh. The triggers and
      matrix are defined in the root Jenkinsfile; this only points Jenkins at the repo. -->
 <flow-definition plugin="workflow-job">
   <actions/>
-  <description>swerve CI — tri-platform build (Linux/macOS/Windows) of the forked Servo engine + browser.</description>
+  <description>navgator CI — tri-platform build (Linux/macOS/Windows) of the forked Servo engine + browser.</description>
   <keepDependencies>false</keepDependencies>
   <properties>
     <com.coravy.hudson.plugins.github.GithubProjectProperty plugin="github">
-      <projectUrl>https://github.com/airgap/swerve/</projectUrl>
-      <displayName>swerve-ci</displayName>
+      <projectUrl>https://github.com/airgap/NavGator/</projectUrl>
+      <displayName>navgator-ci</displayName>
     </com.coravy.hudson.plugins.github.GithubProjectProperty>
   </properties>
   <definition class="org.jenkinsci.plugins.workflow.cps.CpsScmFlowDefinition" plugin="workflow-cps">
@@ -16,7 +16,7 @@
       <configVersion>2</configVersion>
       <userRemoteConfigs>
         <hudson.plugins.git.UserRemoteConfig>
-          <url>https://github.com/airgap/swerve.git</url>
+          <url>https://github.com/airgap/NavGator.git</url>
         </hudson.plugins.git.UserRemoteConfig>
       </userRemoteConfigs>
       <branches>

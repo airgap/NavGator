@@ -1,12 +1,12 @@
-# swerve — Cargo workspace.
+# navgator — Cargo workspace.
 #
-# The engine dependency is quarantined in the `swerve-engine` crate (the only crate
-# that touches the Servo fork). `swerve-protocol` holds servo-free wire types. The
-# `swerve` crate is the browser binary. See docs/ARCHITECTURE.md, docs/FORK.md,
+# The engine dependency is quarantined in the `navgator-engine` crate (the only crate
+# that touches the Servo fork). `navgator-protocol` holds servo-free wire types. The
+# `navgator` crate is the browser binary. See docs/ARCHITECTURE.md, docs/FORK.md,
 # ROADMAP §R2.
 [workspace]
 resolver = "3"
-members = ["crates/swerve-protocol", "crates/swerve-engine", "crates/swerve"]
+members = ["crates/navgator-protocol", "crates/navgator-engine", "crates/navgator"]
 
 # Speed up the (enormous) engine dependency compile in dev builds.
 [profile.dev.package."*"]

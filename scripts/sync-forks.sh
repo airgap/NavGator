@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Maintained-fork sync tooling for swerve's engine forks (docs/FORK.md, ROADMAP §R2).
+# Maintained-fork sync tooling for navgator's engine forks (docs/FORK.md, ROADMAP §R2).
 #
 #   sync-forks.sh --check     Report how far each fork trails upstream (no clone; CI canary).
 #   sync-forks.sh --merge     Merge upstream into each fork on the cadence (needs work clones).
@@ -15,7 +15,7 @@ FORKS=(
 )
 
 MODE="${1:---check}"
-WORKDIR="${SWERVE_FORKS_DIR:-$HOME/swerve-forks}"
+WORKDIR="${NAVGATOR_FORKS_DIR:-$HOME/navgator-forks}"
 
 check() {
   local drift=0
@@ -57,7 +57,7 @@ merge() {
     echo "Merged + pushed ${name}. New HEAD: $(git -C "$dir" rev-parse --short HEAD)"
   done
   echo
-  echo "Next: bump the pinned revs in Cargo.toml (swervo: crates/swerve-engine; stylo/webrender:"
+  echo "Next: bump the pinned revs in Cargo.toml (swervo: crates/navgator-engine; stylo/webrender:"
   echo "root [patch] tables) to the new HEADs, run 'cargo update', and let CI go green before committing."
 }
 

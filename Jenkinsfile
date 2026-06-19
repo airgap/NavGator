@@ -1,6 +1,6 @@
-// swerve CI — tri-platform build on Linux / macOS / Windows (ROADMAP §R2/D2).
+// navgator CI — tri-platform build on Linux / macOS / Windows (ROADMAP §R2/D2).
 //
-// Runs on Jenkins agents labelled `linux`, `macos`, `windows`. Building swerve
+// Runs on Jenkins agents labelled `linux`, `macos`, `windows`. Building navgator
 // compiles our forked engine (mozjs/SpiderMonkey + ANGLE + servo + stylo + webrender)
 // — a multi-GB, long build, so the agents should be provisioned like lyku's
 // `lyku-ci-base`: a single consistent LLVM, Rust (via rust-toolchain.toml), sccache,
@@ -28,7 +28,7 @@ pipeline {
                 [key: 'ref', value: '$.ref'],
                 [key: 'pusher', value: '$.pusher.login']
             ],
-            token: 'swerve-webhook',
+            token: 'navgator-webhook',
             causeString: 'Triggered by push from $pusher',
             printContributedVariables: true,
             printPostContent: false
@@ -121,9 +121,9 @@ pipeline {
                                 // Pure unit tests (servo-free); cross-platform.
                                 def t = {
                                     if (isUnix()) {
-                                        sh 'set -a; [ -f .ci-env ] && . ./.ci-env; set +a; cargo test --locked -p swerve-protocol'
+                                        sh 'set -a; [ -f .ci-env ] && . ./.ci-env; set +a; cargo test --locked -p navgator-protocol'
                                     } else {
-                                        bat 'cargo test --locked -p swerve-protocol'
+                                        bat 'cargo test --locked -p navgator-protocol'
                                     }
                                 }
                                 if (env.PLATFORM == 'linux') { t() }
@@ -155,7 +155,7 @@ pipeline {
                                 [ -f .ci-env ] && set -a && . ./.ci-env && set +a
                                 xvfb-run -a -s "-screen 0 1280x800x24" \
                                   env LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe \
-                                  timeout --signal=KILL 30 ./target/release/swerve || true
+                                  timeout --signal=KILL 30 ./target/release/navgator || true
                             '''
                         }
                     }
@@ -199,8 +199,8 @@ pipeline {
     }
 
     post {
-        success { echo 'swerve CI passed' }
-        unstable { echo 'swerve CI unstable (macOS/Windows not yet green, or upstream drift)' }
-        failure { echo 'swerve CI failed' }
+        success { echo 'navgator CI passed' }
+        unstable { echo 'navgator CI unstable (macOS/Windows not yet green, or upstream drift)' }
+        failure { echo 'navgator CI failed' }
     }
 }

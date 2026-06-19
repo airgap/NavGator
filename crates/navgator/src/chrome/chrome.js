@@ -1,23 +1,23 @@
-// swerve chrome behaviour.
+// navgator chrome behaviour.
 //
-// The chrome talks to the embedder by navigating to `swerve:` command URLs, which the
+// The chrome talks to the embedder by navigating to `navgator:` command URLs, which the
 // Rust side intercepts in `request_navigation` (and denies, so the chrome stays put).
-// The embedder pushes UI state back via the `swerve:state` CustomEvent (tab model,
-// active URL, back/forward) and user settings via `swerve:settings`. Single-process
+// The embedder pushes UI state back via the `navgator:state` CustomEvent (tab model,
+// active URL, back/forward) and user settings via `navgator:settings`. Single-process
 // bridge — to be replaced by a proper channel later.
 
-const swerve = {
-  navigate(input) { go("swerve:nav#" + input); },
-  back() { go("swerve:back"); },
-  forward() { go("swerve:forward"); },
-  reload() { go("swerve:reload"); },
-  newTab() { go("swerve:tab?new=1"); },
-  selectTab(i) { go("swerve:tab?select=" + i); },
-  closeTab(i) { go("swerve:tab?close=" + i); },
-  openSettings() { go("swerve:settings"); },
-  window(action) { go("swerve:window?action=" + action); },
+const navgator = {
+  navigate(input) { go("navgator:nav#" + input); },
+  back() { go("navgator:back"); },
+  forward() { go("navgator:forward"); },
+  reload() { go("navgator:reload"); },
+  newTab() { go("navgator:tab?new=1"); },
+  selectTab(i) { go("navgator:tab?select=" + i); },
+  closeTab(i) { go("navgator:tab?close=" + i); },
+  openSettings() { go("navgator:settings"); },
+  window(action) { go("navgator:window?action=" + action); },
 };
-window.swerve = swerve;
+window.navgator = navgator;
 
 // Each command is a one-shot navigation the embedder denies.
 function go(url) {
@@ -61,7 +61,7 @@ function renderTabs(tabs, active) {
   tabs.forEach((tab, i) => {
     const el = document.createElement("div");
     el.className = "tab" + (i === active ? " is-active" : "");
-    el.addEventListener("click", () => swerve.selectTab(i));
+    el.addEventListener("click", () => navgator.selectTab(i));
 
     const title = document.createElement("span");
     title.className = "tab-title";
@@ -73,7 +73,7 @@ function renderTabs(tabs, active) {
     close.textContent = "×";
     close.addEventListener("click", (e) => {
       e.stopPropagation();
-      swerve.closeTab(i);
+      navgator.closeTab(i);
     });
 
     el.appendChild(title);
@@ -86,12 +86,12 @@ function renderTabs(tabs, active) {
   add.className = "tab-new";
   add.setAttribute("aria-label", "New tab");
   add.textContent = "+";
-  add.addEventListener("click", () => swerve.newTab());
+  add.addEventListener("click", () => navgator.newTab());
   strip.appendChild(add);
 }
 
 // ── State pushed from the engine ──────────────────────────────────────────────
-window.addEventListener("swerve:state", (e) => {
+window.addEventListener("navgator:state", (e) => {
   const d = e.detail ?? {};
   if (Array.isArray(d.tabs)) renderTabs(d.tabs, d.active ?? 0);
   // Don't clobber what the user is actively typing in the address bar.
@@ -103,7 +103,7 @@ window.addEventListener("swerve:state", (e) => {
 });
 
 // ── Settings pushed from the engine ───────────────────────────────────────────
-window.addEventListener("swerve:settings", (e) => {
+window.addEventListener("navgator:settings", (e) => {
   const d = e.detail ?? {};
   if (typeof d.search === "string" && d.search.includes("%s")) searchTemplate = d.search;
   if (typeof d.accent === "string") {
@@ -122,35 +122,35 @@ $("omnibox").addEventListener("submit", (e) => {
       ? raw
       : "https://" + raw
     : searchTemplate.replace("%s", encodeURIComponent(raw));
-  swerve.navigate(target);
+  navgator.navigate(target);
 });
-$("back").addEventListener("click", () => swerve.back());
-$("forward").addEventListener("click", () => swerve.forward());
-$("reload").addEventListener("click", () => swerve.reload());
-$("menu").addEventListener("click", () => swerve.openSettings());
+$("back").addEventListener("click", () => navgator.back());
+$("forward").addEventListener("click", () => navgator.forward());
+$("reload").addEventListener("click", () => navgator.reload());
+$("menu").addEventListener("click", () => navgator.openSettings());
 // Select-all on focus so typing replaces the URL instead of appending.
 $("address").addEventListener("focus", (e) => e.target.select());
 
 // ── Window controls (OS decorations are disabled) ─────────────────────────────
-$("win-min").addEventListener("click", () => swerve.window("minimize"));
-$("win-max").addEventListener("click", () => swerve.window("maximize"));
-$("win-close").addEventListener("click", () => swerve.window("close"));
+$("win-min").addEventListener("click", () => navgator.window("minimize"));
+$("win-max").addEventListener("click", () => navgator.window("maximize"));
+$("win-close").addEventListener("click", () => navgator.window("close"));
 
 // Drag the window from empty titlebar space; double-click toggles maximize.
 const titlebar = $("titlebar");
 const isInteractive = (t) => t.closest("button, input, .tab");
 titlebar.addEventListener("mousedown", (e) => {
-  if (e.button === 0 && !isInteractive(e.target)) swerve.window("drag");
+  if (e.button === 0 && !isInteractive(e.target)) navgator.window("drag");
 });
 titlebar.addEventListener("dblclick", (e) => {
-  if (!isInteractive(e.target)) swerve.window("maximize");
+  if (!isInteractive(e.target)) navgator.window("maximize");
 });
 
 // ── Layout reporting (tells the engine where the content region starts) ───────
 function contentTopCss() {
   return Math.round($("viewport").getBoundingClientRect().top);
 }
-window.addEventListener("resize", () => go("swerve:layout?top=" + contentTopCss()));
+window.addEventListener("resize", () => go("navgator:layout?top=" + contentTopCss()));
 
 // Announce readiness + initial layout; the engine replies with the tab model + settings.
-go("swerve:ready?top=" + contentTopCss());
+go("navgator:ready?top=" + contentTopCss());

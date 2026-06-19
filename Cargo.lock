@@ -3775,6 +3775,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "navgator"
+version = "0.1.0"
+dependencies = [
+ "euclid",
+ "navgator-engine",
+ "navgator-protocol",
+ "rustls",
+ "url",
+ "winit",
+]
+
+[[package]]
+name = "navgator-engine"
+version = "0.1.0"
+dependencies = [
+ "servo",
+ "servo-embedder-traits",
+]
+
+[[package]]
+name = "navgator-protocol"
+version = "0.1.0"
+
+[[package]]
 name = "ndk"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7529,30 +7553,6 @@ name = "swapper"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e454d048db5527d000bfddb77bd072bbf3a1e2ae785f16d9bd116e07c2ab45eb"
-
-[[package]]
-name = "swerve"
-version = "0.1.0"
-dependencies = [
- "euclid",
- "rustls",
- "swerve-engine",
- "swerve-protocol",
- "url",
- "winit",
-]
-
-[[package]]
-name = "swerve-engine"
-version = "0.1.0"
-dependencies = [
- "servo",
- "servo-embedder-traits",
-]
-
-[[package]]
-name = "swerve-protocol"
-version = "0.1.0"
 
 [[package]]
 name = "syn"

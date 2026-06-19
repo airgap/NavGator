@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
-Name=swerve
+Name=NavGator
 Comment=A web browser whose UI is HTML rendered by the Servo engine
-Exec=swerve
-Icon=swerve
+Exec=navgator
+Icon=navgator
 Categories=Network;WebBrowser;
 Terminal=false

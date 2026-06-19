@@ -1,19 +1,19 @@
 [package]
-name = "swerve"
+name = "navgator"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MPL-2.0"
 description = "A web browser whose UI (chrome) is HTML rendered by the Servo engine"
-repository = "https://github.com/airgap/swerve"
+repository = "https://github.com/airgap/NavGator"
 
 [[bin]]
-name = "swerve"
+name = "navgator"
 path = "src/main.rs"
 
 [dependencies]
-swerve-engine = { path = "../swerve-engine" }
-swerve-protocol = { path = "../swerve-protocol" }
+navgator-engine = { path = "../navgator-engine" }
+navgator-protocol = { path = "../navgator-protocol" }
 
 # Windowing / geometry (versions matched to the engine's workspace).
 winit = "0.30.13"
