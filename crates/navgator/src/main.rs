@@ -87,26 +87,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Resolve navgator's bundled web assets (the home page). A packaged build keeps them
-/// next to the executable in `<exe_dir>/resources/content`; `cargo run` falls back to the
-/// source tree.
-fn resources_dir() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let res = dir.join("resources");
-            if res.join("content/home.html").exists() {
-                return res;
-            }
-        }
-    }
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
-}
-
-fn file_url(rel: &str) -> Url {
-    let p = resources_dir().join(rel);
-    Url::from_file_path(&p).unwrap_or_else(|_| Url::parse("about:blank").unwrap())
-}
-
 /// Built-in search engines offered in Settings; the first is the default. The welcome page
 /// and the omnibox both substitute the query for `%s` in the selected template.
 const SEARCH_ENGINES: &[(&str, &str)] = &[
@@ -129,6 +109,30 @@ fn content_url() -> Url {
         eprintln!("navgator: '{arg}' is not a valid URL, loading the welcome page instead");
     }
     Url::parse(WELCOME_URL).expect("gator://welcome is a valid URL")
+}
+
+/// True when the user passed a parseable URL on the command line. When set, that single URL
+/// takes precedence over any saved session at startup.
+fn cli_url_given() -> bool {
+    env::args().nth(1).is_some_and(|arg| Url::parse(&arg).is_ok())
+}
+
+/// Load the previously-saved session: the open tabs' URLs, one per line. Crash-safe — a
+/// missing or malformed file simply yields no tabs (we fall back to the welcome page).
+fn load_session() -> Vec<Url> {
+    let mut urls = Vec::new();
+    if let Some(text) = config_file("session.tsv").and_then(|p| std::fs::read_to_string(p).ok()) {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(u) = Url::parse(line) {
+                urls.push(u);
+            }
+        }
+    }
+    urls
 }
 
 /// User settings, persisted to a small `key=value` config file.
@@ -506,6 +510,9 @@ struct Tab {
     /// since `load_texture` needs the `egui::Context`).
     favicon_pending: Option<egui::ColorImage>,
     favicon_tex: Option<egui::TextureHandle>,
+    /// Set when Servo reports this tab's renderer pipeline panicked; cleared on the next
+    /// fresh load. While set, the tab is showing the `gator://crash` recovery page.
+    crashed: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -659,6 +666,83 @@ impl AppState {
             .replace("__SEARCH_TEMPLATE__", &search)
             .replace("__SEARCH_ENGINE__", engine)
             .replace("__BOOKMARKS__", &bookmarks)
+            .into_bytes()
+    }
+
+    /// Render the `gator://crash` recovery page for a tab whose renderer panicked. `url` is
+    /// the address that was loaded when it crashed (the Reload button links back to it) and
+    /// `reason` is Servo's panic message (shown under a Details disclosure).
+    fn render_gator_crash(&self, url: &str, reason: &str) -> Vec<u8> {
+        let accent = self.settings.borrow().accent.clone();
+        let shown_url = if url.is_empty() { "about:blank" } else { url };
+        let href = if url.is_empty() { WELCOME_URL } else { url };
+        let reason = if reason.trim().is_empty() {
+            "The renderer process exited unexpectedly."
+        } else {
+            reason
+        };
+        include_str!("content/crash.html")
+            .replace("__ACCENT__", &accent)
+            .replace("__CRASH_HREF__", &html_escape(href))
+            .replace("__CRASH_URL__", &html_escape(shown_url))
+            .replace("__CRASH_REASON__", &html_escape(reason))
+            .into_bytes()
+    }
+
+    /// Render the `gator://history` page: recent visits, newest-first, deduped by URL,
+    /// each a clickable link showing title + url. Templated like `gator://welcome`.
+    fn render_gator_history(&self) -> Vec<u8> {
+        let accent = self.settings.borrow().accent.clone();
+        let rows = {
+            let p = self.profile.borrow();
+            // `history` is append-on-first-visit order; show newest first and keep only the
+            // first (most recent) occurrence of each URL.
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let mut out = String::new();
+            for e in p.history.iter().rev() {
+                // record_visit already skips gator://about:/data:/file:; filter here too as
+                // belt-and-suspenders so the history page never lists internal pages.
+                if e.url.starts_with("gator:")
+                    || e.url.starts_with("about:")
+                    || e.url.starts_with("data:")
+                    || e.url.starts_with("file:")
+                {
+                    continue;
+                }
+                if !seen.insert(e.url.as_str()) {
+                    continue;
+                }
+                let title = if e.title.trim().is_empty() {
+                    e.url.as_str()
+                } else {
+                    e.title.as_str()
+                };
+                out.push_str(&format!(
+                    "<a class=\"row\" href=\"{}\"><span class=\"t\">{}</span><span class=\"u\">{}</span></a>",
+                    html_escape(&e.url),
+                    html_escape(&truncate_ellipsis(title, 80)),
+                    html_escape(&e.url),
+                ));
+            }
+            if out.is_empty() {
+                "<p class=\"empty\">No history yet. Pages you visit will appear here.</p>".to_string()
+            } else {
+                format!("<div class=\"list\">{out}</div>")
+            }
+        };
+        include_str!("content/history.html")
+            .replace("__ACCENT__", &accent)
+            .replace("__ROWS__", &rows)
+            .into_bytes()
+    }
+
+    /// Render the `gator://about` page: name, version, a one-line blurb, the keyboard
+    /// shortcuts, and links back to welcome/history. Templated like `gator://welcome`.
+    fn render_gator_about(&self) -> Vec<u8> {
+        let accent = self.settings.borrow().accent.clone();
+        include_str!("content/about.html")
+            .replace("__ACCENT__", &accent)
+            .replace("__VERSION__", env!("CARGO_PKG_VERSION"))
             .into_bytes()
     }
 
@@ -902,6 +986,20 @@ impl AppState {
                     }
                     if ui.add(egui::Button::new("☰").frame(false).min_size(egui::vec2(28.0, 24.0))).clicked() {
                         self.show_settings.set(!self.show_settings.get());
+                    }
+                    // Zoom indicator: only shown when the active tab isn't at 100%.
+                    // Click resets the page zoom; in the right-to-left layout this sits
+                    // just left of the menu button, at the right edge of the omnibox.
+                    let zoom_pct = (self.active_zoom() * 100.0).round() as i32;
+                    if zoom_pct != 100 {
+                        let z = ui.add(
+                            egui::Button::new(format!("{zoom_pct}%"))
+                                .frame(false)
+                                .min_size(egui::vec2(40.0, 24.0)),
+                        );
+                        if z.on_hover_text("Reset zoom (Ctrl+0)").clicked() {
+                            self.zoom_reset();
+                        }
                     }
 
                     let id = egui::Id::new("location_input");
@@ -1472,10 +1570,32 @@ impl AppState {
                 status_text: None,
                 favicon_pending: None,
                 favicon_tex: None,
+                crashed: false,
             });
             tabs.len() - 1
         };
         self.select_tab(idx);
+        self.save_session();
+    }
+
+    /// Persist the open tabs' URLs so the next launch can restore them. Best-effort: write
+    /// failures are ignored, matching save_history/save_bookmarks. Tabs whose URL hasn't been
+    /// reported yet (still String::new()) are skipped.
+    fn save_session(&self) {
+        let Some(path) = config_file("session.tsv") else {
+            return;
+        };
+        if let Some(d) = path.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let s: String = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter(|t| !t.url.is_empty())
+            .map(|t| format!("{}\n", tsv_field(&t.url)))
+            .collect();
+        let _ = std::fs::write(path, s);
     }
 
     fn select_tab(&self, i: usize) {
@@ -1525,6 +1645,7 @@ impl AppState {
             active
         };
         self.select_tab(new_active);
+        self.save_session();
     }
 
     /// Close every tab except `keep` (tab context menu).
@@ -1549,6 +1670,7 @@ impl AppState {
         }
         self.active.set(0);
         self.select_tab(0);
+        self.save_session();
     }
 
     /// Reopen the most-recently-closed tab (Ctrl+Shift+T).
@@ -1564,6 +1686,7 @@ impl AppState {
     /// Record a page visit in history (deduped by URL; frecency = visit count).
     fn record_visit(&self, url: &str, title: &str) {
         if url.is_empty()
+            || url.starts_with("gator:")
             || url.starts_with("about:")
             || url.starts_with("data:")
             || url.starts_with("file:")
@@ -1721,6 +1844,20 @@ impl WebViewDelegate for AppState {
         let url = load.request().url.clone();
         let body = match url.host_str().unwrap_or("welcome") {
             "welcome" | "newtab" | "home" => self.render_gator_welcome(),
+            "history" => self.render_gator_history(),
+            "about" => self.render_gator_about(),
+            "crash" => {
+                let mut crashed_url = String::new();
+                let mut reason = String::new();
+                for (k, v) in url.query_pairs() {
+                    match k.as_ref() {
+                        "url" => crashed_url = v.into_owned(),
+                        "reason" => reason = v.into_owned(),
+                        _ => {}
+                    }
+                }
+                self.render_gator_crash(&crashed_url, &reason)
+            }
             other => format!(
                 "<!doctype html><meta charset=\"utf-8\">\
                  <body style=\"font-family:system-ui;background:#0e1014;color:#e8eaed;padding:48px\">\
@@ -1752,6 +1889,7 @@ impl WebViewDelegate for AppState {
             }
             let title = self.tabs.borrow()[i].title.clone();
             self.record_visit(url.as_str(), &title);
+            self.save_session();
             self.window.request_redraw();
         }
     }
@@ -1790,9 +1928,11 @@ impl WebViewDelegate for AppState {
             {
                 let mut tabs = self.tabs.borrow_mut();
                 tabs[i].loading = !matches!(status, LoadStatus::Complete);
-                // A new load clears any stale hover/status text.
+                // A new load clears any stale hover/status text and the crashed state
+                // (a started load means the pipeline is alive again).
                 if !matches!(status, LoadStatus::Complete) {
                     tabs[i].status_text = None;
+                    tabs[i].crashed = false;
                 }
             }
             if matches!(status, LoadStatus::Complete) && i == self.active.get() {
@@ -1943,6 +2083,35 @@ impl WebViewDelegate for AppState {
         });
     }
 
+    /// A pipeline in this tab's webview panicked. Mark the tab crashed and navigate it to the
+    /// internal `gator://crash` recovery page (served by `load_web_resource`), carrying the
+    /// crashed URL + panic reason so the page can offer a Reload-back-to-that-URL button.
+    /// `tab.load` re-spawns the pipeline, so the tab stays usable.
+    fn notify_crashed(&self, webview: WebView, reason: String, _backtrace: Option<String>) {
+        let Some(i) = self.tab_index(&webview) else {
+            return;
+        };
+        let crashed_url = {
+            let mut tabs = self.tabs.borrow_mut();
+            tabs[i].crashed = true;
+            tabs[i].loading = false;
+            // Don't offer a reload back to our own crash page if it somehow crashes again.
+            if tabs[i].url.starts_with("gator://crash") {
+                String::new()
+            } else {
+                tabs[i].url.clone()
+            }
+        };
+        let recovery = Url::parse_with_params(
+            "gator://crash",
+            &[("url", crashed_url.as_str()), ("reason", reason.as_str())],
+        );
+        if let Ok(recovery) = recovery {
+            webview.load(recovery);
+        }
+        self.window.request_redraw();
+    }
+
     fn notify_fullscreen_state_changed(&self, _webview: WebView, is_fullscreen: bool) {
         self.fullscreen.set(is_fullscreen);
         self.window.request_redraw();
@@ -2038,7 +2207,21 @@ impl ApplicationHandler<WakeUp> for App {
         });
         *state.weak_self.borrow_mut() = Rc::downgrade(&state);
 
-        state.new_tab(content_url());
+        // Restore the previous session's tabs unless the user passed an explicit URL on the
+        // command line (which takes precedence). A missing/empty/malformed session yields no
+        // tabs, in which case we open the welcome page exactly as before.
+        let restored = if cli_url_given() {
+            Vec::new()
+        } else {
+            load_session()
+        };
+        if restored.is_empty() {
+            state.new_tab(content_url());
+        } else {
+            for url in restored {
+                state.new_tab(url);
+            }
+        }
 
         *self = App::Running(state);
     }
@@ -2244,6 +2427,15 @@ impl ApplicationHandler<WakeUp> for App {
                             state.window.request_redraw();
                             return;
                         }
+                        WinitKey::Character(c) if c.eq_ignore_ascii_case("h") => {
+                            if let (Ok(url), Some(tab)) =
+                                (Url::parse("gator://history"), state.active_tab())
+                            {
+                                state.location_dirty.set(false);
+                                tab.load(url);
+                            }
+                            return;
+                        }
                         WinitKey::Character(c) if c == "=" || c == "+" => {
                             state.zoom_in();
                             return;
@@ -2282,6 +2474,15 @@ impl ApplicationHandler<WakeUp> for App {
                         }
                         _ => {}
                     }
+                }
+                // F5 reloads the active tab (Ctrl+R is handled above; F5 carries no Ctrl).
+                if matches!(key_event.state, ElementState::Pressed)
+                    && matches!(key_event.logical_key, WinitKey::Named(NamedKey::F5))
+                {
+                    if let Some(tab) = state.active_tab() {
+                        tab.reload();
+                    }
+                    return;
                 }
                 // Esc closes a context menu, else exits page fullscreen.
                 if matches!(key_event.state, ElementState::Pressed)

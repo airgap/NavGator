@@ -111,7 +111,7 @@ NavGator/
 │   └── navgator/                 # the browser binary
 │       └── src/
 │           ├── main.rs           #   winit app, egui chrome, compositor, WebViewDelegate, IPC
-│           └── content/          #   gator:// internal pages (welcome.html, home.html, about.html)
+│           └── content/          #   gator:// internal pages (welcome/history/about/crash .html)
 └── docs/                         # ARCHITECTURE.md (this file), FORK.md, ROADMAP.md, plan/*
 ```
 
@@ -185,10 +185,10 @@ a `file://` home page, which a packaged build would have to locate on disk.
 page): add a host arm in `load_web_resource`, add an `content/*.html` template, render it in
 a helper like `render_gator_welcome`. No fork patch, no second webview.
 
-> Two non-`gator` content templates exist under `content/` (`home.html`, `about.html`) and
-> can be loaded as `file://` URLs via `file_url()` / `resources_dir()` (which resolves
-> bundled assets next to the executable in a packaged build, or the source tree under
-> `cargo run`). The default new-tab page is `gator://welcome`, not the `file://` home page.
+> Internal pages live as templates under `content/` (`welcome.html`, `history.html`,
+> `about.html`, `crash.html`), embedded into the binary with `include_str!` and served by the
+> matching `render_gator_*` method — there is no `file://` page path. The default new-tab page
+> is `gator://welcome`.
 
 ---
 

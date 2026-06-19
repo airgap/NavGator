@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tab crashed</title>
+<style>
+  :root { --accent: __ACCENT__; --bg:#0e1014; --panel:#171a21; --line:#262b36; --fg:#e8eaed; --muted:#9aa0aa; }
+  * { box-sizing:border-box; }
+  html,body { height:100%; margin:0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    padding: 24px; min-height:100%; text-align:center;
+  }
+  .card { width:min(560px,92vw); }
+  .glyph { font-size:54px; line-height:1; margin:0 0 18px; }
+  h1 { font-size:26px; font-weight:800; letter-spacing:-.5px; margin:0 0 10px; }
+  p.lead { color: var(--muted); margin:0 0 6px; font-size:15px; }
+  .url {
+    display:block; max-width:100%; margin:14px auto 0; padding:9px 12px;
+    background: var(--panel); border:1px solid var(--line); border-radius:9px;
+    color: var(--muted); font-size:13px;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .actions { margin-top:26px; }
+  .btn {
+    display:inline-block; background: var(--accent); color:#0b0d12; text-decoration:none;
+    font-weight:700; font-size:15px; padding:11px 22px; border-radius:11px;
+  }
+  .btn:hover { filter:brightness(1.08); }
+  details { margin-top:24px; color: var(--muted); font-size:12px; }
+  details summary { cursor:pointer; user-select:none; }
+  pre.reason {
+    text-align:left; margin:10px auto 0; max-width:100%; padding:11px 13px;
+    background: var(--panel); border:1px solid var(--line); border-radius:9px;
+    color:#c7ccd6; font-size:12px; white-space:pre-wrap; word-break:break-word; overflow:auto; max-height:180px;
+  }
+  footer { margin-top:36px; color:#5a606b; font-size:12px; letter-spacing:.3px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <p class="glyph">⚠</p>
+    <h1>This tab crashed</h1>
+    <p class="lead">The page renderer stopped responding. Your other tabs are unaffected.</p>
+    <span class="url">__CRASH_URL__</span>
+    <div class="actions">
+      <a class="btn" href="__CRASH_HREF__">Reload page</a>
+    </div>
+    <details>
+      <summary>Details</summary>
+      <pre class="reason">__CRASH_REASON__</pre>
+    </details>
+  </div>
+  <footer>NavGator &middot; gator://crash</footer>
+</body>
+</html>

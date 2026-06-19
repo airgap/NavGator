@@ -1,30 +1,67 @@
-<!DOCTYPE html>
-<!-- A second local content page, used to verify navigation through the bridge. -->
+<!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <title>About navgator</title>
-    <style>
-      html,
-      body { margin: 0; height: 100%; }
-      body {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        gap: 14px;
-        background: radial-gradient(120% 120% at 50% 0%, #2a1430 0%, #1a0e1f 60%, #120a16 100%);
-        color: #f3e9f6;
-        font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
-        -webkit-font-smoothing: antialiased;
-      }
-      h1 { font-size: 44px; font-weight: 600; letter-spacing: -0.02em; color: #e9b8ff; margin: 0; }
-      p { color: #c2a8cc; margin: 0; }
-    </style>
-  </head>
-  <body>
-    <h1>About navgator</h1>
-    <p>You navigated here through the chrome → engine bridge.</p>
-    <p>A second content page, loaded by the content webview.</p>
-  </body>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>About NavGator</title>
+<style>
+  :root { --accent: __ACCENT__; --bg:#0e1014; --panel:#171a21; --line:#262b36; --fg:#e8eaed; --muted:#9aa0aa; }
+  * { box-sizing:border-box; }
+  html,body { height:100%; margin:0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display:flex; flex-direction:column; align-items:center;
+    padding: 10vh 24px 28px; min-height:100%;
+  }
+  .brand { font-size:52px; font-weight:800; letter-spacing:-2px; margin:0 0 4px; }
+  .brand .g { color: var(--accent); }
+  .ver { color: var(--accent); font-size:14px; font-weight:600; margin:0 0 14px; letter-spacing:.4px; }
+  .blurb { color: var(--muted); margin:0 0 36px; font-size:15px; max-width:560px; text-align:center; }
+  .card { width:min(560px,94vw); background: var(--panel); border:1px solid var(--line);
+    border-radius:14px; padding:8px 6px; margin-bottom:24px; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:1px; color: var(--muted);
+    font-weight:700; margin:14px 16px 10px; }
+  .keys { list-style:none; margin:0; padding:0; }
+  .keys li { display:flex; align-items:center; justify-content:space-between; gap:16px;
+    padding:8px 16px; border-top:1px solid var(--line); font-size:14px; }
+  .keys li:first-child { border-top:0; }
+  .keys .d { color: var(--fg); }
+  kbd { font:600 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--fg);
+    background: var(--bg); border:1px solid var(--line); border-bottom-width:2px;
+    border-radius:6px; padding:3px 7px; white-space:nowrap; }
+  .nav { display:flex; gap:12px; }
+  .nav a { display:block; background: var(--panel); border:1px solid var(--line); border-radius:11px;
+    padding:11px 18px; color: var(--fg); text-decoration:none; font-size:14px; transition:border-color .15s; }
+  .nav a:hover { border-color: var(--accent); }
+  footer { margin-top:auto; padding-top:42px; color:#5a606b; font-size:12px; letter-spacing:.3px; }
+</style>
+</head>
+<body>
+  <h1 class="brand">Nav<span class="g">Gator</span></h1>
+  <p class="ver">Version __VERSION__</p>
+  <p class="blurb">A privacy-first browser with a native chrome composited over the Servo engine. Fast. Private. Yours.</p>
+  <div class="card">
+    <h2>Keyboard shortcuts</h2>
+    <ul class="keys">
+      <li><span class="d">New tab</span><kbd>Ctrl + T</kbd></li>
+      <li><span class="d">Reopen closed tab</span><kbd>Ctrl + Shift + T</kbd></li>
+      <li><span class="d">Close tab</span><kbd>Ctrl + W</kbd></li>
+      <li><span class="d">Focus address bar</span><kbd>Ctrl + L</kbd></li>
+      <li><span class="d">Reload page</span><kbd>Ctrl + R</kbd></li>
+      <li><span class="d">Bookmark this page</span><kbd>Ctrl + D</kbd></li>
+      <li><span class="d">Find in page</span><kbd>Ctrl + F</kbd></li>
+      <li><span class="d">History</span><kbd>Ctrl + H</kbd></li>
+      <li><span class="d">Zoom in / out / reset</span><kbd>Ctrl + + / − / 0</kbd></li>
+      <li><span class="d">Jump to tab 1–8 / last</span><kbd>Ctrl + 1–8 / 9</kbd></li>
+      <li><span class="d">Next / previous tab</span><kbd>Ctrl + (Shift) + Tab</kbd></li>
+      <li><span class="d">Close menu / find · exit fullscreen</span><kbd>Esc</kbd></li>
+    </ul>
+  </div>
+  <div class="nav">
+    <a href="gator://welcome">gator://welcome</a>
+    <a href="gator://history">gator://history</a>
+  </div>
+  <footer>NavGator · gator://about</footer>
+</body>
 </html>
