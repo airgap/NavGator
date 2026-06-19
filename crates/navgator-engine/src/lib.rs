@@ -18,8 +18,8 @@ pub use servo::{
 };
 
 pub use servo::{
-    AuthenticationRequest, EmbedderControl, EmbedderControlId, SelectElement, SelectElementOption,
-    SelectElementOptionOrOptgroup, SimpleDialog,
+    AuthenticationRequest, ColorPicker, EmbedderControl, EmbedderControlId, RgbColor, SelectElement,
+    SelectElementOption, SelectElementOptionOrOptgroup, SimpleDialog,
 };
 
 pub use embedder_traits::EventLoopWaker;

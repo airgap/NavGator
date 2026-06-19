@@ -40,8 +40,9 @@ use navgator_engine::{
     LoadStatus, MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
     NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, RenderingContext,
     Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent,
-    WheelMode, WindowRenderingContext, AuthenticationRequest, EmbedderControl, EmbedderControlId,
-    SelectElement, SelectElementOption, SelectElementOptionOrOptgroup, SimpleDialog,
+    WheelMode, WindowRenderingContext, AuthenticationRequest, ColorPicker, EmbedderControl,
+    EmbedderControlId, RgbColor, SelectElement, SelectElementOption, SelectElementOptionOrOptgroup,
+    SimpleDialog,
 };
 use navgator_protocol::IpcCommand;
 use url::Url;
@@ -185,6 +186,19 @@ fn content_size(window: PhysicalSize<u32>, top: u32) -> PhysicalSize<u32> {
     )
 }
 
+/// Parse a `#rrggbb` string into an `RgbColor`.
+fn parse_hex_color(s: &str) -> Option<RgbColor> {
+    let s = s.trim().trim_start_matches('#');
+    if s.len() != 6 {
+        return None;
+    }
+    Some(RgbColor {
+        red: u8::from_str_radix(&s[0..2], 16).ok()?,
+        green: u8::from_str_radix(&s[2..4], 16).ok()?,
+        blue: u8::from_str_radix(&s[4..6], 16).ok()?,
+    })
+}
+
 /// The cursor icon for a resize-band direction.
 fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
     match dir {
@@ -273,6 +287,8 @@ struct AppState {
     pending_auth: RefCell<Option<AuthenticationRequest>>,
     /// A `<select>` element picker awaiting a choice, if any.
     pending_select: RefCell<Option<SelectElement>>,
+    /// A `<input type=color>` picker awaiting a choice, if any.
+    pending_color: RefCell<Option<ColorPicker>>,
     scale: Cell<f64>,
     cursor: Cell<(f64, f64)>,
     focused: Cell<Focused>,
@@ -560,6 +576,48 @@ impl AppState {
         self.window.request_redraw();
     }
 
+    fn show_color(&self, picker: ColorPicker) {
+        let cur = picker
+            .current_color()
+            .unwrap_or(RgbColor { red: 0, green: 0, blue: 0 });
+        let hex = format!("#{:02x}{:02x}{:02x}", cur.red, cur.green, cur.blue);
+        *self.pending_color.borrow_mut() = Some(picker);
+        self.overlay.set(true);
+        self.focused.set(Focused::Chrome);
+        self.chrome_eval(format!(
+            "window.dispatchEvent(new CustomEvent('navgator:color',{{detail:{{value:{}}}}}))",
+            js_string(&hex)
+        ));
+        self.window.request_redraw();
+    }
+
+    fn resolve_color(&self, url: &Url) {
+        let picker = self.pending_color.borrow_mut().take();
+        self.overlay.set(false);
+        self.focused.set(Focused::Content);
+        let Some(mut picker) = picker else {
+            self.window.request_redraw();
+            return;
+        };
+        let mut ok = false;
+        let mut hex = String::new();
+        for (k, v) in url.query_pairs() {
+            match k.as_ref() {
+                "action" => ok = v == "ok",
+                "value" => hex = v.to_string(),
+                _ => {}
+            }
+        }
+        if ok {
+            if let Some(rgb) = parse_hex_color(&hex) {
+                picker.select(Some(rgb));
+            }
+            picker.submit();
+        }
+        // else: dropping `picker` without submitting cancels (no change).
+        self.window.request_redraw();
+    }
+
     // ── Tab management ────────────────────────────────────────────────────────
     fn new_tab(&self, url: Url) {
         let Some(me) = self.weak_self.borrow().upgrade() else {
@@ -699,6 +757,7 @@ impl AppState {
             "dialog" => self.resolve_dialog(url),
             "auth" => self.resolve_auth(url),
             "select" => self.resolve_select(url),
+            "color" => self.resolve_color(url),
             "ready" => {
                 self.apply_layout(url);
                 self.push_model();
@@ -929,7 +988,8 @@ impl WebViewDelegate for AppState {
         match control {
             EmbedderControl::SimpleDialog(dialog) => self.show_dialog(dialog),
             EmbedderControl::SelectElement(select) => self.show_select(select),
-            // File/color pickers, IME, and context menu: not yet implemented.
+            EmbedderControl::ColorPicker(picker) => self.show_color(picker),
+            // File picker, IME, and context menu: not yet implemented.
             _ => {}
         }
     }
@@ -1047,6 +1107,7 @@ impl ApplicationHandler<WakeUp> for App {
             pending_dialog: RefCell::new(None),
             pending_auth: RefCell::new(None),
             pending_select: RefCell::new(None),
+            pending_color: RefCell::new(None),
             scale: Cell::new(scale),
             cursor: Cell::new((0.0, 0.0)),
             focused: Cell::new(Focused::Content),

@@ -184,6 +184,13 @@ function closeModal(action) {
   } else if (modalMode === "select") {
     // `action` is the chosen option id, or "cancel".
     go(action === "cancel" ? "navgator:select" : "navgator:select?id=" + action);
+  } else if (modalMode === "color") {
+    go(
+      "navgator:color?action=" +
+        action +
+        "&value=" +
+        encodeURIComponent(modalInput.value || ""),
+    );
   } else {
     go(
       "navgator:dialog?action=" +
@@ -259,6 +266,22 @@ window.addEventListener("navgator:select", (e) => {
   });
   modalList.style.display = "block";
   modal.style.display = "flex";
+});
+
+// <input type=color> picker (hex entry)
+window.addEventListener("navgator:color", (e) => {
+  const d = e.detail ?? {};
+  modalMode = "color";
+  resetModal();
+  $("modal-msg").textContent = "Choose a color (hex)";
+  modalInput.type = "text";
+  modalInput.placeholder = "#rrggbb";
+  modalInput.value = d.value || "#000000";
+  modalInput.style.display = "block";
+  modalCancel.style.display = "inline-block";
+  modal.style.display = "flex";
+  modalInput.focus();
+  modalInput.select();
 });
 
 modalOk.addEventListener("click", () => closeModal("ok"));
