@@ -36,8 +36,8 @@ use euclid::default::{Point2D, Rect, Size2D};
 // touches the Servo fork (ROADMAP §R2; docs/FORK.md). The IPC wire types come from
 // the servo-free navgator-protocol crate.
 use navgator_engine::{
-    DevicePoint, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent, LoadStatus,
-    MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
+    CreateNewWebViewRequest, DevicePoint, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent,
+    LoadStatus, MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
     NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, RenderingContext,
     Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent,
     WheelMode, WindowRenderingContext,
@@ -426,6 +426,11 @@ impl AppState {
             .hidpi_scale_factor(Scale::new(self.scale.get() as f32))
             .delegate(me)
             .build();
+        self.adopt_tab(webview);
+    }
+
+    /// Resize a freshly-built content webview, push it as a tab, and focus it.
+    fn adopt_tab(&self, webview: WebView) {
         webview.resize(self.content_phys_size());
         let idx = {
             let mut tabs = self.tabs.borrow_mut();
@@ -751,6 +756,25 @@ impl WebViewDelegate for AppState {
         if let Some(i) = self.tab_index(&webview) {
             self.tabs.borrow_mut()[i].loading = !matches!(status, LoadStatus::Complete);
             self.push_model();
+        }
+    }
+
+    fn request_create_new(&self, _parent: WebView, request: CreateNewWebViewRequest) {
+        let Some(me) = self.weak_self.borrow().upgrade() else {
+            return;
+        };
+        // window.open / target=_blank → a new foreground tab (sharing the content context).
+        let webview = request
+            .builder(self.content_context.clone())
+            .hidpi_scale_factor(Scale::new(self.scale.get() as f32))
+            .delegate(me)
+            .build();
+        self.adopt_tab(webview);
+    }
+
+    fn notify_closed(&self, webview: WebView) {
+        if let Some(i) = self.tab_index(&webview) {
+            self.close_tab(i);
         }
     }
 

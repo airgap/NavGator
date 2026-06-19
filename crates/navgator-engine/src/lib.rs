@@ -10,7 +10,8 @@
 //! this crate, not the app.
 
 pub use servo::{
-    DevicePoint, InputEvent, Key, KeyState, KeyboardEvent, LoadStatus, MouseButton, MouseButtonAction,
+    CreateNewWebViewRequest, DevicePoint, InputEvent, Key, KeyState, KeyboardEvent, LoadStatus,
+    MouseButton, MouseButtonAction,
     MouseButtonEvent, MouseMoveEvent, NamedKey, NavigationRequest, OffscreenRenderingContext,
     RenderingContext, Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WheelDelta,
     WheelEvent, WheelMode, WindowRenderingContext,
