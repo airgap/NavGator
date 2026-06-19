@@ -122,6 +122,8 @@ struct Settings {
     search: String,
     /// UI accent color (any CSS-style `#rrggbb`).
     accent: String,
+    /// Dark chrome theme (vs light).
+    dark: bool,
 }
 
 impl Default for Settings {
@@ -129,6 +131,7 @@ impl Default for Settings {
         Self {
             search: "https://duckduckgo.com/?q=%s".to_string(),
             accent: "#5b8cff".to_string(),
+            dark: true,
         }
     }
 }
@@ -148,6 +151,7 @@ fn load_settings() -> Settings {
                 match k.trim() {
                     "search" => s.search = v.trim().to_string(),
                     "accent" => s.accent = v.trim().to_string(),
+                    "dark" => s.dark = v.trim() == "true",
                     _ => {}
                 }
             }
@@ -161,8 +165,44 @@ fn save_settings(s: &Settings) {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(&path, format!("search={}\naccent={}\n", s.search, s.accent));
+        let _ = std::fs::write(
+            &path,
+            format!("search={}\naccent={}\ndark={}\n", s.search, s.accent, s.dark),
+        );
     }
+}
+
+/// Parse a `#rrggbb` accent into an egui color (Color32 has no hex constructor).
+fn accent_color32(hex: &str) -> egui::Color32 {
+    let s = hex.trim().trim_start_matches('#');
+    if s.len() == 6 {
+        if let (Ok(r), Ok(g), Ok(b)) = (
+            u8::from_str_radix(&s[0..2], 16),
+            u8::from_str_radix(&s[2..4], 16),
+            u8::from_str_radix(&s[4..6], 16),
+        ) {
+            return egui::Color32::from_rgb(r, g, b);
+        }
+    }
+    egui::Color32::from_rgb(0x5b, 0x8c, 0xff)
+}
+
+/// Build the chrome's egui visuals from the user's accent + dark/light choice.
+fn build_visuals(accent: egui::Color32, dark: bool) -> egui::Visuals {
+    let mut v = if dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    let tint = |a: u8| egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), a);
+    v.selection.bg_fill = tint(120);
+    v.selection.stroke = egui::Stroke::new(1.0, accent);
+    v.hyperlink_color = accent;
+    v.text_cursor.stroke = egui::Stroke::new(2.0, accent);
+    v.widgets.hovered.weak_bg_fill = tint(40);
+    v.widgets.active.weak_bg_fill = tint(90);
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent);
+    v
 }
 
 /// NavGator's web-feature profile: turn on high-value APIs Servo ships disabled by default
@@ -188,6 +228,11 @@ fn navgator_preferences() -> Preferences {
     // Tier-1 — real backends, high payoff (validate hardening before relying on them).
     p.dom_indexeddb_enabled = true; // rusqlite backend → web apps / PWAs
     p.dom_webgl2_enabled = true; // 3D / maps / games
+    // Second wave — features with real implementations in the fork (additive, low-risk).
+    p.dom_offscreen_canvas_enabled = true; // OffscreenCanvas (2d/bitmap/webgl)
+    p.dom_sanitizer_enabled = true; // HTML Sanitizer API (security pitch)
+    p.dom_exec_command_enabled = true; // contenteditable rich-text editing
+    p.dom_storage_manager_api_enabled = true; // navigator.storage
     p
 }
 
@@ -441,6 +486,7 @@ impl AppState {
         let _ = self.content_context.make_current();
         let mut egui = self.egui.borrow_mut();
         egui.run(&self.window, |ctx| {
+            self.apply_theme(ctx);
             self.load_favicons(ctx);
             if !self.fullscreen.get() {
                 self.draw_chrome(ctx);
@@ -495,6 +541,22 @@ impl AppState {
         self.window_context.prepare_for_rendering();
         self.egui.borrow_mut().paint(&self.window);
         self.window_context.present();
+    }
+
+    /// Apply the user's accent + dark/light theme to the egui chrome each frame.
+    fn apply_theme(&self, ctx: &egui::Context) {
+        let (accent_hex, dark) = {
+            let s = self.settings.borrow();
+            (s.accent.clone(), s.dark)
+        };
+        let accent = accent_color32(&accent_hex);
+        let theme = if dark {
+            egui::Theme::Dark
+        } else {
+            egui::Theme::Light
+        };
+        ctx.set_theme(theme);
+        ctx.set_visuals_of(theme, build_visuals(accent, dark));
     }
 
     /// Upload any decoded favicons to GPU textures (needs the egui Context, so done here).
@@ -650,6 +712,8 @@ impl AppState {
                 ui.add_space(6.0);
                 ui.label("Accent color (#rrggbb)");
                 changed |= ui.text_edit_singleline(&mut s.accent).changed();
+                ui.add_space(6.0);
+                changed |= ui.checkbox(&mut s.dark, "Dark theme").changed();
                 if changed {
                     save_settings(&s);
                 }
