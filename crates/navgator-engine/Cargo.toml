@@ -13,8 +13,8 @@ description = "The only navgator crate that touches the Servo fork — quarantin
 # patch (patches/navgator-ua: brands the default User-Agent). DEFAULT features stay on (baked-in-resources,
 # clipboard, js_jit); media-gstreamer is NOT default (no gstreamer needed). The stylo
 # and webrender forks are wired via the workspace-root `[patch]` tables.
-servo = { git = "https://github.com/airgap/swervo", rev = "e559b12efec38ad23e066ddc96a80794eab9289b" }
+servo = { git = "https://github.com/airgap/swervo", rev = "315497b38e44e4aec90aafe688b224dad5e6af9b" }
 
 # servo-embedder-traits (lib name `embedder_traits`): EventLoopWaker lives here and
 # isn't re-exported by `servo`. Same rev as `servo`.
-embedder_traits = { git = "https://github.com/airgap/swervo", rev = "e559b12efec38ad23e066ddc96a80794eab9289b", package = "servo-embedder-traits" }
+embedder_traits = { git = "https://github.com/airgap/swervo", rev = "315497b38e44e4aec90aafe688b224dad5e6af9b", package = "servo-embedder-traits" }
