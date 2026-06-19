@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=NavGator
-Comment=A web browser whose UI is HTML rendered by the Servo engine
+Comment=A web browser with a native chrome compositing the Servo engine
 Exec=navgator
 Icon=navgator
 Categories=Network;WebBrowser;

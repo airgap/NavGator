@@ -1,0 +1,12 @@
+#!/bin/sh
+# AppImage entry point for NavGator.
+#
+# navgator resolves its bundled web content (resources/content/) relative to the
+# real executable via current_exe() -> resources_dir() in crates/navgator/src/main.rs.
+# On Linux current_exe() reads /proc/self/exe, which resolves THROUGH this AppRun to
+# the real binary at $APPDIR/usr/bin/navgator; package.sh stages the content next to
+# that binary at usr/bin/resources/content, so the home/about/welcome pages load from
+# inside the mounted AppImage. We exec (not source/symlink) so $0 -> the real binary
+# and so any URL arguments are forwarded verbatim.
+HERE="$(dirname "$(readlink -f "$0")")"
+exec "$HERE/usr/bin/navgator" "$@"

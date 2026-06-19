@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Package navgator for distribution into dist/.
-#   linux : navgator-<ver>-linux-x86_64.tar.gz  +  navgator-<ver>-x86_64.AppImage
+#   linux : navgator-<ver>-linux-x86_64.tar.gz  +  navgator-<ver>-linux-x86_64.AppImage
 #   macos : navgator-<ver>-macos-<arch>.tar.gz  +  navgator-<ver>-macos-<arch>.dmg
 #
 # The web content pages (home/about) ship in resources/content/ NEXT TO the binary; navgator
@@ -35,20 +35,39 @@ Linux)
     tar -C "$DIST" -czf "$DIST/navgator-$VERSION-linux-x86_64.tar.gz" "$(basename "$T")"
     rm -rf "$T"
 
-    # AppImage
-    if command -v appimagetool >/dev/null; then
+    # AppImage (optional; needs appimagetool OR linuxdeploy on PATH — degrades to a
+    # clean skip when neither is present, like the dmg/sccache steps elsewhere).
+    APPIMAGE="navgator-$VERSION-linux-x86_64.AppImage"
+    if command -v appimagetool >/dev/null || command -v linuxdeploy >/dev/null; then
         APPDIR="$DIST/navgator.AppDir"
+        rm -rf "$APPDIR"
         mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/256x256/apps"
         cp "$BIN" "$APPDIR/usr/bin/navgator"; stage_resources "$APPDIR/usr/bin"
+        # AppImage spec wants the .desktop + icon at the AppDir root; keep the
+        # FHS copies too so the integrated/installed form is well-formed.
         cp packaging/navgator.desktop "$APPDIR/usr/share/applications/"
         cp packaging/navgator.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/" 2>/dev/null || true
         cp packaging/navgator.desktop "$APPDIR/"
         cp packaging/navgator.png "$APPDIR/" 2>/dev/null || true
-        ln -sf usr/bin/navgator "$APPDIR/AppRun"
-        ( cd "$DIST" && ARCH=x86_64 appimagetool "$APPDIR" "navgator-$VERSION-x86_64.AppImage" )
+        cp packaging/navgator.png "$APPDIR/.DirIcon" 2>/dev/null || true
+        # Prefer the committed AppRun launcher (exec-forwards args, keeps resources
+        # resolvable via current_exe); fall back to a symlink if it is missing.
+        if [ -f packaging/AppRun ]; then
+            cp packaging/AppRun "$APPDIR/AppRun"; chmod +x "$APPDIR/AppRun"
+        else
+            ln -sf usr/bin/navgator "$APPDIR/AppRun"
+        fi
+        if command -v appimagetool >/dev/null; then
+            ( cd "$DIST" && ARCH=x86_64 appimagetool "$APPDIR" "$APPIMAGE" ) \
+                || echo "appimagetool failed; skipping AppImage (tarball still published)" >&2
+        else
+            ( cd "$DIST" && linuxdeploy --appdir "$APPDIR" --output appimage \
+                && mv navgator*.AppImage "$APPIMAGE" 2>/dev/null || true )
+        fi
         rm -rf "$APPDIR"
+        [ -f "$DIST/$APPIMAGE" ] && chmod +x "$DIST/$APPIMAGE" || true
     else
-        echo "appimagetool not found; skipping AppImage"
+        echo "appimagetool/linuxdeploy not found; skipping AppImage"
     fi
     ;;
 Darwin)

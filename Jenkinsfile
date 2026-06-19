@@ -80,6 +80,17 @@ pipeline {
                                             sudo -n apt-get update -q && sudo -n apt-get install -y llvm clang libclang-dev cmake pkg-config python3 xvfb libunwind-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav || true
                                             LIBCLANG="$(llvm-config --libdir 2>/dev/null || echo /usr/lib/llvm-18/lib)"
                                         fi
+                                        # Best-effort appimagetool for the Package stage's AppImage build (Linux only).
+                                        # If it can't be fetched, package.sh degrades to a clean "skipping AppImage".
+                                        if command -v apt-get >/dev/null && ! command -v appimagetool >/dev/null; then
+                                            mkdir -p "$HOME/.local/bin"
+                                            if [ ! -x "$HOME/.local/bin/appimagetool" ]; then
+                                                curl -fsSL -o "$HOME/.local/bin/appimagetool" \
+                                                  https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
+                                                  && chmod +x "$HOME/.local/bin/appimagetool" || true
+                                            fi
+                                            export PATH="$HOME/.local/bin:$PATH"
+                                        fi
                                         # Persist PATH (+ LIBCLANG_PATH) for the Build/Test/smoke stages (same workspace).
                                         { echo "PATH=$PATH"; [ -n "$LIBCLANG" ] && echo "LIBCLANG_PATH=$LIBCLANG"; command -v sccache >/dev/null && echo "RUSTC_WRAPPER=sccache"; } > .ci-env
                                         rustc --version && cargo --version
