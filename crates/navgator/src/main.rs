@@ -29,6 +29,7 @@ use std::thread;
 use egui::text::{CCursor, CCursorRange};
 use egui::text_edit::TextEditState;
 use egui::{LayerId, PaintCallback};
+use egui_file_dialog::{DialogState, FileDialog, Filter};
 use egui_glow::{CallbackFn, EguiGlow};
 use euclid::Scale;
 use euclid::default::{Point2D, Rect, Size2D};
@@ -36,7 +37,8 @@ use euclid::default::{Point2D, Rect, Size2D};
 // the Servo fork (ROADMAP §R2; docs/FORK.md). IPC wire types come from navgator-protocol.
 use navgator_engine::{
     AuthenticationRequest, ColorPicker, CreateNewWebViewRequest, DevicePoint, EmbedderControl,
-    EmbedderControlId, EventLoopWaker, Image, InputEvent, Key, KeyState, KeyboardEvent, LoadStatus,
+    EmbedderControlId, EventLoopWaker, FilePicker, FilterPattern, Image, InputEvent, Key, KeyState,
+    KeyboardEvent, LoadStatus,
     MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
     NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, PixelFormat,
     RenderingContext,
@@ -309,6 +311,10 @@ enum Dialog {
     Color {
         hex: String,
         handle: Option<ColorPicker>,
+    },
+    File {
+        dialog: FileDialog,
+        handle: Option<FilePicker>,
     },
     ContextMenu {
         pos: egui::Pos2,
@@ -783,6 +789,51 @@ impl AppState {
                     });
                 keep
             }
+            Dialog::File { dialog, handle } => {
+                enum Act {
+                    Dismiss,
+                    Submit,
+                    Continue,
+                }
+                let act = if let Some(picker) = handle.as_mut() {
+                    if *dialog.state() == DialogState::Closed {
+                        if picker.allow_select_multiple() {
+                            dialog.pick_multiple();
+                        } else {
+                            dialog.pick_file();
+                        }
+                    }
+                    match dialog.update(ctx).state() {
+                        DialogState::Open => Act::Continue,
+                        DialogState::Picked(path) => {
+                            picker.select(std::slice::from_ref(path));
+                            Act::Submit
+                        }
+                        DialogState::PickedMultiple(paths) => {
+                            picker.select(paths);
+                            Act::Submit
+                        }
+                        _ => Act::Dismiss,
+                    }
+                } else {
+                    Act::Dismiss
+                };
+                let keep = matches!(act, Act::Continue);
+                match act {
+                    Act::Dismiss => {
+                        if let Some(p) = handle.take() {
+                            p.dismiss();
+                        }
+                    }
+                    Act::Submit => {
+                        if let Some(p) = handle.take() {
+                            p.submit();
+                        }
+                    }
+                    Act::Continue => {}
+                }
+                keep
+            }
             Dialog::ContextMenu { pos } => {
                 let mut keep = true;
                 let r = egui::Area::new(egui::Id::new("context_menu"))
@@ -1124,7 +1175,26 @@ impl WebViewDelegate for AppState {
                     handle: Some(picker),
                 });
             }
-            // File picker, IME: not yet implemented.
+            EmbedderControl::FilePicker(picker) => {
+                let mut dialog = FileDialog::new();
+                if !picker.filter_patterns().is_empty() {
+                    let patterns: Vec<FilterPattern> = picker.filter_patterns().to_owned();
+                    let filter = Filter::new(move |path: &Path| {
+                        path.extension().and_then(|e| e.to_str()).is_some_and(|ext| {
+                            let ext = ext.to_lowercase();
+                            patterns.iter().any(|p| ext == p.0)
+                        })
+                    });
+                    dialog = dialog
+                        .add_file_filter("All Supported Types", filter)
+                        .default_file_filter("All Supported Types");
+                }
+                self.push_dialog(Dialog::File {
+                    dialog,
+                    handle: Some(picker),
+                });
+            }
+            // IME: not yet implemented.
             _ => {}
         }
     }
