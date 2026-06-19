@@ -1,4 +1,4 @@
-# swerve master roadmap
+# NavGator master roadmap
 
 Lead-architect synthesis of the ten dimension analyses in [`docs/plan/`](plan/).
 Read this first; each section links the deep-dive it condenses. Written 2026-06-18
@@ -21,14 +21,14 @@ locked decisions and their honest consequences:
 
 | # | Decision | Overrides | Consequence (straight) |
 |---|----------|-----------|------------------------|
-| D1 | **Fork Servo; implement everything ourselves; do NOT file upstream.** | §7 upstream-first; risk #1 framing | We become an **engine vendor**, not an embedder. The "keep-up-with-upstream treadmill" is replaced by **owning the whole web platform** (layout, SpiderMonkey/JS, net, media, security patches) — the single largest cost in the plan; it dwarfs the browser-UI work. Legitimate with real resources (it's what a browser *company* is), but eyes-open. **Sub-decision (D1a):** *hard fork* (permanent divergence; forgo all future Servo work) vs *maintained fork* (rebase on upstream Servo on a cadence + carry our patches). **Recommend maintained fork** — pure divergence rots and forfeits Servo/Igalia's ongoing engine output. "No upstreaming" is a fine *policy*; a periodic **merge-from-upstream cadence is still required** or the fork becomes unmaintainable. **→ Locked: maintained fork** — swerve pins to its own Servo fork, rebases/merges upstream on a scheduled cadence, patches on top. |
+| D1 | **Fork Servo; implement everything ourselves; do NOT file upstream.** | §7 upstream-first; risk #1 framing | We become an **engine vendor**, not an embedder. The "keep-up-with-upstream treadmill" is replaced by **owning the whole web platform** (layout, SpiderMonkey/JS, net, media, security patches) — the single largest cost in the plan; it dwarfs the browser-UI work. Legitimate with real resources (it's what a browser *company* is), but eyes-open. **Sub-decision (D1a):** *hard fork* (permanent divergence; forgo all future Servo work) vs *maintained fork* (rebase on upstream Servo on a cadence + carry our patches). **Recommend maintained fork** — pure divergence rots and forfeits Servo/Igalia's ongoing engine output. "No upstreaming" is a fine *policy*; a periodic **merge-from-upstream cadence is still required** or the fork becomes unmaintainable. **→ Locked: maintained fork** — navgator pins to its own Servo fork, rebases/merges upstream on a scheduled cadence, patches on top. |
 | D2 | **Linux, macOS, Windows all first-class from day one.** | §2 Linux-x86-64-first + the Phase-5 fallback | All three sandboxes (Linux seccomp+userns, macOS Seatbelt, Windows AppContainer + job objects) and tri-platform GPU/`surfman`/ANGLE bring-up are on the critical path from the start. ~**3× the platform/security/CI surface**; Servo's macOS/Windows sandboxing is weak/absent, so most of it we build in the fork (consistent with D1). |
 | D3 | **No cryptocurrency/web3 wallet.** Keep the built-in password manager with **opt-in E2EE sync.** | adds an anti-bloat non-goal | Corrected reading: "86 the crypto wallet" = the **cryptocurrency wallet** (the Brave/Opera-style bloat) — an explicit non-goal, *not* credentials. The **zero-knowledge password vault stays** and syncs **opt-in** via the Lyku account (design: [`sync-lyku-integration.md`](plan/sync-lyku-integration.md)). The separate-sync-passphrase friction (Lyku is passwordless) therefore hits **only users who opt into password sync**; local-only users never see it. Risk #8 (crypto correctness, external review before the vault ships) stands. |
 | D4 | **Self-funded.** | §2/§7a funding gate; "labeled-preview-only"; risk #2 | Funding gate **satisfied** — a public, safety-claiming 1.0 is no longer grant-blocked. Caveat: money ≠ instant expertise; the pool of *Servo-fork + SpiderMonkey + browser-internals* engineers is narrow, so **hiring becomes the critical-path constraint** and bus-factor persists until the team exists. |
 | D5 | **Target full web rendering (Chrome-ish parity).** | §1/§2 "non-DRM mainstream web, not parity"; most §2 non-goals | The de-scoped engine-blocked features — passkeys/WebAuthn, state-partitioning, real downloads/find APIs, IndexedDB, WebGL2/WebGPU, service workers, WebRTC — all move **in-scope, built in our fork**. Reality check: Servo is ~62% WPT / ~20% Baseline-Widely-Available today; closing to Chrome parity is historically **thousands of engineer-years** (only Google/Apple/Mozilla have done it). With sustained resources it's a *multi-year company mission*, not a release. Still **sequence** it (most-used features first, measured vs a real top-sites corpus) rather than chase 100% WPT. **→ Locked: DRM/EME IN SCOPE.** Pursue a Widevine/PlayReady **CDM license** — a **business/legal track, not in-fork engineering**: we build the EME plumbing in the fork to *host* the CDM, but the CDM binary is proprietary (Google/Microsoft). It is the **one deliberate exception** to engine independence — gate it behind a build flag and document the dependency. |
 | D6 | **Resources available (funding + staffing).** | the "~1-person project" framing | Re-frames the plan from solo-constrained to team-scaled. Phase *sequencing* holds; durations compress with headcount — but the **engine-ownership (D1) + parity (D5) + tri-platform (D2)** combination is the defining, dominating cost. |
 
-**Net:** these turn swerve from "a themeable independent *second* browser" into **"build an independent full web platform + browser + browser company, on a Servo fork, across three OSes."** The most ambitious undertaking in consumer software — internally coherent *given real, sustained resources*. The dominating work item is now **the engine fork**; the gating constraint is now **hiring engine-capable engineers**, not money or upstream cooperation.
+**Net:** these turn navgator from "a themeable independent *second* browser" into **"build an independent full web platform + browser + browser company, on a Servo fork, across three OSes."** The most ambitious undertaking in consumer software — internally coherent *given real, sustained resources*. The dominating work item is now **the engine fork**; the gating constraint is now **hiring engine-capable engineers**, not money or upstream cooperation.
 
 **Resolved 2026-06-18:** D1a → **maintained fork**; D3 → **no cryptocurrency wallet; keep the password manager with opt-in zero-knowledge Lyku sync**; D5a → **DRM/EME in scope via CDM licensing** (the one allowed proprietary dependency).
 
@@ -59,7 +59,7 @@ This final cut closes five gaps and tempers five overclaims that an adversarial 
 - **Mobile/Android analyzed, not silently deferred** (§2a) — including whether the GX
   refugee persona is reachable desktop-only.
 - **"An afternoon each" downgraded.** The delegate cluster is re-sequenced strictly
-  *behind* the SQLite store + `swerve://` internal pages + a security-reviewed dialog
+  *behind* the SQLite store + `navgator://` internal pages + a security-reviewed dialog
   track, and re-estimated honestly (§3 Phase 1).
 - **Funding/headcount reconciled as a gate, not a risk-row** (§7a): which phases are
   deferred indefinitely if funding stays Tier-1, and "recruit one co-maintainer" made a
@@ -80,7 +80,7 @@ This final cut closes five gaps and tempers five overclaims that an adversarial 
 
 ## 1. Executive summary + the independence thesis
 
-swerve is a web browser whose **chrome (its own UI) is HTML rendered by Servo**, with
+navgator is a web browser whose **chrome (its own UI) is HTML rendered by Servo**, with
 web pages composited alongside it via an `OffscreenRenderingContext`. M1–M5 built a
 real browser *frame* — HTML chrome, multi-webview compositing, tabs, an
 omnibox/back/forward navigation bridge, mouse+keyboard routing, and an opt-in
@@ -91,13 +91,13 @@ Servo's own cookie jar is ephemeral.
 
 **The independence thesis (true, but not a consumer wedge on its own).** Every viable
 alternative browser traces to Google's engine (Blink, >75% of sessions) or Google's
-money (Mozilla ~85% search-deal revenue, expiring end-2026). Only swerve and Ladybird
+money (Mozilla ~85% search-deal revenue, expiring end-2026). Only navgator and Ladybird
 run on engines that are neither Blink nor Google-funded. That independence is real and
-is swerve's credibility layer — but Firefox at 2.26% share proves values-alone barely
+is navgator's credibility layer — but Firefox at 2.26% share proves values-alone barely
 sells, and Servo's web compat (~62% WPT, **87/439 categorized Baseline-Widely-Available
 features at production quality = 19.8%; 333 partial; 593 in the catalog**, with an
 external projection of an ~80% plateau around 2037 that is directional, not
-authoritative) means swerve **cannot win on parity**. The honest positioning is
+authoritative) means navgator **cannot win on parity**. The honest positioning is
 **"second browser, by choice"**: win on deep, performant theming (the
 HTML-chrome-in-Servo architecture is the one un-copyable feature), verifiable zero
 telemetry, a built-in MV3-proof content blocker, lean footprint, and self-hostable
@@ -105,16 +105,16 @@ end-to-end sync. Independence is the foundation, not the headline. See
 [`positioning.md`](plan/positioning.md).
 
 **The dominant risk is not compat — it is the Servo-embedding maintenance treadmill**
-that archived the direct predecessor **Verso (Oct 8 2025)**. swerve already paid the
+that archived the direct predecessor **Verso (Oct 8 2025)**. navgator already paid the
 architectural insurance Verso skipped (high-level `servo` umbrella crate, ~30 public
 symbols, pinned rev, no self-owned compositor, an 788-LOC diff vs Verso's ~30 crates +
-2,200-LOC compositor). The ground also shifted in swerve's favour in April–May 2026:
+2,200-LOC compositor). The ground also shifted in navgator's favour in April–May 2026:
 Servo published to crates.io and launched an **LTS train with half-yearly migration
 cycles**, converting "chase a HEAD that breaks ~3–6×/month" into "one scoped migration
 twice a year." The residual risk is therefore **process discipline and bus-factor (=1
 today)**, not architecture. **Note that every "must-upstream" item below — downloads,
 find-in-page, a pluggable sandbox — *re-introduces* this exact treadmill risk by making
-swerve carry a patch across every LTS bump; the plan does not pretend otherwise.** See
+navgator carry a patch across every LTS bump; the plan does not pretend otherwise.** See
 [`sustainability.md`](plan/sustainability.md).
 
 **Scale, honestly.** A usable daily-driver 1.0 is a **2–4 year, 1–6 person effort**,
@@ -123,9 +123,9 @@ README and product should say so.
 
 ---
 
-## 2. "swerve 1.0" MVP definition + explicit non-goals
+## 2. "navgator 1.0" MVP definition + explicit non-goals
 
-**swerve 1.0 is a usable, themeable, private second browser for the non-DRM
+**navgator 1.0 is a usable, themeable, private second browser for the non-DRM
 mainstream web, on Linux x86-64 first.** It is defined by these properties:
 
 - **Imports the user's life from their old browser on first run** (P0, not P2):
@@ -145,10 +145,10 @@ mainstream web, on Linux x86-64 first.** It is defined by these properties:
 - **Core product features** present: omnibox with frecency suggestions, bookmarks,
   searchable history, downloads + manager, find-in-page, session/crash restore,
   settings UI, per-site permissions, zoom, clipboard, full keyboard-shortcut set,
-  `swerve://` internal pages.
+  `navgator://` internal pages.
 - **Deep performant theming** as the headline: a `--sw-*` design-token catalog, chrome
   hot-reload (<16ms), live light/dark + force-dark for content, per-site themes,
-  wallpapers via a `swerve-asset://` handler, a validated package format, and a
+  wallpapers via a `navgator-asset://` handler, a validated package format, and a
   **CI-enforced perf budget** (the GX differentiator is being fast, not feature count).
 - **Built-in content blocking on by default** (adblock-rust + EasyList/EasyPrivacy via
   `load_web_resource`), plus userscripts as the native add-on type.
@@ -160,7 +160,7 @@ mainstream web, on Linux x86-64 first.** It is defined by these properties:
   local-folder providers behind one `SyncProvider` trait), zero-knowledge by default.
 - **Verifiable zero telemetry** *paired with* an **opt-in, transparent field-quality
   signal**: local-only error log, opt-in crash report (showing the exact payload before
-  send), and a "report this site" button. The "what swerve sends" page documents both.
+  send), and a "report this site" button. The "what navgator sends" page documents both.
 - **Localizable from day one** (string catalog, no hardcoded English in chrome) even if
   only English + 1–2 community locales ship at 1.0; RTL/IME remain engine-blocked
   stretch goals, stated honestly.
@@ -172,7 +172,7 @@ mainstream web, on Linux x86-64 first.** It is defined by these properties:
   escape hatch.
 - **No WebRTC calling** (Meet/Discord-web/Jitsi) — servo-media backend is immature.
 - **No Chrome-extension (CRX/MV3) compatibility** and **no Chrome DevTools/CDP** — no
-  Puppeteer/Playwright-chromium. swerve ships a native add-on model + WebDriver +
+  Puppeteer/Playwright-chromium. navgator ships a native add-on model + WebDriver +
   Firefox-RDP instead.
 - **No HTTP/3/QUIC** — H1+H2 only (functional, slower on Google/CDN traffic).
 - **No passkeys/WebAuthn** — **definitively engine-blocked, not merely "unconfirmed":**
@@ -188,7 +188,7 @@ mainstream web, on Linux x86-64 first.** It is defined by these properties:
   partitioning is a literal `// TODO: Apply Partitioning checks` stub
   (`components/net/cookie.rs:383`); CHIPS-style partitioning and fingerprint resistance
   are engine-blocked and scoped as a *tracked, upstream-dependent* goal (§6b), not a
-  shipped 1.0 differentiator. swerve's privacy story at 1.0 is **content-blocking + zero
+  shipped 1.0 differentiator. navgator's privacy story at 1.0 is **content-blocking + zero
   telemetry + no third-party-cookie-by-default**, not Tor/Brave-class fingerprint
   resistance.
 - **No OOPIF / full site-per-process isolation** — process-per-registered-domain is the
@@ -200,7 +200,7 @@ mainstream web, on Linux x86-64 first.** It is defined by these properties:
   to post-1.0 "Phase C"). The MVP does **not** claim near-Chrome safety.
 - **No mobile/Android at 1.0** — see §2a for why this is a real strategic cost, not a
   free deferral.
-- **No SwerveOS** — zero engineering spend; narrative only (§9).
+- **No NavGatorOS** — zero engineering spend; narrative only (§9).
 - **Not for**: DRM-streaming-only users, enterprise-SSO shops, banking-appliance use,
   "invisible plumbing" users. Windows/macOS are post-1.0 unless explicitly funded.
 
@@ -214,9 +214,9 @@ persona (privacy/independence-minded power-customizers, GX refugees on **desktop
 exists in enough volume to bootstrap, while the larger GX audience is acknowledged as
 **out of reach until a mobile port exists**. Honest assessment:
 
-- **Architecture mismatch, not just scope.** swerve's chrome-in-Servo +
+- **Architecture mismatch, not just scope.** navgator's chrome-in-Servo +
   `OffscreenRenderingContext` + winit desktop compositing path is **not** the Android
-  EGL/`egl/android` embedding path. A mobile swerve is closer to a **second front-end**
+  EGL/`egl/android` embedding path. A mobile navgator is closer to a **second front-end**
   than a recompile: touch input routing, on-screen keyboard/IME (already engine-weak),
   Android lifecycle, GPU/EGL surface management, and packaging. This is a **multi-person
   -quarter** effort by itself, layered on top of an engine whose Android port is itself
@@ -227,7 +227,7 @@ exists in enough volume to bootstrap, while the larger GX audience is acknowledg
   gravity**. This is a known ceiling, not an oversight.
 - **Decision deferred with a named trigger, not silently dropped.** Mobile is a
   **post-1.0, separately-funded program** with a precondition: Servo's Android shell
-  reaching demonstrable daily-driver stability *and* swerve securing Tier-2 headcount.
+  reaching demonstrable daily-driver stability *and* navgator securing Tier-2 headcount.
   Until then, the README and store copy say "desktop browser" without implying a phone
   app is imminent.
 
@@ -245,7 +245,7 @@ layer; treat the sandbox as the gating deliverable with a pre-decided fallback.*
 enough to actually run.
 - CI with two lanes: a **stable lane** gating every PR against the committed Servo pin,
   and a **nightly canary lane** building against Servo HEAD/latest-monthly so
-  embedding-API breaks surface weeks before a migration. swerve has **no CI today** —
+  embedding-API breaks surface weeks before a migration. navgator has **no CI today** —
   this is the most urgent gap.
 - **In the SAME deliverable** (not a follow-up): a **pinned-LLVM/mozjs dev container +
   sccache + a cached/self-hosted runner**. Without the cached/containerized build, the
@@ -253,14 +253,14 @@ enough to actually run.
   to run, so it silently rots. Quantify and own the build weight: 848 deps, mozjs+mozangle,
   LLVM-pinned; a cold build is the onboarding tax. The dev container is also the
   reproducible-build baseline for §6e.
-- **A swerve-owned top-sites compat smoke-suite** (not just WPT): a curated corpus of the
+- **A navgator-owned top-sites compat smoke-suite** (not just WPT): a curated corpus of the
   top-N real sites the target personas actually use, with scripted load + key-interaction
   checks run on the canary lane. This catches **both** embedding-API breaks **and**
   real-site regressions that WPT misses. See §6a.
-- Quarantine all `servo::` usage behind a thin `swerve-servo` crate (today inlined in
-  `main.rs`); front it with a servo-free, versioned `swerve-protocol` (EngineCommand /
+- Quarantine all `servo::` usage behind a thin `navgator-servo` crate (today inlined in
+  `main.rs`); front it with a servo-free, versioned `navgator-protocol` (EngineCommand /
   EngineEvent).
-- Cargo workspace decomposition (~10 crates) with `swerve-servo` the ONLY crate that
+- Cargo workspace decomposition (~10 crates) with `navgator-servo` the ONLY crate that
   may `use servo::*`.
 - Written, review-enforced diff-minimization + upstream-first policy; adopt the Servo
   **crates.io LTS train** and a ~6-month scheduled-migration calendar.
@@ -268,14 +268,14 @@ enough to actually run.
   critical path and on Servo's LTS cadence, so the lead time must start in Phase 0.
 
 ### Phase 1 — Persistence substrate + first-run + "not broken" web (M6)
-**Goal:** make swerve feel like a real browser, let users *move in*, and unblock ~70%
-of features. **Hard prerequisite ordering:** the store and `swerve://` internal pages
+**Goal:** make navgator feel like a real browser, let users *move in*, and unblock ~70%
+of features. **Hard prerequisite ordering:** the store and `navgator://` internal pages
 land first; the delegate cluster and all chrome UI depend on them.
 - Per-OS profile dir wired to `Opts.config_dir`; SQLite "places" store via rusqlite
   (bundled), with the **universal sync-record envelope** (uuid, datatype, version
   vector, tombstone, updated_at, encrypted payload) baked into every datatype. **(Hard
   prerequisite for everything below and in Phase 2.)**
-- `swerve://` internal-pages framework (registered protocol / `load_web_resource`).
+- `navgator://` internal-pages framework (registered protocol / `load_web_resource`).
   **(Hard prerequisite for every settings/manager/dialog surface.)**
 - **Import-from-other-browsers (P0 adoption-critical):** read Chrome/Chromium, Firefox,
   and Edge profiles — Netscape/JSON bookmarks, `places.sqlite` / Chromium `History`,
@@ -338,8 +338,8 @@ land first; the delegate cluster and all chrome UI depend on them.
   `color-mix()`; refactor `chrome.css` onto it.
 - Chrome hot-reload over the existing bridge; live light/dark via `notify_theme_change`;
   force-dark + per-site themes (embedder URL→sheet map, NOT `@-moz-document`).
-- `swerve-asset://` handler (path-confined, size/dimension capped) for wallpapers/fonts.
-- Validated `.swerve`/`.swervemod` package format (tokens preferred over raw CSS,
+- `navgator-asset://` handler (path-confined, size/dimension capped) for wallpapers/fonts.
+- Validated `.navgator`/`.navgatormod` package format (tokens preferred over raw CSS,
   signature verification, capability declarations, installer-recomputed perf score).
 - **CI-enforced perf budget**: static-by-default, composited-only animation, RSS +
   frame-time sampler in the Xvfb harness. Build on `filter`/gradients — **not**
@@ -347,7 +347,7 @@ land first; the delegate cluster and all chrome UI depend on them.
 - Isolate every Servo theming touchpoint behind one `engine::theming` wrapper.
 - **Footprint claim re-baselined here (honest caveat).** The "beat GX on performance /
   lower idle RAM than Chrome" story comes from the *prototype*, which runs media-OFF,
-  single-process, accessibility-OFF, and most DOM APIs OFF. By this phase swerve has
+  single-process, accessibility-OFF, and most DOM APIs OFF. By this phase navgator has
   flipped media on, accessibility on, the DOM APIs on, and is heading into
   multiprocess+sandbox (N content processes), IndexedDB, service workers, and a
   tens-of-MB adblock engine. **The perf budget must be re-measured against a 1.0-feature
@@ -361,7 +361,7 @@ land first; the delegate cluster and all chrome UI depend on them.
   match on the UI thread** (the net thread `.await`s every request behind one mutex —
   no I/O or list-parsing on that path); never block `is_for_main_frame`.
 - Cosmetic filtering + scriptlets via per-tab `UserContentManager`.
-- Userscripts as the native add-on type (.user.js, GM_* shim, swerve-side `@match`).
+- Userscripts as the native add-on type (.user.js, GM_* shim, navgator-side `@match`).
 - Per-tab top-frame URL tracking in AppState for correct first-party.
 - **Filter-list licensing is a gating legal task, not a footnote** (§6d): EasyList,
   EasyPrivacy, and any default list must have their redistribution terms cleared per
@@ -369,7 +369,7 @@ land first; the delegate cluster and all chrome UI depend on them.
   modification.
 
 ### Phase 5 — Security hardening (M10) — release blocker for any public build
-**Goal:** make swerve safe for real users. **This is the single least-feasible-solo,
+**Goal:** make navgator safe for real users. **This is the single least-feasible-solo,
 most-likely-to-slip v1 commitment in the plan — re-phased accordingly, with a
 pre-decided fallback and a named human precondition.**
 
@@ -403,13 +403,13 @@ pre-decided fallback and a named human precondition.**
 - Baseline security UI: trustworthy origin display, cert interstitial with **no silent
   bypass** (compile `ignore_certificate_errors` out of release), HTTPS-First,
   deny-by-default permission prompts.
-- Harden or drop the `SWERVE_IPC` control plane in consumer builds (off by default,
+- Harden or drop the `NAVGATOR_IPC` control plane in consumer builds (off by default,
   0600, token auth, per-user runtime dir).
 - CI security gates: cargo-deny/audit failing on un-triaged advisories (Servo already
   carries some, e.g. RUSTSEC-2025-0059), PIE/RELRO/BIND_NOW, cargo-fuzz harness.
 - **Honest framing of the residual:** process-per-registered-domain removes the
   universal-compromise case but **not** the cross-origin-iframe / Spectre bar (no OOPIF;
-  in-broker net+cookies). swerve at 1.0 is "meaningfully safer than single-process,
+  in-broker net+cookies). navgator at 1.0 is "meaningfully safer than single-process,
   below Chrome's site-isolation bar" — and says exactly that.
 
 ### Phase 6 — Sync (Lyku) (M11)
@@ -439,9 +439,9 @@ pre-decided fallback and a named human precondition.**
 ### Phase 7 — 1.0 release polish
 **Goal:** ship Linux x86-64 + arm64.
 - Live in-product compat page (driven off Servo BWA gaps) + one-click open-in-system.
-- "What swerve sends" page; default-browser registration; protocol/deep-link handlers.
+- "What navgator sends" page; default-browser registration; protocol/deep-link handlers.
 - **Top-sites compat smoke-suite promoted to a release gate** (§6a) + WPT regression
-  tracking of swerve's target feature set as a per-bump KPI.
+  tracking of navgator's target feature set as a per-bump KPI.
 - **Manual smoke-test matrix** across a documented set of GPUs/drivers (§6f) and the
   supported distro packages (§6e).
 - Enable **WebGL2** (present, pref-off) behind a WPT gate; enable + harden **Service
@@ -462,7 +462,7 @@ pre-decided fallback and a named human precondition.**
 - Cross-origin-iframe isolation ("Phase C") — the actual modern security bar.
 - Lyku marketplace; chrome-mod API v1; PDF viewer + print-to-PDF; IME/composition; RTL.
 - Fund upstream Servo (anchor positioning, layout gaps, downloads/find APIs, EME hooks,
-  WebRTC, pluggable sandbox) — the cheapest durable way to close engine gaps. SwerveOS
+  WebRTC, pluggable sandbox) — the cheapest durable way to close engine gaps. NavGatorOS
   stays a narrative (§9).
 
 ---
@@ -472,9 +472,9 @@ pre-decided fallback and a named human precondition.**
 | Pri | Feature | Status today | Blocker / path |
 |-----|---------|--------------|----------------|
 | P0 | CI (stable + canary) + pinned dev-container + sccache + top-sites smoke-suite | none | build infra |
-| P0 | `swerve-servo` quarantine + `swerve-protocol` | inlined in main.rs | refactor |
+| P0 | `navgator-servo` quarantine + `navgator-protocol` | inlined in main.rs | refactor |
 | P0 | Profile dir + `config_dir` + SQLite places store | zero persistence | app arch (hard prereq) |
-| P0 | `swerve://` internal-pages framework | none | ProtocolHandler (hard prereq) |
+| P0 | `navgator://` internal-pages framework | none | ProtocolHandler (hard prereq) |
 | P0 | **Import bookmarks/history/passwords/cookies from Chrome/FF/Edge** | none | first-run; keychain/DPAPI for passwords |
 | P0 | Delegate cluster (menus, dialogs, pickers, auth, popups, favicons, crash) | 5/38 wired | **days-to-weeks each**, behind store + dialog-review track |
 | P0 | Media backend (video/audio decode) | OFF (bug) | enable feature |
@@ -497,7 +497,7 @@ pre-decided fallback and a named human precondition.**
 | P0 | Localization substrate (no hardcoded strings) | hardcoded English | string catalog |
 | P0 | Distribution: Flatpak + .deb/.rpm/AppImage + AUR, signed | none | packaging per distro |
 | P1 | IndexedDB (hardened) | pref-off | enable + WPT gate |
-| P1 | Force-dark + per-site themes + `swerve-asset://` | none | UserContentManager |
+| P1 | Force-dark + per-site themes + `navgator-asset://` | none | UserContentManager |
 | P1 | Package format + sideload | none | manifest + signing |
 | P1 | Userscripts (GM_* shim) | none | UserContentManager |
 | P1 | Sync: SyncProvider + self-host + E2EE settings/bookmarks/history | none | needs store first; RC-crypto risk |
@@ -548,7 +548,7 @@ near Chrome. The gap is everywhere *between* the cores.
 total** — 593 is the catalog size, NOT the percentage denominator; 87/593 would be
 14.7%). An external linear projection puts the plateau near ~80% by ~2037 at ~13 FTE —
 **directional only, 11 years out, not authoritative.** **Every pref-enable must clear a
-swerve-defined WPT bar** — flipping naively ships bugs users blame on swerve. The
+navgator-defined WPT bar** — flipping naively ships bugs users blame on navgator. The
 value-add over raw Servo is a hardened, verified default profile, not Servo's
 everything-off defaults.
 
@@ -574,7 +574,7 @@ Redis + OpenSearch + NATS + Cloudflare R2, with the `lockstep-core`/`pg-models`/
 type-safe framework. It is a near-ideal backend and already provides opaque session tokens +
 scoped `lyk_` API keys + OAuth2/OIDC, an R2 presigned-upload flow, MessagePack/NATS, and —
 crucially — a generic **`synced<T>` replication framework** that is exactly the delta-sync
-cursor primitive. swerve sync rides those rails: ~4 new `pg-models` tables + ~11 `mapi-models`
+cursor primitive. navgator sync rides those rails: ~4 new `pg-models` tables + ~11 `mapi-models`
 routes + `read/write:sync` scopes, reusing `core-service` auth. Still pluggable: a
 `SyncProvider` trait (Lyku + self-host + local-folder) keeps Lyku optional. **Crypto caveat:**
 Lyku is *passwordless*, so zero-knowledge E2EE can't derive from a login password — it needs a
@@ -585,7 +585,7 @@ any vault ships. Sync is a replication layer over a local store **that does not 
 build each feature's store with the sync envelope from day one; never bolt sync on later.
 
 ### Security & sandboxing — the release blocker. Full: [`security.md`](plan/security.md)
-swerve is single-process and unsandboxed today, with a privileged `file://` chrome
+navgator is single-process and unsandboxed today, with a privileged `file://` chrome
 receiving web-controlled strings — disqualifying for real users. The most load-bearing
 pre-release requirement is sandboxed multiprocess content (≥ process-per-registered-
 domain) — and it is the **single most-likely-to-slip v1 deliverable**, so the 1.0 bar is
@@ -605,7 +605,7 @@ interception) + `UserContentManager` + Brave's `adblock` crate (v0.12.5, MPL-2.0
 add) ships network + cosmetic blocking in low-thousands of lines. **WebExtensions parity
 is NOT realistic** (zero extension infra in Servo, multi-person-year, a fork-magnet —
 the Verso treadmill). Path: content-blocking first, then userscripts (native add-on
-type), then a small native `swerve.*` API — deliberately **not** `chrome.*`. The
+type), then a small native `navgator.*` API — deliberately **not** `chrome.*`. The
 dominant risk is performance: the block decision runs on the UI thread while net
 `.await`s every request behind one mutex — it must be a synchronous in-memory match
 against a pre-compiled engine, nothing else. Default-list **redistribution licensing is
@@ -614,7 +614,7 @@ a gating task** (§6d).
 ### 6a. Testing / QA / web-compat regression strategy (new)
 WPT-gating each pref is necessary but **not sufficient** — it does not tell you whether
 the actual sites your users visit work. The plan adds:
-- **A swerve-owned top-sites compat corpus:** the top-N real sites the personas use
+- **A navgator-owned top-sites compat corpus:** the top-N real sites the personas use
   (search, mail, docs, social, dev tools, media-non-DRM, banking-non-app), each with a
   scripted load + key-interaction smoke check. Runs on the **canary lane** (catches
   embedding-API breaks *and* real-site regressions) and is a **Phase-7 release gate**.
@@ -633,7 +633,7 @@ For a privacy-positioned browser, partitioned storage (CHIPS) and fingerprint
 resistance are table-stakes against Brave/Mullvad/Tor — but they are **engine-blocked**:
 Servo's cookie partitioning is a literal `// TODO: Apply Partitioning checks`
 (`components/net/cookie.rs:383`), and there is no fingerprint-resistance layer. **Honest
-stance:** swerve's 1.0 privacy story is **content-blocking on by default + verifiable
+stance:** navgator's 1.0 privacy story is **content-blocking on by default + verifiable
 zero telemetry + no third-party cookies by default + the SameSite behavior Servo
 provides** (audited, not assumed) — *not* Tor-class fingerprint resistance, which is a
 **post-1.0, upstream-dependent** goal. Marketing must not imply Brave/Tor parity here.
@@ -658,7 +658,7 @@ For anything shipped publicly these are **release-gating**:
 - **GDPR / data-controller obligations** for Lyku-hosted sync — even zero-knowledge sync
   has a controller; a privacy policy + data-processing posture is required before Lyku
   launches.
-- **The "swerve" trademark** — clear the name (and "Lyku") before public launch;
+- **The "navgator" trademark** — clear the name (and "Lyku") before public launch;
   rename cost grows with adoption.
 
 ### 6e. Distribution / packaging (new; quantify the burden)
@@ -677,11 +677,11 @@ large package, heavy per-distro work. Plan:
 
 ### 6f. GPU / driver / surfman portability (new; a real "won't start" cause)
 surfman + ANGLE + WebRender initialization across the long tail of user GPUs/drivers is
-a **top real-world cause of "the browser won't start"** — and a telemetry-free swerve
+a **top real-world cause of "the browser won't start"** — and a telemetry-free navgator
 **cannot passively observe it**. Plan:
 - A **documented supported-GPU/driver matrix** + a manual smoke pass (§6a) on a spread of
   Intel/AMD/NVIDIA + Mesa/proprietary stacks before each release.
-- A **software/llvmpipe fallback path** and a clear first-run error page (a `swerve://`
+- A **software/llvmpipe fallback path** and a clear first-run error page (a `navgator://`
   internal page) when hardware GL/ANGLE init fails — so a driver failure produces an
   actionable message + a "report this" hook, not a silent crash.
 - The opt-in crash/error signal (§6a) carries GPU/driver strings *only with consent*, so
@@ -693,10 +693,10 @@ a **top real-world cause of "the browser won't start"** — and a telemetry-free
 
 **The Verso lesson:** archived Oct 8 2025 for inability to track Servo's churn while
 embedding the **low-level** way (~30 component crates, a 2,200-LOC self-owned
-compositor). swerve embeds the **high-level** way (umbrella `servo` crate, ~30 public
+compositor). navgator embeds the **high-level** way (umbrella `servo` crate, ~30 public
 symbols, pinned rev, no compositor) — the architectural insurance is already paid. **But
 every "must-upstream" item (downloads, find, pluggable sandbox) deliberately re-incurs
-this risk by making swerve own a patch across LTS bumps — the plan accepts this trade
+this risk by making navgator own a patch across LTS bumps — the plan accepts this trade
 consciously and minimizes the count.**
 
 **The strategy is process discipline:**
@@ -704,7 +704,7 @@ consciously and minimizes the count.**
    same deliverable — the canary lane is useless if it's too slow to run.
 2. **Adopt the Servo crates.io LTS train** — one scheduled, reviewed migration every
    ~6 months instead of chasing HEAD. The single biggest risk reducer.
-3. **Quarantine** all `servo::` in one crate; firewall the rest behind `swerve-protocol`.
+3. **Quarantine** all `servo::` in one crate; firewall the rest behind `navgator-protocol`.
 4. **Diff-minimization + upstream-first**, review-enforced: public-API-only, minimal-
    patch steady state, every gap becomes a Servo PR not a private fork. **File the
    pluggable-sandbox RFC in Phase 0.**
@@ -716,7 +716,7 @@ consciously and minimizes the count.**
 7. **Recruit a co-maintainer before committing past Tier-1** — bus-factor=1 is the
    second existential risk, and it is a **hard gate on Phase 5** (§7a).
 
-Accept the trades: LTS lags HEAD by up to 6 months (features feel stale), and swerve
+Accept the trades: LTS lags HEAD by up to 6 months (features feel stale), and navgator
 can never outrun Servo's ~93%-of-tests-it-runs ceiling.
 
 ### 7a. Funding / headcount reconciliation (gate, not a risk-row)
@@ -737,10 +737,10 @@ them with the phase scope or with the secured funding. Pinned now:
   a crypto mistake is catastrophic), and the macOS/Windows/mobile ports. **A public,
   security-claiming 1.0 is gated on Tier-2.**
 - **Dated precondition:** **"recruit one co-maintainer" is a precondition for *starting*
-  Phase 5** — not an aspiration. If no co-maintainer is secured, swerve ships as an
+  Phase 5** — not an aspiration. If no co-maintainer is secured, navgator ships as an
   explicitly-labeled preview/beta and does **not** make safety claims.
 - **Tier-3 ($5–15M / upstream-funding) is the only path** to closing engine gaps
-  (downloads/find/sandbox/anchor/EME) on swerve's own timeline rather than Servo's.
+  (downloads/find/sandbox/anchor/EME) on navgator's own timeline rather than Servo's.
 
 ---
 
@@ -773,16 +773,16 @@ them with the phase scope or with the secured funding. Pinned now:
 
 ---
 
-## 9. SwerveOS note. Full: [`swerveos.md`](plan/swerveos.md)
+## 9. NavGatorOS note. Full: [`navgatoros.md`](plan/navgatoros.md)
 
-A Rust OS with swerve as primary UI is conceivable (Servo runs on Redox as of Oct
+A Rust OS with navgator as primary UI is conceivable (Servo runs on Redox as of Oct
 2025) but its cost is dominated by **kernel + drivers**, not the browser (~5–10% of the
 effort). Reality check: after ~10 years Redox still has no Wi-Fi/BT, Intel-only GPU
 accel, most touchpads unsupported, and its Servo port crashes on the second page.
 ChromeOS and webOS both run **on the Linux kernel** precisely to inherit drivers; a
 from-scratch Rust OS discards that one shippability asset. **Recommendation: zero
 engineering spend now** — it would multiply the treadmill that killed Verso. Keep it as
-a free narrative. If ever built, make it a **swerve-as-shell immutable Linux kiosk
+a free narrative. If ever built, make it a **navgator-as-shell immutable Linux kiosk
 image** that reuses Linux drivers — not a from-scratch OS — and only for captive/known
 hardware (kiosk, signage, thin client, OEM smart-TV).
 
@@ -796,7 +796,7 @@ hardware (kiosk, signage, thin client, OEM smart-TV).
 2. **DRM stance** — ship without it and message clearly (recommended), pursue a Widevine
    partnership later (with the independence-thesis cost), or treat DRM streaming as
    permanently out of scope?
-3. **Upstream-funding posture** — will swerve fund upstream Servo (downloads/find APIs,
+3. **Upstream-funding posture** — will navgator fund upstream Servo (downloads/find APIs,
    pluggable sandbox, IndexedDB, WebGL2, media, partitioning, passkeys, EME hooks), and
    at what FTE? It is the cheapest durable way to close gaps and de-risk the treadmill —
    and it is the only path to a public, safety-claiming 1.0 (§7a).
@@ -813,7 +813,7 @@ hardware (kiosk, signage, thin client, OEM smart-TV).
    passwordless account? (c) `bytea` ciphertext (first production use in `pg-models`) vs
    base64-in-`text`? (d) the idiomatic `synced<T>` path (not yet wired into a live service)
    vs a bare NATS listener for v1? (e) per-row vs per-account-monotonic `sequence` for delta
-   pull? (f) build the (cheap, idiomatic) Lyku-side surface now, before swerve has any local
+   pull? (f) build the (cheap, idiomatic) Lyku-side surface now, before navgator has any local
    store? Plus the GDPR data-controller posture (§6d).
 7. **Sync scope + defaults** — which datatypes sync (bookmarks/history/passwords/
    settings/tabs), and is history-sync default-on (Chrome parity) or off (privacy-first)?

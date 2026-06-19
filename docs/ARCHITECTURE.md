@@ -1,6 +1,6 @@
-# swerve architecture
+# navgator architecture
 
-swerve is a web browser whose **chrome (its own UI) is HTML rendered by Servo**,
+navgator is a web browser whose **chrome (its own UI) is HTML rendered by Servo**,
 with web pages rendered by Servo alongside it — and the engine is meant to also be
 reusable by other apps (Tauri-style) later.
 
@@ -12,14 +12,14 @@ build it in. Read it before changing the rendering/compositing code.
 ## The Verso lesson (why this is shaped conservatively)
 
 [Verso](https://github.com/versotile-org/verso) was a Servo-based browser doing
-almost exactly what swerve wants. It was archived **Oct 8, 2025** because it could
+almost exactly what navgator wants. It was archived **Oct 8, 2025** because it could
 not keep its embedding layer in sync with Servo's pace of change given limited
 funding/manpower. Verso embedded Servo the **low-level** way: it depended on ~30
 individual Servo component crates (`constellation`, `compositing_traits`, `script`,
 …) and drove the constellation/compositor itself (its `compositor.rs` is ~90 KB).
 Every Servo change risked breaking that surface.
 
-Two takeaways baked into swerve:
+Two takeaways baked into navgator:
 
 1. **Use the high-level `libservo` (`servo`) umbrella crate**, not the individual
    components. Far smaller surface to track. The maintained `winit_minimal` example
@@ -54,7 +54,7 @@ two-`WebViewBuilder` call.
 
 `servoshell`'s `Minibrowser` reserves a toolbar height and renders the content
 webview into an **`OffscreenRenderingContext`** (an FBO/texture), then composites
-that texture into the window below the toolbar. swerve uses the same mechanism, with
+that texture into the window below the toolbar. navgator uses the same mechanism, with
 **one twist: the chrome is a second Servo webview rendering our HTML**, instead of
 egui.
 
@@ -112,30 +112,30 @@ versoview is a separate process):
   `KeyboardEvent::from_state_and_key`), routed to the focused webview. Minimal key
   map (printable + editing/nav keys); full coverage would adapt servoshell's
   `keyutils.rs`.
-- **Chrome → engine**: chrome JS sets `location.href` to a `swerve:` command URL
-  (`swerve:nav#<url>`, `swerve:{back,forward,reload}`); the chrome webview's
-  `request_navigation` delegate intercepts the `swerve:` scheme, `deny()`s it, and
+- **Chrome → engine**: chrome JS sets `location.href` to a `navgator:` command URL
+  (`navgator:nav#<url>`, `navgator:{back,forward,reload}`); the chrome webview's
+  `request_navigation` delegate intercepts the `navgator:` scheme, `deny()`s it, and
   drives the content webview (`load`/`reload`/`go_back`/`go_forward`).
 - **Engine → chrome**: the content webview's `notify_url_changed` /
   `notify_page_title_changed` / `notify_history_changed` → `WebView::evaluate_javascript`
-  dispatching the `swerve:state` event (chrome.js updates the URL bar, tab title,
+  dispatching the `navgator:state` event (chrome.js updates the URL bar, tab title,
   back/forward state). chrome.js select-all-on-focus + don't-clobber-while-typing.
 - **Verified** (headless Xvfb + `xdotool`): type a URL in the omnibox → Enter →
   content navigates and the address bar + tab title update. Note: synthetic keys
   need `xdotool windowfocus` first (no WM under Xvfb to assign X input focus).
 - TODO: dynamic content-rect reporting (retire fixed `CHROME_HEIGHT`); IME/composition;
-  a less hacky command channel than `swerve:` navigation; popup/prompt/context-menu hooks.
+  a less hacky command channel than `navgator:` navigation; popup/prompt/context-menu hooks.
 
 ### M4 — tabs / multi-content ✅ (verified) + dynamic content-rect (M3 polish)
 - **Tabs**: content is a `Vec<Tab>` of webviews sharing the one
   `OffscreenRenderingContext`; only the active tab is `show()`n and painted. The
   engine pushes a tab model (`{tabs:[{title}], active, url, canGoBack/Forward}`) to
-  the chrome via `swerve:state`; the chrome renders the strip and sends
-  `swerve:tab?new|select=i|close=i` back. Per-tab URL/title are attributed by
+  the chrome via `navgator:state`; the chrome renders the strip and sends
+  `navgator:tab?new|select=i|close=i` back. Per-tab URL/title are attributed by
   matching the delegate's `WebView` against the tab list (`WebView: PartialEq`).
   A `Weak<AppState>` self-ref lets `&self` delegate callbacks build new tab webviews.
 - **Dynamic content-rect** (retires fixed `CHROME_HEIGHT`): on load/resize the chrome
-  reports its `.viewport` top (CSS px) via `swerve:ready?top=` / `swerve:layout?top=`;
+  reports its `.viewport` top (CSS px) via `navgator:ready?top=` / `navgator:layout?top=`;
   the engine scales it to device px and derives the content rect, resizing the
   offscreen context + tabs.
 - **Verified** (headless Xvfb + `xdotool`): new tab, per-tab navigation (active tab →
@@ -148,7 +148,7 @@ new, Ctrl+W close, Ctrl+Tab next — are done, tracking a `ctrl` modifier flag f
 `ModifiersChanged` and consuming those keys before forwarding to the webview.)
 
 ### M5 — external engine (the Tauri goal) — ⚙️ v0: IPC control surface (verified)
-**Done (v0):** an opt-in IPC control socket (`SWERVE_IPC=/path`; Unix socket, text
+**Done (v0):** an opt-in IPC control socket (`NAVGATOR_IPC=/path`; Unix socket, text
 protocol, no deps) lets an external process drive the engine and receive state:
 - commands in: `navigate <url>`, `new-tab`, `reload`, `back`, `forward`,
   `select-tab <i>`, `close-tab <i>`
@@ -159,7 +159,7 @@ The IPC thread parses each line and posts `WakeUp::Ipc(cmd)` to the winit loop
 connected clients (`Arc<Mutex<Vec<UnixStream>>>`). **Verified**: drove navigation +
 a new tab from `socat` with no window input, and read the emitted events.
 
-**Not done (the big lift):** this is a *control plane* for a standalone swerve
+**Not done (the big lift):** this is a *control plane* for a standalone navgator
 window. The full Verso/`tauri-runtime-verso` model also renders the engine *into the
 host app's own window/surface* (host passes a window/surface handle; the engine
 composites into it), plus a client crate and a stable, versioned protocol. That
@@ -171,7 +171,7 @@ cost concentrates — scope it deliberately. Windows would need a named pipe.
 ## Pinned versions (keep in lockstep)
 
 > **Engine strategy update (per [`ROADMAP.md` §R2](ROADMAP.md), [`FORK.md`](FORK.md)):**
-> swerve now builds on our **maintained fork** `github.com/airgap/swervo`, not upstream
+> navgator now builds on our **maintained fork** `github.com/airgap/swervo`, not upstream
 > `servo/servo`. We own the engine and implement features in the fork; we merge upstream
 > on a cadence but do not file upstream. The "high-level `libservo` + track-upstream"
 > stance in *The Verso lesson* above is superseded — though using the umbrella `servo`
@@ -196,7 +196,7 @@ rebuild from a clean lock.
 - Servo's `[patch.crates-io]` is all commented out here, so external embedders need
   no patch replication. `webrender`/`webrender_api` resolve from crates.io (`0.69`);
   `stylo` is a git dep resolved transitively. If a future rev re-introduces patches,
-  they must be copied into swerve's `Cargo.toml` (cargo ignores a dependency's own
+  they must be copied into navgator's `Cargo.toml` (cargo ignores a dependency's own
   `[patch]`).
 - Resolution confirmed: `cargo generate-lockfile` → 848 packages, stable 1.95.
 - **An embedder must register a resource reader.** Servo's constellation reads

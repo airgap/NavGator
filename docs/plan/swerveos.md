@@ -1,13 +1,13 @@
-# SwerveOS moonshot — concise, honest assessment
+# NavGatorOS moonshot — concise, honest assessment
 
-**TL;DR:** A Rust OS with swerve as the primary UI (analogy: ChromeOS/webOS, but
+**TL;DR:** A Rust OS with navgator as the primary UI (analogy: ChromeOS/webOS, but
 Rust + Servo) is technically *conceivable* — Servo already runs on Redox OS as of
 Oct 2025 — but it is a **separate, ~10-year, separate-company effort** whose cost is
 dominated not by the browser but by **kernel + drivers + hardware support**. It only
 makes economic sense for **dedicated/captive devices** (kiosks, signage, thin
 clients), not general-purpose laptops. **Recommendation: do NOT invest now.** Treat
 it as a north-star narrative. The only justifiable near-term step (years out, if
-ever) is a **swerve-as-shell Linux kiosk image** — reusing Linux's drivers — not a
+ever) is a **navgator-as-shell Linux kiosk image** — reusing Linux's drivers — not a
 from-scratch OS.
 
 ---
@@ -21,7 +21,7 @@ An operating system is, in rough effort proportions for *real-hardware general-p
 | Kernel | Scheduler, MM, IPC, syscalls | Hard but bounded; Redox has it | Redox (microkernel) |
 | **Drivers** | GPU, Wi-Fi, BT, USB, NVMe, audio, touchpad, power/ACPI, suspend | **The killer — open-ended, per-device, never "done"** | Linux (30+ yrs, thousands of contributors) |
 | Userland | libc, shell, services, package mgmt | Medium; Redox has `relibc`, pkg mgr | Redox / Linux |
-| UI / browser | swerve + Servo | **The part we already have** | us + Servo |
+| UI / browser | navgator + Servo | **The part we already have** | us + Servo |
 
 The browser is **maybe 5–10%** of a browser-OS's total cost. ChromeOS and LG webOS
 both made the only rational choice: **they run on the Linux kernel** and inherit its
@@ -54,7 +54,7 @@ ceiling for a from-scratch approach:
 
 Redox has had ~10 years and a dedicated (if small, partly sponsored) team and is
 still **VM-and-a-handful-of-laptops** territory with no Wi-Fi. That is the realistic
-trajectory for swerve-from-scratch-on-Rust-OS.
+trajectory for navgator-from-scratch-on-Rust-OS.
 
 ## 3. Where a browser-centric OS makes sense (and where it doesn't)
 
@@ -71,7 +71,7 @@ driver problem.
 
 Browser-OS works precisely when *someone else owns the hardware list*. ChromeOS
 works because Google certifies each Chromebook; webOS works because LG controls the
-TV silicon. swerve has no OEM and no certification program, so the only honest
+TV silicon. navgator has no OEM and no certification program, so the only honest
 near-term fit is **captive single-SKU devices** — and even those are better served
 by Linux-under-the-hood than a from-scratch kernel. The kiosk/signage market itself
 is dominated by Android then Windows, with Linux a smaller (growing) slice — and the
@@ -86,8 +86,8 @@ drivers and just lock the UI to a browser. That is the template, not Redox.
   embedding Servo.
 - **The #1 project risk is already the Servo sync treadmill** (the reason Verso died
   Oct 2025). Adding an OS multiplies that surface by an entire kernel + driver
-  matrix. Doing both at swerve's current scale would sink both.
-- **Strategic value of the *narrative* is real and ~free:** "swerve is the UI layer
+  matrix. Doing both at navgator's current scale would sink both.
+- **Strategic value of the *narrative* is real and ~free:** "navgator is the UI layer
   of a future all-Rust stack (Servo + Redox)" is a compelling story for recruiting,
   community, and differentiation — *as long as no engineering budget is spent on it
   now.* Keep it as vision, not roadmap.
@@ -97,26 +97,26 @@ drivers and just lock the UI to a browser. That is the template, not Redox.
 Ordered by cost/risk. Do **at most** the first one, and only after the browser is
 genuinely mature (post-parity, post-Lyku):
 
-1. **swerve-as-shell Linux kiosk image (RECOMMENDED if anything).**
+1. **navgator-as-shell Linux kiosk image (RECOMMENDED if anything).**
    A minimal immutable Linux (Yocto/Ubuntu Core/Buildroot) that boots straight into
-   full-screen swerve, no desktop. **Reuses every Linux driver** (real GPU accel,
-   Wi-Fi, touch). This is a *packaging* effort (days–weeks), gives a real "SwerveOS"
+   full-screen navgator, no desktop. **Reuses every Linux driver** (real GPU accel,
+   Wi-Fi, touch). This is a *packaging* effort (days–weeks), gives a real "NavGatorOS"
    demo on real hardware, validates the kiosk niche, and risks nothing. It is *not*
    a from-scratch OS and should be honestly labeled as such.
 2. **Servo-on-Redox demo (research spike, weeks, throwaway).**
    Build the existing crude Servo-on-Redox under QEMU and capture a screenshot/video.
    Pure narrative/marketing asset. Expect it to render one page and fall over — that
-   is the current state of the art, not a swerve failing.
+   is the current state of the art, not a navgator failing.
 3. **A from-scratch Rust OS.** ❌ Do not. This is the whole of Redox + the whole of a
-   driver project. Out of scope for any swerve milestone.
+   driver project. Out of scope for any navgator milestone.
 
 ## 6. Recommendation
 
-- **Now → parity:** ignore SwerveOS entirely. Spend zero engineering on it. Protect
+- **Now → parity:** ignore NavGatorOS entirely. Spend zero engineering on it. Protect
   the team from the Servo treadmill on the *browser* alone.
-- **Keep the narrative** in the vision doc ("Rust all the way down: swerve + Servo,
+- **Keep the narrative** in the vision doc ("Rust all the way down: navgator + Servo,
   someday Redox") — costs nothing, aids positioning.
-- **First concrete artifact, if/when desired:** a **swerve-on-Linux kiosk image**
+- **First concrete artifact, if/when desired:** a **navgator-on-Linux kiosk image**
   (option 1), framed honestly as a locked-down browser appliance, *not* a new OS.
 - **Revisit a true Rust OS only** if (a) the browser is mature and self-sustaining,
   (b) Redox reaches real-hardware GPU + Wi-Fi parity, and (c) a separately funded

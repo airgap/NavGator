@@ -1,37 +1,37 @@
-# swerve — Sustainability, the Servo treadmill & resourcing
+# navgator — Sustainability, the Servo treadmill & resourcing
 
 > Dimension owner deliverable. Scope: the #1 existential risk (staying in sync with
 > Servo), the resourcing/funding/governance reality, and a credible timeline to a
 > usable 1.0 vs "Chrome parity." Brutally honest, quantified, current as of **June 2026**.
 >
 > TL;DR: **The treadmill is real and it killed Verso — but the ground shifted in
-> swerve's favour in April–May 2026.** Servo published to crates.io (`servo 0.1.0`,
+> navgator's favour in April–May 2026.** Servo published to crates.io (`servo 0.1.0`,
 > 13 Apr 2026) and launched an **LTS track with half-yearly migration cycles**. That
 > converts the maintenance problem from "chase a HEAD that breaks the embedding API
-> ~every month" into "do a scheduled, reviewed migration twice a year." swerve's
+> ~every month" into "do a scheduled, reviewed migration twice a year." navgator's
 > private diff against Servo is already tiny (788 LOC, 5 delegate methods, ~30 API
-> symbols, no self-owned compositor). If swerve adopts the LTS train, keeps the diff
+> symbols, no self-owned compositor). If navgator adopts the LTS train, keeps the diff
 > small, and upstreams rather than forks, a **solo-to-tiny team can sustain it** — but
 > a *usable daily-driver 1.0 is a 2–4 year effort*, and *true Chrome parity is never*.
 
 ---
 
-## 1. The thesis in one table: swerve vs. the project that died
+## 1. The thesis in one table: navgator vs. the project that died
 
 Verso (archived **8 Oct 2025** — "unable to keep pace … due to limited manpower and
-funding") is the control group. swerve was deliberately designed to invert every one
+funding") is the control group. navgator was deliberately designed to invert every one
 of Verso's failure modes. The contrast is the whole sustainability argument:
 
-| Axis | Verso (archived) | swerve (today, verified) | Why it matters for the treadmill |
+| Axis | Verso (archived) | navgator (today, verified) | Why it matters for the treadmill |
 | --- | --- | --- | --- |
-| Embedding level | ~30 individual Servo crates (`constellation`, `compositing_traits`, `script`, `layout_thread_2020`, `net`, `script_traits`, `webgpu`, …), all pinned to `5e2d42e` | **Single `servo` umbrella crate** at `ed1af70` (+ `servo-embedder-traits` for `EventLoopWaker`) | Verso tracked ~30 internal-API surfaces that change weekly; swerve tracks **one curated public API** that Servo now versions on crates.io |
-| Compositor | **Own `compositor.rs`: 2,200 LOC / 89 KB** driving the constellation itself | None — uses `WindowRenderingContext` + `OffscreenRenderingContext` and lets Servo composite | The compositor is the single largest churn magnet in Servo internals; swerve carries **zero** of it |
+| Embedding level | ~30 individual Servo crates (`constellation`, `compositing_traits`, `script`, `layout_thread_2020`, `net`, `script_traits`, `webgpu`, …), all pinned to `5e2d42e` | **Single `servo` umbrella crate** at `ed1af70` (+ `servo-embedder-traits` for `EventLoopWaker`) | Verso tracked ~30 internal-API surfaces that change weekly; navgator tracks **one curated public API** that Servo now versions on crates.io |
+| Compositor | **Own `compositor.rs`: 2,200 LOC / 89 KB** driving the constellation itself | None — uses `WindowRenderingContext` + `OffscreenRenderingContext` and lets Servo composite | The compositor is the single largest churn magnet in Servo internals; navgator carries **zero** of it |
 | Total Rust embedder code | ~9,200 LOC across many modules | **788 LOC `main.rs`** + 400 LOC of HTML/CSS/JS chrome | Less surface = less to re-port on every bump |
 | Servo API symbols depended on | hundreds (internal) | **~30 public symbols** (`Servo`, `ServoBuilder`, `WebView`, `WebViewBuilder`, `RenderingContext`, `OffscreenRenderingContext`, 5 `WebViewDelegate` methods, input/key enums) | Quantifiable, auditable, greppable break surface |
-| Servo pin freshness | stale (`stylo` branch `2025-03-15`, `webrender 0.66`) — fell *behind* and couldn't catch up | `ed1af70` — but Servo is now **0.2.0 (May 2026)**; swerve is ~1–2 months behind HEAD | Verso's lesson: falling behind compounds; the fix is *cadence*, not *freshness* |
-| Funding/manpower | hobby/volunteer, "limited" by its own statement | solo/hobby today | Same constraint — so swerve must spend the manpower it has on *features*, not on re-porting a compositor |
+| Servo pin freshness | stale (`stylo` branch `2025-03-15`, `webrender 0.66`) — fell *behind* and couldn't catch up | `ed1af70` — but Servo is now **0.2.0 (May 2026)**; navgator is ~1–2 months behind HEAD | Verso's lesson: falling behind compounds; the fix is *cadence*, not *freshness* |
+| Funding/manpower | hobby/volunteer, "limited" by its own statement | solo/hobby today | Same constraint — so navgator must spend the manpower it has on *features*, not on re-porting a compositor |
 
-**Conclusion:** swerve has already paid the architectural insurance premium Verso
+**Conclusion:** navgator has already paid the architectural insurance premium Verso
 didn't. The remaining risk is **process discipline** (cadence + small diff +
 upstreaming), not architecture. That is good news, because process is the cheap part.
 
@@ -52,14 +52,14 @@ more churn). Verified figures:
 | WPT subtest pass-rate | — | 69.9% | **93.4%** | ~92.7% (current dashboard) |
 
 **Reading the numbers:** ~530 PRs/month land in Servo. The *active core* is ~8–9
-heavy contributors per month — i.e. the engine that swerve rides is itself maintained
-by a team you could fit in one room. That is simultaneously the opportunity (swerve
+heavy contributors per month — i.e. the engine that navgator rides is itself maintained
+by a team you could fit in one room. That is simultaneously the opportunity (navgator
 can become a meaningful voice with a few good PRs) and the risk (if Igalia's funding
-for Servo wavers, the engine slows and swerve inherits the slowdown).
+for Servo wavers, the engine slows and navgator inherits the slowdown).
 
-### Embedding-API breakage rate (the part that actually hurts swerve)
+### Embedding-API breakage rate (the part that actually hurts navgator)
 
-Generic web-feature PRs don't touch swerve. **Embedder-facing API changes do.** Counting
+Generic web-feature PRs don't touch navgator. **Embedder-facing API changes do.** Counting
 only those, from Servo's own monthly reports:
 
 | Month (2026) | Breaking embedding-API changes | Examples |
@@ -71,15 +71,15 @@ only those, from Servo's own monthly reports:
 LTS gap that is ~20–35 individual breaks to absorb in one migration — but they are
 *concentrated, documented in the monthly reports, and mechanical* (renames, `self`→`&self`,
 moved methods). Note the March "delegate-setters moved to `WebViewBuilder`" change is
-exactly the API swerve **already uses** (`WebViewBuilder::new(...).delegate(...)`), so
-swerve at `ed1af70` is already on the *post*-churn shape for that one. This is what a
-small diff buys you: most months, zero of those changes touch swerve's 30 symbols.
+exactly the API navgator **already uses** (`WebViewBuilder::new(...).delegate(...)`), so
+navgator at `ed1af70` is already on the *post*-churn shape for that one. This is what a
+small diff buys you: most months, zero of those changes touch navgator's 30 symbols.
 
 ---
 
 ## 3. The strategic shift that changes everything: crates.io + LTS
 
-Two Servo decisions in April–May 2026 materially de-risk swerve:
+Two Servo decisions in April–May 2026 materially de-risk navgator:
 
 1. **`servo` published to crates.io — `0.1.0`, 13 Apr 2026** (`0.2.0` by end of May).
    You can now `cargo add servo` against a *semver-versioned* crate instead of a raw
@@ -97,7 +97,7 @@ Two Servo decisions in April–May 2026 materially de-risk swerve:
    - Regular monthly releases keep shipping breaking changes; 1.0 semantics are
      "still being discussed."
 
-### What this means for swerve's release strategy
+### What this means for navgator's release strategy
 
 This is the single highest-leverage decision in this whole document:
 
@@ -105,14 +105,14 @@ This is the single highest-leverage decision in this whole document:
 > security patches in between. Do not chase HEAD.**
 
 Verso died chasing HEAD with no funding. The LTS train didn't exist for Verso; it does
-for swerve. Adopting it converts the dominant cost from "continuous, unbounded,
+for navgator. Adopting it converts the dominant cost from "continuous, unbounded,
 surprise breakage" to "two scheduled, scoped, reviewable migrations per year" — a load
 a solo maintainer can actually carry.
 
-**The catch (be honest):** LTS is *security-only*. Riding LTS means swerve's *web-platform
+**The catch (be honest):** LTS is *security-only*. Riding LTS means navgator's *web-platform
 features lag the engine by up to 6 months.* For a from-scratch browser chasing parity
 that is a feature, not a bug — you want a stable base while you build chrome/UX, not a
-moving target. But it does mean swerve will never showcase Servo's newest features on
+moving target. But it does mean navgator will never showcase Servo's newest features on
 day one. Accept that trade explicitly.
 
 ---
@@ -129,11 +129,11 @@ day one. Accept that trade explicitly.
   cases (the Book warns this will happen).
 - Keep `[patch.crates-io]` empty unless a future Servo rev re-introduces patches
   (`ARCHITECTURE.md` already tracks this gotcha — cargo ignores a dependency's own
-  `[patch]`, so they'd have to be copied into swerve's `Cargo.toml`).
+  `[patch]`, so they'd have to be copied into navgator's `Cargo.toml`).
 
-### 4.2 CI: a two-lane treadmill detector (the thing swerve is missing today)
+### 4.2 CI: a two-lane treadmill detector (the thing navgator is missing today)
 
-swerve currently has **no CI** (`/raid/swerve/.github` does not exist; only the
+navgator currently has **no CI** (`/raid/navgator/.github` does not exist; only the
 vendored `reference/verso/.gitlab-ci.yml`). This is the most urgent process gap. Build:
 
 | Lane | Trigger | Pins to | Purpose |
@@ -142,7 +142,7 @@ vendored `reference/verso/.gitlab-ci.yml`). This is the most urgent process gap.
 | **canary** | nightly cron | Servo **HEAD** (or latest monthly) | *early-warning* — tells you what the next migration will cost, weeks before you do it |
 
 The canary lane is the core sustainability instrument: it turns "surprise, the bump
-broke everything" into a continuously-updated diff of *exactly which of swerve's ~30
+broke everything" into a continuously-updated diff of *exactly which of navgator's ~30
 symbols moved*. When canary goes red, the failure log **is** the migration checklist.
 Build cost is the constraint — see §4.4.
 
@@ -158,7 +158,7 @@ A written rule, enforced in review:
    filed upstream PR and a removal trigger.
 3. **Quarantine the API surface.** Wrap all `servo::` usage behind a thin
    `engine/` module (today it's inlined in `main.rs`). One file to re-port per bump;
-   the rest of swerve (chrome bridge, tabs, IPC, theming) is insulated.
+   the rest of navgator (chrome bridge, tabs, IPC, theming) is insulated.
 4. **A Servo bump is its own reviewed commit** — `Cargo.toml` + `rust-toolchain.toml`
    + `Cargo.lock` + the `engine/` re-port move together, with the monthly-report
    breaking-change list pasted into the commit message. (ARCHITECTURE.md already says
@@ -186,25 +186,25 @@ build is *minutes-to-tens-of-minutes and several GB in `target/`.* Implications:
 The cheapest way to keep the diff at zero is to **make the things you need exist in
 Servo's public API**, so you don't have to carry them.
 
-- **Default: upstream, don't fork.** If swerve needs an embedding capability (e.g.
+- **Default: upstream, don't fork.** If navgator needs an embedding capability (e.g.
   sub-rectangle webview placement — the limitation ARCHITECTURE.md documents, where a
   `WebView` fills its `RenderingContext` with no sub-rect API), the highest-leverage
   move is a Servo PR adding it to the public API. Then it ships for *everyone* and
-  swerve carries no patch.
-- **swerve becomes a real embedder voice.** With Verso archived and
+  navgator carries no patch.
+- **navgator becomes a real embedder voice.** With Verso archived and
   `tauri-runtime-verso` dependent on it, there is a **vacuum for a serious downstream
   embedder driving the `[meta] embedding` (#30593) agenda.** Servo's core is ~8–9
   heavy contributors/month; a downstream that lands even 1–2 well-scoped embedding PRs
   a month would be among the most active embedder voices. That earns API-stability
   goodwill and early warning of breaking changes.
-- **Concrete upstream targets** (prioritized for swerve's roadmap): sub-rect/region
+- **Concrete upstream targets** (prioritized for navgator's roadmap): sub-rect/region
   webview compositing API; richer `WebViewDelegate` hooks for prompts/menus/downloads
-  (swerve's M3 TODO); a stable command/IPC surface for the "engine as a service" goal
-  (M5) so it stops being the `swerve:`-scheme hack. Each, if upstreamed, *removes* a
+  (navgator's M3 TODO); a stable command/IPC surface for the "engine as a service" goal
+  (M5) so it stops being the `navgator:`-scheme hack. Each, if upstreamed, *removes* a
   future maintenance burden instead of adding one.
 - **Track Servo's deprecations.** The monthly reports are the canonical changelog;
   treat each one as required reading. Subscribe a bot to post the "Changes for web
-  developers / embedders" section into swerve's issue tracker.
+  developers / embedders" section into navgator's issue tracker.
 
 ---
 
@@ -214,28 +214,28 @@ Servo's public API**, so you don't have to carry them.
 
 - **Chrome/Blink:** thousands of engineers, Google-funded, effectively unlimited.
 - **WebKit, Gecko:** hundreds.
-- **Servo (the engine swerve *rents*):** ~146 contributors/year but an active core of
+- **Servo (the engine navgator *rents*):** ~146 contributors/year but an active core of
   **~8–9 heavy contributors/month**, funded mainly via Igalia + **~$7,349/month** in
   recurring community donations (April 2026; goal $10k/mo). That is a rounding error
   next to Chrome's budget.
-- **swerve (the chrome swerve *builds*):** today, effectively **one person.**
+- **navgator (the chrome navgator *builds*):** today, effectively **one person.**
 
-So swerve is a one-person UX/chrome layer on top of a ~10-person engine that is itself
+So navgator is a one-person UX/chrome layer on top of a ~10-person engine that is itself
 a rounding error against Chrome. **Any plan that assumes otherwise is fiction.** The
 entire strategy must be built around *leverage* (let Servo build the engine) and
 *scope discipline* (don't rebuild Chrome).
 
-### 6.2 What headcount swerve actually needs, by ambition tier
+### 6.2 What headcount navgator actually needs, by ambition tier
 
 | Tier | What it is | Realistic team | Funding/yr (loaded) | Feasible? |
 | --- | --- | --- | --- | --- |
-| **Hobby / hackable** | Daily-driver-for-the-author; chrome, tabs, theming, settings, basic sync | **1–2** people | $0–250k | **Yes** — this is where swerve is and can stay healthy |
+| **Hobby / hackable** | Daily-driver-for-the-author; chrome, tabs, theming, settings, basic sync | **1–2** people | $0–250k | **Yes** — this is where navgator is and can stay healthy |
 | **Niche product** | Opera-GX-class theming, Lyku sync, polished UX, a real user base, security-update SLA | **3–6** eng + 1 design/PM | $0.6–1.5M | Plausible *with funding*; the LTS train makes the eng count realistic |
-| **"Industry-standard" browser** | Extensions, DRM/Widevine-class media, full devtools, profile/sync infra, security response team, multi-OS | **15–40+** | $5–15M+ | Only with serious backing; **mostly gated by Servo's own capability ceiling**, not swerve's |
+| **"Industry-standard" browser** | Extensions, DRM/Widevine-class media, full devtools, profile/sync infra, security response team, multi-OS | **15–40+** | $5–15M+ | Only with serious backing; **mostly gated by Servo's own capability ceiling**, not navgator's |
 | **Chrome parity** | Everything, every site, every API, instantly | **hundreds–thousands** | $100M+ | **Never.** State this in the README. |
 
-The honest framing for stakeholders: **swerve can be an excellent Tier-1/Tier-2
-product.** Tier 3 is contingent on Servo reaching Tier-3 capability *and* swerve
+The honest framing for stakeholders: **navgator can be an excellent Tier-1/Tier-2
+product.** Tier 3 is contingent on Servo reaching Tier-3 capability *and* navgator
 getting funded. Tier 4 is not a goal; it is a myth used to kill projects by comparison.
 
 ### 6.3 Funding options (ranked by realism for a Rust/Servo-aligned project)
@@ -244,13 +244,13 @@ getting funded. Tier 4 is not a goal; it is a myth used to kill projects by comp
    Open Collective, mirroring Servo's own model. Sustains Tier 1 indefinitely; costs
    nothing but time. **This is the base case and it is fine.**
 2. **Lyku as the revenue flywheel.** The planned sync service ("Lyku", self-hostable
-   later) is swerve's most credible *non-ad, non-telemetry* revenue: hosted sync
+   later) is navgator's most credible *non-ad, non-telemetry* revenue: hosted sync
    subscription + self-host for free. This is the Tier-2 funding path and it aligns
    with the no-bloat/no-telemetry ethos (you sell *a service*, not *the user*).
 3. **Grants / foundation money.** NLnet/NGI (EU, Rust- and Servo-adjacent), Linux
    Foundation Europe proximity (Servo is an LFE project), Sovereign Tech Fund. Good
    fit for "independent, privacy-respecting, Rust browser." Lumpy and competitive.
-4. **Contract/consulting on the engine** (the Igalia model): fund swerve dev by doing
+4. **Contract/consulting on the engine** (the Igalia model): fund navgator dev by doing
    paid Servo/embedding work. Doubles as upstreaming.
 5. **Avoid:** ad/affiliate/telemetry monetization — it contradicts the entire premise
    and would forfeit the differentiator.
@@ -280,10 +280,10 @@ Assumes Tier-1 resourcing (1–2 people), LTS adoption, current Servo trajectory
 | **+18–36 mo** | **"1.0": daily-driver for sympathetic users.** Handles the long tail of common sites *to the extent Servo does*; extensions story TBD; security-update SLA via LTS backports | medium-low (gated by Servo) |
 | **Ever** | **Chrome parity** | **No.** Capability ceiling is Servo's, and Servo is ~10 core devs vs Chrome's thousands |
 
-**The load-bearing honesty:** swerve's *own* milestones are achievable on this timeline.
-What swerve **cannot** outrun is **Servo's web-platform completeness** (WPT ~93% of the
+**The load-bearing honesty:** navgator's *own* milestones are achievable on this timeline.
+What navgator **cannot** outrun is **Servo's web-platform completeness** (WPT ~93% of the
 tests *it runs* — but it doesn't run everything; missing/partial: full WebGPU in all
-contexts, the long tail of CSS/DOM, DRM media, extensions). swerve's "1.0" is therefore
+contexts, the long tail of CSS/DOM, DRM media, extensions). navgator's "1.0" is therefore
 "a usable browser for people who accept that some sites won't fully work," not "Chrome
 that doesn't track you." Sell it as the former.
 
@@ -293,9 +293,9 @@ that doesn't track you." Sell it as the former.
 
 | ID | Risk | Likelihood | Impact | Score | Mitigation | Owner trigger |
 | --- | --- | --- | --- | --- | --- | --- |
-| R1 | **Servo-sync treadmill** — bumps break the embedding API faster than swerve can absorb (the Verso death) | Med | Critical | **High** | Ride LTS (§3); small diff (§4.3); canary CI (§4.2); upstream not fork (§5) | canary lane red >2 weeks |
+| R1 | **Servo-sync treadmill** — bumps break the embedding API faster than navgator can absorb (the Verso death) | Med | Critical | **High** | Ride LTS (§3); small diff (§4.3); canary CI (§4.2); upstream not fork (§5) | canary lane red >2 weeks |
 | R2 | **Bus-factor = 1** — single maintainer stalls/leaves | High | Critical | **High** | Docs-in-repo; small diff so it's pickup-able; recruit co-maintainer pre-Tier-2 | no commits 60d |
-| R3 | **Servo itself loses funding / slows** (donations ~$7.3k/mo, below $10k goal; Igalia-dependent) | Low-Med | Critical | **High** | swerve LTS pin survives a Servo pause; contribute $ + PRs to Servo; have a "freeze on last good LTS" plan | Servo monthly report cadence breaks |
+| R3 | **Servo itself loses funding / slows** (donations ~$7.3k/mo, below $10k goal; Igalia-dependent) | Low-Med | Critical | **High** | navgator LTS pin survives a Servo pause; contribute $ + PRs to Servo; have a "freeze on last good LTS" plan | Servo monthly report cadence breaks |
 | R4 | **No CI today** — regressions/bump-breakage found late | High (current) | High | **High** | Build stable+canary lanes *now* (§4.2) | — (open) |
 | R5 | **crates.io LTS needs git deps for CVE patches** (Servo Book warns) — breaks the clean semver story | Med | Med | Med | Keep git-rev escape hatch documented; pin + audit transitively | LTS patch requires git dep |
 | R6 | **Build weight** (854 deps, mozjs/mozangle, LLVM pinning) taxes CI cost + onboarding, depressing bus-factor | High | Med | Med | sccache + cached runners; prebuilt dev container; encode LLVM pins in CI image | CI minutes/cost spike |
@@ -324,7 +324,7 @@ that doesn't track you." Sell it as the former.
 6. **(P1) Put the honest scope in the README:** Tier-1/2 product, "usable not
    universal," "Chrome parity = never." Manages every downstream expectation and kills
    R7 at the source.
-7. **(P2) Make swerve a visible Servo embedder-voice** — land 1–2 embedding PRs/month
+7. **(P2) Make navgator a visible Servo embedder-voice** — land 1–2 embedding PRs/month
    (sub-rect compositing, delegate hooks, stable IPC surface). Buys early warning +
    API goodwill and *removes* future private diff. (R1, R3, R8.)
 8. **(P2) Treat the monthly Servo reports as required reading**; bot the
@@ -348,4 +348,4 @@ that doesn't track you." Sell it as the former.
 - Servo joins Linux Foundation Europe (governance/funding context): https://linuxfoundation.eu/newsroom/servo-web-rendering-engine-joins-linux-foundation-europe
 - Verso archived Oct 2025 (manpower/funding reason): https://github.com/versotile-org/verso/ ; https://github.com/versotile-org/tauri-runtime-verso
 - Servo WPT pass-rate dashboard: https://servo.org/wpt/
-- swerve repo (verified): `/raid/swerve/Cargo.toml`, `/raid/swerve/src/main.rs` (788 LOC), `/raid/swerve/docs/ARCHITECTURE.md`, `/raid/swerve/Cargo.lock` (854 pkgs), `/raid/swerve/reference/verso/` (~9,200 LOC, 2,200-LOC compositor.rs, ~30 Servo crate deps @ `5e2d42e`)
+- navgator repo (verified): `/raid/navgator/Cargo.toml`, `/raid/navgator/src/main.rs` (788 LOC), `/raid/navgator/docs/ARCHITECTURE.md`, `/raid/navgator/Cargo.lock` (854 pkgs), `/raid/navgator/reference/verso/` (~9,200 LOC, 2,200-LOC compositor.rs, ~30 Servo crate deps @ `5e2d42e`)

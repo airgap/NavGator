@@ -1,17 +1,17 @@
-# swerve sync — settings & data sync (Lyku + self-hostable)
+# navgator sync — settings & data sync (Lyku + self-hostable)
 
 > Dimension owner doc. Scope: what syncs, the data model + versioning, conflict
 > resolution per data type, end-to-end encryption (especially secrets/passwords),
 > transport/protocol, offline + merge, and the self-hosted server design.
 >
-> Status date: 2026-06-18. Repo state verified against `/raid/swerve` @ working tree
+> Status date: 2026-06-18. Repo state verified against `/raid/navgator` @ working tree
 > and Servo source @ `ed1af70` (`/home/nicole/.cargo/git/checkouts/servo-e53a6e7b994a25fe/ed1af70`).
 
 ---
 
 ## 0. TL;DR / recommendations (prioritized)
 
-1. **Build the local data layer FIRST, sync second.** swerve today has **zero
+1. **Build the local data layer FIRST, sync second.** navgator today has **zero
    persistence** — it uses `ServoBuilder::default()` with no `config_dir`, so even
    cookies/localStorage are not written to a stable on-disk location, and there is no
    settings/bookmarks/history store at all (verified: only `Arc`/`Mutex` state in
@@ -26,7 +26,7 @@
    **`SyncProvider` trait** with two implementations from the start: `LykuProvider`
    (the hosted default) and `SelfHostProvider` (the same wire protocol, your server
    binary). This makes "self-hostable later" a config flag, not a rewrite. See §8 for
-   the **exact contract swerve needs from Lyku** (auth, blob API, storage model).
+   the **exact contract navgator needs from Lyku** (auth, blob API, storage model).
 
 3. **The crypto is nearly free — it's already in the dependency graph.** Servo's
    transitive deps already pull in, at these exact versions:
@@ -71,17 +71,17 @@
 | Bookmarks / history | Do not exist as features or storage. | repo has no such code |
 | Open-tabs persistence | Tabs are in-memory `Vec<Tab>`; lost on exit. | `docs/ARCHITECTURE.md` M4 |
 | Password manager | None (Servo has no built-in credential UI we surface). | repo |
-| Web storage (cookies/localStorage/IndexedDB) | Servo *can* persist these via its SQLite-backed storage thread, **but only when a `config_dir` is supplied**; swerve supplies none, so they are effectively ephemeral / default-located. | Servo `components/storage/client_storage.rs:10` (`use rusqlite::...`), `storage_thread.rs:18` (`config_dir`) |
+| Web storage (cookies/localStorage/IndexedDB) | Servo *can* persist these via its SQLite-backed storage thread, **but only when a `config_dir` is supplied**; navgator supplies none, so they are effectively ephemeral / default-located. | Servo `components/storage/client_storage.rs:10` (`use rusqlite::...`), `storage_thread.rs:18` (`config_dir`) |
 | Crypto libs available | Full suite already transitively present (see §0.3). | `Cargo.lock` |
-| Network client | None used by swerve; `hyper 1.10.1` is in-graph (Servo's net stack) but no ergonomic *client* wrapper. | `Cargo.lock` |
-| IPC control surface | `SWERVE_IPC` Unix socket, text protocol — relevant later as a hook to *trigger* a sync or read sync status from outside. | `docs/ARCHITECTURE.md` M5 |
+| Network client | None used by navgator; `hyper 1.10.1` is in-graph (Servo's net stack) but no ergonomic *client* wrapper. | `Cargo.lock` |
+| IPC control surface | `NAVGATOR_IPC` Unix socket, text protocol — relevant later as a hook to *trigger* a sync or read sync status from outside. | `docs/ARCHITECTURE.md` M5 |
 
 **Implication.** Two of the six "what syncs" categories (settings, bookmarks, history,
 passwords, open-tabs are mostly *not implemented yet*; only open-tabs exists and only
 in memory). Sync work is gated on building those features with sync-friendly storage.
 The single highest-leverage decision is to **set `config_dir` to a real per-OS profile
 path now** (so Servo's own cookie/localStorage SQLite lands somewhere stable) and to
-put swerve's own data in a sibling SQLite DB in that same profile dir.
+put navgator's own data in a sibling SQLite DB in that same profile dir.
 
 ---
 
@@ -116,9 +116,9 @@ Set `opts.config_dir` to a per-OS path and reuse it for everything:
 
 | OS | Path |
 | --- | --- |
-| Linux | `$XDG_DATA_HOME/swerve/<profile>` (fallback `~/.local/share/swerve/<profile>`) |
-| macOS | `~/Library/Application Support/swerve/<profile>` |
-| Windows | `%LOCALAPPDATA%\swerve\<profile>` |
+| Linux | `$XDG_DATA_HOME/navgator/<profile>` (fallback `~/.local/share/navgator/<profile>`) |
+| macOS | `~/Library/Application Support/navgator/<profile>` |
+| Windows | `%LOCALAPPDATA%\navgator\<profile>` |
 
 (Use the `directories`/`dirs` crate — NOT yet in the graph; tiny, add it.) Multiple
 named profiles supported from day one (`default`, others); each profile = one Lyku
@@ -129,14 +129,14 @@ account binding.
 ```
 <profile>/
   servo/                 # config_dir handed to Servo → cookies/localStorage/IndexedDB SQLite
-  swerve.db              # our data: settings, bookmarks, history, tabs, themes, sync state
+  navgator.db              # our data: settings, bookmarks, history, tabs, themes, sync state
   vault.db               # passwords/secrets — separate file, separate key (defence in depth)
   sync/
     device_id            # random 128-bit, never leaves device in plaintext
     keys.enc             # wrapped Profile/Vault keys (see §5)
 ```
 
-Use **`rusqlite` (already at 0.37.0)** for `swerve.db` and `vault.db`. SQLite gives us
+Use **`rusqlite` (already at 0.37.0)** for `navgator.db` and `vault.db`. SQLite gives us
 transactions, a stable on-disk schema, and—critically—lets sync be expressed as
 "diff the table against the last-synced version vector."
 
@@ -375,9 +375,9 @@ Implementations: `LykuProvider` (hosted default), `SelfHostProvider` (your serve
 `LocalFolderProvider` (writes EncRecords to a directory — for tests + "sync via my own
 Syncthing/Dropbox folder" power-user mode, zero server needed).
 
-### 8.1 What swerve needs FROM Lyku (flag precisely)
+### 8.1 What navgator needs FROM Lyku (flag precisely)
 
-If Lyku is to be the default backend, swerve needs Lyku to provide, **at minimum**:
+If Lyku is to be the default backend, navgator needs Lyku to provide, **at minimum**:
 
 1. **Account + auth**: an account identifier and an auth flow that proves possession of
    an *Argon2id-derived auth secret* without revealing the master password (i.e. Lyku
@@ -409,7 +409,7 @@ auth/identity in front of it.
 - **Transport**: HTTPS (TLS via `rustls 0.23` already in graph) for request/response;
   optional WebSocket/SSE for the "updates available" signal. Content security does NOT
   depend on TLS (everything is E2EE), but TLS protects metadata + prevents tampering.
-- **HTTP client**: swerve has `hyper 1.10.1` (low-level) but no client wrapper. Add a
+- **HTTP client**: navgator has `hyper 1.10.1` (low-level) but no client wrapper. Add a
   thin client (`reqwest` with rustls, or `ureq` for a smaller/sync footprint). Prefer
   `reqwest` (rustls feature) since `tokio` is already in-graph; keep it behind the
   `sync` feature so non-sync builds don't pay for it.
@@ -458,7 +458,7 @@ Goal: a **single small Rust binary** that any user can run; same wire protocol a
   the only plaintext is structural metadata (ids, datatypes, vectors, timestamps,
   sizes). Document the metadata leakage explicitly (the server *can* infer "this account
   has N bookmarks and synced at time T" — acceptable; "what they are" — never).
-- **Ops**: single-binary + Docker image; `swerve-sync-server --data ./data`; backups =
+- **Ops**: single-binary + Docker image; `navgator-sync-server --data ./data`; backups =
   copy the SQLite file (it's all ciphertext, safe to back up anywhere). Quotas + basic
   rate limiting. Federation/multi-tenant explicitly out of scope for v1.
 - **Lyku ↔ self-host parity**: if both implement the identical protocol, "switch backend"
@@ -472,7 +472,7 @@ Goal: a **single small Rust binary** that any user can run; same wire protocol a
 - **Servo-pinned `-rc` crypto versions.** `argon2 0.6.0-rc.8`, `chacha20poly1305
   0.11.0-rc.3`, `blake2 0.11.0-rc.6` are *release candidates* pulled by Servo's lockfile.
   Building sync on them means our crypto API surface can shift when we bump the Servo
-  rev. **Mitigation**: either pin these explicitly in swerve's `Cargo.toml` to the same
+  rev. **Mitigation**: either pin these explicitly in navgator's `Cargo.toml` to the same
   rev Servo uses and wrap them behind a small internal `crypto` module (single choke
   point to fix on a bump), or vendor stable releases independently — but a divergent
   version doubles compile cost (two copies of the same crate). Track this on every Servo

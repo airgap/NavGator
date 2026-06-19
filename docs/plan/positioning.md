@@ -1,4 +1,4 @@
-# swerve — Competitive positioning & the independence thesis
+# navgator — Competitive positioning & the independence thesis
 
 > Dimension owner doc. Honest assessment of whether "go independent on Servo" is a
 > sound strategy, who the realistic user is, what the wedge is, and what
@@ -50,7 +50,7 @@ credible roadmap to "only browser" as Servo matures. Do not market parity. Marke
 ### 1.1 The claim, restated
 
 > Every alternative browser ultimately depends on Google — via the Blink/Chromium engine, or
-> via Google search-default money. swerve breaks the chain by being built on Servo, an
+> via Google search-default money. navgator breaks the chain by being built on Servo, an
 > independent Rust engine with no Google funding.
 
 ### 1.2 The claim is factually true today
@@ -70,7 +70,7 @@ chokepoints, both leading to Google:
 | Firefox | Gecko (Mozilla) | **Yes (engine)** | **No** — ~85% of Mozilla revenue is the Google search default deal; that deal expires end of 2026[^mozilla] |
 | LibreWolf / Waterfox / Mullvad | Gecko (Mozilla) | Yes (engine) | Downstream of Mozilla, downstream of Google's money |
 | **Ladybird** | **LibWeb (own, from scratch)** | **Yes** | **Yes** — donor/sponsor funded (Cloudflare, others) |
-| **swerve** | **Servo (Rust, LF Europe / Igalia)** | **Yes** | **Yes** — no Google money in Servo |
+| **navgator** | **Servo (Rust, LF Europe / Igalia)** | **Yes** | **Yes** — no Google money in Servo |
 
 Sources: 2026 share/funding figures.[^share][^mozilla][^privacy] "Every Chromium browser
 (Brave, Edge, Opera, Vivaldi, Arc) relies on Google's Blink engine," producing what
@@ -79,7 +79,7 @@ session served globally** (Chrome alone 65.1% all-device, 76.39% desktop).[^shar
 
 So the *engine* monoculture is real: every viable engine that is NOT Google's own is either
 Mozilla's Gecko (kept alive by Google's money) or two genuinely-clean-room newcomers, Servo
-and Ladybird. swerve and Ladybird are on the only two engines in the world that are both
+and Ladybird. navgator and Ladybird are on the only two engines in the world that are both
 not-Blink and not-Google-funded. **The independence claim survives scrutiny.**
 
 ### 1.3 But "independent engine" is a weak *consumer* wedge on its own
@@ -93,12 +93,12 @@ Three hard truths:
    all-device despite a decade of "independent + privacy" marketing[^share]).
 2. **"Anti-Google" is already a crowded shelf.** Brave (privacy + its own ad engine),
    Mullvad/Tor (anti-fingerprinting), LibreWolf (de-telemetried Firefox), Vivaldi (explicitly
-   anti-AI, deep customization) all sell some flavor of "escape Google." swerve's
+   anti-AI, deep customization) all sell some flavor of "escape Google." navgator's
    differentiator inside that shelf has to be **the engine is *also* not Google's**, which is
    a strictly stronger claim than any Chromium fork can make — but only Ladybird can match it.
 3. **The funding asymmetry is brutal.** Servo runs on order-of-$30k/yr in community donations
    plus Igalia staff time and a Sovereign Tech Fund grant (Igalia made 26% of PRs; 40% other
-   contributors; rest bots).[^servofund] Chrome is funded by Google's ad business. swerve is a
+   contributors; rest bots).[^servofund] Chrome is funded by Google's ad business. navgator is a
    single-developer project on top of that. "Independence" must be sold as a *deliberate
    trade*, not a free win.
 
@@ -108,7 +108,7 @@ The thesis is **sound as a foundation and as a story, but cannot be the whole pi
 Independence is the *credibility* layer (it's why the privacy/customization claims are not
 hypocritical the way a Chromium fork's are). It is not, by itself, the thing that makes
 someone switch. The switch has to be earned on **control, footprint, and the absence of
-telemetry/AI cram-down** — areas where swerve can plausibly *beat* the incumbents, not merely
+telemetry/AI cram-down** — areas where navgator can plausibly *beat* the incumbents, not merely
 match them.
 
 ---
@@ -121,15 +121,15 @@ match them.
   Rust, memory-safe by construction" is a coherent, defensible identity. Ladybird is the only
   other entrant who can say it, and Ladybird is *not* shipping a customization-first consumer
   browser — it's a standards-conformance engine project (alpha 2026, beta 2027, stable
-  2028).[^ladybird] swerve and Ladybird are **complementary, not duplicative**: different
-  engine, different goal (Ladybird = conformance; swerve = experience/customization).
+  2028).[^ladybird] navgator and Ladybird are **complementary, not duplicative**: different
+  engine, different goal (Ladybird = conformance; navgator = experience/customization).
 - **No Manifest-V3 cage.** Chrome's MV3 transition (completed late 2024) gutted content
   blocking: `webRequest` → `declarativeNetRequest`, no dynamic filtering, full uBlock Origin
-  dead on Chrome.[^mv3] swerve owns its entire stack — it can build blocking *into the engine*
+  dead on Chrome.[^mv3] navgator owns its entire stack — it can build blocking *into the engine*
   (Brave-style) with no extension-API politics and no Google able to revoke it.
 - **No telemetry by construction, and it's believable.** A Chromium fork claiming "no
-  telemetry" is fighting its own upstream forever. swerve's telemetry story is true because
-  there's nothing phoning home unless swerve adds it.
+  telemetry" is fighting its own upstream forever. navgator's telemetry story is true because
+  there's nothing phoning home unless navgator adds it.
 - **Smaller, hackable surface.** Servo + an HTML chrome is dramatically smaller than the
   ~40M-line Chromium tree. That's what makes Opera-GX-class theming *performant and deep*
   rather than bolted-on.
@@ -138,26 +138,26 @@ match them.
 
 - **Web compat is years behind and the curve is slow.** 62% WPT / 19.8% BWA today; 141
   features at "zero velocity" needing architectural work; 51 features *regressed* >5 points;
-  plateau ~80% by ~2037 at current funding.[^readiness] swerve does not control this curve —
+  plateau ~80% by ~2037 at current funding.[^readiness] navgator does not control this curve —
   it rides it.
 - **The embedding treadmill is the proven killer.** Verso did *exactly this* (Servo-based
   browser, HTML-ish UI ambitions) and was **archived Oct 2025** because it "was unable to keep
   pace with significant revisions to Servo due to limited manpower and funding."[^verso] Servo
-  is unversioned and renames crates freely (swerve already hit `embedder_traits` →
-  `servo-embedder-traits`; see `docs/ARCHITECTURE.md`). swerve's mitigation — pin an exact rev,
+  is unversioned and renames crates freely (navgator already hit `embedder_traits` →
+  `servo-embedder-traits`; see `docs/ARCHITECTURE.md`). navgator's mitigation — pin an exact rev,
   use the high-level `libservo` umbrella crate rather than ~30 component crates, bump
   deliberately — is the *correct* lesson from Verso, but it does not remove the cost; it
   reduces the surface and converts churn into scheduled, reviewed work.
 - **No actively-maintained general-purpose Servo browser exists in 2026.** The "Made With
   Servo" roster (Verso, Moto, Kumo, servoshell, Servo-GTK/Qt, Slint-Servo, Beaver, Cuervo) is
   mostly embedding experiments or kiosks; servoshell (egui, first-party) is the only reliably
-  maintained UI and it's a *test harness*, not a consumer browser.[^madewith] **swerve would
+  maintained UI and it's a *test harness*, not a consumer browser.[^madewith] **navgator would
   be attempting something nobody has currently sustained.** That is both the opportunity and
   the warning.
 
 ### 2.3 Where Servo is a *genuine* differentiator (not just a constraint)
 
-Servo is winning or co-leading in a few real places that map directly to swerve's pitch:
+Servo is winning or co-leading in a few real places that map directly to navgator's pitch:
 
 - **Bleeding-edge crypto/standards:** Servo leads on Web Cryptography (ML-KEM, ML-DSA
   post-quantum), shipped 0.0.5 with post-quantum crypto.[^servo2026] A "secure, modern,
@@ -167,7 +167,7 @@ Servo is winning or co-leading in a few real places that map directly to swerve'
   RAM limiters) can be *real* on Servo.
 - **Embeddability is Servo's actual mission.** Servo's north star is "embed web tech in apps,"
   and the embedding API now exposes proxies, root certs, localStorage/sessionStorage, cookies,
-  dialogs, console, and GDPR `clear_site_data()`.[^servo2026] swerve's "engine reusable by
+  dialogs, console, and GDPR `clear_site_data()`.[^servo2026] navgator's "engine reusable by
   other apps" goal (M5) is *with the grain* of where Servo invests, not against it.
 
 **Net:** Servo is a genuine differentiator on *identity, security posture, footprint, and
@@ -208,7 +208,7 @@ Do not aim at "everyone who uses Chrome." Aim at the intersection where independ
   Servo's own mission, validates the M5 external-engine track, and is a B2B/OSS-credibility
   flywheel rather than a consumer play.
 
-### 3.4 Who swerve is explicitly NOT for (state it, don't apologize)
+### 3.4 Who navgator is explicitly NOT for (state it, don't apologize)
 
 - People who need 100% of every site to work on the first try (banking-only users,
   enterprise SSO captives, "my browser is whatever came with the laptop").
@@ -216,7 +216,7 @@ Do not aim at "everyone who uses Chrome." Aim at the intersection where independ
   will churn at the first broken checkout.
 
 Sizing reality: Firefox at 2.26% is the ceiling of the pure values-driven audience; Opera GX
-at 34M shows the customization audience is larger and more capturable. **swerve's realistic
+at 34M shows the customization audience is larger and more capturable. **navgator's realistic
 addressable market is the *overlap* of those two — small in absolute share, but real,
 loyal, vocal, and currently *unserved by an independent engine*.**
 
@@ -228,11 +228,11 @@ loyal, vocal, and currently *unserved by an independent engine*.**
 > Servo embedders.** Win on the four axes where an independent, owned, lean stack is
 > structurally advantaged.
 
-| Axis | Incumbent reality | swerve's structural advantage | Win condition for v1 |
+| Axis | Incumbent reality | navgator's structural advantage | Win condition for v1 |
 |---|---|---|---|
 | **Independence** | Only Ladybird can match; nobody ships it for consumers | Engine + funding both clean of Google | The story is *true* and prominent; the only such consumer browser |
 | **Customization / theming** | Opera GX fakes performance; Vivaldi is deep but Chromium-heavy | Chrome is HTML rendered by Servo → theming is first-class & cheap | Opera-GX-class theming that's *native*, scriptable, performant |
-| **Zero telemetry / no AI cram-down** | Chromium forks fight upstream; Chrome adds AI by default | Nothing phones home unless swerve adds it; believable | Verifiably zero outbound telemetry; AI strictly opt-in |
+| **Zero telemetry / no AI cram-down** | Chromium forks fight upstream; Chrome adds AI by default | Nothing phones home unless navgator adds it; believable | Verifiably zero outbound telemetry; AI strictly opt-in |
 | **Footprint / performance** | GX uses limiters as a band-aid on a heavy engine | Lean Rust engine, fewer threads, single-process option | Lower idle RAM & process count than Chrome on the same tabs |
 
 What "winning" looks like concretely:
@@ -241,7 +241,7 @@ What "winning" looks like concretely:
    (already built: M1–M4) is the unique enabler — full CSS/JS theming of the browser UI with no
    privileged-extension hoops. This is the demo that sells the browser.
 2. **A built-in content blocker in the engine** (MV3 can't touch it), shipped on by default.
-3. **A "what swerve sends" page** that proves zero telemetry — turn the honesty into a feature.
+3. **A "what navgator sends" page** that proves zero telemetry — turn the honesty into a feature.
 4. **Sync via Lyku as a *trust* feature** (self-hostable, no-Google), not just convenience —
    reinforces the independence story instead of contradicting it.
 
@@ -261,7 +261,7 @@ What "winning" looks like concretely:
 Users perceive "a real browser" through features they touch every day, most of which are
 *chrome/UX*, not engine: tabs, history, bookmarks, find-in-page, downloads, password autofill,
 session restore, omnibox suggestions, settings, sync. **These are achievable without Servo
-parity** and are where v1 effort should go. swerve already has tabs, omnibox nav, back/fwd,
+parity** and are where v1 effort should go. navgator already has tabs, omnibox nav, back/fwd,
 history bridge (M1–M5).
 
 ### 5.2 "Without bloat" = a hard, *enforced* exclusion list
@@ -291,8 +291,8 @@ gracefully-handled event:
   sites; explicitly not their bank.
 - **v2 ("primary for the faithful"):** Lyku sync, extensions (a curated subset / WebExtensions
   if Servo supports it), richer compat as Servo's curve rises, mobile maybe.
-- **v3 ("only browser" / SwerveOS optional):** only credible if Servo crosses ~90%+ BWA —
-  i.e. years out and contingent on Servo funding, *not* on swerve's effort. Do not stake v1
+- **v3 ("only browser" / NavGatorOS optional):** only credible if Servo crosses ~90%+ BWA —
+  i.e. years out and contingent on Servo funding, *not* on navgator's effort. Do not stake v1
   messaging on it.
 
 ---
@@ -305,20 +305,20 @@ gracefully-handled event:
 | R2 | **Web-compat breakage churns users** | High | High | Independence is invisible until a site breaks, then it's *all* the user sees | "Second browser by choice" framing + open-in-system-browser escape hatch + honest compat page (§5.3) |
 | R3 | **"Independent engine" doesn't move people; Firefox proves values alone ≈ 2%** | Medium-High | High | The thesis is true but a weak consumer hook on its own | Lead with customization + zero-telemetry; independence is the *credibility* layer, not the headline |
 | R4 | **Ladybird out-executes on the independence story** (funded by Cloudflare et al., alpha 2026)[^ladybird] | Medium | Medium | Both own "independent, non-Google engine"; Ladybird has more funding/press | Differentiate on *experience/customization* (Ladybird = conformance engine, not a GX-class consumer browser); position as complementary |
-| R5 | **Servo's compat curve plateaus** (~80% BWA ~2037 at current funding)[^readiness] | Medium | High | If Servo stalls, swerve's "only browser someday" promise evaporates | Never promise it; keep v1 viable at *today's* compat; track Servo funding as an external dependency |
+| R5 | **Servo's compat curve plateaus** (~80% BWA ~2037 at current funding)[^readiness] | Medium | High | If Servo stalls, navgator's "only browser someday" promise evaporates | Never promise it; keep v1 viable at *today's* compat; track Servo funding as an external dependency |
 | R6 | **Solo/tiny team can't sustain a "real browser" perception** | High | Medium | Users compare to Google-funded incumbents; rough edges read as "abandoned" | Scope to a *narrow excellent* product (theming-first) not a broad mediocre one; ship the demo that wins |
-| R7 | **Independence/privacy story undercut by Lyku** (a sync service) | Low-Medium | Medium | A cloud service can look like the thing swerve claims to oppose | Self-hostable, E2E, opt-in, no account required for the browser; make Lyku *prove* the thesis, not dent it |
+| R7 | **Independence/privacy story undercut by Lyku** (a sync service) | Low-Medium | Medium | A cloud service can look like the thing navgator claims to oppose | Self-hostable, E2E, opt-in, no account required for the browser; make Lyku *prove* the thesis, not dent it |
 | R8 | **DRM/streaming & enterprise SSO gaps** read as "toy" | Medium | Medium | Netflix/Teams not working confirms "not a real browser" to some | Set expectations up front; out-of-scope-for-v1 honestly; escape hatch covers it |
 
 ---
 
 ## 7. Positioning statement (proposed)
 
-> **swerve** is the independent browser for people who want their browser to be *theirs*.
+> **navgator** is the independent browser for people who want their browser to be *theirs*.
 > It's built on Servo — a Rust web engine that owes nothing to Google, Blink, or Chromium —
 > so it spies on nothing, ships no AI you didn't ask for, and bends to your will: the entire
 > interface is themeable like a web page, because it *is* one. It won't render every site on
-> the internet yet — Servo is younger than Chrome and we're honest about that — so swerve makes
+> the internet yet — Servo is younger than Chrome and we're honest about that — so navgator makes
 > it one click to hand a stubborn site to your other browser. Independent by construction.
 > Customizable to the core. Zero telemetry. The browser you keep *because* you chose it.
 
@@ -332,14 +332,14 @@ gracefully-handled event:
 1. **(P0) Adopt "second browser, by choice" as the explicit v1 stance.** It defuses R2/R5,
    makes the compat gap honest, and is the only framing that survives 62%-WPT reality.
 2. **(P0) Make deep theming the headline, not a setting.** The HTML-chrome-in-Servo
-   architecture (already built) is swerve's one un-copyable consumer feature. The launch demo
+   architecture (already built) is navgator's one un-copyable consumer feature. The launch demo
    is "watch me re-skin the entire browser with CSS." Beat Opera GX on *real* performance.
 3. **(P0) Treat the Servo bump as scheduled recurring work with an owner and a checklist** (rev
    + toolchain + `winit_minimal` API recheck + clean lock). This is the anti-Verso discipline;
    it is a *positioning* decision because it's what keeps the project alive (R1).
 4. **(P1) Build the content blocker into the engine and ship it on by default.** Structural win
    vs. MV3 that no Chromium fork can fully match.[^mv3]
-5. **(P1) Ship a verifiable "zero telemetry" guarantee** + an in-browser "what swerve sends"
+5. **(P1) Ship a verifiable "zero telemetry" guarantee** + an in-browser "what navgator sends"
    page. Turn honesty into a feature; it's the believable version of a claim Chromium forks
    can't make.
 6. **(P1) Build the one-click "open in system browser" escape hatch + a live compat page.** This

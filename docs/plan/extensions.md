@@ -1,6 +1,6 @@
-# swerve: Extensions, Add-ons & Content Blocking
+# navgator: Extensions, Add-ons & Content Blocking
 
-*Dimension plan. Ground truth verified against the repo (`/raid/swerve`) and the
+*Dimension plan. Ground truth verified against the repo (`/raid/navgator`) and the
 pinned Servo checkout (`ed1af70`, at
 `/home/nicole/.cargo/git/checkouts/servo-e53a6e7b994a25fe/ed1af70`). June 2026.*
 
@@ -14,7 +14,7 @@ pinned Servo checkout (`ed1af70`, at
    per-webview user content injection channel (`UserContentManager::add_script` /
    `add_stylesheet`). Pair these with Brave's `adblock` crate (v0.12.5, the same
    engine that ships in Brave) for network + cosmetic filtering. This is achievable
-   in the **low thousands of lines** of swerve code and gives a headline,
+   in the **low thousands of lines** of navgator code and gives a headline,
    differentiating feature with no Servo fork.
 2. **Do NOT attempt WebExtensions parity.** Servo has *zero* WebExtensions
    infrastructure (no `chrome.*`/`browser.*` bindings, no background pages, no
@@ -23,11 +23,11 @@ pinned Servo checkout (`ed1af70`, at
    part-time and is not even tracking upstream Servo. Building a meaningful subset
    of WebExtensions is a **multi-person-year** effort and a fork-magnet — exactly
    the Verso maintenance-treadmill risk we are trying to avoid.
-3. **Build a swerve-native add-on model** instead: declarative content-blocker
+3. **Build a navgator-native add-on model** instead: declarative content-blocker
    lists, Greasemonkey/Tampermonkey-style **userscripts** (the single most-wanted
    capability and the one Servo natively supports today), and a small,
-   swerve-owned `swerve.*` JS API surfaced into add-on contexts via the existing
-   `swerve:`/UCM machinery. Treat any future WebExtensions support as an optional,
+   navgator-owned `navgator.*` JS API surfaced into add-on contexts via the existing
+   `navgator:`/UCM machinery. Treat any future WebExtensions support as an optional,
    far-horizon compatibility shim, not a v1 goal.
 
 ---
@@ -35,7 +35,7 @@ pinned Servo checkout (`ed1af70`, at
 ## 1. What Servo gives us today (verified facts at `ed1af70`)
 
 The embedding surface that matters for this dimension lives in the `servo`
-umbrella crate (which swerve already depends on) and `embedder_traits`. swerve does
+umbrella crate (which navgator already depends on) and `embedder_traits`. navgator does
 **not** need to fork Servo to do content blocking or userscripts. Concretely:
 
 ### 1.1 Network-level request interception — `WebViewDelegate::load_web_resource`
@@ -119,10 +119,10 @@ style system (cascade below author styles unless `!important`).
 
 | capability | status at `ed1af70` | consequence for design |
 | --- | --- | --- |
-| `UserScript` match patterns | **none** — `UserScript` is just `{script, source_file}` | swerve must filter by URL itself and rebuild the UCM script set per navigation |
+| `UserScript` match patterns | **none** — `UserScript` is just `{script, source_file}` | navgator must filter by URL itself and rebuild the UCM script set per navigation |
 | Userscript injection time control (`document_start`/`idle`) | **none** — always the head delayed-task | "document-end" semantics must be emulated in-script (`DOMContentLoaded`) |
 | Isolated world / content-script sandbox | **none** — runs in page main world | userscripts can be detected/clobbered by the page; no privilege boundary |
-| `GM_*` / `chrome.*` / `browser.*` APIs | **none** | swerve must implement any privileged API itself |
+| `GM_*` / `chrome.*` / `browser.*` APIs | **none** | navgator must implement any privileged API itself |
 | Background/event pages, service-worker extensions | **none** | no place to run an extension's persistent logic |
 | Extension packaging (CRX/XPI/`manifest.json`) | **none** | no loader, no signing, no update protocol |
 | `declarativeNetRequest` / `webRequest` extension APIs | **none** | content blocking must be embedder-native (which we do) |
@@ -154,7 +154,7 @@ style system (cascade below author styles unless `!important`).
     we mostly use the URL-specific path on Servo).
   - Serialization: a compiled engine can be cached to a blob (`engine.serialize`) for
     fast startup instead of re-parsing megabytes of lists each launch.
-- License: MPL-2.0 — compatible with swerve (also MPL-2.0).
+- License: MPL-2.0 — compatible with navgator (also MPL-2.0).
 
 ### 2.2 Filter lists (data, not code)
 
@@ -183,7 +183,7 @@ from upstream with a bundled fallback snapshot so first-run works offline.
   hundreds of `chrome.*` namespaces, an extension process/permission model, CRX
   parsing + signature verification, an update protocol, an isolated-world content
   script injector, and (for MV3) a `declarativeNetRequest` rule engine. Chromium and
-  Firefox each maintain this with large teams. **For swerve, full or even broad
+  Firefox each maintain this with large teams. **For navgator, full or even broad
   parity is out of scope for the foreseeable future.**
 
 ---
@@ -192,7 +192,7 @@ from upstream with a bundled fallback snapshot so first-run works offline.
 
 ```
                         ┌──────────────────────────────────────────────┐
-                        │                 swerve process                │
+                        │                 navgator process                │
    filter lists  ───►   │  ┌────────────────────┐                       │
    (EasyList etc.)      │  │  Blocking Engine    │  adblock::Engine      │
    userscripts   ───►   │  │  + Userscript store │  (Arc, behind RwLock) │
@@ -202,7 +202,7 @@ from upstream with a bundled fallback snapshot so first-run works offline.
    │ HTML chrome  │◄────┼──┤ WebViewDelegate::load_web_resource      │   │ net thread
    │ (settings UI)│     │  │   → block / allow / redirect            │◄──┼── awaits reply
    └──────────────┘     │  └─────────────────────────────────────────┘   │
-        ▲   swerve:     │  ┌─────────────────────────────────────────┐   │
+        ▲   navgator:     │  ┌─────────────────────────────────────────┐   │
         │   bridge      │  │ per-nav: rebuild UserContentManager:     │   │
         └───────────────┼──┤  • cosmetic CSS (url_cosmetic_resources) │   │
                         │  │  • scriptlets (+js)                      │   │
@@ -227,7 +227,7 @@ On each `load_web_resource(webview, load)`:
      avoid page breakage.
    - else → return (DoNotIntercept; load proceeds).
 4. Bump a per-tab blocked-count for the toolbar badge (push to chrome via the
-   existing `swerve:state` event).
+   existing `navgator:state` event).
 
 ### 3.2 Cosmetic + scriptlet path (per navigation)
 
@@ -248,24 +248,24 @@ perfectly with cosmetic filtering being per-URL:
 > Note: each tab gets its **own** `UserContentManager` (cosmetic content is
 > per-page), but the heavy `adblock::Engine` is a single shared `Arc<RwLock<Engine>>`.
 
-### 3.3 Userscripts (swerve-native, the headline add-on type)
+### 3.3 Userscripts (navgator-native, the headline add-on type)
 
-- A userscript store: `~/.config/swerve/userscripts/*.user.js`, each parsed for its
+- A userscript store: `~/.config/navgator/userscripts/*.user.js`, each parsed for its
   Greasemonkey `==UserScript==` metadata block (`@match`/`@include`/`@exclude`,
   `@run-at`, `@grant`, `@name`, `@version`).
-- On navigation, swerve evaluates `@match`/`@include` against the URL itself (Servo
+- On navigation, navgator evaluates `@match`/`@include` against the URL itself (Servo
   has no match support) and injects matching scripts via the tab UCM.
-- Provide a minimal **`GM_*` / `swerve.*` shim** prepended to each script for the
-  common grants: `GM_addStyle`, `GM_setValue`/`GM_getValue` (backed by a swerve
+- Provide a minimal **`GM_*` / `navgator.*` shim** prepended to each script for the
+  common grants: `GM_addStyle`, `GM_setValue`/`GM_getValue` (backed by a navgator
   key-value store synced via Lyku), `GM_xmlhttpRequest` (proxied through a privileged
-  `swerve:` bridge call so it can bypass page CORS — this is the one capability that
+  `navgator:` bridge call so it can bypass page CORS — this is the one capability that
   genuinely needs embedder cooperation), `GM_openInTab`, `GM_notification`.
 - `@run-at document-end/idle` is emulated in the shim (wrap in a `DOMContentLoaded`/
   `requestIdleCallback`), since Servo only injects at head time.
 
-### 3.4 The swerve-native add-on model (beyond userscripts)
+### 3.4 The navgator-native add-on model (beyond userscripts)
 
-A swerve "add-on" is a small signed bundle:
+A navgator "add-on" is a small signed bundle:
 
 ```
 my-addon/
@@ -277,15 +277,15 @@ my-addon/
 ```
 
 - **Declarative-first.** Most useful add-ons (block lists, site CSS tweaks,
-  redirects, header rewrites) are pure data + the engines swerve already runs. This
+  redirects, header rewrites) are pure data + the engines navgator already runs. This
   avoids running arbitrary privileged code and dodges the WebExtensions process-model
   problem entirely.
-- **Chrome-side panels.** Because swerve's chrome is itself HTML rendered by Servo,
+- **Chrome-side panels.** Because navgator's chrome is itself HTML rendered by Servo,
   an add-on can contribute a panel/popup that the chrome composites — reusing the
-  existing `swerve:` command bridge rather than inventing a new UI runtime.
-- **A tiny `swerve.*` API** (not `chrome.*`) exposed to add-on contexts:
-  `swerve.tabs`, `swerve.storage` (Lyku-synced), `swerve.contentBlocker` (toggle
-  lists), `swerve.userScripts`, `swerve.notifications`. Small, owned by us, versioned
+  existing `navgator:` command bridge rather than inventing a new UI runtime.
+- **A tiny `navgator.*` API** (not `chrome.*`) exposed to add-on contexts:
+  `navgator.tabs`, `navgator.storage` (Lyku-synced), `navgator.contentBlocker` (toggle
+  lists), `navgator.userScripts`, `navgator.notifications`. Small, owned by us, versioned
   by us — the opposite of chasing the WebExtensions surface.
 
 ---
@@ -297,7 +297,7 @@ how Servo surfaces interception.
 
 ### 4.1 Every request round-trips to the UI thread
 
-`load_web_resource` is dispatched from `Servo::spin_event_loop` — i.e. on **swerve's
+`load_web_resource` is dispatched from `Servo::spin_event_loop` — i.e. on **navgator's
 main/UI thread**, the same thread that composites and routes input. The net thread's
 `main_fetch` **`.await`s** the reply for *every* request
 (`fetch/methods.rs:537`), and the interceptor is taken behind a single
@@ -347,18 +347,18 @@ the page's main JS context. That shapes the trust model:
 
 | add-on type | trust level | sandbox | permission gate |
 | --- | --- | --- | --- |
-| Built-in content blocker | swerve-trusted (ships with browser) | n/a (Rust, embedder side) | always on, user-configurable lists |
+| Built-in content blocker | navgator-trusted (ships with browser) | n/a (Rust, embedder side) | always on, user-configurable lists |
 | Declarative add-on (lists/CSS/redirects) | low-risk (data only) | no code execution | install-time list of affected domains |
 | Userscript | **high-risk** (arbitrary JS in page world) | none — runs as the page | per-script `@match` shown at install; `@grant`ed `GM_*` powers shown explicitly |
-| `swerve.*`-API add-on | privileged | chrome-side panel is its own webview | explicit permission prompt per capability |
+| `navgator.*`-API add-on | privileged | chrome-side panel is its own webview | explicit permission prompt per capability |
 
 Principles:
 
 1. **Permissions are explicit and per-capability**, surfaced at install and revocable
    in settings. A userscript that wants `GM_xmlhttpRequest` (cross-origin) or
-   `swerve.tabs` must declare it; swerve shows the grant list before enabling.
+   `navgator.tabs` must declare it; navgator shows the grant list before enabling.
 2. **`GM_xmlhttpRequest` / cross-origin fetch is the one real privilege** — route it
-   through a `swerve:` bridge call validated against the script's declared
+   through a `navgator:` bridge call validated against the script's declared
    `@connect` domains, never by handing the page `fetch` to all origins.
 3. **No silent auto-update of code.** Userscript/add-on updates that change code or
    add permissions require re-confirmation. (Filter *lists* are data and can
@@ -367,9 +367,9 @@ Principles:
    runs code on the pages you visit" warning. A signed registry + Lyku-hosted
    distribution comes later.
 5. **Content blocker integrity:** filter lists are data; the risk is a malicious list
-   doing a `redirect` to a swerve-controlled resource. Only honor `redirect` rules
+   doing a `redirect` to a navgator-controlled resource. Only honor `redirect` rules
    that resolve to adblock-rust's bundled resource set, never to arbitrary URLs.
-6. **Caveat the user honestly:** until Servo gains isolated worlds, swerve userscripts
+6. **Caveat the user honestly:** until Servo gains isolated worlds, navgator userscripts
    are *not* sandboxed from the page and a hostile page can interfere with them.
    Document this; do not imply WebExtensions-grade isolation.
 
@@ -380,18 +380,18 @@ Principles:
 - **Content blocker ↔ content webviews:** purely embedder-side. `load_web_resource`
   is per-`WebView`, so blocking is naturally per-tab; the per-tab `UserContentManager`
   carries that tab's cosmetic set. The blocked-request counter is pushed to the chrome
-  via the existing `swerve:state` `CustomEvent` and rendered as a shield/badge.
+  via the existing `navgator:state` `CustomEvent` and rendered as a shield/badge.
 - **Settings & controls in the chrome:** the chrome already drives the engine through
-  `swerve:` command URLs intercepted in `request_navigation`. Extend that vocabulary:
-  `swerve:blocker?toggle=easylist`, `swerve:blocker?allowlist=<host>`,
-  `swerve:userscript?enable=<id>`. A `swerve://settings/extensions` chrome page lists
+  `navgator:` command URLs intercepted in `request_navigation`. Extend that vocabulary:
+  `navgator:blocker?toggle=easylist`, `navgator:blocker?allowlist=<host>`,
+  `navgator:userscript?enable=<id>`. A `navgator://settings/extensions` chrome page lists
   installed add-ons, toggles, and per-site allowlists.
 - **Add-on chrome panels:** an add-on's optional `panel/index.html` is composited the
   same way the chrome is (it *is* chrome), so no new rendering path. It talks to the
-  engine over a scoped `swerve.*` API rather than raw `swerve:` navigation.
+  engine over a scoped `navgator.*` API rather than raw `navgator:` navigation.
 - **IPC control socket (M5):** extend the text protocol with
   `blocker on|off`, `blocker-stats`, `userscript-add <path>` so external tooling
-  (and Lyku sync) can drive add-on state — consistent with the existing `SWERVE_IPC`
+  (and Lyku sync) can drive add-on state — consistent with the existing `NAVGATOR_IPC`
   design.
 
 ---
@@ -416,15 +416,15 @@ Principles:
   per-nav UCM rebuild plumbing).*
 
 ### Phase C — Userscripts (the most-wanted "add-on")
-- `.user.js` store, metadata parsing, URL `@match` filtering in swerve, UCM injection.
+- `.user.js` store, metadata parsing, URL `@match` filtering in navgator, UCM injection.
 - `GM_*` shim incl. bridged `GM_xmlhttpRequest`; `@run-at` emulation; Lyku-backed
   `GM_setValue`.
-- `swerve://settings/extensions` management page + per-script permission display.
+- `navgator://settings/extensions` management page + per-script permission display.
 - *Est. effort: ~3–4 weeks. Risk: medium (no isolated world; honest about it).*
 
-### Phase D — swerve-native declarative add-ons + minimal `swerve.*` API
+### Phase D — navgator-native declarative add-ons + minimal `navgator.*` API
 - `addon.toml` bundles (lists + scripts + styles + optional chrome panel).
-- Small versioned `swerve.tabs/storage/contentBlocker/userScripts/notifications` API.
+- Small versioned `navgator.tabs/storage/contentBlocker/userScripts/notifications` API.
 - Sideload-from-disk with permission prompts; signing/registry later.
 - *Est. effort: ~4–8 weeks. Risk: medium; this is the durable extensibility story.*
 
@@ -441,7 +441,7 @@ Principles:
 
 ## 8. Open questions
 
-- Does swerve track the per-tab top-frame URL well enough to feed adblock-rust the
+- Does navgator track the per-tab top-frame URL well enough to feed adblock-rust the
   correct first-party for subframe requests? (Needs a small addition to `AppState`.)
 - How aggressively should default blocking be on (Brave-style on-by-default vs. a
   setup choice)? Affects breakage support burden.

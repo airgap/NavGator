@@ -1,12 +1,12 @@
-# swerve ⇄ Lyku — sync integration design
+# navgator ⇄ Lyku — sync integration design
 
-> Concrete integration design for syncing swerve (Servo-based browser, `/raid/swerve`)
+> Concrete integration design for syncing navgator (Servo-based browser, `/raid/navgator`)
 > user data through **Lyku** (lyku.org, `/raid/lyku`) as the default `SyncProvider`,
 > with a self-hostable server speaking the same protocol.
 >
 > Status date: 2026-06-18. **Lyku side verified against the working tree at `/raid/lyku`**
 > (auth gateway, lockstep-core, pg-models/pg-config, mapi-models, r2-client, nats-client,
-> and the existing `synced<T>` framework). swerve side per `docs/plan/sync.md`,
+> and the existing `synced<T>` framework). navgator side per `docs/plan/sync.md`,
 > `docs/plan/security.md`, repo @ working tree.
 >
 > This document **supersedes the "Lyku is unidentifiable" framing in `docs/plan/sync.md`**.
@@ -27,10 +27,10 @@
    convention (`<domain>.${userId}`); and — critically — **a generic `synced<T>`
    replication framework** (`registerSynced` / `publishSynced` / `streamSynced`,
    `{value, schema_version, sequence}` envelopes, a trigger-bumped monotonic `sequence`
-   column) that is exactly the delta-sync primitive swerve needs. swerve should **ride
+   column) that is exactly the delta-sync primitive navgator needs. navgator should **ride
    these existing rails**, not invent parallel ones.
 
-2. **swerve must do all crypto client-side; Lyku stores only ciphertext.** Lyku never
+2. **navgator must do all crypto client-side; Lyku stores only ciphertext.** Lyku never
    sees plaintext. We add new tables whose payloads are `bytea`/`text` ciphertext and
    whose only plaintext columns are structural metadata (`userId`, `datatype`, version
    vector, `sequence`, sizes, timestamps). This is compatible with — and invisible to —
@@ -60,7 +60,7 @@
 
 ---
 
-## 1. What Lyku already provides vs. what swerve-sync needs Lyku to add
+## 1. What Lyku already provides vs. what navgator-sync needs Lyku to add
 
 ### 1.1 Already provided (verified, reusable as-is)
 
@@ -81,7 +81,7 @@
 **Crucial finding:** the `sequence`/`synced<T>` system is the missing piece `sync.md`
 worried about ("a monotonic cursor for incremental pull"). It already exists. Each row
 carries a per-row monotonic `sequence`; the envelope publishes it; a client can order and
-gate on it. swerve's delta-sync cursor *is* `max(sequence)` seen — no new cursor
+gate on it. navgator's delta-sync cursor *is* `max(sequence)` seen — no new cursor
 infrastructure required.
 
 **Crucial caveat (auth):** the OAuth2 `access_token` from `/oauth/token` is validated only
@@ -90,7 +90,7 @@ OAuth alone cannot drive the sync API. Use OAuth/OIDC to *identify*, then `creat
 reuse the active `sessionId`) to *operate*. This matches `sync.md` §8.1's warning that
 "OIDC alone is insufficient."
 
-### 1.2 What swerve-sync needs Lyku to add
+### 1.2 What navgator-sync needs Lyku to add
 
 Three new tables, ~7 routes+handlers, one `registerSynced` entry, one R2 bucket/prefix.
 All in Lyku's exact idiom. Concrete snippets in §2.
@@ -270,7 +270,7 @@ export const syncBlobs = {
 import type { PostgresRecordModel } from '@lyku/lockstep-core';
 
 export const syncDevice = {
-	description: 'A swerve device enrolled in sync for this account. Used for device-to-device key transfer and revocation. Distinct from e2eeDeviceKeys (Signal chat) and deviceTokens (push).',
+	description: 'A navgator device enrolled in sync for this account. Used for device-to-device key transfer and revocation. Distinct from e2eeDeviceKeys (Signal chat) and deviceTokens (push).',
 	properties: {
 		userId: { type: 'bigint' },
 		deviceId: { type: 'text', maxLength: 36, pattern: '^[0-9a-f-]{36}$' },
@@ -545,15 +545,15 @@ keeps E2EE blobs out of the public media bucket). Keep the existing
 
 ### 3.1 The flow (browser → sync API)
 
-1. **Identify once via OIDC.** swerve registers a public OAuth client
+1. **Identify once via OIDC.** navgator registers a public OAuth client
    (`registerOAuthClient`, `requirePkce: true`, `confidential: false`, redirect URI
-   `swerve://oauth/callback` or a loopback `http://127.0.0.1:<port>/callback`). User logs
-   into Lyku in a webview/system browser; swerve runs auth-code + PKCE S256 against
+   `navgator://oauth/callback` or a loopback `http://127.0.0.1:<port>/callback`). User logs
+   into Lyku in a webview/system browser; navgator runs auth-code + PKCE S256 against
    `/oauth/authorize` → `/oauth/token`, gets an `id_token` (account identity) and an
-   `access_token`. This proves "this swerve install belongs to Lyku user `sub`."
+   `access_token`. This proves "this navgator install belongs to Lyku user `sub`."
 2. **Mint a sync-scoped API key.** Because the OAuth `access_token` is **not** accepted by
-   the MessagePack gateway (verified), swerve cannot call sync routes with it. Instead,
-   immediately after OIDC, swerve calls `createApiKey({ name: 'swerve-<device-label>',
+   the MessagePack gateway (verified), navgator cannot call sync routes with it. Instead,
+   immediately after OIDC, navgator calls `createApiKey({ name: 'navgator-<device-label>',
    scopes: ['read:sync','write:sync'] })` (using the active Lyku **session** established
    by the same login, i.e. the `sessionId` cookie/Bearer) and stores the returned
    `lyk_…` key in the **OS keychain**. All subsequent sync calls use
@@ -566,7 +566,7 @@ keeps E2EE blobs out of the public media bucket). Keep the existing
 4. **Revoke.** Revoking the key (or the device, §5) cuts that install off without touching
    the user's password or other devices.
 
-**Simpler alternative for v1:** if swerve already drives a Lyku login (e.g. it embeds the
+**Simpler alternative for v1:** if navgator already drives a Lyku login (e.g. it embeds the
 Lyku webui), it can read the `sessionId` and use it directly as the bearer — exactly what
 `monolith-ts-api` does. The API-key path is preferred because it's scoped (a sync key
 can't post or read messages) and independently revocable. Recommend API key for the
@@ -576,7 +576,7 @@ default; allow session-token fallback.
 
 The Lyku account credential is **not** the E2EE root. Lyku does passwordless OTP / OAuth —
 there is no user "master password" to derive keys from (the `userHashes.hash` is empty for
-all current login methods). So swerve **must** introduce a *separate sync passphrase* as the
+all current login methods). So navgator **must** introduce a *separate sync passphrase* as the
 crypto root (§4). This is actually cleaner: account auth (who you are) and content
 encryption (what you can decrypt) are fully decoupled — a Lyku session compromise yields
 only ciphertext.
@@ -672,7 +672,7 @@ device; MK/PK/VK never leave the device unwrapped.
 
 ---
 
-## 5. The Rust `SyncProvider` client in swerve
+## 5. The Rust `SyncProvider` client in navgator
 
 Refines `sync.md` §8. The trait is unchanged in spirit; the Lyku impl is now concrete.
 
@@ -711,7 +711,7 @@ index) + OS keychain (`keyring`). Crypto crates are already transitively present
 
 **Sync algorithm** (single SQLite txn per cycle):
 1. `pull(since = max_sequence_seen)` → decrypt each (per-record key, verify AAD) → merge
-   per §6 into `swerve.db`/`vault.db`.
+   per §6 into `navgator.db`/`vault.db`.
 2. Collect locally-changed records → encrypt → `push`. Rejected (stale `baseSequence`)
    rows ⇒ re-pull those, re-merge, re-push (converges by CRDT/LWW).
 3. Persist new cursor (`max sequence`) + per-record last-synced version vector.
@@ -750,9 +750,9 @@ interprets). `sequence` is the server-side optimistic-concurrency / cursor mecha
 
 Because Lyku stores only ciphertext + a `sequence` cursor, the self-host server is the same
 five operations. It does **not** need lockstep-core/Bun/Kysely — it just needs to implement
-the wire protocol swerve's `SyncProvider` speaks. Two ways to ship it:
+the wire protocol navgator's `SyncProvider` speaks. Two ways to ship it:
 
-1. **A small Rust binary** (`swerve-sync-server`): `axum`/`hyper` + `rusqlite` (or Postgres),
+1. **A small Rust binary** (`navgator-sync-server`): `axum`/`hyper` + `rusqlite` (or Postgres),
    `tokio`. Tables mirror §2 (`sync_records`, `sync_key_blobs`, `sync_blobs`,
    `sync_devices`, plus `accounts` + `sessions` since there's no Lyku to delegate auth to).
    Endpoints mirror the trait. `sequence` = a per-(account) counter or per-row
@@ -781,7 +781,7 @@ content-type switch — the Rust client supports both; the Lyku provider uses Me
 1. **Auth path confirmation.** Confirm OAuth2 `access_token` truly cannot reach the
    MessagePack gateway (research says yes) — if so, the OIDC→`createApiKey` two-step (§3.1)
    is mandatory. Is there appetite to make the gateway also accept OAuth bearer tokens
-   (then the two-step collapses)? Or should swerve just reuse the `sessionId` directly?
+   (then the two-step collapses)? Or should navgator just reuse the `sessionId` directly?
 2. **API-key scopes.** OK to add `read:sync`/`write:sync` to the `createApiKey` enum, and to
    let new sync routes gate on them? Should a sync key be auto-minted at OIDC time or
    user-initiated?
@@ -808,11 +808,11 @@ content-type switch — the Rust client supports both; the Lyku provider uses Me
    non-existent account password — isn't available.) Mandatory recovery-key generation?
 8. **History default.** Default-on (Chrome parity) or default-off (privacy-first
    positioning)? Most-sensitive non-secret datatype.
-9. **Quota surfacing.** Lyku enforces quota with `507`; swerve needs to surface
+9. **Quota surfacing.** Lyku enforces quota with `507`; navgator needs to surface
    "over quota" / backpressure. Is there a `getSyncStorageStatus` (à la
    `getZoidStorageStatus`) we should add?
-10. **Sequencing dependency.** Per `sync.md`, swerve has *no* local persistence yet
+10. **Sequencing dependency.** Per `sync.md`, navgator has *no* local persistence yet
     (settings/bookmarks/history/passwords don't exist). The Lyku-side tables/routes can be
     built in parallel, but client sync is gated on building those local stores first. Build
-    the Lyku surface now (cheap, idiomatic) or wait until swerve's local stores land?
+    the Lyku surface now (cheap, idiomatic) or wait until navgator's local stores land?
 ```

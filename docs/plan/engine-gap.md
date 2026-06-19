@@ -1,6 +1,6 @@
 # Servo engine capability gap vs Chrome/Blink
 
-**Scope:** Web-platform capability of Servo (libservo, pinned rev `ed1af70`) measured against a production engine (Blink/Chrome, Gecko/Firefox), to decide what swerve must wait-for, upstream, fund, or work around, and which gaps are dealbreakers for "industry standard."
+**Scope:** Web-platform capability of Servo (libservo, pinned rev `ed1af70`) measured against a production engine (Blink/Chrome, Gecko/Firefox), to decide what navgator must wait-for, upstream, fund, or work around, and which gaps are dealbreakers for "industry standard."
 
 **Method:** Ground truth from the cached Servo source at `/home/nicole/.cargo/git/checkouts/servo-e53a6e7b994a25fe/ed1af70`, the pinned `Cargo.lock`, the feature-gate registry in `components/config/prefs.rs`, and live 2026 data from `servo.org/wpt`, `wpt.fyi`, and `webtransitions.org/servo-readiness`.
 
@@ -8,11 +8,11 @@
 
 ## 0. TL;DR (the one-paragraph verdict)
 
-Servo's **engine cores are not the problem** — it ships Mozilla's real production CSS engine (**Stylo 0.18**, the same `stylo` crate Firefox uses) and Mozilla's real JS+Wasm engine (**SpiderMonkey, `mozjs_sys` 140.x = Firefox-140-class, full Baseline+Ion JIT**), plus **WebRender 0.69** for GPU compositing. So CSS *parsing/cascade* and *JavaScript execution* are at or near Chrome parity. The gap is everywhere **between** those cores: Servo's own **layout** engine (a young, parallel, fragment-tree reimplementation — not Gecko's) is missing or stubbing big swaths of modern CSS (anchor positioning, view-transitions, subgrid, masonry, masks, vertical/RTL writing modes, multicol maturity); whole **subsystems are implemented-but-disabled-by-default** (IndexedDB, Service Workers, Shared Workers, WebGL2, WebGPU, WebRTC, WebVTT, Web Animations, OffscreenCanvas, Permissions, Geolocation, Notifications, CSS Font Loading, accessibility, devtools); and several **non-negotiable browser subsystems are absent**: **no EME/DRM** (no Netflix/Spotify/Disney+), **no HTTP/3/QUIC**, **media only via the optional GStreamer backend** (off in swerve today → effectively *no `<video>`/`<audio>`*), **devtools is a Firefox-RDP server, not Chrome CDP**, and there is **no extension engine**. Quantitatively: **~62% overall WPT** (up from 30% in ~2.5 yr) but only **19.8% of "Baseline Widely Available" features at production quality** (87/439 fully, 333 partial, 19 unsupported), with an honest external projection that at ~13 FTE Servo "plateaus around 80% by ~2037 and never catches up." **The maintenance treadmill and the long-tail capability gap — not any single missing feature — are the strategic risk.**
+Servo's **engine cores are not the problem** — it ships Mozilla's real production CSS engine (**Stylo 0.18**, the same `stylo` crate Firefox uses) and Mozilla's real JS+Wasm engine (**SpiderMonkey, `mozjs_sys` 140.x = Firefox-140-class, full Baseline+Ion JIT**), plus **WebRender 0.69** for GPU compositing. So CSS *parsing/cascade* and *JavaScript execution* are at or near Chrome parity. The gap is everywhere **between** those cores: Servo's own **layout** engine (a young, parallel, fragment-tree reimplementation — not Gecko's) is missing or stubbing big swaths of modern CSS (anchor positioning, view-transitions, subgrid, masonry, masks, vertical/RTL writing modes, multicol maturity); whole **subsystems are implemented-but-disabled-by-default** (IndexedDB, Service Workers, Shared Workers, WebGL2, WebGPU, WebRTC, WebVTT, Web Animations, OffscreenCanvas, Permissions, Geolocation, Notifications, CSS Font Loading, accessibility, devtools); and several **non-negotiable browser subsystems are absent**: **no EME/DRM** (no Netflix/Spotify/Disney+), **no HTTP/3/QUIC**, **media only via the optional GStreamer backend** (off in navgator today → effectively *no `<video>`/`<audio>`*), **devtools is a Firefox-RDP server, not Chrome CDP**, and there is **no extension engine**. Quantitatively: **~62% overall WPT** (up from 30% in ~2.5 yr) but only **19.8% of "Baseline Widely Available" features at production quality** (87/439 fully, 333 partial, 19 unsupported), with an honest external projection that at ~13 FTE Servo "plateaus around 80% by ~2037 and never catches up." **The maintenance treadmill and the long-tail capability gap — not any single missing feature — are the strategic risk.**
 
 ---
 
-## 1. The stack swerve actually inherits (exact versions at `ed1af70`)
+## 1. The stack navgator actually inherits (exact versions at `ed1af70`)
 
 From the pinned `Cargo.lock`:
 
@@ -24,13 +24,13 @@ From the pinned `Cargo.lock`:
 | WebGL backend | `mozangle` | 0.5.5 (ANGLE) | Real ANGLE; GLES→native. WebGL1 works; **WebGL2 gated off** (see §3). |
 | WebGPU backend | `wgpu-core` | 29.0.3 | Real `wgpu`; **gated off by default** (see §3). |
 | Layout | `servo/components/layout` | (in-tree) | **Servo's own** "layout 2020" fragment-tree engine + **Taffy** for flexbox/grid. This is the youngest, leakiest part. |
-| Media | `servo-media` (+ GStreamer) | in-tree | Pipeline is real but **codecs come from GStreamer**, which is a *non-default* feature (`media-gstreamer`). swerve does not enable it today. |
+| Media | `servo-media` (+ GStreamer) | in-tree | Pipeline is real but **codecs come from GStreamer**, which is a *non-default* feature (`media-gstreamer`). navgator does not enable it today. |
 | Net | `hyper` 1.x + `hyper-rustls` + `tungstenite` | in-tree | HTTP/1.1 + HTTP/2 + WS only. **No HTTP/3/QUIC.** |
 | Storage | `rusqlite` (bundled SQLite) | in-tree | IndexedDB now has a real SQLite backend (gated off); cookies + localStorage real. |
 | A11y | `accesskit` | workspace | AccessKit tree plumbed through layout/constellation; **`accessibility_enabled = false`** by default. |
 | DevTools | `components/devtools` | in-tree | **Firefox Remote Debugging Protocol**, "reverse-engineered from Firefox devtools logs." **Not** Chrome DevTools Protocol. |
 
-**Implication for swerve:** the parts that would be hardest to build (a conformant CSS cascade, a JIT JS engine, a GPU compositor) are *already production-grade and maintained by Mozilla/Servo*. swerve's parity fight is almost entirely in (a) Servo's bespoke **layout**, (b) flipping on and hardening the **disabled DOM subsystems**, and (c) the **truly-absent** subsystems (EME, HTTP/3, CDP, extensions).
+**Implication for navgator:** the parts that would be hardest to build (a conformant CSS cascade, a JIT JS engine, a GPU compositor) are *already production-grade and maintained by Mozilla/Servo*. navgator's parity fight is almost entirely in (a) Servo's bespoke **layout**, (b) flipping on and hardening the **disabled DOM subsystems**, and (c) the **truly-absent** subsystems (EME, HTTP/3, CDP, extensions).
 
 ---
 
@@ -72,7 +72,7 @@ From the pinned `Cargo.lock`:
 | **DevTools server** | `devtools_server_enabled=false` | off; and it's Firefox-RDP anyway. |
 | **CSS layout gates** | `layout_grid_enabled`, `layout_columns_enabled`, `layout_writing_mode_enabled`, `layout_container_queries_enabled`, `layout_variable_fonts_enabled`, `layout_css_attr_enabled` | These are *stylo* gates flipped via `set_pref!`; some default on, some experimental. |
 
-**Why this matters for swerve:** many of these are a single pref flip away from being *available* — but "available" ≠ "passes WPT." Several are off precisely *because they're not solid yet* (regressions, crashes, low conformance). swerve's job is to (a) decide a default pref profile distinct from Servo's conservative one, and (b) **own a test gate**: flip a feature on only when its WPT subscore clears a swerve-defined bar, else you ship bugs users blame on swerve, not Servo.
+**Why this matters for navgator:** many of these are a single pref flip away from being *available* — but "available" ≠ "passes WPT." Several are off precisely *because they're not solid yet* (regressions, crashes, low conformance). navgator's job is to (a) decide a default pref profile distinct from Servo's conservative one, and (b) **own a test gate**: flip a feature on only when its WPT subscore clears a navgator-defined bar, else you ship bugs users blame on navgator, not Servo.
 
 ---
 
@@ -94,9 +94,9 @@ CSS **parsing and cascade** is Stylo → effectively Firefox-grade (custom prope
 - **CSS specifically** is one of Servo's *stronger* suites due to Stylo, but layout-dependent CSS subtests drag it down vs Chrome's ~95%+.
 - Baseline readiness (webtransitions.org): **19.8% of Baseline-Widely-Available features fully supported**; **75.9% partial**; **141 features at zero progress** "require architectural improvements."
 
-### swerve posture
-- **Must wait-for / upstream:** anchor positioning, view-transitions, subgrid, masonry, vertical writing modes. These are *layout-architecture* work only the Servo layout team (or a funded swerve contributor) can do. Do **not** try to fork layout.
-- **Work-around:** detect-and-degrade — e.g. polyfill `startViewTransition` to a no-op crossfade; ship a default UA stylesheet that avoids relying on ellipsis where swerve chrome is concerned.
+### navgator posture
+- **Must wait-for / upstream:** anchor positioning, view-transitions, subgrid, masonry, vertical writing modes. These are *layout-architecture* work only the Servo layout team (or a funded navgator contributor) can do. Do **not** try to fork layout.
+- **Work-around:** detect-and-degrade — e.g. polyfill `startViewTransition` to a no-op crossfade; ship a default UA stylesheet that avoids relying on ellipsis where navgator chrome is concerned.
 - **Dealbreaker tier:** none individually fatal, but the *aggregate* of "site uses subgrid + anchor tooltips + view-transition nav" = visibly-broken vs Chrome on modern sites.
 
 ---
@@ -105,9 +105,9 @@ CSS **parsing and cascade** is Stylo → effectively Firefox-grade (custom prope
 
 **Strongest area.** SpiderMonkey `mozjs_sys` 140.x with `js_jit` **on by default** (Baseline interpreter + Baseline JIT + IonMonkey + Wasm Baseline/Ion). ES2023/2024 language features, async/await, generators, BigInt, WeakRefs, top-level await, modules, import maps, Wasm (incl. SIMD, threads where wired) are SpiderMonkey-grade. The ECMAScript test262-style WPT `js/` area is high.
 
-**Caveat:** the *engine* is production-grade; the *bindings surface* (which Web APIs are exposed to JS) is the gate — see §2/§5. So `Array.prototype.*` is fine, but `navigator.serviceWorker` may be `undefined` because the **API is pref-off**, not because JS is weak. swerve users will perceive these as "JS errors" (`TypeError: x is not a function`) — a UX problem, not an engine problem.
+**Caveat:** the *engine* is production-grade; the *bindings surface* (which Web APIs are exposed to JS) is the gate — see §2/§5. So `Array.prototype.*` is fine, but `navigator.serviceWorker` may be `undefined` because the **API is pref-off**, not because JS is weak. navgator users will perceive these as "JS errors" (`TypeError: x is not a function`) — a UX problem, not an engine problem.
 
-**Recommendation:** no engine work needed. swerve should expose a curated, *enabled* global surface and ensure feature-detection paths degrade (sites that `if ('serviceWorker' in navigator)` will simply not use it).
+**Recommendation:** no engine work needed. navgator should expose a curated, *enabled* global surface and ensure feature-detection paths degrade (sites that `if ('serviceWorker' in navigator)` will simply not use it).
 
 ---
 
@@ -117,22 +117,22 @@ CSS **parsing and cascade** is Stylo → effectively Firefox-grade (custom prope
 
 **Gaps:** the pref-off list in §2 *is* the DOM-API gap (IndexedDB, SW, IO, Permissions, Geolocation, Notifications, IntersectionObserver, adoptedStyleSheets, FontFace, OffscreenCanvas, Worklets, execCommand, CookieStore, CredMgmt, Sanitizer, VisualViewport, Async Clipboard). Editing/`contenteditable` is weak (execCommand off). Popover API, `<dialog>` maturity, `inert`, and form-control fidelity should be WPT-spot-checked before relying on them.
 
-**Recommendation:** define a **swerve default pref profile** that turns on the subset that is *both* commonly required *and* WPT-passing at swerve's bar (candidate first wave: IntersectionObserver, ResizeObserver [already on], adoptedStyleSheets, FontFace, Web Animations, VisualViewport, Async Clipboard). Gate the heavy ones (IndexedDB, SW) behind explicit hardening milestones.
+**Recommendation:** define a **navgator default pref profile** that turns on the subset that is *both* commonly required *and* WPT-passing at navgator's bar (candidate first wave: IntersectionObserver, ResizeObserver [already on], adoptedStyleSheets, FontFace, Web Animations, VisualViewport, Async Clipboard). Gate the heavy ones (IndexedDB, SW) behind explicit hardening milestones.
 
 ---
 
 ## 6. Media & codecs (the worst practical gap for a daily driver)
 
 - **Pipeline:** `servo-media` with backends `dummy | gstreamer | ohos | auto`. Real codecs come **only** from the **GStreamer** backend, enabled by the **non-default** `media-gstreamer` Cargo feature.
-- **swerve today:** README explicitly leaves `media-gstreamer` OFF ("those libs aren't needed"). **Net effect: `<video>`/`<audio>` decode to nothing / dummy backend.** This is a *current swerve build choice*, not a Servo limitation — but it means **swerve presently has no media**.
+- **navgator today:** README explicitly leaves `media-gstreamer` OFF ("those libs aren't needed"). **Net effect: `<video>`/`<audio>` decode to nothing / dummy backend.** This is a *current navgator build choice*, not a Servo limitation — but it means **navgator presently has no media**.
 - **Codecs (with GStreamer on):** whatever GStreamer plugins are installed — typically H.264/AAC/Opus/Vorbis/VP8/VP9, AV1 via `dav1d`/`aom` plugins, etc. Quality/coverage = the host's GStreamer install, not a fixed guarantee. Recent Servo work added Ogg audio via `<audio>`.
 - **EME / DRM:** **absent.** No `MediaKeys` / `EncryptedMedia` / `navigator.requestMediaKeySystemAccess` WebIDL in the tree (grep: zero matches). **No Widevine/PlayReady/FairPlay → no Netflix, Disney+, Spotify-web, Amazon Prime, HBO, most paid streaming.** Servo's own stance (per 2026 discussions) is that a "daily driver doesn't really need EME" and that DRM could be a separate app — i.e. **not on Servo's roadmap.**
 
-### swerve posture — this is a **Tier-1 dealbreaker** for "industry standard"
-1. **Enable `media-gstreamer` immediately** (or wire the OHOS/system backend) — without it swerve isn't a usable browser. Accept the native-lib build dependency.
+### navgator posture — this is a **Tier-1 dealbreaker** for "industry standard"
+1. **Enable `media-gstreamer` immediately** (or wire the OHOS/system backend) — without it navgator isn't a usable browser. Accept the native-lib build dependency.
 2. **EME:** there is no clean path. Options, all painful:
    - **(a) Out-of-process Widevine CDM** like Chromium/Firefox do — Google licenses Widevine binaries; obtaining a license + sandboxing the `libwidevinecdm.so` and bridging it to a (currently nonexistent) Servo EME implementation is a **multi-quarter, partnership-gated** effort. This is the single largest "fund/partner" item.
-   - **(b) Ship without DRM** and message it ("swerve doesn't do DRM streaming; use the native app"). Honest, but a hard sell for "Chrome parity."
+   - **(b) Ship without DRM** and message it ("navgator doesn't do DRM streaming; use the native app"). Honest, but a hard sell for "Chrome parity."
    - **(c) Defer** and revisit once Servo has any EME hooks (none today).
    - **Recommendation:** plan (b) for v1, with (a) as a funded later milestone. Do **not** promise Netflix at launch.
 
@@ -146,14 +146,14 @@ CSS **parsing and cascade** is Stylo → effectively Firefox-grade (custom prope
 - **WebGL2:** **off** (`dom_webgl2_enabled=false`). Implemented to some degree; needs enabling + WPT hardening. Many 3D sites/maps/games require it.
 - **WebGPU:** present (`wgpu-core 29`) but **off** (`dom_webgpu_enabled=false`) and behind the `webgpu` Cargo feature. Conformance is early everywhere; treat as experimental.
 
-**Recommendation:** enable WebGL2 behind a hardening gate (high payoff, real implementation exists). WebGPU stays experimental/opt-in. Both depend on the host GL/Vulkan/Metal stack — surfman portability is a known sharp edge (swerve already battles ANGLE/LLVM mismatches per README).
+**Recommendation:** enable WebGL2 behind a hardening gate (high payoff, real implementation exists). WebGPU stays experimental/opt-in. Both depend on the host GL/Vulkan/Metal stack — surfman portability is a known sharp edge (navgator already battles ANGLE/LLVM mismatches per README).
 
 ---
 
 ## 8. Networking
 
 - **HTTP/1.1 + HTTP/2:** yes (`hyper` with `http1,http2` + `hyper-rustls`). TLS via rustls.
-- **HTTP/3 / QUIC:** **absent** (no `quinn`/`h3`/`s2n-quic` anywhere in `components/net`). Modern Google/CDN traffic prefers H3; without it swerve falls back to H2 (functional, slightly slower, more visible to network-fingerprinting). **Not a correctness dealbreaker; a performance/parity gap.**
+- **HTTP/3 / QUIC:** **absent** (no `quinn`/`h3`/`s2n-quic` anywhere in `components/net`). Modern Google/CDN traffic prefers H3; without it navgator falls back to H2 (functional, slightly slower, more visible to network-fingerprinting). **Not a correctness dealbreaker; a performance/parity gap.**
 - **WebSockets:** yes (`tungstenite` / `async-tungstenite`).
 - **fetch / CORS / cache:** real `fetch` stack, `cors_cache.rs`, and a real `http_cache.rs` + `image_cache.rs`. Good.
 - **Service Worker fetch interception:** depends on SW being enabled (off) — so no offline/PWA caching today.
@@ -170,13 +170,13 @@ CSS **parsing and cascade** is Stylo → effectively Firefox-grade (custom prope
 - **Worklets:** off.
 - **Storage:** cookies (real, with http-state test suite), localStorage/sessionStorage (`components/storage/webstorage`), **IndexedDB on real bundled SQLite** (`rusqlite`) — but **pref-off**. This is the most consequential storage gate: enabling IndexedDB unblocks a huge class of web apps.
 
-**Recommendation:** sequence = (1) confirm cookies+localStorage solid (likely yes), (2) **harden+enable IndexedDB** (biggest unlock, real backend already there), (3) tackle Service Workers (needed for PWAs and swerve's own offline/Lyku-sync story), (4) Shared Workers/Worklets last.
+**Recommendation:** sequence = (1) confirm cookies+localStorage solid (likely yes), (2) **harden+enable IndexedDB** (biggest unlock, real backend already there), (3) tackle Service Workers (needed for PWAs and navgator's own offline/Lyku-sync story), (4) Shared Workers/Worklets last.
 
 ---
 
 ## 10. WebRTC
 
-`dom_webrtc_enabled=false`; servo-media has a webrtc backend but it is **off and immature**. **No real-time video/audio calls** (Meet, Discord web, Whereby, Jitsi) today. This is **Tier-1 for "industry standard"** and **Tier-2 for swerve's likely early users**. Treat as fund/upstream-later; do not promise calling at launch.
+`dom_webrtc_enabled=false`; servo-media has a webrtc backend but it is **off and immature**. **No real-time video/audio calls** (Meet, Discord web, Whereby, Jitsi) today. This is **Tier-1 for "industry standard"** and **Tier-2 for navgator's likely early users**. Treat as fund/upstream-later; do not promise calling at launch.
 
 ---
 
@@ -192,18 +192,18 @@ AccessKit is plumbed through `components/layout/accessibility_tree.rs`, constell
 
 `components/devtools` implements the **Firefox Remote Debugging Protocol** ("reverse-engineered from Firefox devtool logs"), with a `network_handler`, actors, etc. It is **off by default** and is **not Chrome DevTools Protocol (CDP)**.
 
-**Consequences for swerve:**
-- swerve cannot reuse Chrome DevTools front-end, Puppeteer, Playwright-chromium, or the vast CDP tooling ecosystem out of the box.
+**Consequences for navgator:**
+- navgator cannot reuse Chrome DevTools front-end, Puppeteer, Playwright-chromium, or the vast CDP tooling ecosystem out of the box.
 - WebDriver exists (`components/webdriver_server`) — that's the portable automation path.
-- Building swerve's own in-browser devtools (Opera-GX-class UX is a selling point) means either (a) talking Firefox-RDP to the existing actors, or (b) implementing a CDP shim over Servo internals (large).
+- Building navgator's own in-browser devtools (Opera-GX-class UX is a selling point) means either (a) talking Firefox-RDP to the existing actors, or (b) implementing a CDP shim over Servo internals (large).
 
-**Recommendation:** for v1, lean on the **Firefox RDP server + WebDriver**; defer any CDP ambitions. A CDP shim is a fundable later project if swerve wants Playwright/Puppeteer compatibility.
+**Recommendation:** for v1, lean on the **Firefox RDP server + WebDriver**; defer any CDP ambitions. A CDP shim is a fundable later project if navgator wants Playwright/Puppeteer compatibility.
 
 ---
 
 ## 13. Extensions
 
-Not in scope of the engine per se, but worth flagging as a **structural gap**: Servo has **no WebExtensions/MV3 engine**. "Chrome parity" implies ad-blocking/uBlock-class extensions. There is no path to running Chrome/Firefox extensions without building an extension runtime (content-script injection, `webRequest`/`declarativeNetRequest`, background SW, extension storage) on top of Servo. This is a **major, separate, fundable workstream** — but note swerve's anti-bloat thesis could instead favor a **built-in content-blocker** (network-level filter lists via the existing net stack) rather than a full extension engine, which is far cheaper and aligned with the product.
+Not in scope of the engine per se, but worth flagging as a **structural gap**: Servo has **no WebExtensions/MV3 engine**. "Chrome parity" implies ad-blocking/uBlock-class extensions. There is no path to running Chrome/Firefox extensions without building an extension runtime (content-script injection, `webRequest`/`declarativeNetRequest`, background SW, extension storage) on top of Servo. This is a **major, separate, fundable workstream** — but note navgator's anti-bloat thesis could instead favor a **built-in content-blocker** (network-level filter lists via the existing net stack) rather than a full extension engine, which is far cheaper and aligned with the product.
 
 ---
 
@@ -215,19 +215,19 @@ External, adversarial measurement (webtransitions.org/servo-readiness, 2026):
 - **51 features regressed** >5pp; **141 at zero progress**; **154 features lack WPT coverage** (78 JS built-ins, 23 semantic HTML elements with *unknown* status).
 - Projection: at **13 FTE**, Servo "plateaus around 80% by ~2037 and never catches up." Velocity parity within 3 years is estimated at **~44 FTE / ~€26.3M**.
 
-This is the **Verso lesson restated at the engine layer**: the danger isn't that Servo can't render the web — it's that the web outruns Servo, and a small embedder (swerve) inherits that gap *plus* the cost of tracking Servo's churn. swerve's architecture (high-level `libservo`, pinned rev, deliberate bumps) correctly addresses the *embedding* treadmill; it does **not** address the *capability* treadmill, which is upstream and largely outside swerve's control.
+This is the **Verso lesson restated at the engine layer**: the danger isn't that Servo can't render the web — it's that the web outruns Servo, and a small embedder (navgator) inherits that gap *plus* the cost of tracking Servo's churn. navgator's architecture (high-level `libservo`, pinned rev, deliberate bumps) correctly addresses the *embedding* treadmill; it does **not** address the *capability* treadmill, which is upstream and largely outside navgator's control.
 
-**Mitigations swerve can actually pursue:**
-1. **Fund upstream Servo** for the specific features swerve needs (anchor positioning, IndexedDB hardening, WebGL2, media). Cheaper and more durable than working around in the embedder.
-2. **Be honest about scope:** position swerve as a *fast, private, themeable* browser for the *mainstream non-DRM web*, not "renders everything Chrome does." Pick a target site-list and make *those* perfect.
-3. **Own a pref/test profile:** swerve's value-add over raw Servo is a *curated, hardened default feature set* gated by swerve's own WPT bar — turning Servo's conservative "everything off" into a defensible "these N features on, verified."
-4. **Track the velocity gap as a KPI**, not a vibe: run WPT against each Servo bump, alert on regressions in swerve's target feature set.
+**Mitigations navgator can actually pursue:**
+1. **Fund upstream Servo** for the specific features navgator needs (anchor positioning, IndexedDB hardening, WebGL2, media). Cheaper and more durable than working around in the embedder.
+2. **Be honest about scope:** position navgator as a *fast, private, themeable* browser for the *mainstream non-DRM web*, not "renders everything Chrome does." Pick a target site-list and make *those* perfect.
+3. **Own a pref/test profile:** navgator's value-add over raw Servo is a *curated, hardened default feature set* gated by navgator's own WPT bar — turning Servo's conservative "everything off" into a defensible "these N features on, verified."
+4. **Track the velocity gap as a KPI**, not a vibe: run WPT against each Servo bump, alert on regressions in navgator's target feature set.
 
 ---
 
-## 15. Prioritized recommendations (capability roadmap for swerve)
+## 15. Prioritized recommendations (capability roadmap for navgator)
 
-**Tier 0 — without these swerve is not a usable browser (do now):**
+**Tier 0 — without these navgator is not a usable browser (do now):**
 1. Enable **`media-gstreamer`** (or system media backend) → `<video>`/`<audio>` actually play. *(Currently OFF — top correctness bug.)*
 2. Enable + smoke-test **IntersectionObserver, adoptedStyleSheets, FontFace (CSS Font Loading), Web Animations, VisualViewport** — the silent breakers of modern sites that are cheap to flip.
 3. Enable **AccessKit accessibility** — must-have for v1.
@@ -235,7 +235,7 @@ This is the **Verso lesson restated at the engine layer**: the danger isn't that
 **Tier 1 — required for credible "industry standard" (fund/harden, this year):**
 4. **Harden + enable IndexedDB** (real SQLite backend exists) → unblocks web apps.
 5. **Enable WebGL2** behind a WPT gate → 3D/maps/games.
-6. **Enable + harden Service Workers** → PWAs, offline, and swerve's own Lyku-sync offline story.
+6. **Enable + harden Service Workers** → PWAs, offline, and navgator's own Lyku-sync offline story.
 7. **Async Clipboard, Permissions, Notifications, Geolocation** — common permission-gated APIs.
 
 **Tier 2 — parity gaps that need upstream or partnership (plan, don't promise):**
@@ -249,7 +249,7 @@ This is the **Verso lesson restated at the engine layer**: the danger isn't that
 13. CDP shim for Playwright/Puppeteer compatibility (large; RDP+WebDriver suffice for v1).
 14. WebGPU (stay experimental/opt-in).
 
-**Hard dealbreakers for literal "Chrome parity"** that swerve must either fund-around or explicitly de-scope: **EME/DRM streaming, WebRTC calling, WebExtensions**. The defensible product is *not* "Chrome parity" — it's "the fast, private, deeply-themeable browser for the open (non-DRM) web," with a funded path to close Tier-1/Tier-2 over time.
+**Hard dealbreakers for literal "Chrome parity"** that navgator must either fund-around or explicitly de-scope: **EME/DRM streaming, WebRTC calling, WebExtensions**. The defensible product is *not* "Chrome parity" — it's "the fast, private, deeply-themeable browser for the open (non-DRM) web," with a funded path to close Tier-1/Tier-2 over time.
 
 ---
 

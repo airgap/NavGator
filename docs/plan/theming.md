@@ -1,7 +1,7 @@
-# swerve theming & customization
+# navgator theming & customization
 
 > Dimension owner doc. The headline differentiator: **Opera GX-class deep theming, but
-> fast.** This document is grounded in the actual swerve code (`src/main.rs`,
+> fast.** This document is grounded in the actual navgator code (`src/main.rs`,
 > `src/chrome/*`) and in the pinned Servo source at rev `ed1af70` (cached at
 > `/home/nicole/.cargo/git/checkouts/servo-e53a6e7b994a25fe/ed1af70`) and its stylo
 > (`stylo-482338307e42a9ea/49e912c`). Every Servo capability claim below was verified by
@@ -38,7 +38,7 @@
      `backdrop-filter`.
 - **Performance is the differentiator, not the feature list.** GX is widely criticised for
   650 MB–1.2 GB RAM and 80–100% CPU spikes ([Opera forums][gx-cpu], [techysnoop][gx-mem]).
-  swerve's whole pitch is "the customization without the cost." That means a hard,
+  navgator's whole pitch is "the customization without the cost." That means a hard,
   measured perf budget on the theming layer specifically (the chrome must stay a near-zero
   idle-cost document).
 
@@ -46,7 +46,7 @@
 
 ## 1. What "deep theming" must cover (scope)
 
-| Area | What users expect (GX / Firefox userChrome bar) | swerve feasibility |
+| Area | What users expect (GX / Firefox userChrome bar) | navgator feasibility |
 | --- | --- | --- |
 | Light / dark / custom | base palettes + a true custom palette | **Easy** — chrome CSS tokens; content via `notify_theme_change` |
 | Accent color | one knob recolors the whole UI | **Easy** — single `--accent` token + derived tokens via `color-mix()` |
@@ -73,9 +73,9 @@ From `src/main.rs` + `src/chrome/*`:
   just isn't formalized, themeable, or persisted.
 - The engine→chrome push channel is `WebView::evaluate_javascript(js, cb)`
   (`AppState::chrome_eval`, used by `push_model`). The chrome→engine channel is a denied
-  navigation to a `swerve:` URL intercepted in `request_navigation`. **Both channels are
+  navigation to a `navgator:` URL intercepted in `request_navigation`. **Both channels are
   in place and are exactly what a theme/mod system needs.** A theme apply is just a new
-  `swerve:` verb + a `swerve:state`-style event.
+  `navgator:` verb + a `navgator:state`-style event.
 - `chrome.css` already documents Servo gaps it had to work around:
   `user-select` is an inert stub (worked around via `selectstart` in JS), and
   `text-overflow: ellipsis` is unimplemented (worked around with a JS binary-search
@@ -157,7 +157,7 @@ Tokens are organized in tiers so a theme author can override at any altitude:
   --sw-density: 1;                   /* 0.85 compact · 1 normal · 1.2 spacious */
   --sw-radius: 9px;
   --sw-motion: 1;                    /* 0 = reduce motion (gates transition durations) */
-  --sw-wallpaper: none;              /* url(swerve-asset://theme/<id>/bg.webp) or none */
+  --sw-wallpaper: none;              /* url(navgator-asset://theme/<id>/bg.webp) or none */
   --sw-wallpaper-opacity: 0.12;
 
   /* ---- derived (theme rarely touches these) ---- */
@@ -193,11 +193,11 @@ the first concrete deliverable — it has value even before any theme UI exists.
 
 A theme is fundamentally **a set of token values**. Applying it:
 
-1. Engine receives "apply theme X" (from the settings UI, a `swerve:` command, IPC, or
+1. Engine receives "apply theme X" (from the settings UI, a `navgator:` command, IPC, or
    Lyku sync).
 2. Engine pushes the resolved token map to the chrome via `evaluate_javascript`:
    ```js
-   window.dispatchEvent(new CustomEvent('swerve:theme', { detail: { tokens: {...}, css: "..." } }));
+   window.dispatchEvent(new CustomEvent('navgator:theme', { detail: { tokens: {...}, css: "..." } }));
    ```
 3. The chrome's theme runtime sets each token on `document.documentElement.style`
    (`el.style.setProperty('--sw-color-accent', v)`). This is **instant** — it is a style
@@ -217,17 +217,17 @@ There are **two different hot-reload stories** because Servo treats them differe
 
 ### 4.1 Chrome hot-reload — fully hot, instant
 
-- **Token changes:** push `swerve:theme` → `setProperty` on `:root`. Instant recalc. No
+- **Token changes:** push `navgator:theme` → `setProperty` on `:root`. Instant recalc. No
   reload, no flash. Verified path: `evaluate_javascript` already works (`push_model`).
 - **Author CSS (a theme's extra rules / a mod's CSS):** inject/replace a known
-  `<style id="sw-theme">` element's `textContent` from the `swerve:theme` payload's
+  `<style id="sw-theme">` element's `textContent` from the `navgator:theme` payload's
   `css` field. Replacing a `<style>`'s text triggers a normal stylesheet swap on a live
   document — hot. We deliberately **avoid** `adoptedStyleSheets` because it is OFF by
   default at this rev (`dom_adoptedstylesheet_enabled: false`); a managed `<style>` tag is
   the portable mechanism.
 - **Dev loop for theme authors:** watch the theme dir on disk (a Rust `notify` watcher in
-  the engine), and on change re-read + re-push `swerve:theme`. Author edits `theme.css`,
-  sees it in <100 ms without restarting swerve. This is the killer DX feature and it is
+  the engine), and on change re-read + re-push `navgator:theme`. Author edits `theme.css`,
+  sees it in <100 ms without restarting navgator. This is the killer DX feature and it is
   cheap to build because it rides the existing bridge.
 
 ### 4.2 Content hot-reload — partially hot
@@ -239,7 +239,7 @@ There are **two different hot-reload stories** because Servo treats them differe
 | Per-site CSS toggle | **No — needs reload** | same |
 
 **Design consequence:** when the user toggles force-dark or a per-site theme *on the
-current page*, swerve must trigger a `webview.reload()` to make the injected sheet take
+current page*, navgator must trigger a `webview.reload()` to make the injected sheet take
 effect (or inject the same CSS via `evaluate_javascript` as a one-shot `<style>` element
 for an instant preview, then persist it through `UserContentManager` for future loads).
 The pragmatic pattern:
@@ -265,7 +265,7 @@ the Servo test where a non-`!important` user rule lost to author) **or** an `@la
 strategy. A conservative starting sheet:
 
 ```css
-/* swerve force-dark (user origin). Coarse but safe; refine per-site later. */
+/* navgator force-dark (user origin). Coarse but safe; refine per-site later. */
 :root { color-scheme: dark !important; }
 html, body { background-color: #16181c !important; color: #d7dade !important; }
 img, video, picture, [style*="background-image"] {
@@ -281,7 +281,7 @@ is engine-internal), but it is a legitimate v1.
 
 ### 4.4 Per-site themes — embedder-driven targeting (no `@-moz-document`)
 
-Since `@-moz-document` is disabled in Servo, swerve cannot ship a single user stylesheet
+Since `@-moz-document` is disabled in Servo, navgator cannot ship a single user stylesheet
 that self-targets by domain. Instead the **embedder** decides what to attach:
 
 - Each tab's `UserContentManager` is composed by the engine from: global force-dark (if
@@ -330,12 +330,12 @@ v1 imports plain CSS userstyles only.)
 The chrome is a `file://` document. Referencing theme assets as `file://` paths is fragile
 (sandboxing, sync, marketplace installs from arbitrary dirs). Use Servo's
 **`ProtocolRegistry`** (`ServoBuilder::protocol_registry`, verified `register()` in
-`net/protocols/mod.rs`) to register a custom scheme, e.g. `swerve-asset://`:
+`net/protocols/mod.rs`) to register a custom scheme, e.g. `navgator-asset://`:
 
-- `swerve-asset://theme/<theme-id>/<path>` → resolved by a Rust `ProtocolHandler` to a
+- `navgator-asset://theme/<theme-id>/<path>` → resolved by a Rust `ProtocolHandler` to a
   file inside the installed theme's sandboxed directory (and *only* there — path-traversal
   checked).
-- Benefits: stable URLs in CSS (`--sw-wallpaper: url(swerve-asset://theme/aurora/bg.webp)`),
+- Benefits: stable URLs in CSS (`--sw-wallpaper: url(navgator-asset://theme/aurora/bg.webp)`),
   no leaking absolute paths, a single choke point to enforce theme-dir confinement and
   asset-type/size limits, and it works identically for chrome and (if ever needed) content.
 - The handler caps asset size and validates MIME by extension to keep the perf budget
@@ -349,26 +349,26 @@ right foundation for the marketplace.
 ## 7. Performance budget (the actual differentiator)
 
 GX's reputation is the cautionary tale: 650 MB–1.2 GB RAM, 80–100% CPU spikes
-([Opera forums][gx-cpu]). swerve's promise only holds if the theming layer is provably
+([Opera forums][gx-cpu]). navgator's promise only holds if the theming layer is provably
 cheap. Concrete budget and the reasons it's achievable here:
 
 | Metric | Budget | Why achievable / how enforced |
 | --- | --- | --- |
-| Chrome idle CPU | **~0% when not interacting** | The chrome is a static HTML doc; with `--sw-motion:0` or no running animation it should not repaint. swerve already redraws only on `notify_new_frame_ready` / input. **Rule: no infinite CSS animation in a default theme.** Marketplace themes with looping animation get a perf flag. |
-| Theme apply (token change) | **< 16 ms** (one frame) | It's a `setProperty` storm on one `:root` → single style recalc. Measure via a timestamp round-trip on `swerve:theme`. |
+| Chrome idle CPU | **~0% when not interacting** | The chrome is a static HTML doc; with `--sw-motion:0` or no running animation it should not repaint. navgator already redraws only on `notify_new_frame_ready` / input. **Rule: no infinite CSS animation in a default theme.** Marketplace themes with looping animation get a perf flag. |
+| Theme apply (token change) | **< 16 ms** (one frame) | It's a `setProperty` storm on one `:root` → single style recalc. Measure via a timestamp round-trip on `navgator:theme`. |
 | Theme/mod package install | **< 1 s** for a typical package | Unzip + validate + register assets; cap package size (§9). |
-| Per-theme RAM overhead | **< 5 MB** decoded | Cap wallpaper to one decoded image; cap dimensions; prefer WebP/AVIF; lazy-decode. Enforced in the `swerve-asset` handler. |
+| Per-theme RAM overhead | **< 5 MB** decoded | Cap wallpaper to one decoded image; cap dimensions; prefer WebP/AVIF; lazy-decode. Enforced in the `navgator-asset` handler. |
 | Animation cost | **GPU-composited only** | Animate `transform`/`opacity` (WebRender-composited) — **not** `width`/`top`/`background` (layout/paint). `filter` blur is GPU but expensive; cap blur radius in default themes. |
 | Sound latency | **< 50 ms** click→sound | Preload + decode `<audio>`/WebAudio buffers at theme load, not on event. If Servo audio latency is too high (measure — gstreamer is off by default; enabling it adds deps), ship sounds OFF by default and document the cost. |
 | Mod execution | **time-sliced; no busy loops** | Mod API runs in the chrome JS context; a watchdog disables a mod whose handlers exceed a frame-time budget repeatedly (§8). |
 
 **The hard rule that beats GX:** *a theme cannot run anything continuously.* GX's cost is
-partly the always-animating, always-shimmering UI. swerve's default themes are static;
+partly the always-animating, always-shimmering UI. navgator's default themes are static;
 motion happens only on interaction and only on composited properties. We expose this as a
 **theme perf score** (computed at install: counts infinite animations, blur usage,
 wallpaper size, mod handler count) shown in the marketplace and settings.
 
-**Measurement plan:** add an internal `swerve:perf` event the chrome can emit with
+**Measurement plan:** add an internal `navgator:perf` event the chrome can emit with
 `performance.now()` deltas around theme apply, and an engine-side frame-time/RSS sampler.
 Wire these into the headless Xvfb harness already used for milestone verification so perf
 regressions are caught in CI, not by users.
@@ -382,7 +382,7 @@ gesture). The chrome is JS we control, so mods are **scoped JS + CSS injected in
 chrome document**, not arbitrary native code. Security model:
 
 - **No raw DOM-of-trust:** a mod does *not* get free reign over `document`. It gets a
-  capability object `swerve.mods.api` with a curated, versioned surface:
+  capability object `navgator.mods.api` with a curated, versioned surface:
   ```js
   // exposed to a mod's sandboxed entry script
   const api = {
@@ -401,13 +401,13 @@ chrome document**, not arbitrary native code. Security model:
 - **Isolation:** each mod's script runs in its own scope (an IIFE/module with no access to
   other mods' state and no direct access to the chrome's internal functions). It cannot
   reach the content webviews directly — all engine actions go through `api`, which maps to
-  existing `swerve:` verbs the engine already validates. This reuses the trust boundary
-  swerve already has (the `swerve:` scheme is the only chrome→engine path).
+  existing `navgator:` verbs the engine already validates. This reuses the trust boundary
+  navgator already has (the `navgator:` scheme is the only chrome→engine path).
 - **No content access by default.** A mod cannot read page content; that would require an
   explicit, separately-prompted `content-read` capability backed by a per-site
   `UserScript` (and even then, page-world, not privileged).
 - **Watchdog:** the engine measures time spent in mod callbacks (the chrome can post
-  `swerve:mod-timing`); a mod that repeatedly blows the frame budget is auto-disabled with
+  `navgator:mod-timing`); a mod that repeatedly blows the frame budget is auto-disabled with
   a user notification. This is how we keep the GX perf failure mode from creeping in via
   third-party mods.
 - **CSS mods** are the common case and need no JS capability at all — they're just
@@ -422,10 +422,10 @@ later, much larger project — call it out as out of scope for theming v1.
 
 ## 9. Package format & manifest
 
-A theme or mod is a signed zip (`.swerve` / `.swervemod`) with a strict layout:
+A theme or mod is a signed zip (`.navgator` / `.navgatormod`) with a strict layout:
 
 ```
-my-theme.swerve
+my-theme.navgator
 ├── manifest.json          # required; schema below
 ├── theme.css              # optional: extra chrome rules (managed <style>)
 ├── tokens.json            # optional: token overrides (preferred over raw CSS)
@@ -438,8 +438,8 @@ my-theme.swerve
 │   └── click.ogg           # sounds
 ├── fonts/
 │   └── Inter-var.woff2     # bundled UI fonts (only if @font-face enabled)
-└── mod/                    # only in .swervemod
-    └── main.js             # sandboxed entry, uses swerve.mods.api
+└── mod/                    # only in .navgatormod
+    └── main.js             # sandboxed entry, uses navgator.mods.api
 ```
 
 ### 9.1 Manifest schema (theme)
@@ -454,7 +454,7 @@ my-theme.swerve
   "author": "nicks",
   "license": "MIT",
   "homepage": "https://lyku.example/themes/aurora",
-  "min_swerve": "0.5.0",
+  "min_navgator": "0.5.0",
 
   "scheme": "dark",
   "tokens": {
@@ -463,7 +463,7 @@ my-theme.swerve
     "--sw-color-surface": "#171a21",
     "--sw-font-ui": "\"Inter\", system-ui, sans-serif",
     "--sw-density": "1",
-    "--sw-wallpaper": "url(swerve-asset://theme/aurora/bg.webp)",
+    "--sw-wallpaper": "url(navgator-asset://theme/aurora/bg.webp)",
     "--sw-wallpaper-opacity": "0.10"
   },
   "fonts": [
@@ -495,7 +495,7 @@ my-theme.swerve
   "type": "mod",
   "name": "Vertical Tabs",
   "version": "0.3.1",
-  "min_swerve": "0.6.0",
+  "min_navgator": "0.6.0",
   "entry": "mod/main.js",
   "capabilities": ["ui", "tabs", "nav", "storage"],
   "css": "theme.css"
@@ -504,16 +504,16 @@ my-theme.swerve
 
 ### 9.3 Validation rules (enforced at install)
 
-- `schema` must match a supported version; `min_swerve` must be ≤ running version.
+- `schema` must match a supported version; `min_navgator` must be ≤ running version.
 - `tokens` keys must be in the known token namespace (`--sw-*`); unknown keys rejected
   (forward-compat: warn, don't apply).
 - All `src`/`assets`/`content`/font paths must resolve *inside* the package (no `..`, no
-  absolute paths) — the `swerve-asset` handler enforces the same at runtime.
+  absolute paths) — the `navgator-asset` handler enforces the same at runtime.
 - `capabilities` (mods) must be a subset of the known set; each maps to a prompt at install.
 - Total uncompressed size, per-asset size, and image dimensions are capped (perf + DoS).
 - The `perf` block is *recomputed* by the installer, not trusted from the manifest; the
   recomputed values drive the marketplace perf score.
-- **Signature:** packages are signed; swerve verifies the signature against the
+- **Signature:** packages are signed; navgator verifies the signature against the
   publisher's key (Lyku-issued for marketplace items; self-signed allowed for sideload
   with a clear "unverified" badge). Mods (which run JS) require a stronger trust signal
   than pure-CSS themes.
@@ -551,7 +551,7 @@ sync service (self-hostable later). Integration design:
   would contradict the entire anti-Chrome pitch.
 - **Hook into the existing bridge:** sync is an engine-side concern; on a sync pull that
   changes the active theme, the engine just runs the normal §3.3 apply path
-  (`swerve:theme` push). The chrome doesn't know or care that the change came from sync vs.
+  (`navgator:theme` push). The chrome doesn't know or care that the change came from sync vs.
   the settings UI. This keeps sync fully decoupled from the theming runtime.
 
 ---
@@ -564,12 +564,12 @@ sync service (self-hostable later). Integration design:
   *Community* (signed by author, unverified, clear badge). Mods always show their requested
   capabilities before install (like an app-store permission list).
 - **Install flow:** download blob → verify signature → validate manifest (§9.3) →
-  recompute perf → for mods, show capability prompt → register assets via `swerve-asset` →
+  recompute perf → for mods, show capability prompt → register assets via `navgator-asset` →
   available immediately (theme apply is hot; mod load injects into chrome).
 - **Anti-GX positioning:** the marketplace leads with the perf score and a "static by
   default" badge. The product story is explicitly "looks as good as GX, costs a fraction."
 - **Bootstrap without a server:** before Lyku marketplace exists, support **sideload** of
-  `.swerve`/`.swervemod` files from disk (drag-in or a file picker), with the unverified
+  `.navgator`/`.navgatormod` files from disk (drag-in or a file picker), with the unverified
   badge. This lets the ecosystem start (and lets us dogfood the format) before any backend
   is built — mirrors how Firefox userChrome/FirefoxCSS-Store communities operate
   ([userchrome.org][uc], [FirefoxCSS-Store][fcs]).
@@ -622,7 +622,7 @@ sync service (self-hostable later). Integration design:
 - Sideload signature UX: how do we let power users self-sign without a Lyku account while
   keeping the "unverified" warning honest and not annoying?
 - Does enabling `dom_fontface_enabled` at this rev actually load `@font-face` from a custom
-  `swerve-asset://` URL, or only from `file://`/`http`? Needs a test before promising
+  `navgator-asset://` URL, or only from `file://`/`http`? Needs a test before promising
   bundled fonts.
 
 ---
@@ -631,11 +631,11 @@ sync service (self-hostable later). Integration design:
 
 **P0 — foundations (no Servo risk, high leverage):**
 1. Refactor `chrome.css` onto the `--sw-*` token catalog (§3.2). Pure CSS; do it first.
-2. Add the `swerve:theme` apply path (engine push → `setProperty` on `:root` + managed
+2. Add the `navgator:theme` apply path (engine push → `setProperty` on `:root` + managed
    `<style>`). Reuses the existing bridge. This *is* chrome hot-reload (§4.1).
-3. Add a disk watcher in the engine that re-pushes `swerve:theme` on theme-file change —
+3. Add a disk watcher in the engine that re-pushes `navgator:theme` on theme-file change —
    the author DX loop.
-4. Add the `swerve:perf` round-trip + an engine RSS/frame sampler wired into the Xvfb
+4. Add the `navgator:perf` round-trip + an engine RSS/frame sampler wired into the Xvfb
    harness (§7). Measure before claiming "fast."
 
 **P1 — content theming (the visible differentiator):**
@@ -644,10 +644,10 @@ sync service (self-hostable later). Integration design:
 6. Implement force-dark via an injected `UserContentManager` user stylesheet +
    preview-then-persist (§4.3, §4.2).
 7. Implement per-site sheets with embedder-side URL→sheet targeting (§4.4).
-8. Add the `swerve-asset://` protocol handler for wallpapers (§6).
+8. Add the `navgator-asset://` protocol handler for wallpapers (§6).
 
 **P2 — packaging, fonts, sync:**
-9. Define + validate the `.swerve` manifest/format (§9); support sideload install.
+9. Define + validate the `.navgator` manifest/format (§9); support sideload install.
 10. Enable + verify `dom_fontface_enabled` + variable fonts; bundle 2–4 UI fonts (§5).
 11. Wire theme settings + user packages into Lyku sync with E2E-encrypted settings (§10).
 
