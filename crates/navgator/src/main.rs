@@ -340,6 +340,8 @@ struct Tab {
     can_forward: bool,
     zoom: f32,
     loading: bool,
+    /// Status text (hovered link URL / load status) for the bottom-left status bar.
+    status_text: Option<String>,
     /// A decoded favicon awaiting upload to a GPU texture (uploaded during the egui frame,
     /// since `load_texture` needs the `egui::Context`).
     favicon_pending: Option<egui::ColorImage>,
@@ -495,6 +497,25 @@ impl AppState {
             }
             self.draw_settings(ctx);
             self.draw_dialogs(ctx);
+
+            // Status bar (hovered link URL / load status), bottom-left over the page.
+            let status = self
+                .tabs
+                .borrow()
+                .get(self.active.get())
+                .and_then(|t| t.status_text.clone())
+                .filter(|s| !s.is_empty());
+            if let Some(status) = status {
+                egui::Area::new(egui::Id::new("statusbar"))
+                    .order(egui::Order::Foreground)
+                    .interactable(false)
+                    .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.label(status);
+                        });
+                    });
+            }
 
             // The page occupies everything below the chrome panels. (At the Context
             // level egui's available_rect doesn't reflect panel reservations, so derive
@@ -1070,6 +1091,7 @@ impl AppState {
                 can_forward: false,
                 zoom: 1.0,
                 loading: false,
+                status_text: None,
                 favicon_pending: None,
                 favicon_tex: None,
             });
@@ -1228,10 +1250,24 @@ impl WebViewDelegate for AppState {
 
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
         if let Some(i) = self.tab_index(&webview) {
-            self.tabs.borrow_mut()[i].loading = !matches!(status, LoadStatus::Complete);
+            {
+                let mut tabs = self.tabs.borrow_mut();
+                tabs[i].loading = !matches!(status, LoadStatus::Complete);
+                // A new load clears any stale hover/status text.
+                if !matches!(status, LoadStatus::Complete) {
+                    tabs[i].status_text = None;
+                }
+            }
             if matches!(status, LoadStatus::Complete) && i == self.active.get() {
                 self.location_dirty.set(false);
             }
+            self.window.request_redraw();
+        }
+    }
+
+    fn notify_status_text_changed(&self, webview: WebView, status: Option<String>) {
+        if let Some(i) = self.tab_index(&webview) {
+            self.tabs.borrow_mut()[i].status_text = status;
             self.window.request_redraw();
         }
     }
