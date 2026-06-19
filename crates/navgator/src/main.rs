@@ -371,6 +371,8 @@ struct AppState {
     show_settings: Cell<bool>,
     /// Active native overlays (dialogs, pickers, context menu).
     dialogs: RefCell<Vec<Dialog>>,
+    /// URLs of recently-closed tabs, for Ctrl+Shift+T (reopen most-recent).
+    closed_tabs: RefCell<Vec<String>>,
     fullscreen: Cell<bool>,
     scale: Cell<f64>,
     cursor: Cell<(f64, f64)>,
@@ -1039,6 +1041,10 @@ impl AppState {
             if i >= tabs.len() {
                 return;
             }
+            let url = tabs[i].url.clone();
+            if !url.is_empty() {
+                self.closed_tabs.borrow_mut().push(url);
+            }
             tabs.remove(i); // dropping the WebView handle closes the webview
         }
         if self.tabs.borrow().is_empty() {
@@ -1055,6 +1061,16 @@ impl AppState {
             active
         };
         self.select_tab(new_active);
+    }
+
+    /// Reopen the most-recently-closed tab (Ctrl+Shift+T).
+    fn reopen_closed_tab(&self) {
+        let url = self.closed_tabs.borrow_mut().pop();
+        if let Some(url) = url {
+            if let Ok(u) = Url::parse(&url) {
+                self.new_tab(u);
+            }
+        }
     }
 
     fn handle_ipc(&self, cmd: IpcCommand) {
@@ -1365,6 +1381,7 @@ impl ApplicationHandler<WakeUp> for App {
             focus_omnibox: Cell::new(false),
             show_settings: Cell::new(false),
             dialogs: RefCell::new(Vec::new()),
+            closed_tabs: RefCell::new(Vec::new()),
             fullscreen: Cell::new(false),
             scale: Cell::new(scale),
             cursor: Cell::new((0.0, 0.0)),
@@ -1552,7 +1569,11 @@ impl ApplicationHandler<WakeUp> for App {
                 if matches!(key_event.state, ElementState::Pressed) && state.ctrl.get() {
                     match &key_event.logical_key {
                         WinitKey::Character(c) if c.eq_ignore_ascii_case("t") => {
-                            state.new_tab(content_url());
+                            if state.shift.get() {
+                                state.reopen_closed_tab();
+                            } else {
+                                state.new_tab(content_url());
+                            }
                             return;
                         }
                         WinitKey::Character(c) if c.eq_ignore_ascii_case("w") => {
