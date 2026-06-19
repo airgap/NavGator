@@ -1,49 +1,47 @@
-//! navgator — a web browser whose UI ("chrome") is HTML rendered by Servo.
+//! navgator — a web browser with a native (egui) chrome and Servo as the page renderer.
 //!
-//! ## Milestone 4 (this file): tabs, + dynamic content rect (M3 polish)
-//! Builds on the M2 compositor and M3 bridge.
+//! ## Native-chrome architecture (the M6 pivot)
+//! The browser UI (toolbar, tabs, dialogs, menus) is drawn with **egui** directly over
+//! the page, instead of being a second Servo WebView rendering HTML. Servo renders only
+//! web content, into an `OffscreenRenderingContext`; each frame egui draws the page
+//! texture on its background layer (via `render_to_parent_callback`) and the chrome
+//! panels on top. This is how servoshell — Servo's own reference shell — is built.
 //!
-//! * **Tabs** — the content area is a `Vec<Tab>` of webviews that all share the one
-//!   `OffscreenRenderingContext`; only the active tab is shown and painted. The
-//!   engine pushes a tab model (`{tabs:[{title}], active, url, canGoBack/Forward}`)
-//!   to the chrome via the `navgator:state` event, and the chrome renders the tab
-//!   strip from it. Tab actions come back as `navgator:tab?new|select=i|close=i`.
-//! * **Dynamic content rect (retires fixed `CHROME_HEIGHT`)** — on load/resize the
-//!   chrome reports its content region's top (CSS px) via `navgator:ready?top=` /
-//!   `navgator:layout?top=`; the engine derives the content rect from that, so the
-//!   chrome/engine split is whatever the chrome actually lays out.
+//! Why: the old "UI is HTML rendered by Servo" model needed a two-webview compositor and
+//! a `navgator:` URL string-bridge, and made overlays (context menu, dialogs) painful.
+//! Native chrome makes them trivial (an egui `Area`/`Window`), is leaner (no second engine
+//! document), and gives a clean privilege boundary — privileged actions are direct Rust
+//! calls, not URL messages parsed from a webview. Security + performance are the pitch.
 //!
-//! A `Weak<AppState>` self-reference lets `&self` delegate callbacks build new tab
-//! webviews (which need the `Rc<AppState>` as their delegate).
-//!
-//! API verified against servo rev `ed1af70`. Bridge/compositing: see M2/M3 notes.
-//! TODO: IME/composition; popup/prompt/context-menu hooks; a less hacky command
-//! channel than `navgator:` navigation.
+//! A `Weak<AppState>` self-reference lets `&self` delegate callbacks build new tab webviews
+//! (which need the `Rc<AppState>` as their delegate).
 
 use std::cell::{Cell, RefCell};
 use std::env;
 use std::error::Error;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Write as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use base64::Engine as _;
+use egui::text::{CCursor, CCursorRange};
+use egui::text_edit::TextEditState;
+use egui::{LayerId, PaintCallback};
+use egui_glow::{CallbackFn, EguiGlow};
 use euclid::Scale;
 use euclid::default::{Point2D, Rect, Size2D};
-// Everything from the engine comes through navgator-engine, the only crate that
-// touches the Servo fork (ROADMAP §R2; docs/FORK.md). The IPC wire types come from
-// the servo-free navgator-protocol crate.
+// Everything from the engine comes through navgator-engine, the only crate that touches
+// the Servo fork (ROADMAP §R2; docs/FORK.md). IPC wire types come from navgator-protocol.
 use navgator_engine::{
-    CreateNewWebViewRequest, DevicePoint, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent,
-    LoadStatus, MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
+    AuthenticationRequest, ColorPicker, CreateNewWebViewRequest, DevicePoint, EmbedderControl,
+    EmbedderControlId, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent, LoadStatus,
+    MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
     NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, RenderingContext,
-    Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent,
-    WheelMode, WindowRenderingContext, AuthenticationRequest, ColorPicker, EmbedderControl,
-    EmbedderControlId, Image, PixelFormat, RgbColor, SelectElement, SelectElementOption,
-    SelectElementOptionOrOptgroup, SimpleDialog,
+    RgbColor, SelectElement, SelectElementOptionOrOptgroup, Servo, ServoBuilder, SimpleDialog,
+    WebView, WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent, WheelMode,
+    WindowRenderingContext,
 };
 use navgator_protocol::IpcCommand;
 use url::Url;
@@ -54,10 +52,6 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WinitKey, NamedKey};
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
-
-/// Fallback chrome height (logical px) used until the chrome reports its real
-/// content-region top via the `navgator:ready`/`navgator:layout` bridge command.
-const CHROME_HEIGHT_FALLBACK: u32 = 84;
 
 /// Width of the invisible window-edge band (logical px) that starts a resize on the
 /// borderless window — OS decorations are off, so we hit-test it and `drag_resize_window`.
@@ -75,9 +69,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let event_loop = EventLoop::with_user_event().build()?;
 
-    // Optional IPC control socket (M5): when NAVGATOR_IPC is set, an external process
-    // can drive the engine over it. `ipc_clients` holds connected clients' write
-    // halves so the UI thread can push state events to them.
     let ipc_clients: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
     if let Ok(path) = env::var("NAVGATOR_IPC") {
         start_ipc(path, event_loop.create_proxy(), ipc_clients.clone());
@@ -91,15 +82,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Resolve navgator's bundled web assets. A packaged build keeps them next to the
-/// executable in `<exe_dir>/resources/{chrome,content}`; `cargo run` (no such dir)
-/// falls back to the source tree. Without this, `env!("CARGO_MANIFEST_DIR")` would
-/// point at the build machine's path and a distributed binary couldn't find its UI.
+/// Resolve navgator's bundled web assets (the home page). A packaged build keeps them
+/// next to the executable in `<exe_dir>/resources/content`; `cargo run` falls back to the
+/// source tree.
 fn resources_dir() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let res = dir.join("resources");
-            if res.join("chrome/index.html").exists() {
+            if res.join("content/home.html").exists() {
                 return res;
             }
         }
@@ -110,10 +100,6 @@ fn resources_dir() -> PathBuf {
 fn file_url(rel: &str) -> Url {
     let p = resources_dir().join(rel);
     Url::from_file_path(&p).unwrap_or_else(|_| Url::parse("about:blank").unwrap())
-}
-
-fn chrome_url() -> Url {
-    file_url("chrome/index.html")
 }
 
 fn content_url() -> Url {
@@ -131,7 +117,7 @@ fn content_url() -> Url {
 struct Settings {
     /// Search URL template; `%s` is replaced with the URL-encoded query.
     search: String,
-    /// Chrome accent color (any CSS color).
+    /// UI accent color (any CSS-style `#rrggbb`).
     accent: String,
 }
 
@@ -176,56 +162,29 @@ fn save_settings(s: &Settings) {
     }
 }
 
-fn settings_url() -> Url {
-    file_url("content/settings.html")
-}
-
-fn content_size(window: PhysicalSize<u32>, top: u32) -> PhysicalSize<u32> {
-    PhysicalSize::new(
-        window.width.max(1),
-        window.height.saturating_sub(top).max(1),
-    )
-}
-
-/// Encode a decoded favicon image as a `data:image/png;base64,...` URL for the chrome.
-fn favicon_data_url(img: &Image) -> Option<String> {
-    let (w, h) = (img.width, img.height);
-    if w == 0 || h == 0 {
-        return None;
-    }
-    let src = img.data();
-    let mut rgba: Vec<u8> = Vec::with_capacity((w as usize) * (h as usize) * 4);
-    match img.format {
-        PixelFormat::RGBA8 => rgba.extend_from_slice(src),
-        PixelFormat::BGRA8 => {
-            for px in src.chunks_exact(4) {
-                rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+/// Percent-encode a search query for substitution into the `%s` of a search template.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
             }
-        }
-        PixelFormat::RGB8 => {
-            for px in src.chunks_exact(3) {
-                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
-            }
-        }
-        PixelFormat::K8 => {
-            for &k in src {
-                rgba.extend_from_slice(&[k, k, k, 255]);
-            }
-        }
-        PixelFormat::KA8 => {
-            for px in src.chunks_exact(2) {
-                rgba.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
-            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
         }
     }
-    let buf = image::RgbaImage::from_raw(w, h, rgba)?;
-    let mut png: Vec<u8> = Vec::new();
-    buf.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-        .ok()?;
-    Some(format!(
-        "data:image/png;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(&png)
-    ))
+    out
+}
+
+/// Truncate a tab title to `max` chars with an ellipsis.
+fn truncate_ellipsis(input: &str, max: usize) -> String {
+    if input.chars().count() > max {
+        let t: String = input.chars().take(max.saturating_sub(1)).collect();
+        format!("{t}…")
+    } else {
+        input.to_string()
+    }
 }
 
 /// Parse a `#rrggbb` string into an `RgbColor`.
@@ -251,24 +210,6 @@ fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
     }
 }
 
-/// Escape a string into a JS double-quoted string literal.
-fn js_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '<' => out.push_str("\\u003c"),
-            _ => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 /// Minimal winit→Servo key mapping (printable + editing/nav keys).
 fn winit_key_to_servo(key: &WinitKey) -> Option<Key> {
     Some(match key {
@@ -289,13 +230,7 @@ fn winit_key_to_servo(key: &WinitKey) -> Option<Key> {
     })
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Focused {
-    Chrome,
-    Content,
-}
-
-/// One browser tab: a content webview plus the state we mirror into the chrome.
+/// One browser tab: a content webview plus the state egui mirrors into the chrome.
 struct Tab {
     webview: WebView,
     url: String,
@@ -304,55 +239,108 @@ struct Tab {
     can_forward: bool,
     zoom: f32,
     loading: bool,
-    favicon: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SimpleKind {
+    Alert,
+    Confirm,
+    Prompt,
+}
+
+/// A flattened `<select>` option (a header has `id == None`).
+struct SelectOpt {
+    id: Option<usize>,
+    label: String,
+    disabled: bool,
+}
+
+/// A native (egui) overlay awaiting user input. The held engine request is consumed on
+/// resolve; dropping it without resolving cancels (the engine's default).
+enum Dialog {
+    Simple {
+        kind: SimpleKind,
+        message: String,
+        input: String,
+        handle: Option<SimpleDialog>,
+    },
+    Auth {
+        message: String,
+        user: String,
+        pass: String,
+        handle: Option<AuthenticationRequest>,
+    },
+    Select {
+        options: Vec<SelectOpt>,
+        handle: Option<SelectElement>,
+    },
+    Color {
+        hex: String,
+        handle: Option<ColorPicker>,
+    },
+    ContextMenu {
+        pos: egui::Pos2,
+    },
 }
 
 struct AppState {
-    window: Window,
     servo: Servo,
     window_context: Rc<WindowRenderingContext>,
     content_context: Rc<OffscreenRenderingContext>,
-    chrome: RefCell<Option<WebView>>,
+    egui: RefCell<EguiGlow>,
+    /// Height (logical px) of the egui chrome panels; the page begins below this.
+    toolbar_height: Cell<f32>,
+    /// The content webviews' current device-px size (page area), to avoid redundant resizes.
+    content_px: Cell<(u32, u32)>,
     tabs: RefCell<Vec<Tab>>,
     active: Cell<usize>,
-    /// Device-px y where the content region starts (effective; forced to 0 in fullscreen).
-    content_top: Cell<u32>,
-    /// The chrome's last reported content top; restored when leaving fullscreen.
-    chrome_top: Cell<u32>,
-    /// Whether the active page is in fullscreen (chrome hidden, content fills the window).
+    /// Address-bar text + whether the user has edited it without navigating.
+    location: RefCell<String>,
+    location_dirty: Cell<bool>,
+    /// Ctrl+L sets this; the next egui frame focuses + selects the address bar.
+    focus_omnibox: Cell<bool>,
+    /// Whether the native settings window is open.
+    show_settings: Cell<bool>,
+    /// Active native overlays (dialogs, pickers, context menu).
+    dialogs: RefCell<Vec<Dialog>>,
     fullscreen: Cell<bool>,
-    /// Whether a chrome overlay (modal dialog) is active; the content blit is skipped so
-    /// the chrome — which renders the whole window — shows the modal over the page region.
-    overlay: Cell<bool>,
-    /// The JS dialog awaiting a user response, if any.
-    pending_dialog: RefCell<Option<SimpleDialog>>,
-    /// An HTTP authentication request awaiting credentials, if any.
-    pending_auth: RefCell<Option<AuthenticationRequest>>,
-    /// A `<select>` element picker awaiting a choice, if any.
-    pending_select: RefCell<Option<SelectElement>>,
-    /// A `<input type=color>` picker awaiting a choice, if any.
-    pending_color: RefCell<Option<ColorPicker>>,
     scale: Cell<f64>,
     cursor: Cell<(f64, f64)>,
-    focused: Cell<Focused>,
-    /// Whether a Ctrl modifier is currently held (for tab shortcuts).
     ctrl: Cell<bool>,
-    /// Whether a Shift modifier is currently held (Ctrl+Shift+Tab, etc.).
     shift: Cell<bool>,
-    /// Self-reference so `&self` delegate callbacks can build webviews (which need
-    /// the `Rc<AppState>` as their delegate).
     weak_self: RefCell<Weak<AppState>>,
-    /// Connected IPC clients' write halves, for pushing state events.
     ipc_clients: Arc<Mutex<Vec<UnixStream>>>,
-    /// User settings (search engine, accent), persisted to disk.
     settings: RefCell<Settings>,
-    /// Proxy onto the winit loop, used to request app exit from `&self` callbacks.
     event_proxy: EventLoopProxy<WakeUp>,
+    /// Declared last so the GL contexts (which borrow the window) drop before it.
+    window: Window,
+}
+
+impl Drop for AppState {
+    fn drop(&mut self) {
+        let _ = self.content_context.make_current();
+        self.egui.borrow_mut().destroy();
+    }
 }
 
 impl AppState {
-    fn content_phys_size(&self) -> PhysicalSize<u32> {
-        content_size(self.window.inner_size(), self.content_top.get())
+    fn active_tab(&self) -> Option<WebView> {
+        self.tabs
+            .borrow()
+            .get(self.active.get())
+            .map(|t| t.webview.clone())
+    }
+
+    fn tab_index(&self, webview: &WebView) -> Option<usize> {
+        self.tabs.borrow().iter().position(|t| &t.webview == webview)
+    }
+
+    fn active_nav(&self) -> (bool, bool) {
+        self.tabs
+            .borrow()
+            .get(self.active.get())
+            .map(|t| (t.can_back, t.can_forward))
+            .unwrap_or((false, false))
     }
 
     /// If the cursor (physical px) sits in the window-edge resize band, the direction to
@@ -378,95 +366,428 @@ impl AppState {
         })
     }
 
-    fn active_tab(&self) -> Option<WebView> {
-        self.tabs.borrow().get(self.active.get()).map(|t| t.webview.clone())
-    }
-
-    fn tab_index(&self, webview: &WebView) -> Option<usize> {
-        self.tabs.borrow().iter().position(|t| &t.webview == webview)
-    }
-
-    fn render(&self) {
-        let chrome = self.chrome.borrow();
-        let (Some(chrome), Some(active)) = (chrome.as_ref(), self.active_tab()) else {
-            return;
-        };
-
+    // ── egui frame build + paint ───────────────────────────────────────────────
+    fn update(&self) {
         let _ = self.content_context.make_current();
-        active.paint();
-
-        let _ = self.window_context.make_current();
-        self.window_context.prepare_for_rendering();
-        chrome.paint();
-
-        // While a chrome overlay (modal) is up, skip the content blit so the chrome's
-        // full-window render (with the modal) shows over the page region.
-        if !self.overlay.get() {
-            if let Some(blit) = self.content_context.render_to_parent_callback() {
-                let win = self.window.inner_size();
-                let w = win.width.max(1) as i32;
-                let h = win.height.saturating_sub(self.content_top.get()).max(1) as i32;
-                let target = Rect::new(Point2D::new(0, 0), Size2D::new(w, h));
-                let gl = self.window_context.glow_gl_api();
-                blit(&*gl, target);
+        let mut egui = self.egui.borrow_mut();
+        egui.run(&self.window, |ctx| {
+            if !self.fullscreen.get() {
+                self.draw_chrome(ctx);
+            } else {
+                self.toolbar_height.set(0.0);
             }
-        }
+            self.draw_settings(ctx);
+            self.draw_dialogs(ctx);
 
+            // The page occupies everything below the chrome panels. (At the Context
+            // level egui's available_rect doesn't reflect panel reservations, so derive
+            // the content rect from the toolbar height measured during draw_chrome.)
+            let top = self.toolbar_height.get();
+            let screen = ctx.screen_rect();
+            let avail = egui::Rect::from_min_max(egui::pos2(0.0, top), screen.max);
+            let scale = ctx.pixels_per_point();
+            let w = (avail.width() * scale).round().max(1.0) as u32;
+            let h = (avail.height() * scale).round().max(1.0) as u32;
+            if (w, h) != self.content_px.get() {
+                self.content_px.set((w, h));
+                self.content_context.resize(PhysicalSize::new(w, h));
+                for t in self.tabs.borrow().iter() {
+                    t.webview.resize(PhysicalSize::new(w, h));
+                }
+            }
+            if let Some(tab) = self.active_tab() {
+                tab.paint();
+            }
+
+            // Blit the page's offscreen FBO onto egui's background layer; chrome draws over it.
+            if let Some(blit) = self.content_context.render_to_parent_callback() {
+                ctx.layer_painter(LayerId::background()).add(PaintCallback {
+                    rect: avail,
+                    callback: Arc::new(CallbackFn::new(move |info, painter| {
+                        let clip = info.viewport_in_pixels();
+                        let target = Rect::new(
+                            Point2D::new(clip.left_px, clip.from_bottom_px),
+                            Size2D::new(clip.width_px, clip.height_px),
+                        );
+                        blit(painter.gl(), target);
+                    })),
+                });
+            }
+        });
+        if egui.egui_ctx.has_requested_repaint() {
+            self.window.request_redraw();
+        }
+    }
+
+    fn paint(&self) {
+        let _ = self.content_context.make_current();
+        self.window_context.prepare_for_rendering();
+        self.egui.borrow_mut().paint(&self.window);
         self.window_context.present();
     }
 
-    fn resize(&self, size: PhysicalSize<u32>) {
-        self.window_context.resize(size);
-        if let Some(chrome) = self.chrome.borrow().as_ref() {
-            chrome.resize(size);
+    /// Toolbar (nav + address + window controls) and the tab strip.
+    fn draw_chrome(&self, ctx: &egui::Context) {
+        let frame = egui::Frame::default()
+            .fill(ctx.style().visuals.window_fill)
+            .inner_margin(6.0);
+        egui::TopBottomPanel::top("toolbar").frame(frame).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let (cb, cf) = self.active_nav();
+                if ui
+                    .add_enabled(cb, egui::Button::new("◀").frame(false).min_size(egui::vec2(24.0, 24.0)))
+                    .clicked()
+                {
+                    if let Some(t) = self.active_tab() {
+                        t.go_back(1);
+                    }
+                }
+                if ui
+                    .add_enabled(cf, egui::Button::new("▶").frame(false).min_size(egui::vec2(24.0, 24.0)))
+                    .clicked()
+                {
+                    if let Some(t) = self.active_tab() {
+                        t.go_forward(1);
+                    }
+                }
+                if ui
+                    .add(egui::Button::new("↻").frame(false).min_size(egui::vec2(24.0, 24.0)))
+                    .clicked()
+                {
+                    if let Some(t) = self.active_tab() {
+                        t.reload();
+                    }
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new("✕").frame(false).min_size(egui::vec2(28.0, 24.0))).clicked() {
+                        let _ = self.event_proxy.send_event(WakeUp::Exit);
+                    }
+                    if ui.add(egui::Button::new("▢").frame(false).min_size(egui::vec2(28.0, 24.0))).clicked() {
+                        self.window.set_maximized(!self.window.is_maximized());
+                    }
+                    if ui.add(egui::Button::new("—").frame(false).min_size(egui::vec2(28.0, 24.0))).clicked() {
+                        self.window.set_minimized(true);
+                    }
+                    if ui.add(egui::Button::new("☰").frame(false).min_size(egui::vec2(28.0, 24.0))).clicked() {
+                        self.show_settings.set(!self.show_settings.get());
+                    }
+
+                    let id = egui::Id::new("location_input");
+                    let mut loc = self.location.borrow_mut();
+                    let field = ui.add_sized(
+                        ui.available_size(),
+                        egui::TextEdit::singleline(&mut *loc)
+                            .id(id)
+                            .hint_text("Search or enter address"),
+                    );
+                    if field.changed() {
+                        self.location_dirty.set(true);
+                    }
+                    if self.focus_omnibox.take() {
+                        field.request_focus();
+                    }
+                    if field.gained_focus() {
+                        if let Some(mut st) = TextEditState::load(ui.ctx(), id) {
+                            st.cursor.set_char_range(Some(CCursorRange::two(
+                                CCursor::new(0),
+                                CCursor::new(loc.len()),
+                            )));
+                            st.store(ui.ctx(), id);
+                        }
+                    }
+                    if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        let raw = loc.trim().to_string();
+                        drop(loc);
+                        self.navigate_from_omnibox(&raw);
+                    }
+                });
+            });
+        });
+
+        let outer = egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
+            egui::ScrollArea::horizontal()
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let active = self.active.get();
+                        let count = self.tabs.borrow().len();
+                        for i in 0..count {
+                            let title = self.tabs.borrow()[i].title.clone();
+                            let tab = ui.add(egui::Button::selectable(
+                                i == active,
+                                truncate_ellipsis(&title, 20),
+                            ));
+                            if tab.clicked() && i != active {
+                                self.select_tab(i);
+                            }
+                            if tab.middle_clicked() {
+                                self.close_tab(i);
+                                break;
+                            }
+                            if ui.add(egui::Button::new("×").frame(false)).clicked() {
+                                self.close_tab(i);
+                                break;
+                            }
+                        }
+                        if ui.add(egui::Button::new("+").frame(false)).clicked() {
+                            self.new_tab(content_url());
+                        }
+                    });
+                });
+        });
+        self.toolbar_height.set(outer.response.rect.max.y);
+    }
+
+    fn draw_settings(&self, ctx: &egui::Context) {
+        if !self.show_settings.get() {
+            return;
         }
-        let csize = self.content_phys_size();
-        self.content_context.resize(csize);
-        for tab in self.tabs.borrow().iter() {
-            tab.webview.resize(csize);
+        let mut open = true;
+        egui::Window::new("Settings")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let mut s = self.settings.borrow_mut();
+                let mut changed = false;
+                ui.label("Search engine (use %s for the query)");
+                changed |= ui.text_edit_singleline(&mut s.search).changed();
+                ui.add_space(6.0);
+                ui.label("Accent color (#rrggbb)");
+                changed |= ui.text_edit_singleline(&mut s.accent).changed();
+                if changed {
+                    save_settings(&s);
+                }
+            });
+        if !open {
+            self.show_settings.set(false);
         }
+    }
+
+    fn draw_dialogs(&self, ctx: &egui::Context) {
+        let mut dialogs = self.dialogs.borrow_mut();
+        let mut i = 0;
+        while i < dialogs.len() {
+            if self.draw_one_dialog(ctx, &mut dialogs[i]) {
+                i += 1;
+            } else {
+                dialogs.remove(i);
+            }
+        }
+    }
+
+    /// Render one overlay; returns false when it has been resolved (and should be removed).
+    fn draw_one_dialog(&self, ctx: &egui::Context, dialog: &mut Dialog) -> bool {
+        let center = egui::Align2::CENTER_CENTER;
+        match dialog {
+            Dialog::Simple {
+                kind,
+                message,
+                input,
+                handle,
+            } => {
+                let mut keep = true;
+                let title = match kind {
+                    SimpleKind::Alert => "Alert",
+                    SimpleKind::Confirm => "Confirm",
+                    SimpleKind::Prompt => "Prompt",
+                };
+                egui::Window::new(title)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(center, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        ui.label(message.as_str());
+                        if *kind == SimpleKind::Prompt {
+                            ui.text_edit_singleline(input);
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("OK").clicked() {
+                                if let Some(h) = handle.take() {
+                                    match h {
+                                        SimpleDialog::Prompt(mut p) => {
+                                            p.set_current_value(input);
+                                            p.confirm();
+                                        }
+                                        other => other.confirm(),
+                                    }
+                                }
+                                keep = false;
+                            }
+                            if *kind != SimpleKind::Alert && ui.button("Cancel").clicked() {
+                                if let Some(h) = handle.take() {
+                                    h.dismiss();
+                                }
+                                keep = false;
+                            }
+                        });
+                    });
+                keep
+            }
+            Dialog::Auth {
+                message,
+                user,
+                pass,
+                handle,
+            } => {
+                let mut keep = true;
+                egui::Window::new("Authentication required")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(center, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        ui.label(message.as_str());
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Username");
+                            ui.text_edit_singleline(user);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Password");
+                            ui.add(egui::TextEdit::singleline(pass).password(true));
+                        });
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("OK").clicked() {
+                                if let Some(h) = handle.take() {
+                                    h.authenticate(user.clone(), pass.clone());
+                                }
+                                keep = false;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                handle.take();
+                                keep = false;
+                            }
+                        });
+                    });
+                keep
+            }
+            Dialog::Select { options, handle } => {
+                let mut keep = true;
+                egui::Window::new("Select")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(center, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                            for opt in options.iter() {
+                                let Some(id) = opt.id else {
+                                    ui.label(egui::RichText::new(&opt.label).weak());
+                                    continue;
+                                };
+                                if ui
+                                    .add_enabled(!opt.disabled, egui::Button::new(&opt.label).frame(false))
+                                    .clicked()
+                                {
+                                    if let Some(mut s) = handle.take() {
+                                        s.select(vec![id]);
+                                        s.submit();
+                                    }
+                                    keep = false;
+                                }
+                            }
+                        });
+                        ui.add_space(6.0);
+                        if ui.button("Cancel").clicked() {
+                            handle.take();
+                            keep = false;
+                        }
+                    });
+                keep
+            }
+            Dialog::Color { hex, handle } => {
+                let mut keep = true;
+                egui::Window::new("Choose a color")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(center, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Hex");
+                            ui.text_edit_singleline(hex);
+                        });
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("OK").clicked() {
+                                if let Some(mut p) = handle.take() {
+                                    if let Some(rgb) = parse_hex_color(hex) {
+                                        p.select(Some(rgb));
+                                    }
+                                    p.submit();
+                                }
+                                keep = false;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                handle.take();
+                                keep = false;
+                            }
+                        });
+                    });
+                keep
+            }
+            Dialog::ContextMenu { pos } => {
+                let mut keep = true;
+                let r = egui::Area::new(egui::Id::new("context_menu"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(*pos)
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.set_min_width(150.0);
+                            let (cb, cf) = self.active_nav();
+                            if ui.add_enabled(cb, egui::Button::new("Back").frame(false)).clicked() {
+                                if let Some(t) = self.active_tab() {
+                                    t.go_back(1);
+                                }
+                                keep = false;
+                            }
+                            if ui.add_enabled(cf, egui::Button::new("Forward").frame(false)).clicked() {
+                                if let Some(t) = self.active_tab() {
+                                    t.go_forward(1);
+                                }
+                                keep = false;
+                            }
+                            if ui.add(egui::Button::new("Reload").frame(false)).clicked() {
+                                if let Some(t) = self.active_tab() {
+                                    t.reload();
+                                }
+                                keep = false;
+                            }
+                        });
+                    });
+                if r.response.clicked_elsewhere() {
+                    keep = false;
+                }
+                keep
+            }
+        }
+    }
+
+    fn push_dialog(&self, d: Dialog) {
+        self.dialogs.borrow_mut().push(d);
         self.window.request_redraw();
     }
 
-    fn route(&self, x: f64, y: f64) -> Option<(WebView, DevicePoint)> {
-        // A modal overlay is drawn by the chrome across the whole window.
-        if self.overlay.get() {
-            return Some((self.chrome.borrow().clone()?, DevicePoint::new(x as f32, y as f32)));
+    fn navigate_from_omnibox(&self, raw: &str) {
+        if raw.is_empty() {
+            return;
         }
-        let top = self.content_top.get() as f64;
-        if y < top {
-            Some((self.chrome.borrow().clone()?, DevicePoint::new(x as f32, y as f32)))
+        let target = if raw.contains("://") {
+            raw.to_string()
+        } else if raw.contains('.') && !raw.contains(' ') {
+            format!("https://{raw}")
         } else {
-            Some((self.active_tab()?, DevicePoint::new(x as f32, (y - top) as f32)))
+            self.settings.borrow().search.replace("%s", &url_encode(raw))
+        };
+        if let (Ok(url), Some(tab)) = (Url::parse(&target), self.active_tab()) {
+            self.location_dirty.set(false);
+            tab.load(url);
         }
     }
 
-    fn focused_webview(&self) -> Option<WebView> {
-        match self.focused.get() {
-            Focused::Chrome => self.chrome.borrow().clone(),
-            Focused::Content => self.active_tab(),
-        }
-    }
-
-    fn is_chrome(&self, webview: &WebView) -> bool {
-        self.chrome.borrow().as_ref() == Some(webview)
-    }
-
-    fn chrome_eval(&self, js: String) {
-        if let Some(chrome) = self.chrome.borrow().as_ref() {
-            chrome.evaluate_javascript(js, |_| {});
-        }
-    }
-
-    /// Focus + select the address bar (Ctrl+L).
-    fn focus_omnibox(&self) {
-        self.focused.set(Focused::Chrome);
-        self.chrome_eval(
-            "var a=document.getElementById('address');if(a){a.focus();a.select();}".to_string(),
-        );
-    }
-
-    // ── Page zoom (Ctrl +/-/0, Ctrl+wheel) ────────────────────────────────────
+    // ── Page zoom ──────────────────────────────────────────────────────────────
     fn active_zoom(&self) -> f32 {
         self.tabs
             .borrow()
@@ -493,174 +814,6 @@ impl AppState {
         self.apply_zoom(1.0);
     }
 
-    // ── Modal overlay (JS dialogs) ─────────────────────────────────────────────
-    fn show_dialog(&self, dialog: SimpleDialog) {
-        let (kind, default) = match &dialog {
-            SimpleDialog::Alert(_) => ("alert", String::new()),
-            SimpleDialog::Confirm(_) => ("confirm", String::new()),
-            SimpleDialog::Prompt(p) => ("prompt", p.current_value().to_string()),
-        };
-        let message = dialog.message().to_string();
-        *self.pending_dialog.borrow_mut() = Some(dialog);
-        self.overlay.set(true);
-        self.focused.set(Focused::Chrome);
-        self.chrome_eval(format!(
-            "window.dispatchEvent(new CustomEvent('navgator:dialog',{{detail:{{kind:{},message:{},value:{}}}}}))",
-            js_string(kind),
-            js_string(&message),
-            js_string(&default),
-        ));
-        self.window.request_redraw();
-    }
-
-    fn resolve_dialog(&self, url: &Url) {
-        let dialog = self.pending_dialog.borrow_mut().take();
-        self.overlay.set(false);
-        self.focused.set(Focused::Content);
-        let Some(dialog) = dialog else {
-            self.window.request_redraw();
-            return;
-        };
-        let mut ok = false;
-        let mut value = String::new();
-        for (k, v) in url.query_pairs() {
-            match k.as_ref() {
-                "action" => ok = v == "ok",
-                "value" => value = v.to_string(),
-                _ => {}
-            }
-        }
-        if ok {
-            match dialog {
-                SimpleDialog::Prompt(mut p) => {
-                    p.set_current_value(&value);
-                    p.confirm();
-                }
-                other => other.confirm(),
-            }
-        } else {
-            dialog.dismiss();
-        }
-        self.window.request_redraw();
-    }
-
-    fn resolve_auth(&self, url: &Url) {
-        let request = self.pending_auth.borrow_mut().take();
-        self.overlay.set(false);
-        self.focused.set(Focused::Content);
-        let Some(request) = request else {
-            self.window.request_redraw();
-            return;
-        };
-        let mut ok = false;
-        let mut user = String::new();
-        let mut pass = String::new();
-        for (k, v) in url.query_pairs() {
-            match k.as_ref() {
-                "action" => ok = v == "ok",
-                "user" => user = v.to_string(),
-                "pass" => pass = v.to_string(),
-                _ => {}
-            }
-        }
-        if ok {
-            request.authenticate(user, pass);
-        }
-        // else: dropping `request` cancels the authentication.
-        self.window.request_redraw();
-    }
-
-    fn show_select(&self, select: SelectElement) {
-        let opt_json = |o: &SelectElementOption| {
-            format!(
-                "{{id:{},label:{},disabled:{}}}",
-                o.id,
-                js_string(&o.label),
-                o.is_disabled
-            )
-        };
-        let mut parts: Vec<String> = Vec::new();
-        for item in select.options() {
-            match item {
-                SelectElementOptionOrOptgroup::Option(o) => parts.push(opt_json(o)),
-                SelectElementOptionOrOptgroup::Optgroup { label, options } => {
-                    parts.push(format!("{{header:{}}}", js_string(label)));
-                    parts.extend(options.iter().map(&opt_json));
-                }
-            }
-        }
-        let opts = format!("[{}]", parts.join(","));
-        *self.pending_select.borrow_mut() = Some(select);
-        self.overlay.set(true);
-        self.focused.set(Focused::Chrome);
-        self.chrome_eval(format!(
-            "window.dispatchEvent(new CustomEvent('navgator:select',{{detail:{{options:{opts}}}}}))"
-        ));
-        self.window.request_redraw();
-    }
-
-    fn resolve_select(&self, url: &Url) {
-        let select = self.pending_select.borrow_mut().take();
-        self.overlay.set(false);
-        self.focused.set(Focused::Content);
-        let Some(mut select) = select else {
-            self.window.request_redraw();
-            return;
-        };
-        let chosen = url
-            .query_pairs()
-            .find(|(k, _)| k == "id")
-            .and_then(|(_, v)| v.parse::<usize>().ok());
-        if let Some(id) = chosen {
-            select.select(vec![id]);
-            select.submit();
-        }
-        // else: dropping `select` without submitting cancels the picker (no change).
-        self.window.request_redraw();
-    }
-
-    fn show_color(&self, picker: ColorPicker) {
-        let cur = picker
-            .current_color()
-            .unwrap_or(RgbColor { red: 0, green: 0, blue: 0 });
-        let hex = format!("#{:02x}{:02x}{:02x}", cur.red, cur.green, cur.blue);
-        *self.pending_color.borrow_mut() = Some(picker);
-        self.overlay.set(true);
-        self.focused.set(Focused::Chrome);
-        self.chrome_eval(format!(
-            "window.dispatchEvent(new CustomEvent('navgator:color',{{detail:{{value:{}}}}}))",
-            js_string(&hex)
-        ));
-        self.window.request_redraw();
-    }
-
-    fn resolve_color(&self, url: &Url) {
-        let picker = self.pending_color.borrow_mut().take();
-        self.overlay.set(false);
-        self.focused.set(Focused::Content);
-        let Some(mut picker) = picker else {
-            self.window.request_redraw();
-            return;
-        };
-        let mut ok = false;
-        let mut hex = String::new();
-        for (k, v) in url.query_pairs() {
-            match k.as_ref() {
-                "action" => ok = v == "ok",
-                "value" => hex = v.to_string(),
-                _ => {}
-            }
-        }
-        if ok {
-            if let Some(rgb) = parse_hex_color(&hex) {
-                picker.select(Some(rgb));
-            }
-            picker.submit();
-        }
-        // else: dropping `picker` without submitting cancels (no change).
-        self.window.request_redraw();
-    }
-
     // ── Tab management ────────────────────────────────────────────────────────
     fn new_tab(&self, url: Url) {
         let Some(me) = self.weak_self.borrow().upgrade() else {
@@ -674,9 +827,11 @@ impl AppState {
         self.adopt_tab(webview);
     }
 
-    /// Resize a freshly-built content webview, push it as a tab, and focus it.
     fn adopt_tab(&self, webview: WebView) {
-        webview.resize(self.content_phys_size());
+        let (w, h) = self.content_px.get();
+        if w > 0 && h > 0 {
+            webview.resize(PhysicalSize::new(w, h));
+        }
         let idx = {
             let mut tabs = self.tabs.borrow_mut();
             tabs.push(Tab {
@@ -687,7 +842,6 @@ impl AppState {
                 can_forward: false,
                 zoom: 1.0,
                 loading: false,
-                favicon: None,
             });
             tabs.len() - 1
         };
@@ -708,10 +862,10 @@ impl AppState {
                 }
             }
             tabs[i].webview.focus();
+            *self.location.borrow_mut() = tabs[i].url.clone();
         }
+        self.location_dirty.set(false);
         self.active.set(i);
-        self.focused.set(Focused::Content);
-        self.push_model();
         self.window.request_redraw();
     }
 
@@ -723,7 +877,6 @@ impl AppState {
             }
             tabs.remove(i); // dropping the WebView handle closes the webview
         }
-        // Closing the last tab closes the window (request exit on the winit loop).
         if self.tabs.borrow().is_empty() {
             let _ = self.event_proxy.send_event(WakeUp::Exit);
             return;
@@ -740,169 +893,6 @@ impl AppState {
         self.select_tab(new_active);
     }
 
-    /// Push the full tab model to the chrome UI.
-    fn push_model(&self) {
-        let (tabs_json, active, url, can_back, can_forward) = {
-            let tabs = self.tabs.borrow();
-            let active = self.active.get();
-            let mut j = String::from("[");
-            for (i, t) in tabs.iter().enumerate() {
-                if i > 0 {
-                    j.push(',');
-                }
-                let fav = t
-                    .favicon
-                    .as_deref()
-                    .map(js_string)
-                    .unwrap_or_else(|| "null".to_string());
-                j.push_str(&format!(
-                    "{{title:{},loading:{},favicon:{}}}",
-                    js_string(&t.title),
-                    t.loading,
-                    fav
-                ));
-            }
-            j.push(']');
-            let (url, cb, cf) = tabs
-                .get(active)
-                .map(|t| (t.url.clone(), t.can_back, t.can_forward))
-                .unwrap_or_default();
-            (j, active, url, cb, cf)
-        };
-        self.chrome_eval(format!(
-            "window.dispatchEvent(new CustomEvent('navgator:state',{{detail:{{tabs:{tabs_json},active:{active},url:{},canGoBack:{can_back},canGoForward:{can_forward}}}}}))",
-            js_string(&url)
-        ));
-    }
-
-    // ── Bridge command handling ───────────────────────────────────────────────
-    fn handle_chrome_command(&self, url: &Url) {
-        match url.path() {
-            "nav" => {
-                if let (Some(target), Some(tab)) = (
-                    url.fragment().and_then(|f| Url::parse(f).ok()),
-                    self.active_tab(),
-                ) {
-                    tab.load(target);
-                }
-            }
-            "back" => {
-                if let Some(tab) = self.active_tab() {
-                    tab.go_back(1);
-                }
-            }
-            "forward" => {
-                if let Some(tab) = self.active_tab() {
-                    tab.go_forward(1);
-                }
-            }
-            "reload" => {
-                if let Some(tab) = self.active_tab() {
-                    tab.reload();
-                }
-            }
-            "tab" => self.handle_tab_command(url),
-            "window" => self.handle_window_command(url),
-            "settings" => self.new_tab(settings_url()),
-            "dialog" => self.resolve_dialog(url),
-            "auth" => self.resolve_auth(url),
-            "select" => self.resolve_select(url),
-            "color" => self.resolve_color(url),
-            "ready" => {
-                self.apply_layout(url);
-                self.push_model();
-                self.apply_settings_to_chrome();
-            }
-            "layout" => self.apply_layout(url),
-            other => eprintln!("navgator: unknown chrome command '{other}'"),
-        }
-    }
-
-    fn handle_tab_command(&self, url: &Url) {
-        for (key, value) in url.query_pairs() {
-            match key.as_ref() {
-                "new" => self.new_tab(content_url()),
-                "select" => {
-                    if let Ok(i) = value.parse::<usize>() {
-                        self.select_tab(i);
-                    }
-                }
-                "close" => {
-                    if let Ok(i) = value.parse::<usize>() {
-                        self.close_tab(i);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// Window controls — we draw our own, the OS titlebar is disabled.
-    fn handle_window_command(&self, url: &Url) {
-        for (key, value) in url.query_pairs() {
-            if key == "action" {
-                match value.as_ref() {
-                    "minimize" => self.window.set_minimized(true),
-                    "maximize" => self.window.set_maximized(!self.window.is_maximized()),
-                    "close" => {
-                        let _ = self.event_proxy.send_event(WakeUp::Exit);
-                    }
-                    "drag" => {
-                        let _ = self.window.drag_window();
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    fn is_settings_page(&self, webview: &WebView) -> bool {
-        self.tab_index(webview)
-            .map(|i| self.tabs.borrow()[i].url.ends_with("content/settings.html"))
-            .unwrap_or(false)
-    }
-
-    /// Settings-page bridge: our trusted settings page can read/write settings.
-    fn handle_settings_command(&self, webview: &WebView, url: &Url) {
-        match url.path() {
-            "settings-get" => self.push_settings_to(webview),
-            "settings-set" => {
-                {
-                    let mut s = self.settings.borrow_mut();
-                    for (k, v) in url.query_pairs() {
-                        match k.as_ref() {
-                            "search" => s.search = v.to_string(),
-                            "accent" => s.accent = v.to_string(),
-                            _ => {}
-                        }
-                    }
-                    save_settings(&s);
-                }
-                self.apply_settings_to_chrome();
-                self.push_settings_to(webview);
-            }
-            _ => {}
-        }
-    }
-
-    fn settings_event_js(&self) -> String {
-        let s = self.settings.borrow();
-        format!(
-            "window.dispatchEvent(new CustomEvent('navgator:settings',{{detail:{{search:{},accent:{}}}}}))",
-            js_string(&s.search),
-            js_string(&s.accent)
-        )
-    }
-
-    fn push_settings_to(&self, webview: &WebView) {
-        webview.evaluate_javascript(self.settings_event_js(), |_| {});
-    }
-
-    fn apply_settings_to_chrome(&self) {
-        self.chrome_eval(self.settings_event_js());
-    }
-
-    /// Execute a command received over the IPC control socket.
     fn handle_ipc(&self, cmd: IpcCommand) {
         match cmd {
             IpcCommand::Navigate(url) => {
@@ -931,43 +921,21 @@ impl AppState {
         }
     }
 
-    /// Send a line to every connected IPC client, dropping any that error.
     fn ipc_emit(&self, line: &str) {
         let mut clients = self.ipc_clients.lock().unwrap();
         clients.retain_mut(|c| writeln!(c, "{line}").is_ok());
     }
 
-    /// Update the content-region top from a chrome-reported CSS-px value.
-    /// Set the effective content-region top and resize the content webviews to match.
-    fn set_content_top(&self, dev: u32) {
-        if dev == self.content_top.get() {
-            return;
+    /// Forward a mouse/keyboard/wheel input to the active page webview.
+    fn forward_to_page(&self, event: InputEvent) {
+        if let Some(tab) = self.active_tab() {
+            tab.notify_input_event(event);
         }
-        self.content_top.set(dev);
-        let csize = self.content_phys_size();
-        self.content_context.resize(csize);
-        for tab in self.tabs.borrow().iter() {
-            tab.webview.resize(csize);
-        }
-        self.window.request_redraw();
     }
 
-    fn apply_layout(&self, url: &Url) {
-        for (key, value) in url.query_pairs() {
-            if key == "top" {
-                if let Ok(css_top) = value.parse::<f64>() {
-                    let dev = (css_top * self.scale.get()).round().max(0.0) as u32;
-                    if dev < self.window.inner_size().height {
-                        self.chrome_top.set(dev);
-                        // In fullscreen the content covers the chrome (top forced to 0);
-                        // just remember the chrome's top so we can restore it on exit.
-                        if !self.fullscreen.get() {
-                            self.set_content_top(dev);
-                        }
-                    }
-                }
-            }
-        }
+    /// Device-px y at which the page area begins (below the chrome).
+    fn toolbar_dev(&self) -> f64 {
+        self.toolbar_height.get() as f64 * self.scale.get()
     }
 }
 
@@ -980,11 +948,10 @@ impl WebViewDelegate for AppState {
         if let Some(i) = self.tab_index(&webview) {
             self.tabs.borrow_mut()[i].url = url.to_string();
             self.ipc_emit(&format!("url {i} {url}"));
-            self.push_model();
-            // Hand the settings page its current values once it loads.
-            if url.as_str().ends_with("content/settings.html") {
-                self.push_settings_to(&webview);
+            if i == self.active.get() && !self.location_dirty.get() {
+                *self.location.borrow_mut() = url.to_string();
             }
+            self.window.request_redraw();
         }
     }
 
@@ -993,33 +960,27 @@ impl WebViewDelegate for AppState {
             let title = title.unwrap_or_else(|| "New tab".to_string());
             self.ipc_emit(&format!("title {i} {title}"));
             self.tabs.borrow_mut()[i].title = title;
-            self.push_model();
-        }
-    }
-
-    fn notify_favicon_changed(&self, webview: WebView) {
-        if let Some(i) = self.tab_index(&webview) {
-            let data_url = webview.favicon().and_then(|img| favicon_data_url(&img));
-            self.tabs.borrow_mut()[i].favicon = data_url;
-            self.push_model();
+            self.window.request_redraw();
         }
     }
 
     fn notify_history_changed(&self, webview: WebView, entries: Vec<Url>, current: usize) {
         if let Some(i) = self.tab_index(&webview) {
-            {
-                let mut tabs = self.tabs.borrow_mut();
-                tabs[i].can_back = current > 0;
-                tabs[i].can_forward = current + 1 < entries.len();
-            }
-            self.push_model();
+            let mut tabs = self.tabs.borrow_mut();
+            tabs[i].can_back = current > 0;
+            tabs[i].can_forward = current + 1 < entries.len();
+            drop(tabs);
+            self.window.request_redraw();
         }
     }
 
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
         if let Some(i) = self.tab_index(&webview) {
             self.tabs.borrow_mut()[i].loading = !matches!(status, LoadStatus::Complete);
-            self.push_model();
+            if matches!(status, LoadStatus::Complete) && i == self.active.get() {
+                self.location_dirty.set(false);
+            }
+            self.window.request_redraw();
         }
     }
 
@@ -1027,7 +988,6 @@ impl WebViewDelegate for AppState {
         let Some(me) = self.weak_self.borrow().upgrade() else {
             return;
         };
-        // window.open / target=_blank → a new foreground tab (sharing the content context).
         let webview = request
             .builder(self.content_context.clone())
             .hidpi_scale_factor(Scale::new(self.scale.get() as f32))
@@ -1044,63 +1004,97 @@ impl WebViewDelegate for AppState {
 
     fn show_embedder_control(&self, _webview: WebView, control: EmbedderControl) {
         match control {
-            EmbedderControl::SimpleDialog(dialog) => self.show_dialog(dialog),
-            EmbedderControl::SelectElement(select) => self.show_select(select),
-            EmbedderControl::ColorPicker(picker) => self.show_color(picker),
-            // File picker, IME, and context menu: not yet implemented.
+            EmbedderControl::SimpleDialog(dialog) => {
+                let (kind, input) = match &dialog {
+                    SimpleDialog::Alert(_) => (SimpleKind::Alert, String::new()),
+                    SimpleDialog::Confirm(_) => (SimpleKind::Confirm, String::new()),
+                    SimpleDialog::Prompt(p) => (SimpleKind::Prompt, p.current_value().to_string()),
+                };
+                let message = dialog.message().to_string();
+                self.push_dialog(Dialog::Simple {
+                    kind,
+                    message,
+                    input,
+                    handle: Some(dialog),
+                });
+            }
+            EmbedderControl::SelectElement(select) => {
+                let mut options = Vec::new();
+                for item in select.options() {
+                    match item {
+                        SelectElementOptionOrOptgroup::Option(o) => options.push(SelectOpt {
+                            id: Some(o.id),
+                            label: o.label.clone(),
+                            disabled: o.is_disabled,
+                        }),
+                        SelectElementOptionOrOptgroup::Optgroup { label, options: opts } => {
+                            options.push(SelectOpt {
+                                id: None,
+                                label: label.clone(),
+                                disabled: true,
+                            });
+                            for o in opts {
+                                options.push(SelectOpt {
+                                    id: Some(o.id),
+                                    label: o.label.clone(),
+                                    disabled: o.is_disabled,
+                                });
+                            }
+                        }
+                    }
+                }
+                self.push_dialog(Dialog::Select {
+                    options,
+                    handle: Some(select),
+                });
+            }
+            EmbedderControl::ColorPicker(picker) => {
+                let cur = picker.current_color().unwrap_or(RgbColor {
+                    red: 0,
+                    green: 0,
+                    blue: 0,
+                });
+                self.push_dialog(Dialog::Color {
+                    hex: format!("#{:02x}{:02x}{:02x}", cur.red, cur.green, cur.blue),
+                    handle: Some(picker),
+                });
+            }
+            // File picker, IME: not yet implemented.
             _ => {}
         }
     }
 
     fn hide_embedder_control(&self, _webview: WebView, _control_id: EmbedderControlId) {
-        // The page withdrew a control (e.g. navigated away mid-dialog); clear any overlay.
-        if self.pending_dialog.borrow().is_some() {
-            *self.pending_dialog.borrow_mut() = None;
-            self.overlay.set(false);
-            self.focused.set(Focused::Content);
-            self.window.request_redraw();
-        }
+        // The page withdrew a control (e.g. navigated away mid-dialog). Drop pending
+        // engine-backed overlays (dropping the handle cancels); keep any context menu.
+        self.dialogs
+            .borrow_mut()
+            .retain(|d| matches!(d, Dialog::ContextMenu { .. }));
+        self.window.request_redraw();
     }
 
     fn request_authentication(&self, _webview: WebView, request: AuthenticationRequest) {
         let url = request.url().to_string();
-        let proxy = request.for_proxy();
-        *self.pending_auth.borrow_mut() = Some(request);
-        self.overlay.set(true);
-        self.focused.set(Focused::Chrome);
-        let message = if proxy {
+        let message = if request.for_proxy() {
             format!("The proxy at {url} requires a username and password.")
         } else {
             format!("{url} requires a username and password.")
         };
-        self.chrome_eval(format!(
-            "window.dispatchEvent(new CustomEvent('navgator:auth',{{detail:{{message:{}}}}}))",
-            js_string(&message)
-        ));
-        self.window.request_redraw();
+        self.push_dialog(Dialog::Auth {
+            message,
+            user: String::new(),
+            pass: String::new(),
+            handle: Some(request),
+        });
     }
 
     fn notify_fullscreen_state_changed(&self, _webview: WebView, is_fullscreen: bool) {
         self.fullscreen.set(is_fullscreen);
-        let top = if is_fullscreen { 0 } else { self.chrome_top.get() };
-        self.set_content_top(top);
+        self.window.request_redraw();
     }
 
-    fn request_navigation(&self, webview: WebView, navigation_request: NavigationRequest) {
-        // `navgator:` navigations are bridge commands, not real loads. Honored from the
-        // chrome and from our own (trusted) settings page; ignored from any other web
-        // content so a random site can't drive the browser.
-        if navigation_request.url.scheme() == "navgator" {
-            let url = navigation_request.url.clone();
-            navigation_request.deny();
-            if self.is_chrome(&webview) {
-                self.handle_chrome_command(&url);
-            } else if self.is_settings_page(&webview) {
-                self.handle_settings_command(&webview, &url);
-            }
-        } else {
-            navigation_request.allow();
-        }
+    fn request_navigation(&self, _webview: WebView, navigation_request: NavigationRequest) {
+        navigation_request.allow();
     }
 }
 
@@ -1118,7 +1112,6 @@ impl ApplicationHandler<WakeUp> for App {
             App::Initial { waker, ipc_clients } => (waker.clone(), ipc_clients.clone()),
             App::Running(_) => return,
         };
-        // A proxy for requesting app exit from `&self` callbacks (window close, last tab).
         let event_proxy = waker.0.clone();
 
         let display_handle = event_loop.display_handle().expect("no display handle");
@@ -1127,6 +1120,7 @@ impl ApplicationHandler<WakeUp> for App {
                 Window::default_attributes()
                     .with_title("NavGator")
                     .with_decorations(false)
+                    .with_visible(false)
                     .with_inner_size(LogicalSize::new(1280.0, 800.0)),
             )
             .expect("failed to create window");
@@ -1134,58 +1128,53 @@ impl ApplicationHandler<WakeUp> for App {
 
         let inner = window.inner_size();
         let scale = window.scale_factor();
-        let content_top = (CHROME_HEIGHT_FALLBACK as f64 * scale).round() as u32;
 
         let window_context = Rc::new(
             WindowRenderingContext::new(display_handle, window_handle, inner)
                 .expect("failed to create WindowRenderingContext"),
         );
         let _ = window_context.make_current();
-
-        let content_context =
-            Rc::new(window_context.offscreen_context(content_size(inner, content_top)));
+        let content_context = Rc::new(window_context.offscreen_context(inner));
 
         let servo = ServoBuilder::default()
             .event_loop_waker(Box::new(waker))
             .build();
         servo.setup_logging();
 
+        let _ = content_context.make_current();
+        let egui = EguiGlow::new(event_loop, content_context.glow_gl_api(), None, None, false);
+        egui.egui_ctx.options_mut(|o| {
+            o.zoom_with_keyboard = false;
+        });
+        window.set_visible(true);
+
         let state = Rc::new(AppState {
-            window,
             servo,
             window_context,
             content_context,
-            chrome: RefCell::new(None),
+            egui: RefCell::new(egui),
+            toolbar_height: Cell::new(0.0),
+            content_px: Cell::new((0, 0)),
             tabs: RefCell::new(Vec::new()),
             active: Cell::new(0),
-            content_top: Cell::new(content_top),
-            chrome_top: Cell::new(content_top),
+            location: RefCell::new(String::new()),
+            location_dirty: Cell::new(false),
+            focus_omnibox: Cell::new(false),
+            show_settings: Cell::new(false),
+            dialogs: RefCell::new(Vec::new()),
             fullscreen: Cell::new(false),
-            overlay: Cell::new(false),
-            pending_dialog: RefCell::new(None),
-            pending_auth: RefCell::new(None),
-            pending_select: RefCell::new(None),
-            pending_color: RefCell::new(None),
             scale: Cell::new(scale),
             cursor: Cell::new((0.0, 0.0)),
-            focused: Cell::new(Focused::Content),
             ctrl: Cell::new(false),
             shift: Cell::new(false),
             weak_self: RefCell::new(Weak::new()),
             ipc_clients,
             settings: RefCell::new(load_settings()),
             event_proxy,
+            window,
         });
         *state.weak_self.borrow_mut() = Rc::downgrade(&state);
 
-        let chrome = WebViewBuilder::new(&state.servo, state.window_context.clone())
-            .url(chrome_url())
-            .hidpi_scale_factor(Scale::new(scale as f32))
-            .delegate(state.clone())
-            .build();
-        *state.chrome.borrow_mut() = Some(chrome);
-
-        // First tab.
         state.new_tab(content_url());
 
         *self = App::Running(state);
@@ -1209,46 +1198,93 @@ impl ApplicationHandler<WakeUp> for App {
         let App::Running(state) = self else { return };
         state.servo.spin_event_loop();
 
-        match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::RedrawRequested => state.render(),
-            WindowEvent::Resized(size) => state.resize(size),
-
+        // Window-level events handled before egui.
+        match &event {
+            WindowEvent::CloseRequested => {
+                event_loop.exit();
+                return;
+            }
+            WindowEvent::RedrawRequested => {
+                state.update();
+                state.paint();
+                return;
+            }
+            WindowEvent::Resized(size) => {
+                state.window_context.resize(*size);
+                state.window.request_redraw();
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                state.scale.set(*scale_factor);
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 state.cursor.set((position.x, position.y));
+            }
+            WindowEvent::ModifiersChanged(m) => {
+                state.ctrl.set(m.state().control_key());
+                state.shift.set(m.state().shift_key());
+            }
+            _ => {}
+        }
+
+        // Feed egui, then decide whether the event also goes to the page.
+        let resp = state.egui.borrow_mut().on_window_event(&state.window, &event);
+        if resp.repaint {
+            state.window.request_redraw();
+        }
+
+        let scale = state.scale.get();
+        let toolbar_dev = state.toolbar_dev();
+        let (cx, cy) = state.cursor.get();
+        let over_toolbar = cy < toolbar_dev;
+        let dialog_open = !state.dialogs.borrow().is_empty();
+
+        match event {
+            WindowEvent::CursorMoved { position, .. } => {
                 match state.resize_direction_at(position.x, position.y) {
                     Some(dir) => state.window.set_cursor(resize_cursor(dir)),
                     None => state.window.set_cursor(CursorIcon::Default),
                 }
-                if let Some((webview, point)) = state.route(position.x, position.y) {
-                    webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(
-                        point.into(),
+                if !(resp.consumed || over_toolbar || dialog_open) {
+                    state.forward_to_page(InputEvent::MouseMove(MouseMoveEvent::new(
+                        DevicePoint::new(position.x as f32, (position.y - toolbar_dev) as f32).into(),
                     )));
                 }
             }
 
             WindowEvent::MouseInput {
-                state: button_state,
+                state: bs,
                 button,
                 ..
             } => {
-                let (x, y) = state.cursor.get();
-                // Borderless-window edge resize: a left-press in the edge band starts a
-                // system resize; don't forward it to a webview.
-                if button == MouseButton::Left && matches!(button_state, ElementState::Pressed) {
-                    if let Some(dir) = state.resize_direction_at(x, y) {
+                // Borderless edge resize takes priority.
+                if button == MouseButton::Left && bs == ElementState::Pressed {
+                    if let Some(dir) = state.resize_direction_at(cx, cy) {
                         let _ = state.window.drag_resize_window(dir);
                         return;
                     }
                 }
-                if matches!(button_state, ElementState::Pressed) {
-                    let top = state.content_top.get() as f64;
-                    state
-                        .focused
-                        .set(if y < top { Focused::Chrome } else { Focused::Content });
+                // Right-click over the page → native context menu.
+                if button == MouseButton::Right
+                    && bs == ElementState::Pressed
+                    && !over_toolbar
+                    && !dialog_open
+                {
+                    state.push_dialog(Dialog::ContextMenu {
+                        pos: egui::pos2((cx / scale) as f32, (cy / scale) as f32),
+                    });
+                    return;
                 }
-                if let Some((webview, point)) = state.route(x, y) {
-                    let action = match button_state {
+                // Drag the window from empty toolbar space.
+                if button == MouseButton::Left
+                    && bs == ElementState::Pressed
+                    && over_toolbar
+                    && !resp.consumed
+                {
+                    let _ = state.window.drag_window();
+                    return;
+                }
+                if !(resp.consumed || over_toolbar || dialog_open) {
+                    let action = match bs {
                         ElementState::Pressed => MouseButtonAction::Down,
                         ElementState::Released => MouseButtonAction::Up,
                     };
@@ -1260,19 +1296,20 @@ impl ApplicationHandler<WakeUp> for App {
                         MouseButton::Forward => ServoMouseButton::Forward,
                         MouseButton::Other(v) => ServoMouseButton::Other(v),
                     };
-                    if matches!(button_state, ElementState::Pressed) {
-                        webview.focus();
+                    if bs == ElementState::Pressed {
+                        if let Some(tab) = state.active_tab() {
+                            tab.focus();
+                        }
                     }
-                    webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+                    state.forward_to_page(InputEvent::MouseButton(MouseButtonEvent::new(
                         action,
                         servo_button,
-                        point.into(),
+                        DevicePoint::new(cx as f32, (cy - toolbar_dev) as f32).into(),
                     )));
                 }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                // Ctrl+wheel zooms the active tab instead of scrolling.
                 if state.ctrl.get() {
                     let up = match delta {
                         MouseScrollDelta::LineDelta(_, ly) => ly > 0.0,
@@ -1285,29 +1322,30 @@ impl ApplicationHandler<WakeUp> for App {
                     }
                     return;
                 }
-                let (x, y) = state.cursor.get();
-                if let Some((webview, point)) = state.route(x, y) {
+                if !(resp.consumed || over_toolbar || dialog_open) {
                     let (dx, dy, mode) = match delta {
                         MouseScrollDelta::LineDelta(lx, ly) => {
                             ((lx * 76.0) as f64, (ly * 76.0) as f64, WheelMode::DeltaLine)
                         }
                         MouseScrollDelta::PixelDelta(p) => (p.x, p.y, WheelMode::DeltaPixel),
                     };
-                    let delta = WheelDelta { x: dx, y: dy, z: 0.0, mode };
-                    webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
-                        delta,
-                        point.into(),
+                    let wheel = WheelDelta {
+                        x: dx,
+                        y: dy,
+                        z: 0.0,
+                        mode,
+                    };
+                    state.forward_to_page(InputEvent::Wheel(WheelEvent::new(
+                        wheel,
+                        DevicePoint::new(cx as f32, (cy - toolbar_dev) as f32).into(),
                     )));
                 }
             }
 
-            WindowEvent::ModifiersChanged(modifiers) => {
-                state.ctrl.set(modifiers.state().control_key());
-                state.shift.set(modifiers.state().shift_key());
-            }
-
-            WindowEvent::KeyboardInput { event: key_event, .. } => {
-                // Ctrl-based tab shortcuts are handled here and not forwarded.
+            WindowEvent::KeyboardInput {
+                event: key_event, ..
+            } => {
+                // Ctrl-based shortcuts are handled here and not forwarded.
                 if matches!(key_event.state, ElementState::Pressed) && state.ctrl.get() {
                     match &key_event.logical_key {
                         WinitKey::Character(c) if c.eq_ignore_ascii_case("t") => {
@@ -1319,7 +1357,8 @@ impl ApplicationHandler<WakeUp> for App {
                             return;
                         }
                         WinitKey::Character(c) if c.eq_ignore_ascii_case("l") => {
-                            state.focus_omnibox();
+                            state.focus_omnibox.set(true);
+                            state.window.request_redraw();
                             return;
                         }
                         WinitKey::Character(c) if c.eq_ignore_ascii_case("r") => {
@@ -1341,7 +1380,6 @@ impl ApplicationHandler<WakeUp> for App {
                             return;
                         }
                         WinitKey::Character(c) => {
-                            // Ctrl+1..8 → that tab; Ctrl+9 → last tab.
                             if let Ok(n) = c.parse::<usize>() {
                                 let len = state.tabs.borrow().len();
                                 if n == 9 && len > 0 {
@@ -1356,7 +1394,6 @@ impl ApplicationHandler<WakeUp> for App {
                             let len = state.tabs.borrow().len();
                             if len > 1 {
                                 let cur = state.active.get();
-                                // Ctrl+Shift+Tab cycles backward.
                                 let next = if state.shift.get() {
                                     (cur + len - 1) % len
                                 } else {
@@ -1369,23 +1406,29 @@ impl ApplicationHandler<WakeUp> for App {
                         _ => {}
                     }
                 }
-                // Esc exits page fullscreen (the engine then restores the chrome).
-                if state.fullscreen.get()
-                    && matches!(key_event.state, ElementState::Pressed)
+                // Esc closes a context menu, else exits page fullscreen.
+                if matches!(key_event.state, ElementState::Pressed)
                     && matches!(key_event.logical_key, WinitKey::Named(NamedKey::Escape))
                 {
-                    if let Some(tab) = state.active_tab() {
-                        tab.exit_fullscreen();
+                    if !state.dialogs.borrow().is_empty() {
+                        state.dialogs.borrow_mut().clear();
+                        state.window.request_redraw();
+                        return;
                     }
-                    return;
+                    if state.fullscreen.get() {
+                        if let Some(tab) = state.active_tab() {
+                            tab.exit_fullscreen();
+                        }
+                        return;
+                    }
                 }
-                if let Some(key) = winit_key_to_servo(&key_event.logical_key) {
-                    let key_state = match key_event.state {
-                        ElementState::Pressed => KeyState::Down,
-                        ElementState::Released => KeyState::Up,
-                    };
-                    if let Some(webview) = state.focused_webview() {
-                        webview.notify_input_event(InputEvent::Keyboard(
+                if !(resp.consumed || dialog_open) {
+                    if let Some(key) = winit_key_to_servo(&key_event.logical_key) {
+                        let key_state = match key_event.state {
+                            ElementState::Pressed => KeyState::Down,
+                            ElementState::Released => KeyState::Up,
+                        };
+                        state.forward_to_page(InputEvent::Keyboard(
                             KeyboardEvent::from_state_and_key(key_state, key),
                         ));
                     }
@@ -1423,11 +1466,8 @@ impl EventLoopWaker for Waker {
 }
 
 /// Bind the IPC control socket and accept connections on a background thread.
-/// Each line read is parsed into an [`IpcCommand`] and posted to the UI loop; the
-/// connection's write half is registered to receive state events. Unix-only for now
-/// (Windows would use a named pipe).
 fn start_ipc(path: String, proxy: EventLoopProxy<WakeUp>, clients: Arc<Mutex<Vec<UnixStream>>>) {
-    let _ = std::fs::remove_file(&path); // clear a stale socket
+    let _ = std::fs::remove_file(&path);
     let listener = match UnixListener::bind(&path) {
         Ok(listener) => listener,
         Err(e) => {

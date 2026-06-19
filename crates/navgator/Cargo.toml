@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MPL-2.0"
-description = "A web browser whose UI (chrome) is HTML rendered by the Servo engine"
+description = "A web browser with native (egui) chrome and Servo as the page renderer"
 repository = "https://github.com/airgap/NavGator"
 
 [[bin]]
@@ -23,7 +23,9 @@ url = "2.5"
 # Servo does TLS through rustls; a crypto provider is installed at startup.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 
-# Favicon encoding: decoded pixels → PNG → base64 data URL. Both are already in the
-# lockfile transitively (via the engine), so these add no new compiled crates.
-image = { version = "0.25", default-features = false, features = ["png"] }
-base64 = "0.22"
+# Native chrome: egui drawn over the page (same versions servoshell uses, so the lock
+# resolves cleanly against the engine's glow/winit/raw-window-handle).
+egui = "0.34.3"
+egui_glow = { version = "0.34.3", features = ["winit"] }
+egui-winit = { version = "0.34.3", default-features = false, features = ["clipboard", "wayland"] }
+glow = "0.17"
