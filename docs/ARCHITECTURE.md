@@ -1,11 +1,28 @@
 # navgator architecture
 
-navgator is a web browser whose **chrome (its own UI) is HTML rendered by Servo**,
-with web pages rendered by Servo alongside it — and the engine is meant to also be
-reusable by other apps (Tauri-style) later.
+navgator is a web browser with a **native (Rust / egui) chrome** and **Servo as the page
+renderer** — the engine is also meant to be reusable by other apps (Tauri-style) later.
 
-This document records *why* the design is shaped the way it is, and the order we
-build it in. Read it before changing the rendering/compositing code.
+This document records *why* the design is shaped the way it is. Read it before changing the
+rendering/compositing code.
+
+> ## M6 pivot — native chrome (current architecture)
+>
+> The chrome (toolbar, tabs, address bar, menus, dialogs) is drawn with **egui directly over
+> the page**, not as a second Servo webview of HTML. Servo renders web content into an
+> `OffscreenRenderingContext`; each frame egui blits that texture onto its background layer
+> (`render_to_parent_callback`) and draws the chrome on top. This is servoshell's model.
+>
+> It replaced the original "chrome = a second Servo WebView rendering HTML, bridged over a
+> `navgator:` URL scheme" design, which forced a fragile, non-deterministic two-webview
+> compositor and made overlays (context menu, dialogs, pickers) painful. Native chrome makes
+> overlays trivial egui `Area`/`Window`s (no engine fork patch), is leaner (no second engine
+> document), and gives a clean privilege boundary — privileged actions are direct Rust calls,
+> not URL messages from a webview. **Security + performance are the product pitch.**
+>
+> **The sections below — from "Why not an `<iframe>`" through the compositing notes — describe
+> the pre-M6 HTML-chrome design and are kept for history.** The Verso lesson and the
+> high-level-`libservo` + pinned-rev engine strategy (next section) remain in force.
 
 ---
 
