@@ -19,7 +19,7 @@ pub use servo::{
 
 pub use servo::{
     AuthenticationRequest, ColorPicker, EmbedderControl, EmbedderControlId, FilePicker,
-    FilterPattern, Image, PixelFormat, RgbColor, SelectElement,
+    FilterPattern, Image, PermissionRequest, PixelFormat, RgbColor, SelectElement,
     SelectElementOption, SelectElementOptionOrOptgroup, SimpleDialog,
 };
 

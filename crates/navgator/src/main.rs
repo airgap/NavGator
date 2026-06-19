@@ -40,8 +40,8 @@ use navgator_engine::{
     EmbedderControlId, EventLoopWaker, FilePicker, FilterPattern, Image, InputEvent, Key, KeyState,
     KeyboardEvent, LoadStatus,
     MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
-    NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, PixelFormat,
-    Preferences, RenderingContext,
+    NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, PermissionRequest,
+    PixelFormat, Preferences, RenderingContext,
     RgbColor, SelectElement, SelectElementOptionOrOptgroup, Servo, ServoBuilder, SimpleDialog,
     WebView, WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent, WheelMode,
     WindowRenderingContext,
@@ -181,6 +181,10 @@ fn navgator_preferences() -> Preferences {
     p.dom_web_animations_enabled = true; // Web Animations API
     p.dom_visual_viewport_enabled = true; // zoom/viewport-aware sites
     p.dom_async_clipboard_enabled = true; // navigator.clipboard
+    // Permission-gated APIs — expose them; actual grants are prompted (request_permission).
+    p.dom_permissions_enabled = true;
+    p.dom_notification_enabled = true;
+    p.dom_geolocation_enabled = true;
     // Tier-1 — real backends, high payoff (validate hardening before relying on them).
     p.dom_indexeddb_enabled = true; // rusqlite backend → web apps / PWAs
     p.dom_webgl2_enabled = true; // 3D / maps / games
@@ -337,6 +341,10 @@ enum Dialog {
     File {
         dialog: FileDialog,
         handle: Option<FilePicker>,
+    },
+    Permission {
+        message: String,
+        handle: Option<PermissionRequest>,
     },
     ContextMenu {
         pos: egui::Pos2,
@@ -856,6 +864,32 @@ impl AppState {
                 }
                 keep
             }
+            Dialog::Permission { message, handle } => {
+                let mut keep = true;
+                egui::Window::new("Permission request")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(center, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        ui.label(message.as_str());
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Allow").clicked() {
+                                if let Some(r) = handle.take() {
+                                    r.allow();
+                                }
+                                keep = false;
+                            }
+                            if ui.button("Deny").clicked() {
+                                if let Some(r) = handle.take() {
+                                    r.deny();
+                                }
+                                keep = false;
+                            }
+                        });
+                    });
+                keep
+            }
             Dialog::ContextMenu { pos } => {
                 let mut keep = true;
                 let r = egui::Area::new(egui::Id::new("context_menu"))
@@ -1241,6 +1275,17 @@ impl WebViewDelegate for AppState {
             message,
             user: String::new(),
             pass: String::new(),
+            handle: Some(request),
+        });
+    }
+
+    fn request_permission(&self, _webview: WebView, request: PermissionRequest) {
+        let message = format!(
+            "This site is requesting permission: {:?}",
+            request.feature()
+        );
+        self.push_dialog(Dialog::Permission {
+            message,
             handle: Some(request),
         });
     }
