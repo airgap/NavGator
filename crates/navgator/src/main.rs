@@ -36,9 +36,10 @@ use euclid::default::{Point2D, Rect, Size2D};
 // the Servo fork (ROADMAP §R2; docs/FORK.md). IPC wire types come from navgator-protocol.
 use navgator_engine::{
     AuthenticationRequest, ColorPicker, CreateNewWebViewRequest, DevicePoint, EmbedderControl,
-    EmbedderControlId, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent, LoadStatus,
+    EmbedderControlId, EventLoopWaker, Image, InputEvent, Key, KeyState, KeyboardEvent, LoadStatus,
     MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
-    NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, RenderingContext,
+    NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, PixelFormat,
+    RenderingContext,
     RgbColor, SelectElement, SelectElementOptionOrOptgroup, Servo, ServoBuilder, SimpleDialog,
     WebView, WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent, WheelMode,
     WindowRenderingContext,
@@ -187,6 +188,33 @@ fn truncate_ellipsis(input: &str, max: usize) -> String {
     }
 }
 
+/// Convert a decoded favicon (any `PixelFormat`) into an `egui::ColorImage`.
+fn favicon_color_image(image: &Image) -> egui::ColorImage {
+    let w = image.width as usize;
+    let h = image.height as usize;
+    match image.format {
+        PixelFormat::K8 => egui::ColorImage::from_gray([w, h], image.data()),
+        PixelFormat::KA8 => {
+            let data: Vec<u8> = image
+                .data()
+                .chunks_exact(2)
+                .flat_map(|p| [p[0], p[0], p[0], p[1]])
+                .collect();
+            egui::ColorImage::from_rgba_unmultiplied([w, h], &data)
+        }
+        PixelFormat::RGB8 => egui::ColorImage::from_rgb([w, h], image.data()),
+        PixelFormat::RGBA8 => egui::ColorImage::from_rgba_unmultiplied([w, h], image.data()),
+        PixelFormat::BGRA8 => {
+            let data: Vec<u8> = image
+                .data()
+                .chunks_exact(4)
+                .flat_map(|c| [c[2], c[1], c[0], c[3]])
+                .collect();
+            egui::ColorImage::from_rgba_unmultiplied([w, h], &data)
+        }
+    }
+}
+
 /// Parse a `#rrggbb` string into an `RgbColor`.
 fn parse_hex_color(s: &str) -> Option<RgbColor> {
     let s = s.trim().trim_start_matches('#');
@@ -239,6 +267,10 @@ struct Tab {
     can_forward: bool,
     zoom: f32,
     loading: bool,
+    /// A decoded favicon awaiting upload to a GPU texture (uploaded during the egui frame,
+    /// since `load_texture` needs the `egui::Context`).
+    favicon_pending: Option<egui::ColorImage>,
+    favicon_tex: Option<egui::TextureHandle>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -371,6 +403,7 @@ impl AppState {
         let _ = self.content_context.make_current();
         let mut egui = self.egui.borrow_mut();
         egui.run(&self.window, |ctx| {
+            self.load_favicons(ctx);
             if !self.fullscreen.get() {
                 self.draw_chrome(ctx);
             } else {
@@ -424,6 +457,16 @@ impl AppState {
         self.window_context.prepare_for_rendering();
         self.egui.borrow_mut().paint(&self.window);
         self.window_context.present();
+    }
+
+    /// Upload any decoded favicons to GPU textures (needs the egui Context, so done here).
+    fn load_favicons(&self, ctx: &egui::Context) {
+        for (i, tab) in self.tabs.borrow_mut().iter_mut().enumerate() {
+            if let Some(img) = tab.favicon_pending.take() {
+                tab.favicon_tex =
+                    Some(ctx.load_texture(format!("favicon-{i}"), img, Default::default()));
+            }
+        }
     }
 
     /// Toolbar (nav + address + window controls) and the tab strip.
@@ -513,7 +556,19 @@ impl AppState {
                         let active = self.active.get();
                         let count = self.tabs.borrow().len();
                         for i in 0..count {
-                            let title = self.tabs.borrow()[i].title.clone();
+                            let (title, fav) = {
+                                let tabs = self.tabs.borrow();
+                                let fav = tabs[i].favicon_tex.as_ref().map(|t| {
+                                    egui::load::SizedTexture::new(t.id(), egui::vec2(16.0, 16.0))
+                                });
+                                (tabs[i].title.clone(), fav)
+                            };
+                            if let Some(sized) = fav {
+                                ui.add(
+                                    egui::Image::from_texture(sized)
+                                        .fit_to_exact_size(egui::vec2(16.0, 16.0)),
+                                );
+                            }
                             let tab = ui.add(egui::Button::selectable(
                                 i == active,
                                 truncate_ellipsis(&title, 20),
@@ -842,6 +897,8 @@ impl AppState {
                 can_forward: false,
                 zoom: 1.0,
                 loading: false,
+                favicon_pending: None,
+                favicon_tex: None,
             });
             tabs.len() - 1
         };
@@ -970,6 +1027,14 @@ impl WebViewDelegate for AppState {
             tabs[i].can_back = current > 0;
             tabs[i].can_forward = current + 1 < entries.len();
             drop(tabs);
+            self.window.request_redraw();
+        }
+    }
+
+    fn notify_favicon_changed(&self, webview: WebView) {
+        if let Some(i) = self.tab_index(&webview) {
+            let img = webview.favicon().map(|f| favicon_color_image(&f));
+            self.tabs.borrow_mut()[i].favicon_pending = img;
             self.window.request_redraw();
         }
     }
