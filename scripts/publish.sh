@@ -43,13 +43,14 @@ export REGISTER_URL="${REGISTER_URL:-https://api.lyku.org/register-app-release}"
 wr() { parabun x wrangler@3 "$@"; }
 
 published=0
-for f in "$DIST"/navgator-*.tar.gz "$DIST"/navgator-*.AppImage "$DIST"/navgator-*.dmg; do
+for f in "$DIST"/navgator-*.tar.gz "$DIST"/navgator-*.AppImage "$DIST"/navgator-*.dmg "$DIST"/navgator-*.apk "$DIST"/navgator-*.aab; do
     [ -f "$f" ] || continue
     name="$(basename "$f")"
     size="$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")"
     case "$name" in
         *-linux-*) plat=linux ;;
         *-macos-*) plat=macos ;;
+        *-android-*) plat=android ;;
         *) plat=linux ;;
     esac
     for chan in "v$VERSION" "dev-$SHA" "latest"; do

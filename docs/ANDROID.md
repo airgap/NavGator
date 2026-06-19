@@ -36,12 +36,32 @@ Two NDK-specific fixes are required (both are standard, not NavGator-specific):
 engine builds without media there. Android `<video>`/`<audio>` will need a separate
 servo-media backend later.
 
-## Remaining for a runnable APK (next phase)
-All tractable embedder-side work — no engine cross-compile risk left:
-- **`android_main` entry**: restructure navgator from a bin (`fn main`) to a lib + cdylib
-  with `#[no_mangle] android_main(AndroidApp)` (via `android-activity` / winit's
-  `EventLoopBuilderExtAndroid::with_android_app`), keeping a thin desktop `main`.
+## APK — built, signed, installable ✅
+`navgator` is now a lib (rlib + cdylib) with `desktop_main()` + an `android_main(AndroidApp)`
+entry (winit `EventLoopBuilderExtAndroid::with_android_app`); `src/main.rs` is a thin desktop
+binary. **cargo-apk produces a signed APK:**
+```sh
+cargo install cargo-apk
+# bindgen needs the NDK sysroot (cargo-apk, unlike cargo-ndk, doesn't set it):
+env "BINDGEN_EXTRA_CLANG_ARGS_aarch64-linux-android=--sysroot=$NDK_TC/sysroot --target=aarch64-linux-android30" \
+  cargo apk build --release --manifest-path crates/navgator/Cargo.toml --lib
+```
+`scripts/android-apk.sh` wraps this (toolchain setup, the libgcc shim, the bindgen env) and
+stages `dist/navgator-<ver>-android-arm64.apk`. The APK is `org.airgap.navgator` (in
+`[package.metadata.android]`): NativeActivity → `android_main`, **`libc++_shared.so` bundled**,
+**INTERNET permission**, minSdk 30. Verified well-formed via `aapt2 dump badging`.
+
+## CI publishing ✅
+The Jenkinsfile **Android APK** stage runs `scripts/android-apk.sh` on the linux agent and
+stashes the APK; the Publish stage uploads it to R2 + registers it at `lyku.org/apps/NavGator`
+(`publish.sh` globs `.apk`/`.aab`, platform `android`). The stage **no-ops gracefully** if the
+runner lacks the Android SDK/NDK — so it never gates the desktop build. **To enable Android
+publishing, the CI runner needs the Android SDK + NDK 27 provisioned** (and a JDK for apksigner).
+
+## Remaining (runtime validation + polish)
+- **Emulator/device smoke test**: confirm it launches + renders. The APK is arm64-v8a; on an
+  x86_64 host emulator that needs an arm64 system-image (slow QEMU translation) or build an
+  `x86_64-linux-android` APK to match an x86_64 emulator. Physical arm64 device is simplest.
 - **Touch input** → Servo (currently only mouse is forwarded).
 - **Mobile egui layout** (touch-sized toolbar/tabs; likely a bottom bar).
-- **APK packaging** (`cargo-apk` or `cargo-ndk` + a gradle wrapper) with a manifest.
-- **Emulator smoke test** via adb (the dev box has system-images + adb).
+- **AAB** (Play Store) would need a gradle wrapper; the APK suffices for lyku.org/apps sideload.
