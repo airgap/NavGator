@@ -422,7 +422,7 @@ impl AppState {
             // level egui's available_rect doesn't reflect panel reservations, so derive
             // the content rect from the toolbar height measured during draw_chrome.)
             let top = self.toolbar_height.get();
-            let screen = ctx.screen_rect();
+            let screen = ctx.content_rect();
             let avail = egui::Rect::from_min_max(egui::pos2(0.0, top), screen.max);
             let scale = ctx.pixels_per_point();
             let w = (avail.width() * scale).round().max(1.0) as u32;
@@ -478,7 +478,7 @@ impl AppState {
     /// Toolbar (nav + address + window controls) and the tab strip.
     fn draw_chrome(&self, ctx: &egui::Context) {
         let frame = egui::Frame::default()
-            .fill(ctx.style().visuals.window_fill)
+            .fill(ctx.global_style().visuals.window_fill)
             .inner_margin(6.0);
         egui::TopBottomPanel::top("toolbar").frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
