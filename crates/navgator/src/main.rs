@@ -172,6 +172,93 @@ fn save_settings(s: &Settings) {
     }
 }
 
+/// One visited page (frecency = visit count, for autocomplete ranking later).
+struct HistoryEntry {
+    url: String,
+    title: String,
+    visits: u32,
+}
+
+struct Bookmark {
+    url: String,
+    title: String,
+}
+
+/// Persisted browsing profile (history + bookmarks), stored as TSV under the config dir.
+#[derive(Default)]
+struct Profile {
+    history: Vec<HistoryEntry>,
+    bookmarks: Vec<Bookmark>,
+}
+
+fn config_file(name: &str) -> Option<PathBuf> {
+    let base = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("navgator").join(name))
+}
+
+/// TSV cell sanitizer — fields can't contain the tab/newline separators.
+fn tsv_field(s: &str) -> String {
+    s.replace(['\t', '\n'], " ")
+}
+
+fn load_profile() -> Profile {
+    let mut p = Profile::default();
+    if let Some(text) = config_file("history.tsv").and_then(|p| std::fs::read_to_string(p).ok()) {
+        for line in text.lines() {
+            let mut it = line.splitn(3, '\t');
+            if let (Some(u), Some(t), Some(v)) = (it.next(), it.next(), it.next()) {
+                p.history.push(HistoryEntry {
+                    url: u.to_string(),
+                    title: t.to_string(),
+                    visits: v.parse().unwrap_or(1),
+                });
+            }
+        }
+    }
+    if let Some(text) = config_file("bookmarks.tsv").and_then(|p| std::fs::read_to_string(p).ok()) {
+        for line in text.lines() {
+            let mut it = line.splitn(2, '\t');
+            if let (Some(u), Some(t)) = (it.next(), it.next()) {
+                p.bookmarks.push(Bookmark {
+                    url: u.to_string(),
+                    title: t.to_string(),
+                });
+            }
+        }
+    }
+    p
+}
+
+fn save_history(p: &Profile) {
+    if let Some(path) = config_file("history.tsv") {
+        if let Some(d) = path.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let s: String = p
+            .history
+            .iter()
+            .map(|e| format!("{}\t{}\t{}\n", tsv_field(&e.url), tsv_field(&e.title), e.visits))
+            .collect();
+        let _ = std::fs::write(path, s);
+    }
+}
+
+fn save_bookmarks(p: &Profile) {
+    if let Some(path) = config_file("bookmarks.tsv") {
+        if let Some(d) = path.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let s: String = p
+            .bookmarks
+            .iter()
+            .map(|b| format!("{}\t{}\n", tsv_field(&b.url), tsv_field(&b.title)))
+            .collect();
+        let _ = std::fs::write(path, s);
+    }
+}
+
 /// Parse a `#rrggbb` accent into an egui color (Color32 has no hex constructor).
 fn accent_color32(hex: &str) -> egui::Color32 {
     let s = hex.trim().trim_start_matches('#');
@@ -428,6 +515,8 @@ struct AppState {
     weak_self: RefCell<Weak<AppState>>,
     ipc_clients: Arc<Mutex<Vec<UnixStream>>>,
     settings: RefCell<Settings>,
+    /// Persisted history + bookmarks.
+    profile: RefCell<Profile>,
     event_proxy: EventLoopProxy<WakeUp>,
     /// Declared last so the GL contexts (which borrow the window) drop before it.
     window: Window,
@@ -741,7 +830,38 @@ impl AppState {
                     });
                 });
         });
-        self.toolbar_height.set(outer.response.rect.max.y);
+        let mut bottom = outer.response.rect.max.y;
+
+        // Bookmarks bar (only when there are bookmarks), below the tab strip.
+        let have_bookmarks = !self.profile.borrow().bookmarks.is_empty();
+        if have_bookmarks {
+            let bm = egui::TopBottomPanel::top("bookmarks").show(ctx, |ui| {
+                egui::ScrollArea::horizontal()
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let bms: Vec<(String, String)> = self
+                                .profile
+                                .borrow()
+                                .bookmarks
+                                .iter()
+                                .map(|b| (b.url.clone(), b.title.clone()))
+                                .collect();
+                            for (url, title) in bms {
+                                let label = truncate_ellipsis(&title, 18);
+                                if ui.add(egui::Button::new(label).frame(false)).clicked() {
+                                    if let (Ok(u), Some(tab)) = (Url::parse(&url), self.active_tab())
+                                    {
+                                        tab.load(u);
+                                    }
+                                }
+                            }
+                        });
+                    });
+            });
+            bottom = bm.response.rect.max.y;
+        }
+        self.toolbar_height.set(bottom);
     }
 
     fn draw_settings(&self, ctx: &egui::Context) {
@@ -1212,6 +1332,54 @@ impl AppState {
         }
     }
 
+    /// Record a page visit in history (deduped by URL; frecency = visit count).
+    fn record_visit(&self, url: &str, title: &str) {
+        if url.is_empty()
+            || url.starts_with("about:")
+            || url.starts_with("data:")
+            || url.starts_with("file:")
+        {
+            return;
+        }
+        let mut p = self.profile.borrow_mut();
+        if let Some(e) = p.history.iter_mut().find(|e| e.url == url) {
+            e.visits += 1;
+            if !title.is_empty() {
+                e.title = title.to_string();
+            }
+        } else {
+            p.history.push(HistoryEntry {
+                url: url.to_string(),
+                title: title.to_string(),
+                visits: 1,
+            });
+            const MAX_HISTORY: usize = 2000;
+            if p.history.len() > MAX_HISTORY {
+                let excess = p.history.len() - MAX_HISTORY;
+                p.history.drain(0..excess);
+            }
+        }
+        save_history(&p);
+    }
+
+    /// Bookmark or un-bookmark the active tab's page (Ctrl+D).
+    fn toggle_bookmark_active(&self) {
+        let (url, title) = match self.tabs.borrow().get(self.active.get()) {
+            Some(t) => (t.url.clone(), t.title.clone()),
+            None => return,
+        };
+        if url.is_empty() {
+            return;
+        }
+        let mut p = self.profile.borrow_mut();
+        if let Some(pos) = p.bookmarks.iter().position(|b| b.url == url) {
+            p.bookmarks.remove(pos);
+        } else {
+            p.bookmarks.push(Bookmark { url, title });
+        }
+        save_bookmarks(&p);
+    }
+
     fn handle_ipc(&self, cmd: IpcCommand) {
         match cmd {
             IpcCommand::Navigate(url) => {
@@ -1270,6 +1438,8 @@ impl WebViewDelegate for AppState {
             if i == self.active.get() && !self.location_dirty.get() {
                 *self.location.borrow_mut() = url.to_string();
             }
+            let title = self.tabs.borrow()[i].title.clone();
+            self.record_visit(url.as_str(), &title);
             self.window.request_redraw();
         }
     }
@@ -1278,7 +1448,9 @@ impl WebViewDelegate for AppState {
         if let Some(i) = self.tab_index(&webview) {
             let title = title.unwrap_or_else(|| "New tab".to_string());
             self.ipc_emit(&format!("title {i} {title}"));
-            self.tabs.borrow_mut()[i].title = title;
+            let url = self.tabs.borrow()[i].url.clone();
+            self.tabs.borrow_mut()[i].title = title.clone();
+            self.record_visit(&url, &title);
             self.window.request_redraw();
         }
     }
@@ -1543,6 +1715,7 @@ impl ApplicationHandler<WakeUp> for App {
             weak_self: RefCell::new(Weak::new()),
             ipc_clients,
             settings: RefCell::new(load_settings()),
+            profile: RefCell::new(load_profile()),
             event_proxy,
             window,
         });
@@ -1742,6 +1915,10 @@ impl ApplicationHandler<WakeUp> for App {
                             if let Some(tab) = state.active_tab() {
                                 tab.reload();
                             }
+                            return;
+                        }
+                        WinitKey::Character(c) if c.eq_ignore_ascii_case("d") => {
+                            state.toggle_bookmark_active();
                             return;
                         }
                         WinitKey::Character(c) if c == "=" || c == "+" => {
