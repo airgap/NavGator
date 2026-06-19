@@ -19,3 +19,7 @@ servo = { git = "https://github.com/airgap/swervo", rev = "315497b38e44e4aec90aa
 # servo-embedder-traits (lib name `embedder_traits`): EventLoopWaker lives here and
 # isn't re-exported by `servo`. Same rev as `servo`.
 embedder_traits = { git = "https://github.com/airgap/swervo", rev = "315497b38e44e4aec90aafe688b224dad5e6af9b", package = "servo-embedder-traits" }
+
+# `http` (HeaderMap/StatusCode/HeaderValue) — needed to build WebResourceResponse for the
+# gator:// internal-page interception. Unifies with the engine's own http (servo uses 1.x).
+http = "1"

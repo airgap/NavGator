@@ -4375,6 +4375,7 @@ dependencies = [
 name = "navgator-engine"
 version = "0.1.0"
 dependencies = [
+ "http 1.4.2",
  "servo",
  "servo-embedder-traits",
 ]

@@ -23,4 +23,13 @@ pub use servo::{
     SelectElementOption, SelectElementOptionOrOptgroup, SimpleDialog,
 };
 
+// Web-resource interception — used to serve gator:// internal pages without a net-internal
+// ProtocolHandler. InterceptedWebResourceLoad / WebResourceRequest are returned/borrowed by
+// callers and don't need to be named.
+pub use servo::{WebResourceLoad, WebResourceResponse};
+
 pub use embedder_traits::{EventLoopWaker, JSValue};
+
+// `http` types (HeaderMap/StatusCode/HeaderValue), version-matched to the engine, for building
+// the WebResourceResponse served to gator:// loads.
+pub use http;

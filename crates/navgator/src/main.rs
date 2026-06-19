@@ -43,9 +43,11 @@ use navgator_engine::{
     NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, PermissionRequest,
     PixelFormat, Preferences, RenderingContext,
     RgbColor, SelectElement, SelectElementOptionOrOptgroup, Servo, ServoBuilder, SimpleDialog,
-    WebView, WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent, WheelMode,
-    WindowRenderingContext,
+    WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WheelDelta,
+    WheelEvent, WheelMode, WindowRenderingContext,
 };
+// `http` types for building the WebResourceResponse served to gator:// internal pages.
+use navgator_engine::http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE};
 use navgator_protocol::IpcCommand;
 use url::Url;
 use winit::application::ApplicationHandler;
@@ -105,14 +107,28 @@ fn file_url(rel: &str) -> Url {
     Url::from_file_path(&p).unwrap_or_else(|_| Url::parse("about:blank").unwrap())
 }
 
+/// Built-in search engines offered in Settings; the first is the default. The welcome page
+/// and the omnibox both substitute the query for `%s` in the selected template.
+const SEARCH_ENGINES: &[(&str, &str)] = &[
+    ("DuckDuckGo", "https://duckduckgo.com/?q=%s"),
+    ("Kagi", "https://kagi.com/search?q=%s"),
+    ("Bing", "https://www.bing.com/search?q=%s"),
+    ("Google", "https://www.google.com/search?q=%s"),
+];
+
+/// NavGator's internal welcome / new-tab page, served from the `gator://` scheme by
+/// `AppState::load_web_resource`. Works everywhere (no filesystem dependency), unlike a
+/// `file://` home page.
+const WELCOME_URL: &str = "gator://welcome";
+
 fn content_url() -> Url {
     if let Some(arg) = env::args().nth(1) {
         if let Ok(url) = Url::parse(&arg) {
             return url;
         }
-        eprintln!("navgator: '{arg}' is not a valid URL, loading the home page instead");
+        eprintln!("navgator: '{arg}' is not a valid URL, loading the welcome page instead");
     }
-    file_url("content/home.html")
+    Url::parse(WELCOME_URL).expect("gator://welcome is a valid URL")
 }
 
 /// User settings, persisted to a small `key=value` config file.
@@ -353,6 +369,14 @@ fn url_encode(s: &str) -> String {
     out
 }
 
+/// Escape text for safe interpolation into HTML (the gator://welcome template).
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 /// Truncate a tab title to `max` chars with an ellipsis.
 fn truncate_ellipsis(input: &str, max: usize) -> String {
     if input.chars().count() > max {
@@ -585,6 +609,59 @@ impl Drop for AppState {
 }
 
 impl AppState {
+    /// Render the `gator://welcome` page, templated with the current accent, the selected
+    /// search engine, and the user's bookmarks (as quick-link tiles).
+    fn render_gator_welcome(&self) -> Vec<u8> {
+        let (search, accent) = {
+            let s = self.settings.borrow();
+            (s.search.clone(), s.accent.clone())
+        };
+        let engine = SEARCH_ENGINES
+            .iter()
+            .find(|(_, t)| *t == search)
+            .map(|(n, _)| *n)
+            .unwrap_or("the web");
+        let bookmarks = {
+            let p = self.profile.borrow();
+            if p.bookmarks.is_empty() {
+                "<p class=\"empty\">Bookmark a page with Ctrl+D and it will show up here.</p>"
+                    .to_string()
+            } else {
+                let tiles: String = p
+                    .bookmarks
+                    .iter()
+                    .take(12)
+                    .map(|b| {
+                        let title = if b.title.trim().is_empty() {
+                            b.url.as_str()
+                        } else {
+                            b.title.as_str()
+                        };
+                        let letter = title
+                            .chars()
+                            .find(|c| c.is_alphanumeric())
+                            .map(|c| c.to_uppercase().to_string())
+                            .unwrap_or_else(|| "•".to_string());
+                        format!(
+                            "<a class=\"tile\" href=\"{}\" title=\"{}\"><span class=\"dot\">{}</span>{}</a>",
+                            html_escape(&b.url),
+                            html_escape(title),
+                            html_escape(&letter),
+                            html_escape(&truncate_ellipsis(title, 18)),
+                        )
+                    })
+                    .collect();
+                format!("<div class=\"links\">{tiles}</div>")
+            }
+        };
+        include_str!("content/welcome.html")
+            .replace("__ACCENT__", &accent)
+            .replace("__SEARCH_TEMPLATE__", &search)
+            .replace("__SEARCH_ENGINE__", engine)
+            .replace("__BOOKMARKS__", &bookmarks)
+            .into_bytes()
+    }
+
     fn active_tab(&self) -> Option<WebView> {
         self.tabs
             .borrow()
@@ -1013,7 +1090,23 @@ impl AppState {
             .show(ctx, |ui| {
                 let mut s = self.settings.borrow_mut();
                 let mut changed = false;
-                ui.label("Search engine (use %s for the query)");
+                ui.label("Search engine");
+                let current = SEARCH_ENGINES
+                    .iter()
+                    .find(|(_, t)| *t == s.search)
+                    .map(|(n, _)| *n)
+                    .unwrap_or("Custom");
+                egui::ComboBox::from_id_salt("search_engine")
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        for (name, template) in SEARCH_ENGINES {
+                            changed |= ui
+                                .selectable_value(&mut s.search, template.to_string(), *name)
+                                .changed();
+                        }
+                    });
+                ui.add_space(4.0);
+                ui.label("Custom search URL (use %s for the query)");
                 changed |= ui.text_edit_singleline(&mut s.search).changed();
                 ui.add_space(6.0);
                 ui.label("Accent color (#rrggbb)");
@@ -1615,6 +1708,39 @@ impl AppState {
 impl WebViewDelegate for AppState {
     fn notify_new_frame_ready(&self, _webview: WebView) {
         self.window.request_redraw();
+    }
+
+    /// Serve NavGator's internal `gator://` pages (e.g. `gator://welcome`). Servo asks the
+    /// embedder to intercept every resource load *before* it resolves the scheme, so a custom
+    /// scheme works here with no engine fork patch and no net-internal ProtocolHandler. Loads
+    /// we don't recognise are left alone (dropping `load` signals "do not intercept").
+    fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
+        if load.request().url.scheme() != "gator" {
+            return;
+        }
+        let url = load.request().url.clone();
+        let body = match url.host_str().unwrap_or("welcome") {
+            "welcome" | "newtab" | "home" => self.render_gator_welcome(),
+            other => format!(
+                "<!doctype html><meta charset=\"utf-8\">\
+                 <body style=\"font-family:system-ui;background:#0e1014;color:#e8eaed;padding:48px\">\
+                 <h1>gator://{}</h1><p>No such internal page. \
+                 Try <a style=\"color:#5b8cff\" href=\"gator://welcome\">gator://welcome</a>.</p>",
+                html_escape(other)
+            )
+            .into_bytes(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        let response = WebResourceResponse::new(url)
+            .status_code(StatusCode::OK)
+            .headers(headers);
+        let mut intercepted = load.intercept(response);
+        intercepted.send_body_data(body);
+        intercepted.finish();
     }
 
     fn notify_url_changed(&self, webview: WebView, url: Url) {

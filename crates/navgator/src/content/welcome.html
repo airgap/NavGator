@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NavGator</title>
+<style>
+  :root { --accent: __ACCENT__; --bg:#0e1014; --panel:#171a21; --line:#262b36; --fg:#e8eaed; --muted:#9aa0aa; }
+  * { box-sizing:border-box; }
+  html,body { height:100%; margin:0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display:flex; flex-direction:column; align-items:center;
+    padding: 13vh 24px 28px; min-height:100%;
+  }
+  .brand { font-size:58px; font-weight:800; letter-spacing:-2px; margin:0 0 6px; }
+  .brand .g { color: var(--accent); }
+  .tag { color: var(--muted); margin:0 0 36px; font-size:15px; }
+  form { width:min(680px,92vw); margin:0; }
+  .box {
+    display:flex; align-items:center; gap:11px;
+    background: var(--panel); border:1.5px solid var(--line); border-radius:14px; padding:15px 18px;
+    transition: border-color .15s;
+  }
+  .box:focus-within { border-color: var(--accent); }
+  .box svg { flex:none; color: var(--muted); }
+  #q { flex:1; background:transparent; border:0; outline:0; color: var(--fg); font-size:17px; }
+  #q::placeholder { color: var(--muted); }
+  .hint { color: var(--muted); font-size:13px; margin-top:13px; }
+  .hint b { color: var(--fg); font-weight:600; }
+  .links { width:min(680px,92vw); margin-top:42px;
+    display:grid; grid-template-columns:repeat(auto-fill,minmax(118px,1fr)); gap:12px; }
+  .tile {
+    display:block; background: var(--panel); border:1px solid var(--line); border-radius:12px;
+    padding:14px 10px; text-align:center; color: var(--fg); text-decoration:none; font-size:13px;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; transition:border-color .15s;
+  }
+  .tile:hover { border-color: var(--accent); }
+  .tile .dot { display:block; width:32px; height:32px; line-height:32px; border-radius:9px;
+    margin:0 auto 9px; background: var(--line); color: var(--accent); font-weight:700; font-size:15px; }
+  .empty { color: var(--muted); font-size:13px; margin-top:38px; }
+  footer { margin-top:auto; padding-top:42px; color:#5a606b; font-size:12px; letter-spacing:.3px; }
+</style>
+</head>
+<body>
+  <h1 class="brand">Nav<span class="g">Gator</span></h1>
+  <p class="tag">Fast. Private. Yours.</p>
+  <form onsubmit="return go(event)">
+    <label class="box">
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.2-4.2"/></svg>
+      <input id="q" autofocus autocomplete="off" spellcheck="false" placeholder="Search __SEARCH_ENGINE__ or type a URL">
+    </label>
+  </form>
+  <p class="hint">Searching with <b>__SEARCH_ENGINE__</b> &middot; change it in Settings</p>
+  __BOOKMARKS__
+  <footer>NavGator &middot; gator://welcome</footer>
+<script>
+  var TEMPLATE = "__SEARCH_TEMPLATE__";
+  function go(e){
+    e.preventDefault();
+    var q = document.getElementById('q').value.trim();
+    if(!q) return false;
+    var hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(q);
+    var looksDomain = /^[^\s]+\.[^\s]{2,}$/.test(q) && !/\s/.test(q);
+    if(hasScheme){ window.location.href = q; }
+    else if(looksDomain){ window.location.href = 'https://' + q; }
+    else { window.location.href = TEMPLATE.replace('%s', encodeURIComponent(q)); }
+    return false;
+  }
+</script>
+</body>
+</html>
