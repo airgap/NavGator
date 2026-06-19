@@ -677,14 +677,16 @@ impl AppState {
                         let active = self.active.get();
                         let count = self.tabs.borrow().len();
                         for i in 0..count {
-                            let (title, fav) = {
+                            let (title, fav, loading) = {
                                 let tabs = self.tabs.borrow();
                                 let fav = tabs[i].favicon_tex.as_ref().map(|t| {
                                     egui::load::SizedTexture::new(t.id(), egui::vec2(16.0, 16.0))
                                 });
-                                (tabs[i].title.clone(), fav)
+                                (tabs[i].title.clone(), fav, tabs[i].loading)
                             };
-                            if let Some(sized) = fav {
+                            if loading {
+                                ui.add(egui::Spinner::new().size(14.0));
+                            } else if let Some(sized) = fav {
                                 ui.add(
                                     egui::Image::from_texture(sized)
                                         .fit_to_exact_size(egui::vec2(16.0, 16.0)),
@@ -700,6 +702,33 @@ impl AppState {
                             if tab.middle_clicked() {
                                 self.close_tab(i);
                                 break;
+                            }
+                            let mut menu_act = 0u8;
+                            tab.context_menu(|ui| {
+                                if ui.button("New tab").clicked() {
+                                    menu_act = 1;
+                                }
+                                if ui.button("Close tab").clicked() {
+                                    menu_act = 2;
+                                }
+                                if ui.button("Close other tabs").clicked() {
+                                    menu_act = 3;
+                                }
+                            });
+                            match menu_act {
+                                1 => {
+                                    self.new_tab(content_url());
+                                    break;
+                                }
+                                2 => {
+                                    self.close_tab(i);
+                                    break;
+                                }
+                                3 => {
+                                    self.close_others(i);
+                                    break;
+                                }
+                                _ => {}
                             }
                             if ui.add(egui::Button::new("×").frame(false)).clicked() {
                                 self.close_tab(i);
@@ -1147,6 +1176,30 @@ impl AppState {
             active
         };
         self.select_tab(new_active);
+    }
+
+    /// Close every tab except `keep` (tab context menu).
+    fn close_others(&self, keep: usize) {
+        {
+            let tabs = self.tabs.borrow();
+            if keep >= tabs.len() {
+                return;
+            }
+            let mut closed = self.closed_tabs.borrow_mut();
+            for (j, t) in tabs.iter().enumerate() {
+                if j != keep && !t.url.is_empty() {
+                    closed.push(t.url.clone());
+                }
+            }
+        }
+        {
+            let mut tabs = self.tabs.borrow_mut();
+            let kept = tabs.remove(keep);
+            tabs.clear();
+            tabs.push(kept);
+        }
+        self.active.set(0);
+        self.select_tab(0);
     }
 
     /// Reopen the most-recently-closed tab (Ctrl+Shift+T).
