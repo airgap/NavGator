@@ -31,3 +31,7 @@ egui-winit = { version = "0.34.3", default-features = false, features = ["clipbo
 glow = "0.17"
 # In-egui file picker (no native GTK/portal dep), as used by servoshell.
 egui-file-dialog = "0.13.0"
+
+# Android entry point: winit drives the NativeActivity via android-activity (Android only).
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }
