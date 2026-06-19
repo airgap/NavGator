@@ -7,6 +7,12 @@ license = "MPL-2.0"
 description = "A web browser with native (egui) chrome and Servo as the page renderer"
 repository = "https://github.com/airgap/NavGator"
 
+[lib]
+name = "navgator"
+# rlib for the desktop binary to link; cdylib for the Android NativeActivity (.so).
+crate-type = ["lib", "cdylib"]
+path = "src/lib.rs"
+
 [[bin]]
 name = "navgator"
 path = "src/main.rs"
