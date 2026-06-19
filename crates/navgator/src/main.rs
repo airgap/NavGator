@@ -257,6 +257,8 @@ struct AppState {
     focused: Cell<Focused>,
     /// Whether a Ctrl modifier is currently held (for tab shortcuts).
     ctrl: Cell<bool>,
+    /// Whether a Shift modifier is currently held (Ctrl+Shift+Tab, etc.).
+    shift: Cell<bool>,
     /// Self-reference so `&self` delegate callbacks can build webviews (which need
     /// the `Rc<AppState>` as their delegate).
     weak_self: RefCell<Weak<AppState>>,
@@ -366,6 +368,14 @@ impl AppState {
         if let Some(chrome) = self.chrome.borrow().as_ref() {
             chrome.evaluate_javascript(js, |_| {});
         }
+    }
+
+    /// Focus + select the address bar (Ctrl+L).
+    fn focus_omnibox(&self) {
+        self.focused.set(Focused::Chrome);
+        self.chrome_eval(
+            "var a=document.getElementById('address');if(a){a.focus();a.select();}".to_string(),
+        );
     }
 
     // ── Tab management ────────────────────────────────────────────────────────
@@ -757,6 +767,7 @@ impl ApplicationHandler<WakeUp> for App {
             cursor: Cell::new((0.0, 0.0)),
             focused: Cell::new(Focused::Content),
             ctrl: Cell::new(false),
+            shift: Cell::new(false),
             weak_self: RefCell::new(Weak::new()),
             ipc_clients,
             settings: RefCell::new(load_settings()),
@@ -876,6 +887,7 @@ impl ApplicationHandler<WakeUp> for App {
 
             WindowEvent::ModifiersChanged(modifiers) => {
                 state.ctrl.set(modifiers.state().control_key());
+                state.shift.set(modifiers.state().shift_key());
             }
 
             WindowEvent::KeyboardInput { event: key_event, .. } => {
@@ -890,10 +902,39 @@ impl ApplicationHandler<WakeUp> for App {
                             state.close_tab(state.active.get());
                             return;
                         }
+                        WinitKey::Character(c) if c.eq_ignore_ascii_case("l") => {
+                            state.focus_omnibox();
+                            return;
+                        }
+                        WinitKey::Character(c) if c.eq_ignore_ascii_case("r") => {
+                            if let Some(tab) = state.active_tab() {
+                                tab.reload();
+                            }
+                            return;
+                        }
+                        WinitKey::Character(c) => {
+                            // Ctrl+1..8 → that tab; Ctrl+9 → last tab.
+                            if let Ok(n) = c.parse::<usize>() {
+                                let len = state.tabs.borrow().len();
+                                if n == 9 && len > 0 {
+                                    state.select_tab(len - 1);
+                                } else if (1..=8).contains(&n) && n <= len {
+                                    state.select_tab(n - 1);
+                                }
+                                return;
+                            }
+                        }
                         WinitKey::Named(NamedKey::Tab) => {
                             let len = state.tabs.borrow().len();
                             if len > 1 {
-                                state.select_tab((state.active.get() + 1) % len);
+                                let cur = state.active.get();
+                                // Ctrl+Shift+Tab cycles backward.
+                                let next = if state.shift.get() {
+                                    (cur + len - 1) % len
+                                } else {
+                                    (cur + 1) % len
+                                };
+                                state.select_tab(next);
                             }
                             return;
                         }
