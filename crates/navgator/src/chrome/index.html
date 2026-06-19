@@ -54,6 +54,19 @@
     <!-- The content webview is composited into this region. -->
     <main class="viewport" id="viewport"></main>
 
+    <!-- Modal for JS dialogs (alert/confirm/prompt). The engine suppresses the content
+         blit while this is shown, so it appears over the page region. -->
+    <div class="modal-backdrop" id="modal">
+      <div class="modal">
+        <p class="modal-msg" id="modal-msg"></p>
+        <input class="modal-input" id="modal-input" type="text" spellcheck="false" />
+        <div class="modal-actions">
+          <button class="btn-text" id="modal-cancel">Cancel</button>
+          <button class="btn-accent" id="modal-ok">OK</button>
+        </div>
+      </div>
+    </div>
+
     <script src="chrome.js"></script>
   </body>
 </html>

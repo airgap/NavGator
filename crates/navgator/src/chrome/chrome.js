@@ -153,6 +153,45 @@ titlebar.addEventListener("dblclick", (e) => {
 });
 
 // ── Layout reporting (tells the engine where the content region starts) ───────
+// ── JS dialogs (alert/confirm/prompt) — drawn as a chrome modal over the page ──
+const modal = $("modal");
+const modalInput = $("modal-input");
+const modalCancel = $("modal-cancel");
+
+function closeDialog(action) {
+  modal.style.display = "none";
+  go(
+    "navgator:dialog?action=" +
+      action +
+      "&value=" +
+      encodeURIComponent(modalInput.value || ""),
+  );
+}
+
+window.addEventListener("navgator:dialog", (e) => {
+  const d = e.detail ?? {};
+  $("modal-msg").textContent = d.message || "";
+  const isPrompt = d.kind === "prompt";
+  modalInput.value = d.value || "";
+  modalInput.style.display = isPrompt ? "block" : "none";
+  modalCancel.style.display = d.kind === "alert" ? "none" : "inline-block";
+  modal.style.display = "flex";
+  if (isPrompt) {
+    modalInput.focus();
+    modalInput.select();
+  } else {
+    $("modal-ok").focus();
+  }
+});
+
+$("modal-ok").addEventListener("click", () => closeDialog("ok"));
+modalCancel.addEventListener("click", () => closeDialog("cancel"));
+modal.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") closeDialog("ok");
+  else if (e.key === "Escape") closeDialog("cancel");
+});
+
+// ── Layout reporting (tells the engine where the content region starts) ───────
 function contentTopCss() {
   return Math.round($("viewport").getBoundingClientRect().top);
 }

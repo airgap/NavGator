@@ -40,7 +40,7 @@ use navgator_engine::{
     LoadStatus, MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
     NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, RenderingContext,
     Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent,
-    WheelMode, WindowRenderingContext,
+    WheelMode, WindowRenderingContext, EmbedderControl, EmbedderControlId, SimpleDialog,
 };
 use navgator_protocol::IpcCommand;
 use url::Url;
@@ -263,6 +263,11 @@ struct AppState {
     chrome_top: Cell<u32>,
     /// Whether the active page is in fullscreen (chrome hidden, content fills the window).
     fullscreen: Cell<bool>,
+    /// Whether a chrome overlay (modal dialog) is active; the content blit is skipped so
+    /// the chrome — which renders the whole window — shows the modal over the page region.
+    overlay: Cell<bool>,
+    /// The JS dialog awaiting a user response, if any.
+    pending_dialog: RefCell<Option<SimpleDialog>>,
     scale: Cell<f64>,
     cursor: Cell<(f64, f64)>,
     focused: Cell<Focused>,
@@ -330,13 +335,17 @@ impl AppState {
         self.window_context.prepare_for_rendering();
         chrome.paint();
 
-        if let Some(blit) = self.content_context.render_to_parent_callback() {
-            let win = self.window.inner_size();
-            let w = win.width.max(1) as i32;
-            let h = win.height.saturating_sub(self.content_top.get()).max(1) as i32;
-            let target = Rect::new(Point2D::new(0, 0), Size2D::new(w, h));
-            let gl = self.window_context.glow_gl_api();
-            blit(&*gl, target);
+        // While a chrome overlay (modal) is up, skip the content blit so the chrome's
+        // full-window render (with the modal) shows over the page region.
+        if !self.overlay.get() {
+            if let Some(blit) = self.content_context.render_to_parent_callback() {
+                let win = self.window.inner_size();
+                let w = win.width.max(1) as i32;
+                let h = win.height.saturating_sub(self.content_top.get()).max(1) as i32;
+                let target = Rect::new(Point2D::new(0, 0), Size2D::new(w, h));
+                let gl = self.window_context.glow_gl_api();
+                blit(&*gl, target);
+            }
         }
 
         self.window_context.present();
@@ -356,6 +365,10 @@ impl AppState {
     }
 
     fn route(&self, x: f64, y: f64) -> Option<(WebView, DevicePoint)> {
+        // A modal overlay is drawn by the chrome across the whole window.
+        if self.overlay.get() {
+            return Some((self.chrome.borrow().clone()?, DevicePoint::new(x as f32, y as f32)));
+        }
         let top = self.content_top.get() as f64;
         if y < top {
             Some((self.chrome.borrow().clone()?, DevicePoint::new(x as f32, y as f32)))
@@ -414,6 +427,57 @@ impl AppState {
     }
     fn zoom_reset(&self) {
         self.apply_zoom(1.0);
+    }
+
+    // ── Modal overlay (JS dialogs) ─────────────────────────────────────────────
+    fn show_dialog(&self, dialog: SimpleDialog) {
+        let (kind, default) = match &dialog {
+            SimpleDialog::Alert(_) => ("alert", String::new()),
+            SimpleDialog::Confirm(_) => ("confirm", String::new()),
+            SimpleDialog::Prompt(p) => ("prompt", p.current_value().to_string()),
+        };
+        let message = dialog.message().to_string();
+        *self.pending_dialog.borrow_mut() = Some(dialog);
+        self.overlay.set(true);
+        self.focused.set(Focused::Chrome);
+        self.chrome_eval(format!(
+            "window.dispatchEvent(new CustomEvent('navgator:dialog',{{detail:{{kind:{},message:{},value:{}}}}}))",
+            js_string(kind),
+            js_string(&message),
+            js_string(&default),
+        ));
+        self.window.request_redraw();
+    }
+
+    fn resolve_dialog(&self, url: &Url) {
+        let dialog = self.pending_dialog.borrow_mut().take();
+        self.overlay.set(false);
+        self.focused.set(Focused::Content);
+        let Some(dialog) = dialog else {
+            self.window.request_redraw();
+            return;
+        };
+        let mut ok = false;
+        let mut value = String::new();
+        for (k, v) in url.query_pairs() {
+            match k.as_ref() {
+                "action" => ok = v == "ok",
+                "value" => value = v.to_string(),
+                _ => {}
+            }
+        }
+        if ok {
+            match dialog {
+                SimpleDialog::Prompt(mut p) => {
+                    p.set_current_value(&value);
+                    p.confirm();
+                }
+                other => other.confirm(),
+            }
+        } else {
+            dialog.dismiss();
+        }
+        self.window.request_redraw();
     }
 
     // ── Tab management ────────────────────────────────────────────────────────
@@ -552,6 +616,7 @@ impl AppState {
             "tab" => self.handle_tab_command(url),
             "window" => self.handle_window_command(url),
             "settings" => self.new_tab(settings_url()),
+            "dialog" => self.resolve_dialog(url),
             "ready" => {
                 self.apply_layout(url);
                 self.push_model();
@@ -778,6 +843,25 @@ impl WebViewDelegate for AppState {
         }
     }
 
+    fn show_embedder_control(&self, _webview: WebView, control: EmbedderControl) {
+        match control {
+            EmbedderControl::SimpleDialog(dialog) => self.show_dialog(dialog),
+            // Context menu / select / file / color pickers / IME: not yet implemented
+            // (they need a non-modal overlay or native menus — see docs/ROADMAP).
+            _ => {}
+        }
+    }
+
+    fn hide_embedder_control(&self, _webview: WebView, _control_id: EmbedderControlId) {
+        // The page withdrew a control (e.g. navigated away mid-dialog); clear any overlay.
+        if self.pending_dialog.borrow().is_some() {
+            *self.pending_dialog.borrow_mut() = None;
+            self.overlay.set(false);
+            self.focused.set(Focused::Content);
+            self.window.request_redraw();
+        }
+    }
+
     fn notify_fullscreen_state_changed(&self, _webview: WebView, is_fullscreen: bool) {
         self.fullscreen.set(is_fullscreen);
         let top = if is_fullscreen { 0 } else { self.chrome_top.get() };
@@ -859,6 +943,8 @@ impl ApplicationHandler<WakeUp> for App {
             content_top: Cell::new(content_top),
             chrome_top: Cell::new(content_top),
             fullscreen: Cell::new(false),
+            overlay: Cell::new(false),
+            pending_dialog: RefCell::new(None),
             scale: Cell::new(scale),
             cursor: Cell::new((0.0, 0.0)),
             focused: Cell::new(Focused::Content),
