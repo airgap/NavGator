@@ -259,6 +259,21 @@ fn save_bookmarks(p: &Profile) {
     }
 }
 
+/// History-backed omnibox suggestions: entries whose URL/title contains `query`,
+/// ranked by frecency (visit count), top 6.
+fn suggestions(history: &[HistoryEntry], query: &str) -> Vec<(String, String)> {
+    let q = query.to_lowercase();
+    let mut m: Vec<&HistoryEntry> = history
+        .iter()
+        .filter(|e| e.url.to_lowercase().contains(&q) || e.title.to_lowercase().contains(&q))
+        .collect();
+    m.sort_by(|a, b| b.visits.cmp(&a.visits));
+    m.into_iter()
+        .take(6)
+        .map(|e| (e.url.clone(), e.title.clone()))
+        .collect()
+}
+
 /// Parse a `#rrggbb` accent into an egui color (Color32 has no hex constructor).
 fn accent_color32(hex: &str) -> egui::Color32 {
     let s = hex.trim().trim_start_matches('#');
@@ -835,10 +850,45 @@ impl AppState {
                             st.store(ui.ctx(), id);
                         }
                     }
+                    let mut go: Option<String> = None;
                     if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        let raw = loc.trim().to_string();
+                        go = Some(loc.trim().to_string());
+                    }
+                    // History-backed autocomplete dropdown under the address bar.
+                    if field.has_focus() && !loc.trim().is_empty() {
+                        let sugg = suggestions(&self.profile.borrow().history, loc.trim());
+                        if !sugg.is_empty() {
+                            egui::Area::new(egui::Id::new("omnibox_suggest"))
+                                .order(egui::Order::Foreground)
+                                .fixed_pos(field.rect.left_bottom())
+                                .show(ui.ctx(), |ui| {
+                                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                        ui.set_min_width(field.rect.width().max(220.0));
+                                        for (url, title) in &sugg {
+                                            let label = if title.is_empty() {
+                                                url.clone()
+                                            } else {
+                                                format!("{title}  —  {url}")
+                                            };
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(truncate_ellipsis(&label, 80))
+                                                        .frame(false),
+                                                )
+                                                .clicked()
+                                            {
+                                                go = Some(url.clone());
+                                            }
+                                        }
+                                    });
+                                });
+                        }
+                    }
+                    if let Some(target) = go {
+                        *loc = target.clone();
                         drop(loc);
-                        self.navigate_from_omnibox(&raw);
+                        self.location_dirty.set(false);
+                        self.navigate_from_omnibox(&target);
                     }
                 });
             });
