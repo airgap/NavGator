@@ -50,11 +50,15 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WinitKey, NamedKey};
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 
 /// Fallback chrome height (logical px) used until the chrome reports its real
 /// content-region top via the `navgator:ready`/`navgator:layout` bridge command.
 const CHROME_HEIGHT_FALLBACK: u32 = 84;
+
+/// Width of the invisible window-edge band (logical px) that starts a resize on the
+/// borderless window — OS decorations are off, so we hit-test it and `drag_resize_window`.
+const RESIZE_BORDER: f64 = 6.0;
 
 fn main() -> Result<(), Box<dyn Error>> {
     rustls::crypto::aws_lc_rs::default_provider()
@@ -175,6 +179,16 @@ fn content_size(window: PhysicalSize<u32>, top: u32) -> PhysicalSize<u32> {
     )
 }
 
+/// The cursor icon for a resize-band direction.
+fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
+    match dir {
+        ResizeDirection::North | ResizeDirection::South => CursorIcon::NsResize,
+        ResizeDirection::East | ResizeDirection::West => CursorIcon::EwResize,
+        ResizeDirection::NorthEast | ResizeDirection::SouthWest => CursorIcon::NeswResize,
+        ResizeDirection::NorthWest | ResizeDirection::SouthEast => CursorIcon::NwseResize,
+    }
+}
+
 /// Escape a string into a JS double-quoted string literal.
 fn js_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -257,6 +271,29 @@ struct AppState {
 impl AppState {
     fn content_phys_size(&self) -> PhysicalSize<u32> {
         content_size(self.window.inner_size(), self.content_top.get())
+    }
+
+    /// If the cursor (physical px) sits in the window-edge resize band, the direction to
+    /// resize; `None` when maximized or away from the edges.
+    fn resize_direction_at(&self, x: f64, y: f64) -> Option<ResizeDirection> {
+        if self.window.is_maximized() {
+            return None;
+        }
+        let size = self.window.inner_size();
+        let b = RESIZE_BORDER * self.scale.get();
+        let (w, h) = (size.width as f64, size.height as f64);
+        let (left, right, top, bottom) = (x <= b, x >= w - b, y <= b, y >= h - b);
+        Some(match (top, bottom, left, right) {
+            (true, _, true, _) => ResizeDirection::NorthWest,
+            (true, _, _, true) => ResizeDirection::NorthEast,
+            (_, true, true, _) => ResizeDirection::SouthWest,
+            (_, true, _, true) => ResizeDirection::SouthEast,
+            (true, _, _, _) => ResizeDirection::North,
+            (_, true, _, _) => ResizeDirection::South,
+            (_, _, true, _) => ResizeDirection::West,
+            (_, _, _, true) => ResizeDirection::East,
+            _ => return None,
+        })
     }
 
     fn active_tab(&self) -> Option<WebView> {
@@ -765,6 +802,10 @@ impl ApplicationHandler<WakeUp> for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 state.cursor.set((position.x, position.y));
+                match state.resize_direction_at(position.x, position.y) {
+                    Some(dir) => state.window.set_cursor(resize_cursor(dir)),
+                    None => state.window.set_cursor(CursorIcon::Default),
+                }
                 if let Some((webview, point)) = state.route(position.x, position.y) {
                     webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(
                         point.into(),
@@ -778,6 +819,14 @@ impl ApplicationHandler<WakeUp> for App {
                 ..
             } => {
                 let (x, y) = state.cursor.get();
+                // Borderless-window edge resize: a left-press in the edge band starts a
+                // system resize; don't forward it to a webview.
+                if button == MouseButton::Left && matches!(button_state, ElementState::Pressed) {
+                    if let Some(dir) = state.resize_direction_at(x, y) {
+                        let _ = state.window.drag_resize_window(dir);
+                        return;
+                    }
+                }
                 if matches!(button_state, ElementState::Pressed) {
                     let top = state.content_top.get() as f64;
                     state
