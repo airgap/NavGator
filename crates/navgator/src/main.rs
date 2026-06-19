@@ -36,7 +36,7 @@ use euclid::default::{Point2D, Rect, Size2D};
 // touches the Servo fork (ROADMAP §R2; docs/FORK.md). The IPC wire types come from
 // the servo-free navgator-protocol crate.
 use navgator_engine::{
-    DevicePoint, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent,
+    DevicePoint, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent, LoadStatus,
     MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
     NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, RenderingContext,
     Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent,
@@ -246,6 +246,7 @@ struct Tab {
     can_back: bool,
     can_forward: bool,
     zoom: f32,
+    loading: bool,
 }
 
 struct AppState {
@@ -435,6 +436,7 @@ impl AppState {
                 can_back: false,
                 can_forward: false,
                 zoom: 1.0,
+                loading: false,
             });
             tabs.len() - 1
         };
@@ -497,7 +499,11 @@ impl AppState {
                 if i > 0 {
                     j.push(',');
                 }
-                j.push_str(&format!("{{title:{}}}", js_string(&t.title)));
+                j.push_str(&format!(
+                    "{{title:{},loading:{}}}",
+                    js_string(&t.title),
+                    t.loading
+                ));
             }
             j.push(']');
             let (url, cb, cf) = tabs
@@ -737,6 +743,13 @@ impl WebViewDelegate for AppState {
                 tabs[i].can_back = current > 0;
                 tabs[i].can_forward = current + 1 < entries.len();
             }
+            self.push_model();
+        }
+    }
+
+    fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
+        if let Some(i) = self.tab_index(&webview) {
+            self.tabs.borrow_mut()[i].loading = !matches!(status, LoadStatus::Complete);
             self.push_model();
         }
     }

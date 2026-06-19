@@ -101,6 +101,22 @@ body {
   cursor: default;
 }
 
+.tab-spin {
+  width: 11px;
+  height: 11px;
+  flex: 0 0 auto;
+  border: 2px solid var(--ink-dim);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: ng-spin 0.7s linear infinite;
+}
+
+@keyframes ng-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .tab.is-active {
   background: var(--tab-active);
   color: var(--ink);

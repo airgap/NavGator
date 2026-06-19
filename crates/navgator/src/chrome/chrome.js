@@ -76,6 +76,12 @@ function renderTabs(tabs, active) {
       navgator.closeTab(i);
     });
 
+    if (tab.loading) {
+      const spin = document.createElement("span");
+      spin.className = "tab-spin";
+      spin.setAttribute("aria-label", "Loading");
+      el.appendChild(spin);
+    }
     el.appendChild(title);
     el.appendChild(close);
     strip.appendChild(el);
