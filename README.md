@@ -1,12 +1,20 @@
-# swerve
+# NavGator
 
-A web browser whose **UI is HTML rendered by [Servo](https://servo.org)** — and
-whose engine is meant to be reusable by other apps (Tauri-style) down the line.
+A web browser with a **native (Rust / [egui](https://github.com/emilk/egui)) UI and
+[Servo](https://servo.org) as the page renderer** — engine meant to be reusable by other
+apps (Tauri-style) down the line. **Security and performance are the pitch.**
 
-The browser chrome (tabs, toolbar, address bar) is an HTML/CSS/JS document that
-Servo paints, and web pages are rendered by Servo alongside it. Not via an
-`<iframe>` (the web blocks that — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)),
-but as a separate webview composited into the window.
+The browser chrome (tabs, toolbar, address bar, menus, dialogs) is drawn natively with
+egui directly over the page; Servo renders web content into an `OffscreenRenderingContext`
+that egui composites beneath the chrome. This is how servoshell — Servo's own reference
+shell — is built: native chrome keeps the UI out of the web engine (a cleaner privilege
+boundary) and avoids running a second engine document for the UI.
+
+> **Architecture note (M6):** earlier milestones rendered the chrome as a *second Servo
+> webview* of HTML/CSS/JS bridged to the engine over a `navgator:` URL scheme. That was
+> replaced by the native egui chrome on the `native-chrome` branch — it dissolved the
+> two-webview compositor problem (context menus, dialogs, and pickers are now trivial
+> native overlays, with no engine fork patch). See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Status
 
