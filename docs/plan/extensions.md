@@ -280,9 +280,11 @@ my-addon/
   redirects, header rewrites) are pure data + the engines navgator already runs. This
   avoids running arbitrary privileged code and dodges the WebExtensions process-model
   problem entirely.
-- **Chrome-side panels.** Because navgator's chrome is itself HTML rendered by Servo,
-  an add-on can contribute a panel/popup that the chrome composites — reusing the
-  existing `navgator:` command bridge rather than inventing a new UI runtime.
+- **Chrome-side panels.** navgator's chrome is now **native egui**, not HTML rendered by
+  Servo, so an add-on panel is not "just more chrome HTML." Two viable paths: render a panel
+  in egui from declarative add-on metadata, or host an add-on's HTML panel as a small Servo
+  `WebView` composited beside the page (the way page content is). There is no `navgator:`
+  command bridge to reuse — add-on↔engine calls are in-process Rust.
 - **A tiny `navgator.*` API** (not `chrome.*`) exposed to add-on contexts:
   `navgator.tabs`, `navgator.storage` (Lyku-synced), `navgator.contentBlocker` (toggle
   lists), `navgator.userScripts`, `navgator.notifications`. Small, owned by us, versioned
@@ -384,11 +386,13 @@ Principles:
 - **Settings & controls in the chrome:** the chrome already drives the engine through
   `navgator:` command URLs intercepted in `request_navigation`. Extend that vocabulary:
   `navgator:blocker?toggle=easylist`, `navgator:blocker?allowlist=<host>`,
-  `navgator:userscript?enable=<id>`. A `navgator://settings/extensions` chrome page lists
-  installed add-ons, toggles, and per-site allowlists.
-- **Add-on chrome panels:** an add-on's optional `panel/index.html` is composited the
-  same way the chrome is (it *is* chrome), so no new rendering path. It talks to the
-  engine over a scoped `navgator.*` API rather than raw `navgator:` navigation.
+  `navgator:userscript?enable=<id>`. A `gator://settings/extensions` internal page (or a
+  native egui settings pane) lists installed add-ons, toggles, and per-site allowlists.
+- **Add-on chrome panels:** the chrome itself is native egui, so an add-on's optional
+  `panel/index.html` is *not* composited "the same way the chrome is." Either render the
+  panel natively in egui from declarative metadata, or composite an add-on HTML panel as a
+  dedicated Servo `WebView` (the same path page content uses). It talks to the engine over a
+  scoped in-process `navgator.*` API, not raw `navgator:` navigation.
 - **IPC control socket (M5):** extend the text protocol with
   `blocker on|off`, `blocker-stats`, `userscript-add <path>` so external tooling
   (and Lyku sync) can drive add-on state — consistent with the existing `NAVGATOR_IPC`

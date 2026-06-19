@@ -48,12 +48,12 @@
 | --- | --- | --- |
 | Crates | **1** binary crate (`navgator`) | `Cargo.toml` |
 | Rust LOC | `src/main.rs` = **788 lines**; everything in one file | `wc -l` |
-| Chrome assets | `index.html` 60, `chrome.css` 214, `chrome.js` 126 | `wc -l src/chrome/*` |
+| Chrome | **Native egui** (toolbar, tabs, dialogs, menus, settings drawn directly with egui); no HTML/CSS/JS chrome assets | `crates/navgator/src/main.rs` |
 | Dependency graph | **855** packages in `Cargo.lock` | `grep -c 'name =' Cargo.lock` |
 | Direct deps | `servo`, `embedder_traits`, `winit 0.30`, `euclid`, `dpi`, `url`, `rustls` | `Cargo.toml` |
 | Engine embedding | High-level `libservo` umbrella crate, **pinned rev**, default features (incl. `baked-in-resources`) | `Cargo.toml`, `ARCHITECTURE.md` |
 | Process model | **Single process, single thread** UI; Servo in-process; one IPC background thread for the optional control socket | `src/main.rs` |
-| Engine↔UI bridge | In-process. Chrome→engine via `location.href = "navgator:..."` intercepted in `request_navigation`; engine→chrome via `WebView::evaluate_javascript` dispatching `navgator:state` CustomEvent | `main.rs`, `chrome.js` |
+| Engine↔UI | In-process, **direct Rust method calls**. The egui chrome calls `WebView`/`AppState` methods directly (`webview.load(url)`, etc.); there is no `navgator:`-URL command bridge and no `evaluate_javascript` chrome-state push. (`evaluate_javascript` is now used only to run find-in-page JS *inside page content*.) | `main.rs` |
 | External control | Opt-in Unix-socket text protocol (`NAVGATOR_IPC`), ~7 verbs in / 2 events out | `main.rs` `start_ipc` |
 | Data layer | **None.** No history/bookmarks DB, no profiles, no settings persistence. Servo's own per-site storage uses its default `config_dir` | `main.rs`, Servo `opts.rs` |
 | State holder | One `Rc<AppState>` with `RefCell`/`Cell` interior mutability; `Vec<Tab>` of webviews sharing one `OffscreenRenderingContext` | `main.rs` |
@@ -80,8 +80,10 @@ today. The architecture should lean on these instead of reinventing them:
   **per-profile data directories** are a Servo-native concept; you do not build
   cookie/localStorage persistence yourself.
 - **`ProtocolHandler`/`ProtocolRegistry`** (`protocol_handler` module) → register
-  a real `navgator://` (or `about:`) scheme for internal pages (settings, history,
-  newtab) instead of `file://` + a fake `navgator:` command scheme.
+  a real internal-page scheme for settings, history, newtab. (navgator has since
+  done this: the `gator://` scheme — e.g. `gator://welcome` — is served from
+  embedded resources via `AppState::load_web_resource`/`render_gator_welcome`,
+  with no `file://` and no fake `navgator:` command scheme.)
 - **The full `WebViewDelegate`** (38+ callbacks) — `main.rs` implements 5. A real
   browser MUST handle: `show_embedder_control` (alert/confirm/prompt, `<select>`,
   color/file pickers, context menus, IME), `request_permission`,
@@ -313,7 +315,13 @@ engine prefs; map only the safe subset onto Servo.
 
 ## 5. The chrome as a real app (HTML/CSS/JS, no bloat)
 
-The chrome is HTML rendered by a Servo `WebView`. Two hard constraints shape the
+> **Stale (pre-pivot):** this section assumed an HTML chrome rendered by a Servo
+> `WebView`. navgator has since moved the chrome to **native egui** (see §1), so the
+> two constraints below — Servo CSS/JS gaps in the chrome, and a JS-framework
+> runtime inside the browser UI — no longer apply to the chrome. The discussion is
+> retained only as the rationale for that pivot.
+
+The chrome was originally HTML rendered by a Servo `WebView`. Two hard constraints shaped the
 stack:
 
 1. **Servo's web platform support has gaps.** Already worked around in
@@ -346,8 +354,11 @@ question, §10).
 
 ### 5.2 Replace the `navgator:` `location.href` bridge with a typed protocol
 
-Today the chrome does `window.location.href = "navgator:nav#" + url`, intercepted
-in `request_navigation`. This is clever but limited (one-shot, string-only,
+The original HTML chrome did `window.location.href = "navgator:nav#" + url`, intercepted
+in `request_navigation`. (With the native-egui chrome this bridge no longer exists —
+`request_navigation` now simply `allow()`s — and the typed-protocol design below is moot
+for the chrome; keep it only as reference for the external `NAVGATOR_IPC`/engine-as-a-service
+surface.) This was clever but limited (one-shot, string-only,
 collides with real navigation, no responses). Replace with:
 
 - **Chrome → engine**: a small injected JS shim `window.navgator.send(cmd)` that

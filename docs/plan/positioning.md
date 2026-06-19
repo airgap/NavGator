@@ -130,8 +130,9 @@ match them.
 - **No telemetry by construction, and it's believable.** A Chromium fork claiming "no
   telemetry" is fighting its own upstream forever. navgator's telemetry story is true because
   there's nothing phoning home unless navgator adds it.
-- **Smaller, hackable surface.** Servo + an HTML chrome is dramatically smaller than the
-  ~40M-line Chromium tree. That's what makes Opera-GX-class theming *performant and deep*
+- **Smaller, hackable surface.** Servo (page renderer) + a native-egui chrome is dramatically
+  smaller than the ~40M-line Chromium tree — and, unlike an HTML chrome, the UI doesn't even
+  run on the web engine. That's what makes Opera-GX-class theming *performant and deep*
   rather than bolted-on.
 
 ### 2.2 What it costs — quantified
@@ -231,15 +232,15 @@ loyal, vocal, and currently *unserved by an independent engine*.**
 | Axis | Incumbent reality | navgator's structural advantage | Win condition for v1 |
 |---|---|---|---|
 | **Independence** | Only Ladybird can match; nobody ships it for consumers | Engine + funding both clean of Google | The story is *true* and prominent; the only such consumer browser |
-| **Customization / theming** | Opera GX fakes performance; Vivaldi is deep but Chromium-heavy | Chrome is HTML rendered by Servo → theming is first-class & cheap | Opera-GX-class theming that's *native*, scriptable, performant |
+| **Customization / theming** | Opera GX fakes performance; Vivaldi is deep but Chromium-heavy | Native-egui chrome → UI theming is first-class & cheap, and not bottlenecked by the web engine | Opera-GX-class theming that's *native*, scriptable, performant |
 | **Zero telemetry / no AI cram-down** | Chromium forks fight upstream; Chrome adds AI by default | Nothing phones home unless navgator adds it; believable | Verifiably zero outbound telemetry; AI strictly opt-in |
 | **Footprint / performance** | GX uses limiters as a band-aid on a heavy engine | Lean Rust engine, fewer threads, single-process option | Lower idle RAM & process count than Chrome on the same tabs |
 
 What "winning" looks like concretely:
 
-1. **Theming as the headline feature**, not a settings sub-page. The chrome being HTML-in-Servo
-   (already built: M1–M4) is the unique enabler — full CSS/JS theming of the browser UI with no
-   privileged-extension hoops. This is the demo that sells the browser.
+1. **Theming as the headline feature**, not a settings sub-page. The native-egui chrome
+   (already built) is the unique enabler — direct, in-process theming of the browser UI with no
+   privileged-extension hoops and no second engine to render it. This is the demo that sells the browser.
 2. **A built-in content blocker in the engine** (MV3 can't touch it), shipped on by default.
 3. **A "what navgator sends" page** that proves zero telemetry — turn the honesty into a feature.
 4. **Sync via Lyku as a *trust* feature** (self-hostable, no-Google), not just convenience —
@@ -331,9 +332,9 @@ gracefully-handled event:
 
 1. **(P0) Adopt "second browser, by choice" as the explicit v1 stance.** It defuses R2/R5,
    makes the compat gap honest, and is the only framing that survives 62%-WPT reality.
-2. **(P0) Make deep theming the headline, not a setting.** The HTML-chrome-in-Servo
-   architecture (already built) is navgator's one un-copyable consumer feature. The launch demo
-   is "watch me re-skin the entire browser with CSS." Beat Opera GX on *real* performance.
+2. **(P0) Make deep theming the headline, not a setting.** The native-egui chrome
+   (already built) is navgator's one un-copyable consumer feature. The launch demo
+   is "watch me re-skin the entire browser instantly." Beat Opera GX on *real* performance.
 3. **(P0) Treat the Servo bump as scheduled recurring work with an owner and a checklist** (rev
    + toolchain + `winit_minimal` API recheck + clean lock). This is the anti-Verso discipline;
    it is a *positioning* decision because it's what keeps the project alive (R1).

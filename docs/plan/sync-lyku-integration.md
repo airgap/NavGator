@@ -547,7 +547,7 @@ keeps E2EE blobs out of the public media bucket). Keep the existing
 
 1. **Identify once via OIDC.** navgator registers a public OAuth client
    (`registerOAuthClient`, `requirePkce: true`, `confidential: false`, redirect URI
-   `navgator://oauth/callback` or a loopback `http://127.0.0.1:<port>/callback`). User logs
+   `gator://oauth/callback` or a loopback `http://127.0.0.1:<port>/callback`). User logs
    into Lyku in a webview/system browser; navgator runs auth-code + PKCE S256 against
    `/oauth/authorize` → `/oauth/token`, gets an `id_token` (account identity) and an
    `access_token`. This proves "this navgator install belongs to Lyku user `sub`."

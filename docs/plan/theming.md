@@ -11,11 +11,13 @@
 
 ## 0. TL;DR
 
-- **The chrome is already an HTML document Servo paints** (`src/chrome/index.html` +
-  `chrome.css` + `chrome.js`). That is the entire theming substrate. Theming the chrome =
-  swapping CSS custom properties / stylesheets in a document we own. This is *cheap* and
-  the single biggest lever — most of GX's look is achievable with CSS variables + a
-  hot-reload path. No Servo changes required for chrome theming.
+- **The chrome is now drawn with native egui** (toolbar, tabs, dialogs, menus, settings),
+  not an HTML document Servo paints. Theming the chrome = driving egui's `Visuals` (accent,
+  dark/light, spacing) from the theme tokens — see `build_visuals`/`accent_color32` in
+  `main.rs`. This is still *cheap* and the single biggest lever, and needs no Servo support
+  at all. (The CSS-variable / `evaluate_javascript` hot-reload mechanics described later in
+  this doc were written for the old HTML chrome and no longer apply to chrome theming; they
+  remain valid only for the *content* userstyle/force-dark layer below.)
 - **Content theming (force-dark, per-site CSS) is real and supported.** Servo exposes a
   public `UserContentManager` API (`servo::UserContentManager`, verified in
   `components/servo/user_content_manager.rs` and exercised by Servo's own test
@@ -67,15 +69,15 @@
 
 From `src/main.rs` + `src/chrome/*`:
 
-- The chrome is a Servo `WebView` loaded from a `file://` URL (`chrome_url()` →
-  `src/chrome/index.html`). It already uses CSS custom properties under `:root`
-  (`--bg`, `--bar`, `--accent`, `--radius`, …) — i.e. **a token system already exists**, it
-  just isn't formalized, themeable, or persisted.
-- The engine→chrome push channel is `WebView::evaluate_javascript(js, cb)`
-  (`AppState::chrome_eval`, used by `push_model`). The chrome→engine channel is a denied
-  navigation to a `navgator:` URL intercepted in `request_navigation`. **Both channels are
-  in place and are exactly what a theme/mod system needs.** A theme apply is just a new
-  `navgator:` verb + a `navgator:state`-style event.
+- The chrome is **native egui**, not a Servo `WebView` (there is no `chrome_url()`,
+  `src/chrome/index.html`, `chrome.js`, or `file://` chrome). It builds its colors from an
+  accent + dark/light choice via `build_visuals`/`accent_color32` in `main.rs` — i.e. **an
+  accent-driven token notion already exists**, it just isn't a formalized, persisted theme yet.
+- There is **no engine↔chrome JS bridge** (`chrome_eval`/`push_model`/the `navgator:` URL
+  intercept are gone — `request_navigation` now just `allow()`s). The egui chrome and the
+  engine are the same process and call each other directly, so a theme apply is an ordinary
+  Rust state change that updates egui `Visuals` on the next frame — cheaper than the old
+  CustomEvent path. (`evaluate_javascript` survives only for find-in-page inside page content.)
 - `chrome.css` already documents Servo gaps it had to work around:
   `user-select` is an inert stub (worked around via `selectstart` in JS), and
   `text-overflow: ellipsis` is unimplemented (worked around with a JS binary-search
@@ -206,8 +208,14 @@ A theme is fundamentally **a set of token values**. Applying it:
    `content_webview.notify_theme_change(Theme::Dark|Light)` for the active tab(s) so
    content's `prefers-color-scheme` follows the chrome.
 
-This is the whole reason the HTML-chrome architecture is a superpower for theming: the
-theme apply is a CSS variable write, the cheapest possible operation.
+> **Note (post-pivot):** the hot path above (an `evaluate_javascript` `navgator:theme`
+> CustomEvent → `setProperty` on `:root`) was the HTML-chrome design and no longer applies
+> to the chrome, which is now native egui. The equivalent today is even cheaper and
+> in-process: apply the resolved tokens to egui's `Visuals` (`build_visuals`) and the chrome
+> repaints next frame — no JS, no event, no document. Step 4 (calling
+> `content_webview.notify_theme_change(Theme::Dark|Light)` so page `prefers-color-scheme`
+> follows) is still correct and is the *content* side. The CSS-variable framing below survives
+> only for the content userstyle layer.
 
 ---
 

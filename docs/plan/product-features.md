@@ -1,13 +1,22 @@
 # navgator — Browser Product Feature Inventory & Gap vs. M1–M5
 
 > Scope: everything a full browser needs as a **product** (not engine internals),
-> gapped against navgator's verified current state (repo at `/raid/navgator`, Servo rev
+> gapped against navgator's verified current state (repo at `/raid/NavGator`, Servo rev
 > `ed1af70`). Each feature is tagged **have / partial / missing** with a target
 > **priority** (P0 = required for a credible 1.0, P1 = expected by power users / fast
 > follow, P2 = differentiator or later).
 >
-> Ground truth used: `src/main.rs` (788 lines), `src/chrome/{index.html,chrome.css,chrome.js}`,
-> `docs/ARCHITECTURE.md`, and the cached Servo source at
+> **Architecture note (M6 native-chrome pivot):** the browser UI — toolbar, tabs, dialogs,
+> menus, settings, find bar, bookmarks bar, omnibox dropdown — is now drawn **natively with
+> egui** directly over the page. Servo renders **only web content** into an offscreen GL
+> texture; egui blits that texture on its background layer and paints the chrome on top.
+> There is no second Servo WebView for the UI and no `navgator:`/`chrome.js` string-bridge
+> anymore; privileged actions are direct Rust calls. The old "UI is HTML rendered by Servo"
+> model (chrome.js / index.html / a `navgator:` command channel) is gone.
+>
+> Ground truth used: `crates/navgator/src/main.rs` (~2375 lines; `struct AppState` impls
+> `WebViewDelegate`), the `navgator_engine` facade (`crates/navgator-engine/src/lib.rs`),
+> `crates/navgator/src/content/welcome.html`, and the cached Servo source at
 > `/home/nicole/.cargo/git/checkouts/servo-e53a6e7b994a25fe/ed1af70/`
 > (`components/servo/webview_delegate.rs`, `webview.rs`, `servo_delegate.rs`,
 > `components/shared/embedder/lib.rs`, `components/net/resource_thread.rs`,
@@ -17,48 +26,62 @@
 
 ## TL;DR — the shape of the gap
 
-navgator M1–M5 built the **shell and the compositing/bridge plumbing**: HTML chrome,
-content webviews, tabs, omnibox-driven navigation, an input router, and an external
-IPC control plane. That is a real browser *frame*. But essentially **none of the
-product features** that make a browser usable day-to-day exist yet, and — crucially —
-**libservo does not give them to you for free**. The engine exposes the *hooks*
-(delegate callbacks and a handful of `WebView` methods); the embedder must build the
-storage, the UI, and the policy on top.
+navgator built a real **shell** — and after the M6 native-chrome pivot it now ships a
+large slice of the day-to-day product layer on top of it: native egui chrome, tabs with
+favicons and spinners, omnibox navigation **with a history-backed suggestion dropdown**,
+JS dialogs, form/file/color pickers, a right-click context menu, permission prompts, HTTP
+auth, a hover-URL status bar, find-in-page, zoom, a native settings panel, persisted
+history + bookmarks (with a bookmarks bar), search-engine config, a `gator://`
+internal-pages framework, a real new-tab/welcome page, and reopen-closed-tab. The earlier
+revision of this doc marked most of those MISSING; they are now **done** (verified in
+`main.rs`). What remains genuinely missing is the heavier tier — downloads, full session
+restore, a history/downloads/permissions *manager UI*, crash recovery, profiles,
+passwords, reader mode, PDF — and most of that still needs **engine work or substantial
+embedder build-out**, because **libservo gives hooks, not features**.
 
-Three structural facts dominate this whole dimension:
+Three structural facts still shape this dimension:
 
-1. **No persistence layer exists at all.** navgator writes nothing to disk — no
-   bookmarks, history, downloads, settings, passwords, sessions. Even Servo's own
-   cookie jar is ephemeral, because navgator never sets `config_dir`
-   (`ServoBuilder::default()` in `main.rs:544`; Servo only persists `cookie_jar.json`
-   when a config dir is configured — `components/net/resource_thread.rs:213,672`).
-   **A profile/data store is the precondition for ~70% of this list** and should be
-   the very next thing built.
+1. **A persistence layer now exists — as flat files, not a database.** navgator persists
+   **settings** (`~/.config/navgator/settings.conf`, `load_settings`/`save_settings`),
+   **history** and **bookmarks** as TSV (`history.tsv`/`bookmarks.tsv` via `config_file`,
+   `save_history`, `save_bookmarks`, `record_visit`; `struct Profile` in `main.rs`). What's
+   still missing is a *structured* store (SQLite) and a richer schema (downloads, passwords,
+   per-site permissions/zoom, full sessions), plus **Servo's own `config_dir`** is still
+   unset, so its `cookie_jar.json` remains ephemeral (`ServoBuilder::default()` in
+   `resumed()`; `components/net/resource_thread.rs:213,672`). The TSV store unblocked
+   history/bookmarks/suggestions; a real DB is the precondition for the rest of the list.
 
-2. **libservo gives hooks, not features.** The good news: at rev `ed1af70` the
-   `WebViewDelegate` trait is rich — `request_permission`, `request_authentication`,
-   `request_create_new` (popups/`window.open`), `request_protocol_handler`,
-   `show_embedder_control` (select/file/color/datetime/IME/**context menu**/simple
-   dialogs), `notify_favicon_changed` + `WebView::favicon()`, `notify_crashed`,
-   `notify_fullscreen_state_changed`, full **AccessKit** accessibility tree updates,
-   `WebView::set_page_zoom`, and `WebView::take_screenshot`. The bad news: navgator
-   implements only **4 of ~40** delegate methods today (`notify_new_frame_ready`,
-   `notify_url_changed`, `notify_page_title_changed`, `notify_history_changed`,
-   `request_navigation`). Every unimplemented method is a visible product bug waiting
-   to happen (a `confirm()` dialog silently does nothing; a `<select>` doesn't open;
-   `window.open` is a no-op; a download just fails).
+2. **libservo gives hooks, not features — and navgator now wires most of the P0 hooks.**
+   At rev `ed1af70` the `WebViewDelegate` trait is rich, and `AppState` now **implements**
+   a large chunk of it: `load_web_resource` (the `gator://` scheme), `notify_url_changed`,
+   `notify_page_title_changed`, `notify_history_changed`, `notify_favicon_changed`
+   (+`WebView::favicon()`), `notify_load_status_changed`, `notify_status_text_changed`,
+   `request_create_new` (popups/`window.open`), `notify_closed`, `show_embedder_control`
+   (simple dialogs + `<select>` + color + file pickers), `request_authentication`,
+   `request_permission`, `notify_fullscreen_state_changed`, and `request_navigation`. The
+   right-click menu is built natively (winit right-press → an egui context-menu overlay),
+   not via `EmbedderControl::ContextMenu`. Still **unimplemented**: `notify_crashed`
+   (no sad-tab/recovery), accessibility tree updates, IME composition
+   (`InputMethodControl`), `request_protocol_handler`, and `show_notification`. So the old
+   "silent no-op cliff" is largely closed for the common cases (`alert`/`confirm`/`prompt`,
+   `<select>`, file/color pickers, auth, permissions, popups all work), but a content
+   **crash** still blanks the tab and CJK/dead-key **IME** input is still broken.
 
-3. **Some marquee features the engine does NOT provide and navgator must build itself
-   (or do without):** **find-in-page**, **downloads** (no download delegate exists at
-   all in libservo at this rev — searched `components/servo/`, `components/net/`; only
-   a `fetch` `Initiator::Download` enum value), **PDF viewing**, **reader mode**, and
-   **a real private/incognito profile boundary**. These are genuinely expensive and
-   several are blocked on engine work, not just UI work.
+3. **Some marquee features the engine does NOT provide; navgator builds them itself or
+   does without.** **Find-in-page** is now shipped as a **JS-injected highlight overlay**
+   (`FIND_JS` + a Ctrl+F egui bar with next/prev/count — `find_run`/`find_step`/`find_close`),
+   since there's still no native `find_*` on `WebView`; it's the imperfect-but-usable
+   option (#18 is now partial, not missing). Still genuinely expensive and mostly
+   engine-blocked: **downloads** (no download delegate at all in libservo at this rev —
+   only a `fetch` `Initiator::Download` enum value), **PDF viewing**, **reader mode**, and
+   **a real private/incognito profile boundary**.
 
-If you ship M1–M5 as-is and call it a browser, the first five things a user tries —
-right-click, download a file, find text on a page, log in (saved password / autofill),
-and reopen the window (session restore) — **all fail or no-op**. That's the priority
-signal.
+Of the "first five things a user tries," most now work: **right-click** opens a (small)
+context menu, **find text** works (JS overlay), and **log in to a basic-auth site** prompts
+properly. What still fails or no-ops: **downloading a file** (no engine download path),
+**saved-password / autofill** login, and **full session restore** on relaunch (only
+reopen-*closed-tab* exists). Those — plus downloads' manager UI and a history page — are
+where the remaining priority is.
 
 ---
 
@@ -69,68 +92,73 @@ Status legend: ✅ have · 🟡 partial · ❌ missing · 🧱 *engine-blocked* 
 
 | # | Feature | Status | Priority | Current state in navgator | What's needed |
 |---|---------|--------|----------|-------------------------|---------------|
-| 1 | **Omnibox: URL parse + go** | 🟡 | P0 | `chrome.js:101-112`: trims, `https://` prefix, DuckDuckGo fallback. Heuristic-only. | Proper URL/term disambiguation, IDN/punycode, localhost/IP, `scheme:` passthrough. |
-| 2 | **Omnibox: suggestions/autocomplete dropdown** | ❌ | P0 | None. No dropdown, no inline autocomplete. | A suggestion UI + ranked source merge (history/bookmarks/search). Needs #14/#9/#10 stores. |
-| 3 | **Omnibox: history-weighted ranking** | ❌ | P1 | None. | Frecency scoring over history+bookmarks (visit count × recency decay), prefix/host match. |
-| 4 | **Omnibox: search-engine config + suggest API** | 🟡 | P1 | Hardcoded DDG (`chrome.js:110`). | Engine list, default selection, `%s` templates, keyword search, optional suggest endpoint. |
-| 5 | **Bookmarks: add/remove/star** | ❌ | P0 | None. No store, no star UI. | Data store (#store) + star button + manager page. |
-| 6 | **Bookmarks: folders / bookmarks bar** | ❌ | P1 | None. | Folder tree model, bookmarks-bar strip in chrome, drag-org. |
+| 1 | **Omnibox: URL parse + go** | 🟡 | P0 | `navigate_from_omnibox` (`main.rs`): `://` passthrough, dotted-no-space → `https://`, else search template. Heuristic-only. | Proper URL/term disambiguation, IDN/punycode, localhost/IP, bare `scheme:` passthrough. |
+| 2 | **Omnibox: suggestions/autocomplete dropdown** | ✅ | P0 | Done. `suggestions()` matches history by URL/title and shows an egui dropdown under the address bar (`draw_chrome`, `main.rs`); click navigates. | Add inline autocomplete + bookmarks/search-suggest sources to the dropdown. |
+| 3 | **Omnibox: history-weighted ranking** | 🟡 | P1 | Ranked by **visit count** only (`suggestions()` sorts by `HistoryEntry.visits`, top 6). No recency decay, no bookmark/host weighting. | Full frecency (visit count × recency decay), prefix/host match, include bookmarks. |
+| 4 | **Omnibox: search-engine config + suggest API** | ✅ | P1 | Done. `SEARCH_ENGINES` (DDG default + Kagi/Bing/Google) with `%s` templates, chosen in the native Settings panel (`draw_settings`), plus a custom-URL field; persisted to `settings.conf`. | Keyword (`!bang`-style) search + an optional live suggest endpoint. |
+| 5 | **Bookmarks: add/remove/star** | ✅ | P0 | Done. Ctrl+D toggles a bookmark for the active page (`toggle_bookmark_active`), persisted to `bookmarks.tsv`. No toolbar star icon (keyboard/bar only) and no dedicated manager page yet. | A star button in the toolbar + a `gator://bookmarks` manager. |
+| 6 | **Bookmarks: folders / bookmarks bar** | 🟡 | P1 | **Bookmarks bar shipped** — a horizontal strip below the tabs when any bookmarks exist (`draw_chrome`), each button loads the page. No folders, no drag-org. | Folder tree model + nesting in the bar + drag-organise. |
 | 7 | **Bookmarks: import/export (HTML/Netscape)** | ❌ | P1 | None. | Parser/serializer for the Netscape bookmark format (Chrome/FF interop). |
-| 8 | **History: record visits** | 🟡 | P0 | `notify_url_changed`/`notify_history_changed` fire (`main.rs:466,483`) but data is **per-tab in-memory only**, lost on close. | Persist `(url,title,visit_time,transition)` rows to the store. |
+| 8 | **History: record visits** | ✅ | P0 | Done. `record_visit` (called from `notify_url_changed`/`notify_page_title_changed`) dedupes by URL, increments a visit count, caps at 2000, and persists to `history.tsv`; skips `about:`/`data:`/`file:`. | Add visit *timestamps* + transition types (TSV stores only url/title/visits today). |
 | 9 | **History: UI + search** | ❌ | P0 | None. | A `navgator://history` page with text search + delete + clear-range. |
 | 10 | **Downloads: trigger + save to disk** | 🧱❌ | P0 | None. A download today just fails silently — **libservo exposes no download delegate** at `ed1af70`. | Intercept attachment responses via `load_web_resource`/`WebResourceLoad` or add an engine download path; stream to disk. Hard. |
 | 11 | **Downloads: manager UI** | ❌ | P0 | None. | `navgator://downloads` list, per-item progress, open/show-in-folder, cancel. |
 | 12 | **Downloads: resume / pause** | 🧱❌ | P2 | None. | HTTP Range + persisted partial state. Depends on #10 path. |
 | 13 | **Profiles / multi-account** | ❌ | P1 | None. Single ephemeral session. | Profile dirs (config_dir per profile), profile switcher, isolated cookie/storage. |
-| 14 | **Profile/data store (the substrate)** | ❌ | **P0** | None whatsoever — nothing persists. | SQLite (recommend `rusqlite`) + an `XDG`/per-OS data dir; migrations. **Build first.** |
+| 14 | **Profile/data store (the substrate)** | 🟡 | **P0** | **Flat-file store shipped:** settings (`settings.conf`) + history/bookmarks (TSV) under `$XDG_CONFIG_HOME/navgator` (`config_file`, `load_profile`, `save_*`). No DB, no migrations, no rows for downloads/passwords/permissions/sessions; Servo `config_dir` still unset. | Migrate to SQLite (`rusqlite`) with a real schema + migrations; set Servo's `config_dir` so cookies persist. |
 | 15 | **Password manager (store/fill)** | ❌ | P1 | None. | Encrypted credential store (OS keyring), capture-on-submit, fill-on-load via injected script (`UserContentManager`). |
 | 16 | **Autofill: forms / addresses / cards** | ❌ | P2 | None. | Profile data + field-heuristics + fill UI. Large surface. |
 | 17 | **Passkeys / WebAuthn** | 🧱❌ | P2 | None. | WebAuthn is an engine/DOM capability; verify Servo support (likely absent) before promising. Engine-blocked. |
-| 18 | **Find-in-page (Ctrl+F)** | 🧱❌ | P0 | None. **No find API in libservo** (`webview.rs` has no `find_*`; searched whole `components/servo/`). | Either land find in Servo, or inject a JS find-highlight overlay via `UserContentManager` (imperfect). |
+| 18 | **Find-in-page (Ctrl+F)** | 🧱🟡 | P0 | **Shipped as a JS overlay** (no native find API in libservo). Ctrl+F opens an egui find bar; `FIND_JS` wraps matches in `<span data-ngf>` via `evaluate_javascript`, `find_step` cycles ▲/▼ and scrolls, with a live count. Imperfect (regex-escaped substring, fragile on complex DOM, no engine match-nav). | Land native find in Servo for correctness; or harden the overlay. |
 | 19 | **PDF viewing** | 🧱❌ | P1 | None. PDFs would download, not render. | Servo has no PDF renderer; bundle a WASM/JS viewer (e.g. pdf.js-equivalent) served via internal scheme, or native. |
 | 20 | **Reader mode** | ❌ | P2 | None. | Article extraction (Readability-style) + a styled reader page; inject via internal scheme. Pure embedder work. |
 | 21 | **Private / incognito window** | 🧱🟡 | P1 | None. All tabs share one ephemeral session — *accidentally* non-persistent, not *isolated*. | A real boundary needs per-session storage/cookies; verify libservo can give a webview an isolated, non-persisted storage scope. |
-| 22 | **Session restore (reopen tabs)** | ❌ | P0 | None. Closing the window loses everything. | Persist tab list + per-tab URL (history is harder); restore on launch; "reopen closed tab". |
-| 23 | **Crash restore** | 🟡 | P1 | `notify_crashed` exists in the trait but navgator **doesn't implement it** (only 5 delegate methods total). A content crash = blank tab, no recovery. | Implement `notify_crashed` → sad-tab UI + reload; periodic session snapshot for restore. |
-| 24 | **Tabs: new/select/close** | ✅ | P0 | Done & verified (`main.rs:256-323`; Ctrl+T/W/Tab `main.rs:666-684`). | — |
-| 25 | **Tabs: favicons** | 🟡 | P0 | Engine provides `notify_favicon_changed` + `WebView::favicon()` (`webview.rs:355`); navgator ignores both. Tabs are title-only. | Implement the callback, decode the `Image`, render in tab strip + omnibox. |
+| 22 | **Session restore (reopen tabs)** | 🟡 | P0 | **Reopen-closed-tab shipped** (Ctrl+Shift+T → `reopen_closed_tab`, popping a per-session `closed_tabs` URL stack, also fed by close/close-others). No persisted session: relaunch still starts at the welcome page. | Persist the open-tab list + per-tab URL to the store; restore on launch. |
+| 23 | **Crash restore** | ❌ | P1 | `notify_crashed` exists in the trait but navgator still **doesn't implement it**. A content crash = blank tab, no sad-tab, no recovery. | Implement `notify_crashed` → sad-tab UI + reload; periodic session snapshot for restore. |
+| 24 | **Tabs: new/select/close** | ✅ | P0 | Done & verified (`new_tab`/`select_tab`/`close_tab`/`close_others`; `+` button, middle-click close, per-tab `×`, tab context menu; Ctrl+T/W/Tab/Shift+Tab + Ctrl+1–9 in the keyboard match). | — |
+| 25 | **Tabs: favicons** | ✅ | P0 | Done. `notify_favicon_changed` decodes `WebView::favicon()` (all `PixelFormat`s → `favicon_color_image`), uploads to a GPU texture in `load_favicons`, and renders a 16px icon per tab (a `Spinner` while loading). | Also surface the favicon in the omnibox / suggestion rows. |
 | 26 | **Tabs: pinning** | ❌ | P1 | None. | Per-tab pinned flag + reordering + render. |
 | 27 | **Tabs: groups** | ❌ | P2 | None. | Grouping model + collapsible UI. |
 | 28 | **Tabs: vertical tabs** | ❌ | P1 | Horizontal strip only (`chrome.css`). Since chrome is HTML, this is a CSS/layout mode — cheap relative to Chrome. **Natural differentiator.** | Layout variant + content-rect now comes from left edge, not just top (extend the `navgator:layout` handshake to report a rect, not a scalar `top`). |
 | 29 | **Tabs: search / overflow / scroll** | ❌ | P1 | None; strip will overflow with many tabs. | Overflow scroll + a tab-search palette. |
 | 30 | **Tabs: drag-reorder** | ❌ | P1 | Explicitly deferred (M4b). | Pointer drag in chrome JS + model reorder command. |
-| 31 | **Tabs: hibernation / throttling** | 🟡 | P1 | `WebView::set_throttled` exists (`webview.rs:707`); unused. Background tabs run full-tilt. | Throttle/`hide()` background tabs; discard + restore-on-activate for memory. |
-| 32 | **Settings UI** | ❌ | P0 | None. No prefs page, nothing to persist. | `navgator://settings` HTML page bound to the store; the chrome-is-HTML model makes this cheap. |
-| 33 | **Site permissions: prompts** | ❌ | P0 | `request_permission` exists with `PermissionFeature` {Geolocation, Notifications, Push, Midi, Camera, Microphone, Speaker, DeviceInfo, BackgroundSync, Bluetooth, PersistentStorage, ScreenWakeLock, Gamepad} (`embedder/lib.rs:619`). navgator **doesn't implement it → all such requests hang/deny by default**. | Implement → prompt UI + remember decision in store. |
+| 31 | **Tabs: hibernation / throttling** | 🟡 | P1 | `select_tab` already `hide()`s inactive webviews and `show()`s the active one, but `WebView::set_throttled` is unused, so background tabs still run full-tilt. | Throttle background tabs + discard/restore-on-activate for memory. |
+| 32 | **Settings UI** | ✅ | P0 | Done — **as a native egui panel**, not a web page. The ☰ button opens `draw_settings`: search-engine combo + custom URL, accent color, dark-theme toggle, all persisted via `save_settings` and applied live (`apply_theme`). | Expand to more prefs (downloads dir, permissions, per-site data) as those stores land. |
+| 33 | **Site permissions: prompts** | ✅ | P0 | Done. `request_permission` pushes a `Dialog::Permission` egui overlay showing the requested `feature()` with Allow/Deny (`draw_one_dialog`). Decision is **not remembered** across requests. | Remember per-site decisions in the store (#14) + a management UI (#34). |
 | 34 | **Site permissions: management UI** | ❌ | P1 | None. | Per-site settings page + page-info popover (the "lock icon" panel). |
-| 35 | **Authentication (HTTP basic/proxy)** | ❌ | P0 | `request_authentication` exists (`webview_delegate.rs`); not implemented → **auth-protected sites just fail**. | Username/password dialog (HTML overlay) wired to `AuthenticationRequest::authenticate`. |
-| 36 | **JS dialogs (alert/confirm/prompt)** | ❌ | P0 | `show_embedder_control(SimpleDialog)` delivers these (`webview_delegate.rs:340`); not implemented → **`alert()`/`confirm()`/`prompt()` are no-ops**. | Modal HTML dialogs; must be visually un-spoofable per the spec note in Servo. |
-| 37 | **`<select>` / `<input type=file/color/date>` pickers** | ❌ | P0 | `show_embedder_control` delivers `SelectElement`/`FilePicker`/`ColorPicker`/`InputMethod`; none implemented → **native form controls don't open**. | Implement each control's UI + `submit`/`dismiss`. |
-| 37b | **Context menu (right-click)** | ❌ | P0 | `EmbedderControl::ContextMenu` is delivered (`webview_delegate.rs:340`); not implemented → **right-click does nothing**. | Build the menu UI + handle items (open-in-new-tab, copy link, save image, inspect, back/forward/reload). |
-| 38 | **Popups / `window.open` / target=_blank** | ❌ | P0 | `request_create_new` (`CreateNewWebViewRequest`) not implemented → **links/JS that open new windows silently fail**. | Build the new WebView as a new tab/window; keep the handle alive (Servo warns it's dropped otherwise). |
-| 39 | **Zoom (Ctrl+/-/0, pinch)** | 🟡 | P0 | `WebView::set_page_zoom`/`page_zoom`/`adjust_pinch_zoom` exist (`webview.rs:650-680`); **unused** — no key bindings, no per-site memory. | Wire Ctrl+/Ctrl-/Ctrl0 + wheel-zoom; persist per-site zoom. |
+| 35 | **Authentication (HTTP basic/proxy)** | ✅ | P0 | Done. `request_authentication` pushes a `Dialog::Auth` egui overlay (username + masked password, proxy-aware message) wired to `AuthenticationRequest::authenticate`; Cancel drops the handle. | Optional: remember/save credentials (needs the password store, #15). |
+| 36 | **JS dialogs (alert/confirm/prompt)** | ✅ | P0 | Done. `show_embedder_control(SimpleDialog)` → a centered `Dialog::Simple` egui window; alert (OK), confirm (OK/Cancel), prompt (text field + OK/Cancel) all wired to `confirm()`/`dismiss()`/`set_current_value`. | Harden against spoofing (origin label / non-dismissable focus) per Servo's note. |
+| 37 | **`<select>` / `<input type=file/color/date>` pickers** | 🟡 | P0 | `<select>` (incl. optgroups), file picker (via `egui-file-dialog`, single/multiple + extension filters), and color picker are all implemented in `show_embedder_control` → egui overlays with select/submit/dismiss. **Date/time** pickers and **IME** are not handled (the `_ => {}` arm). | Add date/time control UI + IME (#46). |
+| 37b | **Context menu (right-click)** | 🟡 | P0 | Done minimally — a **native** egui context menu (right-press over the page → `Dialog::ContextMenu` at the cursor) with Back / Forward / Reload. Built directly in the winit handler, not from `EmbedderControl::ContextMenu`. Missing the link/image items. | Add open-in-new-tab, copy/save link, save image, view source/inspect — needs the engine to surface the hit-test target. |
+| 38 | **Popups / `window.open` / target=_blank** | ✅ | P0 | Done. `request_create_new` builds the requested WebView (`request.builder(...)`) and `adopt_tab`s it as a new tab, keeping the handle alive; `notify_closed` removes it. | Optional: real popup-window sizing / `noopener` policy. |
+| 39 | **Zoom (Ctrl+/-/0, pinch)** | 🟡 | P0 | Done for the common path: Ctrl+`=`/`+`, Ctrl+`-`, Ctrl+`0`, and Ctrl+wheel call `zoom_in`/`zoom_out`/`zoom_reset` → `WebView::set_page_zoom`, clamped 0.3–3.0, stored per-tab. No per-site **persistence**; touchpad pinch not wired. | Persist per-site zoom in the store; wire `adjust_pinch_zoom`. |
 | 40 | **Print** | 🧱❌ | P1 | None. No print path in libservo at this rev. | Likely route via "print to PDF" once a PDF/print path exists; engine-dependent. |
 | 41 | **Screenshot / capture** | 🟡 | P1 | `WebView::take_screenshot` exists (`webview.rs:784`); unused. | Wire a capture command (visible / full-page) + save dialog. Low-effort win. |
 | 42 | **Translation** | ❌ | P2 | None. | Detect language + a translation backend (self-hostable to stay off Google). Big. |
-| 43 | **Accessibility (screen readers)** | 🟡 | P1 | Engine ships full AccessKit: `notify_accessibility_tree_update` + `WebView::set_accessibility_active` (`webview.rs:890,908`). navgator **never activates it** → screen readers see nothing; the *HTML chrome itself* also needs an AccessKit adapter. | Activate per-webview + wire an AccessKit adapter to the platform AT bridge. Real work but unusually well-supported by Servo. |
-| 44 | **Keyboard shortcuts (full set)** | 🟡 | P1 | Minimal map (`main.rs:122-139`: printable + nav/editing); tab Ctrl+T/W/Tab only. No Ctrl+L, Ctrl+F, Ctrl+R, Ctrl+±, reopen-tab, etc. | Adapt servoshell `keyutils.rs`; a bindable shortcut table. |
+| 43 | **Accessibility (screen readers)** | 🟡 | P1 | Engine ships full AccessKit (`notify_accessibility_tree_update` + `WebView::set_accessibility_active`); navgator **never activates it** → screen readers see nothing in page content. (egui chrome has its own limited AccessKit surface.) | Activate accessibility per-webview + bridge the tree to the platform AT layer. |
+| 44 | **Keyboard shortcuts (full set)** | 🟡 | P1 | Solid core, hardcoded in the winit handler: Ctrl+T/W/Shift+T (reopen), Ctrl+L (omnibox), Ctrl+R (reload), Ctrl+D (bookmark), Ctrl+F (find), Ctrl +/-/0 (zoom), Ctrl+1–9 (select tab), Ctrl+Tab/Shift+Tab (cycle), Esc (close find/dialog/fullscreen). No history nav (Alt+←/→), no devtools, not user-bindable. | A bindable shortcut table; fill the gaps (Alt+arrows, etc.). |
 | 45 | **i18n / localization** | ❌ | P2 | English-only hardcoded strings in chrome HTML. | String catalog + locale switch; affects all chrome pages. |
-| 46 | **IME / composition input** | 🧱🟡 | P1 | `InputMethodControl` delivered via `show_embedder_control`; navgator sends only raw key events (`main.rs:664-697`), no composition → **CJK/dead-key input broken**. | Implement IME control + winit IME events. |
+| 46 | **IME / composition input** | 🧱🟡 | P1 | `InputMethodControl` is delivered via `show_embedder_control` but falls into the `_ => {}` arm; navgator forwards only raw mapped keys (`winit_key_to_servo`), no composition → **CJK/dead-key input broken**. | Implement the IME control + winit IME events. |
 | 47 | **Default-browser handling** | ❌ | P1 | None. | Per-OS registration (xdg `.desktop`/mimeapps on Linux; registry on Win; LSSetDefault on mac) + a "set default" prompt. |
 | 48 | **Protocol / deep-link handlers** | ❌ | P1 | `request_protocol_handler` exists (default-deny per Servo doc); not implemented → `registerProtocolHandler` no-ops. Also no OS-level `mailto:`/custom-scheme dispatch. | Implement the delegate + persist registrations + OS handler registration. |
-| 49 | **`navgator://` internal pages framework** | ❌ | P0 | None. navgator uses `navgator:` only as a *command* channel (`request_navigation` intercept, `main.rs:494`); there's no internal-page *content* scheme. Internal pages currently load from `file://` (`content/home.html`). | A registered internal scheme (or a `load_web_resource` interceptor) serving settings/history/downloads/newtab. Foundational for #9/#11/#32/#34. |
-| 50 | **New-tab page (real)** | 🟡 | P1 | Static `content/home.html` (search box is inert decoration; not wired to the omnibox). | Dynamic NTP: top sites (from history), bookmarks, themeable (ties to the Opera-GX goal). |
-| 51 | **Status bar (hover URL) / loading UI** | 🟡 | P1 | `notify_status_text_changed` + `WebView::status_text()` + `notify_load_status_changed` exist; unused. No hover-URL, no progress/spinner. | Implement callbacks → status overlay + tab spinner. Cheap. |
-| 52 | **Fullscreen (page-requested)** | 🟡 | P1 | `notify_fullscreen_state_changed` + `WebView::exit_fullscreen()` exist; unused → video fullscreen won't work right. | Implement: hide chrome, resize content to full window, Esc to exit. |
+| 49 | **`gator://` internal pages framework** | ✅ | P0 | Done. `load_web_resource` intercepts the `gator://` scheme and serves embedded HTML (`gator://welcome`/`newtab`/`home` → `render_gator_welcome`; unknown hosts → a 404 page) with proper `Content-Type` + `StatusCode::OK`. No `file://` dependency. Foundational for future `gator://history`/`downloads`/`bookmarks`. | Add the manager pages (history #9, downloads #11, etc.) on this same path. |
+| 50 | **New-tab page (real)** | 🟡 | P1 | `gator://welcome` is a **dynamic** page (`render_gator_welcome`): a working search box that posts to the configured engine, accent-themed from settings, and bookmark quick-link tiles (first 12). Missing: top-sites-from-history, deeper theming. | Add top sites (from the history store) + richer theming (ties to the Opera-GX goal). |
+| 51 | **Status bar (hover URL) / loading UI** | ✅ | P1 | Done. `notify_status_text_changed` drives a bottom-left status overlay (hover-URL / load status); `notify_load_status_changed` sets per-tab `loading`, rendering a `Spinner` in the tab strip and clearing stale status on a new load. | Optional: a determinate progress bar. |
+| 52 | **Fullscreen (page-requested)** | ✅ | P1 | Done. `notify_fullscreen_state_changed` sets a `fullscreen` flag that makes `update` skip `draw_chrome` (toolbar height → 0, page fills the window); Esc calls `WebView::exit_fullscreen()`. | — |
 | 53 | **Clipboard (copy/paste/cut in content)** | 🟡 | P0 | `ClipboardDelegate` trait exists (`clipboard_delegate.rs`); `servo`'s default `clipboard` feature is on, but navgator sets no custom delegate — **verify copy/paste actually works in content**; chrome JS only blocks `selectstart` (`chrome.js:30`). | Confirm/implement a `ClipboardDelegate` bridging the OS clipboard. |
 | 54 | **Notifications (web `Notification`)** | ❌ | P2 | `show_notification` (Web + Servo delegate) not implemented → notifications no-op. | OS notification bridge + permission (#33). |
 
-**Counts:** ~54 line items. P0: ~22. Of those P0s, navgator **has** exactly one
-(tabs), and ~6 more are "engine hook exists, just unimplemented" (favicons, dialogs,
-form pickers, context menu, zoom, permissions, auth) — i.e. **cheap to close**. The
-expensive P0s are downloads (#10/#11, engine-blocked), find-in-page (#18,
-engine-blocked), session restore (#22), and the data store + internal-pages framework
-(#14/#49) that everything else hangs off.
+**Counts:** ~54 line items. P0: ~22. After the M6 native-chrome pivot, navgator now **has**
+(✅) the bulk of the P0 cluster: tabs (#24), favicons (#25), omnibox suggestions (#2),
+search config (#4), bookmarks add/remove (#5), history record (#8), JS dialogs (#36),
+popups (#38), permissions (#33), auth (#35), settings UI (#32), the `gator://`
+internal-pages framework (#49), status/loading UI (#51), and fullscreen (#52). **Partial**
+(🟡) P0s now genuinely usable but incomplete: URL parse (#1), pickers (#37, no date/IME),
+context menu (#37b, nav-only), zoom (#39, no per-site memory), find-in-page (#18, JS
+overlay), session restore (#22, reopen-closed only), and the data store (#14, TSV not DB).
+The **still-missing** P0s are downloads (#10/#11, engine-blocked) and a history/downloads
+*manager UI* (#9/#11) — plus crash restore (#23). The cheap-hook batch is essentially
+done; the remaining P0 cost is concentrated in downloads and the DB-backed store.
 
 ---
 
@@ -171,12 +199,12 @@ This dimension's dependency graph collapses to a clear front-loaded order:
    or a registered protocol). *Unblocks settings/history/downloads/permissions UIs and
    a real NTP* — and since chrome is already HTML, these pages are cheap once the
    plumbing exists.
-3. **Close the "hook exists, unimplemented" P0 cluster** — these are mostly an
-   afternoon each because Servo already hands you the request object: **context menu
-   (#37b), JS dialogs (#36), form/file/color pickers (#37), permissions prompts (#33),
-   HTTP auth (#35), popups/`window.open` (#38), favicons (#25), zoom keybindings
-   (#39), status/loading UI (#51), fullscreen (#52), crash tab (#23).** This single
-   batch flips the most P0 cells and removes the most "silently does nothing" bugs.
+3. **The "hook exists, unimplemented" P0 cluster is now mostly DONE** — JS dialogs (#36),
+   form/file/color pickers (#37), permissions (#33), HTTP auth (#35), popups (#38),
+   favicons (#25), zoom (#39), status/loading UI (#51), fullscreen (#52), and a native
+   context menu (#37b) all landed in the native-chrome build. The remaining stragglers
+   from this batch are **crash tab (#23)** and **IME (#46)**; finish those + enrich the
+   context menu (link/image items) and pickers (date/time).
 4. **Session restore (#22)** + reopen-closed-tab — directly on top of #14.
 5. **History UI/search (#9) + bookmarks (#5–#7) + omnibox suggestions (#2/#3).** These
    are the "feels like a browser" tier and all sit on #14/#49.

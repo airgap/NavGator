@@ -26,7 +26,7 @@ of Verso's failure modes. The contrast is the whole sustainability argument:
 | --- | --- | --- | --- |
 | Embedding level | ~30 individual Servo crates (`constellation`, `compositing_traits`, `script`, `layout_thread_2020`, `net`, `script_traits`, `webgpu`, …), all pinned to `5e2d42e` | **Single `servo` umbrella crate** at `ed1af70` (+ `servo-embedder-traits` for `EventLoopWaker`) | Verso tracked ~30 internal-API surfaces that change weekly; navgator tracks **one curated public API** that Servo now versions on crates.io |
 | Compositor | **Own `compositor.rs`: 2,200 LOC / 89 KB** driving the constellation itself | None — uses `WindowRenderingContext` + `OffscreenRenderingContext` and lets Servo composite | The compositor is the single largest churn magnet in Servo internals; navgator carries **zero** of it |
-| Total Rust embedder code | ~9,200 LOC across many modules | **788 LOC `main.rs`** + 400 LOC of HTML/CSS/JS chrome | Less surface = less to re-port on every bump |
+| Total Rust embedder code | ~9,200 LOC across many modules | **single-file `main.rs`** (native egui chrome + Servo page renderer); **no HTML/CSS/JS chrome** | Less surface = less to re-port on every bump; the chrome no longer rides the web engine at all |
 | Servo API symbols depended on | hundreds (internal) | **~30 public symbols** (`Servo`, `ServoBuilder`, `WebView`, `WebViewBuilder`, `RenderingContext`, `OffscreenRenderingContext`, 5 `WebViewDelegate` methods, input/key enums) | Quantifiable, auditable, greppable break surface |
 | Servo pin freshness | stale (`stylo` branch `2025-03-15`, `webrender 0.66`) — fell *behind* and couldn't catch up | `ed1af70` — but Servo is now **0.2.0 (May 2026)**; navgator is ~1–2 months behind HEAD | Verso's lesson: falling behind compounds; the fix is *cadence*, not *freshness* |
 | Funding/manpower | hobby/volunteer, "limited" by its own statement | solo/hobby today | Same constraint — so navgator must spend the manpower it has on *features*, not on re-porting a compositor |
@@ -200,7 +200,8 @@ Servo's public API**, so you don't have to carry them.
 - **Concrete upstream targets** (prioritized for navgator's roadmap): sub-rect/region
   webview compositing API; richer `WebViewDelegate` hooks for prompts/menus/downloads
   (navgator's M3 TODO); a stable command/IPC surface for the "engine as a service" goal
-  (M5) so it stops being the `navgator:`-scheme hack. Each, if upstreamed, *removes* a
+  (M5) for the external engine-as-a-service surface. (The old in-chrome `navgator:`-scheme
+  command bridge is already gone — the chrome is native egui and calls the engine directly.) Each, if upstreamed, *removes* a
   future maintenance burden instead of adding one.
 - **Track Servo's deprecations.** The monthly reports are the canonical changelog;
   treat each one as required reading. Subscribe a bot to post the "Changes for web
@@ -273,7 +274,7 @@ Assumes Tier-1 resourcing (1–2 people), LTS adoption, current Servo trajectory
 
 | Horizon | What "done" looks like | Confidence |
 | --- | --- | --- |
-| **Now (M1–M5 done)** | Chrome-as-HTML, multi-tab compositing, nav bridge, IPC control plane, 788-LOC diff | shipped/verified |
+| **Now (M1–M5 done + native-chrome pivot)** | Native-egui chrome, Servo page renderer, multi-tab compositing, `gator://` internal pages, IPC control plane | shipped/verified |
 | **+0–3 mo** | **CI (stable + canary lanes)**; migrate to crates.io LTS pin; quarantine `servo::` into `engine/`; written sync/diff policy | high |
 | **+3–9 mo** | First *scheduled* LTS migration executed cleanly (proves the cadence works); downloads, prompts/menus/context-menu via upstreamed delegate hooks; settings UI; first theming pass | medium-high |
 | **+9–18 mo** | **Usable daily-driver for the author**: history/bookmarks, profiles, Lyku sync v1, password/form basics, deep theming (Opera-GX-class), 2 LTS migrations behind it | medium |

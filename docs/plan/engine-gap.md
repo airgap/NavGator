@@ -96,7 +96,7 @@ CSS **parsing and cascade** is Stylo → effectively Firefox-grade (custom prope
 
 ### navgator posture
 - **Must wait-for / upstream:** anchor positioning, view-transitions, subgrid, masonry, vertical writing modes. These are *layout-architecture* work only the Servo layout team (or a funded navgator contributor) can do. Do **not** try to fork layout.
-- **Work-around:** detect-and-degrade — e.g. polyfill `startViewTransition` to a no-op crossfade; ship a default UA stylesheet that avoids relying on ellipsis where navgator chrome is concerned.
+- **Work-around:** detect-and-degrade — e.g. polyfill `startViewTransition` to a no-op crossfade; ship a default UA stylesheet for *page content* that avoids relying on ellipsis. (The chrome itself is native egui, so these Servo CSS gaps no longer affect navgator's own UI — only rendered pages.)
 - **Dealbreaker tier:** none individually fatal, but the *aggregate* of "site uses subgrid + anchor tooltips + view-transition nav" = visibly-broken vs Chrome on modern sites.
 
 ---

@@ -5,7 +5,7 @@ Date: 2026-06-18. Servo pin: `ed1af70`. Verified against the cached Servo source
 `/home/nicole/.cargo/git/checkouts/servo-e53a6e7b994a25fe/ed1af70` and the navgator repo.
 
 > **One-line verdict:** navgator today is a **single-process, unsandboxed** browser whose
-> own privileged UI is a `file://` document. That is acceptable for a prototype and
+> own privileged UI is **native egui** (no longer a `file://` document). That is acceptable for a prototype and
 > **disqualifying for shipping to real users.** The single hardest, most load-bearing
 > requirement before any public release is a **sandboxed multiprocess content model
 > with at least site-per-process isolation** — and the engine code to do it exists in
@@ -22,8 +22,8 @@ Date: 2026-06-18. Servo pin: `ed1af70`. Verified against the cached Servo source
 | --- | --- | --- |
 | Process model | **Single process.** `src/main.rs` never sets `opts.multiprocess`, never calls `run_content_process`, has no `--content-process` arg branch. | `grep multiprocess/sandbox/content-process src/main.rs` → 0 hits. |
 | Sandbox | **None.** No seccomp, no namespaces, no entitlements. Web JS runs in the same address space as the chrome UI and the embedder. | same. |
-| Privileged UI origin | Chrome is **`file://…/src/chrome/index.html`** (`chrome_url()` → `file_url(...)`). | `src/main.rs:79-83,568`. |
-| Chrome ↔ content boundary | Engine pushes web-origin **title/URL into the privileged chrome JS context** via `WebView::evaluate_javascript`. Strings escaped by `js_string()`. | `src/main.rs:251,326-347`; `js_string` at `104-119`. |
+| Privileged UI | Chrome is **native egui**, not a web document — there is no `file://` chrome, `chrome_url()`, or `src/chrome/index.html`. | `crates/navgator/src/main.rs`. |
+| Chrome ↔ content boundary | The egui chrome and Servo are the same process; web-origin title/URL flow into chrome **state (Rust strings rendered by egui)**, not into a privileged JS context. There is no `evaluate_javascript` chrome push. (`evaluate_javascript` is now used only for find-in-page inside page content.) | `crates/navgator/src/main.rs`. |
 | `js_string` escaping | Escapes `" \ \n \r <`. **Does not escape U+2028/U+2029** (JS line terminators) — a real, if narrow, injection edge in the privileged context. | `src/main.rs:104-119`. |
 | External control socket | `NAVGATOR_IPC` Unix socket, **no auth, default umask perms**, full navigation/tab control. Off unless env var set. | `src/main.rs:763-772`. |
 | TLS / network | Inherited from Servo `net` (rustls + aws-lc-rs). No navgator-side policy. | below. |
@@ -31,13 +31,13 @@ Date: 2026-06-18. Servo pin: `ed1af70`. Verified against the cached Servo source
 
 **Two embedder-level findings that matter even before multiprocess:**
 
-1. **The chrome is unprivileged-by-construction.** It is a `file://` document with no
-   special scheme, no isolated origin, and no CSP. In a single-process build, a Servo
-   DOM/JS exploit in *any* tab compromises the chrome and embedder equally — there is
-   no boundary to cross. Even after multiprocess, a `file://` chrome that receives
-   web-controlled strings is a privilege-escalation surface (string → DOM →, if the
-   chrome ever uses `innerHTML`/`eval`, code execution **in the UI process that drives
-   navigation, tabs, and IPC**).
+1. **The chrome is native egui, not a web document** (post-pivot). It no longer has a
+   `file://` origin, a DOM, or a JS context, so the classic "web-controlled string → chrome
+   DOM → `innerHTML`/`eval` → UI code execution" escalation path described in the original
+   threat model is **closed by construction**. The remaining single-process exposure stands:
+   in a single-process build a Servo DOM/JS exploit in *any* tab still shares the embedder's
+   address space (G1) — the multiprocess/sandbox requirement below is unchanged. (Web-origin
+   title/URL strings still reach the chrome, but as Rust data rendered by egui, not as JS.)
 
 2. **`NAVGATOR_IPC` is an unauthenticated local control plane.** Any local process /
    user that can reach the socket path can drive navigation and open tabs. For a
@@ -140,7 +140,7 @@ at all.
 | # | Gap | Severity | Why it gates shipping |
 | --- | --- | --- | --- |
 | **G1** | **No content sandbox + single process.** Any memory-safety bug in SpiderMonkey, WebRender, image/font/media decoders, or `unsafe` Servo code = full RCE in the embedder, the chrome UI, and the user's session. Rust does **not** make the JS engine (C++) or `unsafe` FFI safe. | **Critical / blocker** | This is the table-stakes browser security property. Without it navgator is a remote-code-execution delivery vehicle. |
-| **G2** | **Privileged `file://` chrome receiving web-controlled data.** Chrome UI drives nav/tabs/IPC; web origin strings flow into it; no CSP; no scheme isolation. | **Critical / blocker** | Turns a content-side string/XSS bug into UI/embedder control. Classic UXSS → full compromise. |
+| **G2** | **(Largely resolved by the native-egui pivot.)** The privileged UI is no longer a `file://` web document with a DOM/JS context, so the UXSS escalation path (content string/XSS → chrome DOM → UI control) is closed by construction. Residual: web-origin strings still reach the chrome as data, and the chrome still shares the single process with content (folds into G1). | **Largely resolved / residual under G1** | Native chrome removes the classic privileged-`file://`-chrome surface; only the single-process sharing remains, tracked by G1. |
 | **G3** | **No auto-update + no code signing + no release integrity.** | **Critical / blocker** | You cannot ship a browser you can't security-patch within hours, and unsigned binaries are both unrunnable (macOS/Win SmartScreen) and trivially trojanable. |
 | **G4** | **Sandbox tech debt: `gaol` 0.2.1 unmaintained, Windows/Apple-Silicon/Linux-arm unsupported, brittle seccomp, sandboxed-process reaping is a TODO.** | **High** | The thing that provides G1 is itself the maintenance risk that killed Verso, plus it doesn't cover the platforms most users are on (Windows, M-series Macs). |
 | **G5** | **Isolation granularity = process-per-registered-domain, no OOPIF / no Site Isolation for cross-origin iframes; compositor/net/GPU unisolated.** | **High** | Spectre-class cross-origin reads, and a compromised content process still talks to a privileged net/compositor in-process. Below Chrome's bar. |
@@ -148,7 +148,7 @@ at all.
 | **G7** | **No exploit-mitigation posture defined** (CFI, stack clash, RELRO/BIND_NOW, ASLR/PIE, W^X JIT, arena hardening, `-Z sanitizer` CI, fuzzing). | **Medium-High** | Reduces exploitability of the inevitable bugs; cheap-ish to adopt; expected of a "v1 industry-standard" browser. |
 | **G8** | **No security UI / indicators** (origin display, cert info, permission prompts, downloads-are-dangerous, HTTPS-Only mode, mixed-content UI). | **Medium** | Users can't make trust decisions; phishing/spoofing trivially succeeds. |
 | **G9** | **Unauthenticated `NAVGATOR_IPC` + permissive socket perms.** | **Medium (local)** | Local privilege/automation surface; must be hardened or release-gated off. |
-| **G10** | **No CSP on the chrome doc; `js_string` misses U+2028/2029.** | **Medium** | Hardening the privileged context (defense-in-depth for G2). |
+| **G10** | **`js_string` misses U+2028/2029.** ("No CSP on the chrome doc" no longer applies — the native-egui chrome is not a document.) The gap affects only find-in-page strings interpolated into *content* JS via `js_string`; `gator://` internal pages are HTML-escaped by a separate `html_escape`. | **Low** | Defense-in-depth for the residual find-in-page content-JS path. |
 | **G11** | **No sync-security model for Lyku** (E2E encryption, key handling, what is *never* synced — cert overrides, cookies?). | **Medium (future)** | Sync is a credential/PII firehose; designing it insecure now is hard to undo. |
 
 ---
@@ -211,20 +211,20 @@ Servo-bump cost, consistent with the project's pinning discipline).
 
 ### 3.3 Privileged chrome hardening (fixes G2/G10)
 
-- Move the chrome **off `file://`** onto an internal **`navgator://` privileged scheme**
-  whose handler only serves embedded, signed-in-binary resources (no filesystem reach,
-  no remote load, fixed origin). Register via Servo's protocol-handler API.
-- The chrome webview runs in the **broker** but with a hard rule: **it must never load
-  or be navigable to web content**, and **web origins must never share its event loop**
-  (Servo already forces fresh loops for sandboxed origins; enforce chrome-origin is
-  unique). Treat any chrome navigation to non-`navgator://` as a bug → block (navgator
-  already denies `navgator:` command nav; extend to a strict allowlist).
-- Ship a **strict CSP** on the chrome document (`default-src 'none'; script-src
-  'self'; …`), forbid `eval`/inline, and route all web→chrome data through
-  **structured `postMessage`/CustomEvent detail objects**, never string-concatenated
-  JS. Replace ad-hoc `evaluate_javascript(format!(...))` with a single typed bridge that
-  passes JSON parsed by the chrome, and fix `js_string` to also escape U+2028/U+2029
-  (and prefer JSON-serialization over hand-rolled escaping).
+- **(Mostly moot post-pivot: the chrome is native egui, not a webview, so it has no
+  navigable origin to harden.)** What remains: navgator's internal *content* pages are
+  served from the embedded **`gator://`** scheme (`AppState::load_web_resource` →
+  `render_gator_welcome`, serving only embedded in-binary resources, no filesystem reach,
+  no remote load). Keep that handler strictly embedded-only.
+- The page renderer must never treat `gator://` (or other privileged internal) resources as
+  web-script-reachable; keep internal pages embedded and origin-isolated from web content.
+- **(Post-pivot: there is no chrome document, so chrome CSP and a chrome JS bridge are
+  N/A.)** The native-egui chrome receives web→chrome data as typed Rust values, never as
+  concatenated JS, which is what the original "typed bridge" item asked for. The only
+  remaining string-into-JS interpolation is find-in-page (`evaluate_javascript(format!(...))`
+  with `js_string`), so the residual hardening is just `js_string`: also escape U+2028/U+2029
+  (prefer serialization over hand-rolled escaping). Internal `gator://` pages are templated
+  HTML escaped separately by `html_escape`, not `js_string`.
 - Long-term, run the chrome UI in its **own low-privilege "UI" process** distinct from
   the broker, so a chrome compromise still can't directly touch the socket/net layer.
 
@@ -300,8 +300,10 @@ These are **non-negotiable for a v1 public release.** Everything else is "after.
    process-per-registered-domain (Servo's existing granularity) with a **real,
    maintained** OS sandbox — not gaol-as-is on the two platforms it half-supports.
    → resolves **G1, G4**.
-2. **Privileged chrome on an internal `navgator://` scheme with strict CSP and a typed,
-   non-`eval` bridge**; chrome can never load web content. → resolves **G2, G10**.
+2. **Native-egui chrome (done): no web origin, no DOM/JS, typed in-process data only;
+   internal *content* pages served from the embedded `gator://` scheme.** This already
+   resolves the G2 privileged-`file://`-chrome surface; remaining G10 work is just hardening
+   `js_string` (the find-in-page content-JS interpolation). → resolves **G2**, narrows **G10**.
 3. **Auto-update with signed releases + TUF (or equivalent) integrity, plus a tested
    emergency-patch path.** → resolves **G3**.
 4. **A privacy-preserving Safe-Browsing-equivalent + dangerous-download warnings, on by
@@ -328,7 +330,7 @@ sync (ship sync *after* security, with the model in 3.4/G11 designed up front).
 | 1 | Turn on Servo multiprocess+sandbox in navgator; implement the embedder `--content-process` branch and `ServoBuilder.opts(multiprocess+sandbox)`; verify per-domain processes spawn. | Servo API (`run_content_process`) | weeks (engine API is ready) |
 | 2 | Replace gaol Linux/macOS profiles with owned `seccompiler`+namespaces (+Landlock) and a macOS Seatbelt profile **covering Apple Silicon**; fix sandboxed-process reaping. Likely needs an upstream Servo patch to make the sandbox pluggable. | (1) | 1–2 quarters; upstream coordination |
 | 3 | Windows AppContainer + Job Object + token restriction + mitigation policies. Net-new. | (1) | 1–2 quarters |
-| 4 | `navgator://` privileged chrome scheme + CSP + typed bridge. | — (parallel) | weeks |
+| 4 | Native-egui chrome (done) + embedded `gator://` internal-content scheme; residual: `js_string` hardening for the find-in-page content-JS path. | — (parallel) | done / small residual |
 | 5 | Auto-update + signing + TUF + CI security gates. | — (parallel) | 1 quarter + per-platform CA/cert setup |
 | 6 | Safe-Browsing-equivalent (local prefix lists via Lyku) + download protection + security UI. | — (parallel) | 1 quarter |
 | 7 | Phase B site-keying (scheme+eTLD+1), origin checks on IPC; then Phase C OOPIF; Phase D GPU/net brokers. | (1)(2)(3) | multi-quarter, partly upstream |
@@ -344,7 +346,7 @@ deliberately-bumped patch** — and never float the gaol/sandbox dependency.
 
 ## 6. Concrete file references (ground truth)
 
-- navgator single-process / file:// chrome / IPC: `/raid/navgator/src/main.rs:79-83, 104-119, 251, 326-347, 568, 763-772`.
+- navgator single-process / native-egui chrome / `gator://` internal scheme / IPC: `/raid/NavGator/crates/navgator/src/main.rs` (`load_web_resource`/`render_gator_welcome`, `js_string`, IPC `start_ipc`). (The old `file://` chrome / `chrome_url` references are obsolete post-pivot.)
 - Servo sandbox profiles + spawn + gate stubs: `…/ed1af70/components/constellation/sandboxing.rs`.
 - Servo process reaping TODO: `…/components/constellation/process_manager.rs:28-32`.
 - Process-per-Host event-loop keying: `…/components/constellation/constellation.rs:260-261, 842-969`.
