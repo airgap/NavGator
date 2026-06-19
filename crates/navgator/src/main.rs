@@ -60,6 +60,11 @@ const CHROME_HEIGHT_FALLBACK: u32 = 84;
 /// borderless window — OS decorations are off, so we hit-test it and `drag_resize_window`.
 const RESIZE_BORDER: f64 = 6.0;
 
+/// Page-zoom step + bounds (Ctrl +/-/0, Ctrl+wheel).
+const ZOOM_STEP: f32 = 1.1;
+const ZOOM_MIN: f32 = 0.3;
+const ZOOM_MAX: f32 = 3.0;
+
 fn main() -> Result<(), Box<dyn Error>> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
@@ -240,6 +245,7 @@ struct Tab {
     title: String,
     can_back: bool,
     can_forward: bool,
+    zoom: f32,
 }
 
 struct AppState {
@@ -378,6 +384,33 @@ impl AppState {
         );
     }
 
+    // ── Page zoom (Ctrl +/-/0, Ctrl+wheel) ────────────────────────────────────
+    fn active_zoom(&self) -> f32 {
+        self.tabs
+            .borrow()
+            .get(self.active.get())
+            .map(|t| t.zoom)
+            .unwrap_or(1.0)
+    }
+
+    fn apply_zoom(&self, zoom: f32) {
+        let z = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        if let Some(tab) = self.tabs.borrow_mut().get_mut(self.active.get()) {
+            tab.webview.set_page_zoom(z);
+            tab.zoom = z;
+        }
+    }
+
+    fn zoom_in(&self) {
+        self.apply_zoom(self.active_zoom() * ZOOM_STEP);
+    }
+    fn zoom_out(&self) {
+        self.apply_zoom(self.active_zoom() / ZOOM_STEP);
+    }
+    fn zoom_reset(&self) {
+        self.apply_zoom(1.0);
+    }
+
     // ── Tab management ────────────────────────────────────────────────────────
     fn new_tab(&self, url: Url) {
         let Some(me) = self.weak_self.borrow().upgrade() else {
@@ -397,6 +430,7 @@ impl AppState {
                 title: "New tab".to_string(),
                 can_back: false,
                 can_forward: false,
+                zoom: 1.0,
             });
             tabs.len() - 1
         };
@@ -869,6 +903,19 @@ impl ApplicationHandler<WakeUp> for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                // Ctrl+wheel zooms the active tab instead of scrolling.
+                if state.ctrl.get() {
+                    let up = match delta {
+                        MouseScrollDelta::LineDelta(_, ly) => ly > 0.0,
+                        MouseScrollDelta::PixelDelta(p) => p.y > 0.0,
+                    };
+                    if up {
+                        state.zoom_in();
+                    } else {
+                        state.zoom_out();
+                    }
+                    return;
+                }
                 let (x, y) = state.cursor.get();
                 if let Some((webview, point)) = state.route(x, y) {
                     let (dx, dy, mode) = match delta {
@@ -910,6 +957,18 @@ impl ApplicationHandler<WakeUp> for App {
                             if let Some(tab) = state.active_tab() {
                                 tab.reload();
                             }
+                            return;
+                        }
+                        WinitKey::Character(c) if c == "=" || c == "+" => {
+                            state.zoom_in();
+                            return;
+                        }
+                        WinitKey::Character(c) if c == "-" || c == "_" => {
+                            state.zoom_out();
+                            return;
+                        }
+                        WinitKey::Character(c) if c == "0" => {
+                            state.zoom_reset();
                             return;
                         }
                         WinitKey::Character(c) => {
