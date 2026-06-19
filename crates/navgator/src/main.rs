@@ -41,7 +41,7 @@ use navgator_engine::{
     NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, RenderingContext,
     Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent,
     WheelMode, WindowRenderingContext, AuthenticationRequest, EmbedderControl, EmbedderControlId,
-    SimpleDialog,
+    SelectElement, SelectElementOption, SelectElementOptionOrOptgroup, SimpleDialog,
 };
 use navgator_protocol::IpcCommand;
 use url::Url;
@@ -271,6 +271,8 @@ struct AppState {
     pending_dialog: RefCell<Option<SimpleDialog>>,
     /// An HTTP authentication request awaiting credentials, if any.
     pending_auth: RefCell<Option<AuthenticationRequest>>,
+    /// A `<select>` element picker awaiting a choice, if any.
+    pending_select: RefCell<Option<SelectElement>>,
     scale: Cell<f64>,
     cursor: Cell<(f64, f64)>,
     focused: Cell<Focused>,
@@ -509,6 +511,55 @@ impl AppState {
         self.window.request_redraw();
     }
 
+    fn show_select(&self, select: SelectElement) {
+        let opt_json = |o: &SelectElementOption| {
+            format!(
+                "{{id:{},label:{},disabled:{}}}",
+                o.id,
+                js_string(&o.label),
+                o.is_disabled
+            )
+        };
+        let mut parts: Vec<String> = Vec::new();
+        for item in select.options() {
+            match item {
+                SelectElementOptionOrOptgroup::Option(o) => parts.push(opt_json(o)),
+                SelectElementOptionOrOptgroup::Optgroup { label, options } => {
+                    parts.push(format!("{{header:{}}}", js_string(label)));
+                    parts.extend(options.iter().map(&opt_json));
+                }
+            }
+        }
+        let opts = format!("[{}]", parts.join(","));
+        *self.pending_select.borrow_mut() = Some(select);
+        self.overlay.set(true);
+        self.focused.set(Focused::Chrome);
+        self.chrome_eval(format!(
+            "window.dispatchEvent(new CustomEvent('navgator:select',{{detail:{{options:{opts}}}}}))"
+        ));
+        self.window.request_redraw();
+    }
+
+    fn resolve_select(&self, url: &Url) {
+        let select = self.pending_select.borrow_mut().take();
+        self.overlay.set(false);
+        self.focused.set(Focused::Content);
+        let Some(mut select) = select else {
+            self.window.request_redraw();
+            return;
+        };
+        let chosen = url
+            .query_pairs()
+            .find(|(k, _)| k == "id")
+            .and_then(|(_, v)| v.parse::<usize>().ok());
+        if let Some(id) = chosen {
+            select.select(vec![id]);
+            select.submit();
+        }
+        // else: dropping `select` without submitting cancels the picker (no change).
+        self.window.request_redraw();
+    }
+
     // ── Tab management ────────────────────────────────────────────────────────
     fn new_tab(&self, url: Url) {
         let Some(me) = self.weak_self.borrow().upgrade() else {
@@ -647,6 +698,7 @@ impl AppState {
             "settings" => self.new_tab(settings_url()),
             "dialog" => self.resolve_dialog(url),
             "auth" => self.resolve_auth(url),
+            "select" => self.resolve_select(url),
             "ready" => {
                 self.apply_layout(url);
                 self.push_model();
@@ -876,8 +928,8 @@ impl WebViewDelegate for AppState {
     fn show_embedder_control(&self, _webview: WebView, control: EmbedderControl) {
         match control {
             EmbedderControl::SimpleDialog(dialog) => self.show_dialog(dialog),
-            // Context menu / select / file / color pickers / IME: not yet implemented
-            // (they need a non-modal overlay or native menus — see docs/ROADMAP).
+            EmbedderControl::SelectElement(select) => self.show_select(select),
+            // File/color pickers, IME, and context menu: not yet implemented.
             _ => {}
         }
     }
@@ -994,6 +1046,7 @@ impl ApplicationHandler<WakeUp> for App {
             overlay: Cell::new(false),
             pending_dialog: RefCell::new(None),
             pending_auth: RefCell::new(None),
+            pending_select: RefCell::new(None),
             scale: Cell::new(scale),
             cursor: Cell::new((0.0, 0.0)),
             focused: Cell::new(Focused::Content),

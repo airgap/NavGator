@@ -17,6 +17,9 @@ pub use servo::{
     WheelEvent, WheelMode, WindowRenderingContext,
 };
 
-pub use servo::{AuthenticationRequest, EmbedderControl, EmbedderControlId, SimpleDialog};
+pub use servo::{
+    AuthenticationRequest, EmbedderControl, EmbedderControlId, SelectElement, SelectElementOption,
+    SelectElementOptionOrOptgroup, SimpleDialog,
+};
 
 pub use embedder_traits::EventLoopWaker;

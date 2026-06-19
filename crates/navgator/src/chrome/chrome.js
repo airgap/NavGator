@@ -157,8 +157,18 @@ titlebar.addEventListener("dblclick", (e) => {
 const modal = $("modal");
 const modalInput = $("modal-input");
 const modalInput2 = $("modal-input2");
+const modalList = $("modal-list");
+const modalOk = $("modal-ok");
 const modalCancel = $("modal-cancel");
 let modalMode = "dialog";
+
+function resetModal() {
+  modalInput.style.display = "none";
+  modalInput2.style.display = "none";
+  modalList.style.display = "none";
+  modalOk.style.display = "inline-block";
+  modalCancel.style.display = "none";
+}
 
 function closeModal(action) {
   modal.style.display = "none";
@@ -171,6 +181,9 @@ function closeModal(action) {
         "&pass=" +
         encodeURIComponent(modalInput2.value || ""),
     );
+  } else if (modalMode === "select") {
+    // `action` is the chosen option id, or "cancel".
+    go(action === "cancel" ? "navgator:select" : "navgator:select?id=" + action);
   } else {
     go(
       "navgator:dialog?action=" +
@@ -185,20 +198,20 @@ function closeModal(action) {
 window.addEventListener("navgator:dialog", (e) => {
   const d = e.detail ?? {};
   modalMode = "dialog";
+  resetModal();
   $("modal-msg").textContent = d.message || "";
   const isPrompt = d.kind === "prompt";
   modalInput.type = "text";
   modalInput.placeholder = "";
   modalInput.value = d.value || "";
   modalInput.style.display = isPrompt ? "block" : "none";
-  modalInput2.style.display = "none";
   modalCancel.style.display = d.kind === "alert" ? "none" : "inline-block";
   modal.style.display = "flex";
   if (isPrompt) {
     modalInput.focus();
     modalInput.select();
   } else {
-    $("modal-ok").focus();
+    modalOk.focus();
   }
 });
 
@@ -206,6 +219,7 @@ window.addEventListener("navgator:dialog", (e) => {
 window.addEventListener("navgator:auth", (e) => {
   const d = e.detail ?? {};
   modalMode = "auth";
+  resetModal();
   $("modal-msg").textContent = d.message || "Authentication required";
   modalInput.type = "text";
   modalInput.placeholder = "Username";
@@ -219,7 +233,35 @@ window.addEventListener("navgator:auth", (e) => {
   modalInput.focus();
 });
 
-$("modal-ok").addEventListener("click", () => closeModal("ok"));
+// <select> element picker
+window.addEventListener("navgator:select", (e) => {
+  const d = e.detail ?? {};
+  modalMode = "select";
+  resetModal();
+  $("modal-msg").textContent = "";
+  modalOk.style.display = "none";
+  modalCancel.style.display = "inline-block";
+  modalList.innerHTML = "";
+  (d.options || []).forEach((o) => {
+    if (o.header !== undefined) {
+      const h = document.createElement("div");
+      h.className = "modal-optgroup";
+      h.textContent = o.header;
+      modalList.appendChild(h);
+    } else {
+      const b = document.createElement("button");
+      b.className = "modal-option";
+      b.textContent = o.label;
+      if (o.disabled) b.disabled = true;
+      else b.addEventListener("click", () => closeModal(String(o.id)));
+      modalList.appendChild(b);
+    }
+  });
+  modalList.style.display = "block";
+  modal.style.display = "flex";
+});
+
+modalOk.addEventListener("click", () => closeModal("ok"));
 modalCancel.addEventListener("click", () => closeModal("cancel"));
 modal.addEventListener("keydown", (e) => {
   if (e.key === "Enter") closeModal("ok");
