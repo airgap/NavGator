@@ -9,11 +9,12 @@ description = "The only navgator crate that touches the Servo fork — quarantin
 [dependencies]
 # ── Servo embedding (our maintained fork; see docs/FORK.md, ROADMAP §R2) ──────
 # This is the ONLY crate that depends on the engine, so engine churn is isolated
-# here. `servo` is the high-level embedding crate. rev e559b12 carries our first fork
-# patch (patches/navgator-ua: brands the default User-Agent). DEFAULT features stay on (baked-in-resources,
-# clipboard, js_jit); media-gstreamer is NOT default (no gstreamer needed). The stylo
-# and webrender forks are wired via the workspace-root `[patch]` tables.
-servo = { git = "https://github.com/airgap/swervo", rev = "315497b38e44e4aec90aafe688b224dad5e6af9b" }
+# here. `servo` is the high-level embedding crate. rev 315497b carries our first fork
+# patch (patches/navgator-ua: brands the default User-Agent). DEFAULT features stay on
+# (baked-in-resources, clipboard, js_jit); `media-gstreamer` is added so <video>/<audio>
+# decode via GStreamer (requires libgstreamer1.0-dev + plugins; engine-gap.md Tier-0 #1).
+# The stylo and webrender forks are wired via the workspace-root `[patch]` tables.
+servo = { git = "https://github.com/airgap/swervo", rev = "315497b38e44e4aec90aafe688b224dad5e6af9b", features = ["media-gstreamer"] }
 
 # servo-embedder-traits (lib name `embedder_traits`): EventLoopWaker lives here and
 # isn't re-exported by `servo`. Same rev as `servo`.
