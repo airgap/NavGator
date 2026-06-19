@@ -111,6 +111,13 @@ body {
   animation: ng-spin 0.7s linear infinite;
 }
 
+.tab-favicon {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  border-radius: 3px;
+}
+
 @keyframes ng-spin {
   to {
     transform: rotate(360deg);

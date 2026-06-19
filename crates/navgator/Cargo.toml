@@ -22,3 +22,8 @@ url = "2.5"
 
 # Servo does TLS through rustls; a crypto provider is installed at startup.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+
+# Favicon encoding: decoded pixels → PNG → base64 data URL. Both are already in the
+# lockfile transitively (via the engine), so these add no new compiled crates.
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"

@@ -30,6 +30,7 @@ use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use base64::Engine as _;
 use euclid::Scale;
 use euclid::default::{Point2D, Rect, Size2D};
 // Everything from the engine comes through navgator-engine, the only crate that
@@ -41,8 +42,8 @@ use navgator_engine::{
     NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, RenderingContext,
     Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent,
     WheelMode, WindowRenderingContext, AuthenticationRequest, ColorPicker, EmbedderControl,
-    EmbedderControlId, RgbColor, SelectElement, SelectElementOption, SelectElementOptionOrOptgroup,
-    SimpleDialog,
+    EmbedderControlId, Image, PixelFormat, RgbColor, SelectElement, SelectElementOption,
+    SelectElementOptionOrOptgroup, SimpleDialog,
 };
 use navgator_protocol::IpcCommand;
 use url::Url;
@@ -186,6 +187,47 @@ fn content_size(window: PhysicalSize<u32>, top: u32) -> PhysicalSize<u32> {
     )
 }
 
+/// Encode a decoded favicon image as a `data:image/png;base64,...` URL for the chrome.
+fn favicon_data_url(img: &Image) -> Option<String> {
+    let (w, h) = (img.width, img.height);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let src = img.data();
+    let mut rgba: Vec<u8> = Vec::with_capacity((w as usize) * (h as usize) * 4);
+    match img.format {
+        PixelFormat::RGBA8 => rgba.extend_from_slice(src),
+        PixelFormat::BGRA8 => {
+            for px in src.chunks_exact(4) {
+                rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            }
+        }
+        PixelFormat::RGB8 => {
+            for px in src.chunks_exact(3) {
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+        }
+        PixelFormat::K8 => {
+            for &k in src {
+                rgba.extend_from_slice(&[k, k, k, 255]);
+            }
+        }
+        PixelFormat::KA8 => {
+            for px in src.chunks_exact(2) {
+                rgba.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
+            }
+        }
+    }
+    let buf = image::RgbaImage::from_raw(w, h, rgba)?;
+    let mut png: Vec<u8> = Vec::new();
+    buf.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .ok()?;
+    Some(format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&png)
+    ))
+}
+
 /// Parse a `#rrggbb` string into an `RgbColor`.
 fn parse_hex_color(s: &str) -> Option<RgbColor> {
     let s = s.trim().trim_start_matches('#');
@@ -262,6 +304,7 @@ struct Tab {
     can_forward: bool,
     zoom: f32,
     loading: bool,
+    favicon: Option<String>,
 }
 
 struct AppState {
@@ -644,6 +687,7 @@ impl AppState {
                 can_forward: false,
                 zoom: 1.0,
                 loading: false,
+                favicon: None,
             });
             tabs.len() - 1
         };
@@ -706,10 +750,16 @@ impl AppState {
                 if i > 0 {
                     j.push(',');
                 }
+                let fav = t
+                    .favicon
+                    .as_deref()
+                    .map(js_string)
+                    .unwrap_or_else(|| "null".to_string());
                 j.push_str(&format!(
-                    "{{title:{},loading:{}}}",
+                    "{{title:{},loading:{},favicon:{}}}",
                     js_string(&t.title),
-                    t.loading
+                    t.loading,
+                    fav
                 ));
             }
             j.push(']');
@@ -943,6 +993,14 @@ impl WebViewDelegate for AppState {
             let title = title.unwrap_or_else(|| "New tab".to_string());
             self.ipc_emit(&format!("title {i} {title}"));
             self.tabs.borrow_mut()[i].title = title;
+            self.push_model();
+        }
+    }
+
+    fn notify_favicon_changed(&self, webview: WebView) {
+        if let Some(i) = self.tab_index(&webview) {
+            let data_url = webview.favicon().and_then(|img| favicon_data_url(&img));
+            self.tabs.borrow_mut()[i].favicon = data_url;
             self.push_model();
         }
     }

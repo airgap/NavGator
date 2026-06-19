@@ -3778,7 +3778,9 @@ dependencies = [
 name = "navgator"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "euclid",
+ "image",
  "navgator-engine",
  "navgator-protocol",
  "rustls",

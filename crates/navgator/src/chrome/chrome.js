@@ -81,6 +81,11 @@ function renderTabs(tabs, active) {
       spin.className = "tab-spin";
       spin.setAttribute("aria-label", "Loading");
       el.appendChild(spin);
+    } else if (tab.favicon) {
+      const fav = document.createElement("img");
+      fav.className = "tab-favicon";
+      fav.src = tab.favicon;
+      el.appendChild(fav);
     }
     el.appendChild(title);
     el.appendChild(close);
