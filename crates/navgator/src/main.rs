@@ -41,7 +41,7 @@ use navgator_engine::{
     KeyboardEvent, LoadStatus,
     MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
     NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, PixelFormat,
-    RenderingContext,
+    Preferences, RenderingContext,
     RgbColor, SelectElement, SelectElementOptionOrOptgroup, Servo, ServoBuilder, SimpleDialog,
     WebView, WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent, WheelMode,
     WindowRenderingContext,
@@ -163,6 +163,28 @@ fn save_settings(s: &Settings) {
         }
         let _ = std::fs::write(&path, format!("search={}\naccent={}\n", s.search, s.accent));
     }
+}
+
+/// NavGator's web-feature profile: turn on high-value APIs Servo ships disabled by default
+/// (see docs/plan/engine-gap.md — Servo's posture is "everything off"; NavGator's value-add
+/// is a curated, distinct default). The first-wave items are common "silent breakers" of
+/// modern sites and are low-risk API surfaces; IndexedDB/WebGL2 have real backends (rusqlite,
+/// ANGLE) but should still be WPT-validated before being relied on. Accessibility and the
+/// permission-prompted APIs (Geolocation/Notifications) need embedder plumbing and are
+/// enabled in follow-ups.
+fn navgator_preferences() -> Preferences {
+    let mut p = Preferences::default();
+    // Tier-0 first wave (engine-gap.md §15) — cheap, common, low-risk.
+    p.dom_intersection_observer_enabled = true; // lazy-load / infinite scroll
+    p.dom_adoptedstylesheet_enabled = true; // web components / Lit / Shadow DOM
+    p.dom_fontface_enabled = true; // CSS Font Loading (web fonts)
+    p.dom_web_animations_enabled = true; // Web Animations API
+    p.dom_visual_viewport_enabled = true; // zoom/viewport-aware sites
+    p.dom_async_clipboard_enabled = true; // navigator.clipboard
+    // Tier-1 — real backends, high payoff (validate hardening before relying on them).
+    p.dom_indexeddb_enabled = true; // rusqlite backend → web apps / PWAs
+    p.dom_webgl2_enabled = true; // 3D / maps / games
+    p
 }
 
 /// Percent-encode a search query for substitution into the `%s` of a search template.
@@ -1273,6 +1295,7 @@ impl ApplicationHandler<WakeUp> for App {
 
         let servo = ServoBuilder::default()
             .event_loop_waker(Box::new(waker))
+            .preferences(navgator_preferences())
             .build();
         servo.setup_logging();
 

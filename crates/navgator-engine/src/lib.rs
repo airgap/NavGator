@@ -13,8 +13,8 @@ pub use servo::{
     CreateNewWebViewRequest, DevicePoint, InputEvent, Key, KeyState, KeyboardEvent, LoadStatus,
     MouseButton, MouseButtonAction,
     MouseButtonEvent, MouseMoveEvent, NamedKey, NavigationRequest, OffscreenRenderingContext,
-    RenderingContext, Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WheelDelta,
-    WheelEvent, WheelMode, WindowRenderingContext,
+    Preferences, RenderingContext, Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate,
+    WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
 };
 
 pub use servo::{
