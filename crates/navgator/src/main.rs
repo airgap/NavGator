@@ -40,7 +40,8 @@ use navgator_engine::{
     LoadStatus, MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
     NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, RenderingContext,
     Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent,
-    WheelMode, WindowRenderingContext, EmbedderControl, EmbedderControlId, SimpleDialog,
+    WheelMode, WindowRenderingContext, AuthenticationRequest, EmbedderControl, EmbedderControlId,
+    SimpleDialog,
 };
 use navgator_protocol::IpcCommand;
 use url::Url;
@@ -268,6 +269,8 @@ struct AppState {
     overlay: Cell<bool>,
     /// The JS dialog awaiting a user response, if any.
     pending_dialog: RefCell<Option<SimpleDialog>>,
+    /// An HTTP authentication request awaiting credentials, if any.
+    pending_auth: RefCell<Option<AuthenticationRequest>>,
     scale: Cell<f64>,
     cursor: Cell<(f64, f64)>,
     focused: Cell<Focused>,
@@ -480,6 +483,32 @@ impl AppState {
         self.window.request_redraw();
     }
 
+    fn resolve_auth(&self, url: &Url) {
+        let request = self.pending_auth.borrow_mut().take();
+        self.overlay.set(false);
+        self.focused.set(Focused::Content);
+        let Some(request) = request else {
+            self.window.request_redraw();
+            return;
+        };
+        let mut ok = false;
+        let mut user = String::new();
+        let mut pass = String::new();
+        for (k, v) in url.query_pairs() {
+            match k.as_ref() {
+                "action" => ok = v == "ok",
+                "user" => user = v.to_string(),
+                "pass" => pass = v.to_string(),
+                _ => {}
+            }
+        }
+        if ok {
+            request.authenticate(user, pass);
+        }
+        // else: dropping `request` cancels the authentication.
+        self.window.request_redraw();
+    }
+
     // ── Tab management ────────────────────────────────────────────────────────
     fn new_tab(&self, url: Url) {
         let Some(me) = self.weak_self.borrow().upgrade() else {
@@ -617,6 +646,7 @@ impl AppState {
             "window" => self.handle_window_command(url),
             "settings" => self.new_tab(settings_url()),
             "dialog" => self.resolve_dialog(url),
+            "auth" => self.resolve_auth(url),
             "ready" => {
                 self.apply_layout(url);
                 self.push_model();
@@ -862,6 +892,24 @@ impl WebViewDelegate for AppState {
         }
     }
 
+    fn request_authentication(&self, _webview: WebView, request: AuthenticationRequest) {
+        let url = request.url().to_string();
+        let proxy = request.for_proxy();
+        *self.pending_auth.borrow_mut() = Some(request);
+        self.overlay.set(true);
+        self.focused.set(Focused::Chrome);
+        let message = if proxy {
+            format!("The proxy at {url} requires a username and password.")
+        } else {
+            format!("{url} requires a username and password.")
+        };
+        self.chrome_eval(format!(
+            "window.dispatchEvent(new CustomEvent('navgator:auth',{{detail:{{message:{}}}}}))",
+            js_string(&message)
+        ));
+        self.window.request_redraw();
+    }
+
     fn notify_fullscreen_state_changed(&self, _webview: WebView, is_fullscreen: bool) {
         self.fullscreen.set(is_fullscreen);
         let top = if is_fullscreen { 0 } else { self.chrome_top.get() };
@@ -945,6 +993,7 @@ impl ApplicationHandler<WakeUp> for App {
             fullscreen: Cell::new(false),
             overlay: Cell::new(false),
             pending_dialog: RefCell::new(None),
+            pending_auth: RefCell::new(None),
             scale: Cell::new(scale),
             cursor: Cell::new((0.0, 0.0)),
             focused: Cell::new(Focused::Content),

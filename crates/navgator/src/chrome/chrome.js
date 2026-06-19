@@ -156,24 +156,42 @@ titlebar.addEventListener("dblclick", (e) => {
 // ── JS dialogs (alert/confirm/prompt) — drawn as a chrome modal over the page ──
 const modal = $("modal");
 const modalInput = $("modal-input");
+const modalInput2 = $("modal-input2");
 const modalCancel = $("modal-cancel");
+let modalMode = "dialog";
 
-function closeDialog(action) {
+function closeModal(action) {
   modal.style.display = "none";
-  go(
-    "navgator:dialog?action=" +
-      action +
-      "&value=" +
-      encodeURIComponent(modalInput.value || ""),
-  );
+  if (modalMode === "auth") {
+    go(
+      "navgator:auth?action=" +
+        action +
+        "&user=" +
+        encodeURIComponent(modalInput.value || "") +
+        "&pass=" +
+        encodeURIComponent(modalInput2.value || ""),
+    );
+  } else {
+    go(
+      "navgator:dialog?action=" +
+        action +
+        "&value=" +
+        encodeURIComponent(modalInput.value || ""),
+    );
+  }
 }
 
+// alert / confirm / prompt
 window.addEventListener("navgator:dialog", (e) => {
   const d = e.detail ?? {};
+  modalMode = "dialog";
   $("modal-msg").textContent = d.message || "";
   const isPrompt = d.kind === "prompt";
+  modalInput.type = "text";
+  modalInput.placeholder = "";
   modalInput.value = d.value || "";
   modalInput.style.display = isPrompt ? "block" : "none";
+  modalInput2.style.display = "none";
   modalCancel.style.display = d.kind === "alert" ? "none" : "inline-block";
   modal.style.display = "flex";
   if (isPrompt) {
@@ -184,11 +202,28 @@ window.addEventListener("navgator:dialog", (e) => {
   }
 });
 
-$("modal-ok").addEventListener("click", () => closeDialog("ok"));
-modalCancel.addEventListener("click", () => closeDialog("cancel"));
+// HTTP authentication (username + password)
+window.addEventListener("navgator:auth", (e) => {
+  const d = e.detail ?? {};
+  modalMode = "auth";
+  $("modal-msg").textContent = d.message || "Authentication required";
+  modalInput.type = "text";
+  modalInput.placeholder = "Username";
+  modalInput.value = "";
+  modalInput.style.display = "block";
+  modalInput2.placeholder = "Password";
+  modalInput2.value = "";
+  modalInput2.style.display = "block";
+  modalCancel.style.display = "inline-block";
+  modal.style.display = "flex";
+  modalInput.focus();
+});
+
+$("modal-ok").addEventListener("click", () => closeModal("ok"));
+modalCancel.addEventListener("click", () => closeModal("cancel"));
 modal.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") closeDialog("ok");
-  else if (e.key === "Escape") closeDialog("cancel");
+  if (e.key === "Enter") closeModal("ok");
+  else if (e.key === "Escape") closeModal("cancel");
 });
 
 // ── Layout reporting (tells the engine where the content region starts) ───────
