@@ -164,6 +164,8 @@ struct Settings {
     sync_bookmarks: bool,
     sync_history: bool,
     sync_passwords: bool,
+    /// Block ads + trackers (adblock-rust). On by default — it's the pitch.
+    block_ads: bool,
 }
 
 impl Default for Settings {
@@ -176,6 +178,7 @@ impl Default for Settings {
             sync_bookmarks: false,
             sync_history: false,
             sync_passwords: false,
+            block_ads: true,
         }
     }
 }
@@ -200,6 +203,7 @@ fn load_settings() -> Settings {
                     "sync_bookmarks" => s.sync_bookmarks = v.trim() == "true",
                     "sync_history" => s.sync_history = v.trim() == "true",
                     "sync_passwords" => s.sync_passwords = v.trim() == "true",
+                    "block_ads" => s.block_ads = v.trim() == "true",
                     _ => {}
                 }
             }
@@ -216,14 +220,15 @@ fn save_settings(s: &Settings) {
         let _ = std::fs::write(
             &path,
             format!(
-                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\n",
+                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nblock_ads={}\n",
                 s.search,
                 s.accent,
                 s.dark,
                 s.sync_api_key,
                 s.sync_bookmarks,
                 s.sync_history,
-                s.sync_passwords
+                s.sync_passwords,
+                s.block_ads
             ),
         );
     }
@@ -763,6 +768,9 @@ struct AppState {
     sync_cursor_bookmarks: Cell<i64>,
     sync_cursor_history: Cell<i64>,
     sync_cursor_passwords: Cell<i64>,
+    /// Ad/tracker blocking engine (adblock-rust) + a session blocked counter.
+    adblock: adblock::Engine,
+    adblock_blocked: Cell<u64>,
     sync_status: RefCell<String>,
     syncing: Cell<bool>,
     /// Downloads (engine-streamed to ~/Downloads) + a transient toast for the latest one.
@@ -1616,6 +1624,22 @@ impl AppState {
                 changed |= ui.text_edit_singleline(&mut s.accent).changed();
                 ui.add_space(6.0);
                 changed |= ui.checkbox(&mut s.dark, "Dark theme").changed();
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Privacy").strong());
+                changed |= ui
+                    .checkbox(&mut s.block_ads, "Block ads & trackers")
+                    .changed();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} ad/tracker request(s) blocked this session.",
+                        self.adblock_blocked.get()
+                    ))
+                    .small()
+                    .weak(),
+                );
 
                 ui.add_space(10.0);
                 ui.separator();
@@ -2621,11 +2645,30 @@ impl WebViewDelegate for AppState {
     /// embedder to intercept every resource load *before* it resolves the scheme, so a custom
     /// scheme works here with no engine fork patch and no net-internal ProtocolHandler. Loads
     /// we don't recognise are left alone (dropping `load` signals "do not intercept").
-    fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
-        if load.request().url.scheme() != "gator" {
+    fn load_web_resource(&self, webview: WebView, load: WebResourceLoad) {
+        let url = load.request().url.clone();
+        if url.scheme() != "gator" {
+            // Ad/tracker blocking. This delegate already intercepts every load, so a matched
+            // request is intercepted with an empty 204 instead of being fetched. `source` is the
+            // requesting tab's URL, so first-vs-third-party rules resolve correctly.
+            if matches!(url.scheme(), "http" | "https") && self.settings.borrow().block_ads {
+                let source = self
+                    .tab_index(&webview)
+                    .and_then(|i| self.tabs.borrow().get(i).map(|t| t.url.clone()))
+                    .unwrap_or_default();
+                if let Ok(req) = adblock::request::Request::new(url.as_str(), &source, "other") {
+                    if self.adblock.check_network_request(&req).matched {
+                        self.adblock_blocked.set(self.adblock_blocked.get() + 1);
+                        let response =
+                            WebResourceResponse::new(url).status_code(StatusCode::NO_CONTENT);
+                        let mut intercepted = load.intercept(response);
+                        intercepted.finish();
+                        return;
+                    }
+                }
+            }
             return;
         }
-        let url = load.request().url.clone();
         let body = match url.host_str().unwrap_or("welcome") {
             "welcome" | "newtab" | "home" => self.render_gator_welcome(),
             "history" => self.render_gator_history(),
@@ -3018,6 +3061,11 @@ impl ApplicationHandler<WakeUp> for App {
             sync_cursor_bookmarks: Cell::new(sync_cb),
             sync_cursor_history: Cell::new(sync_ch),
             sync_cursor_passwords: Cell::new(sync_cp),
+            adblock: adblock::Engine::from_rules(
+                include_str!("content/blocklist.txt").lines(),
+                adblock::lists::ParseOptions::default(),
+            ),
+            adblock_blocked: Cell::new(0),
             sync_status: RefCell::new(String::new()),
             syncing: Cell::new(false),
             downloads: RefCell::new(Vec::new()),
@@ -3426,4 +3474,37 @@ fn start_ipc(path: String, proxy: EventLoopProxy<WakeUp>, clients: Arc<Mutex<Vec
             });
         }
     });
+}
+
+#[cfg(test)]
+mod adblock_tests {
+    #[test]
+    fn blocks_trackers_allows_content() {
+        let engine = adblock::Engine::from_rules(
+            include_str!("content/blocklist.txt").lines(),
+            adblock::lists::ParseOptions::default(),
+        );
+        // a known tracker, loaded third-party from a content site, is blocked
+        let ad = adblock::request::Request::new(
+            "https://www.google-analytics.com/analytics.js",
+            "https://news.example.com/article",
+            "script",
+        )
+        .unwrap();
+        assert!(
+            engine.check_network_request(&ad).matched,
+            "tracker should be blocked"
+        );
+        // the page's own first-party content is not blocked
+        let page = adblock::request::Request::new(
+            "https://news.example.com/article.html",
+            "https://news.example.com/article",
+            "document",
+        )
+        .unwrap();
+        assert!(
+            !engine.check_network_request(&page).matched,
+            "first-party content must not be blocked"
+        );
+    }
 }

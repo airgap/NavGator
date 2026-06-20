@@ -30,6 +30,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "adblock"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db6fe7702c798519299bcbe011ff6f1dc9e3aedc1f3171178cddf71e1736bf95"
+dependencies = [
+ "addr",
+ "arrayvec",
+ "base64",
+ "bitflags 2.13.0",
+ "flatbuffers",
+ "idna",
+ "itertools 0.13.0",
+ "memchr",
+ "percent-encoding",
+ "precomputed-hash",
+ "regex",
+ "rustc-hash 1.1.0",
+ "seahash",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "url",
+]
+
+[[package]]
+name = "addr"
+version = "0.15.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a93b8a41dbe230ad5087cc721f8d41611de654542180586b315d9f4cf6b72bef"
+dependencies = [
+ "psl",
+ "psl-types",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -528,7 +563,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "shlex 1.3.0",
  "syn",
 ]
@@ -2008,6 +2043,16 @@ name = "fixedbitset"
 version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
+
+[[package]]
+name = "flatbuffers"
+version = "25.12.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35f6839d7b3b98adde531effaf34f0c2badc6f4735d26fe74709d8e513a96ef3"
+dependencies = [
+ "bitflags 2.13.0",
+ "rustc_version",
+]
 
 [[package]]
 name = "flate2"
@@ -3783,7 +3828,7 @@ dependencies = [
  "mio",
  "postcard",
  "rand 0.9.4",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "serde_core",
  "tempfile",
  "thiserror 2.0.18",
@@ -4358,6 +4403,7 @@ checksum = "956787520e75e9bd233246045d19f42fb73242759cc57fba9611d940ae96d4b0"
 name = "navgator"
 version = "0.1.0"
 dependencies = [
+ "adblock",
  "argon2",
  "chacha20poly1305",
  "egui",
@@ -5536,6 +5582,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "psl"
+version = "2.1.213"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04e78830163eebdf905adb55ba26ba9b3ba554b08bd84c2fbe3b643c8addf22c"
+dependencies = [
+ "psl-types",
+]
+
+[[package]]
+name = "psl-types"
+version = "2.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33cb294fe86a74cbcf50d4445b37da762029549ebeea341421c7c70370f86cac"
+
+[[package]]
 name = "pxfm"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5934,6 +5995,12 @@ checksum = "b50b8869d9fc858ce7266cce0194bd74df58b9d0e3f6df3a9fc8eb470d95c09d"
 
 [[package]]
 name = "rustc-hash"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
+
+[[package]]
+name = "rustc-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
@@ -6151,6 +6218,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "seahash"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
+
+[[package]]
 name = "sec1"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6200,7 +6273,7 @@ dependencies = [
  "phf",
  "phf_codegen",
  "precomputed-hash",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "servo_arc",
  "smallvec",
  "to_shmem",
@@ -6320,7 +6393,7 @@ dependencies = [
  "log",
  "mozangle",
  "parking_lot",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "serde",
  "servo-background-hang-monitor",
  "servo-base",
@@ -6384,7 +6457,7 @@ dependencies = [
  "crossbeam-channel",
  "libc",
  "log",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "serde_json",
  "servo-background-hang-monitor-api",
  "servo-base",
@@ -6435,7 +6508,7 @@ dependencies = [
  "kurbo",
  "log",
  "peniko",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "servo-base",
  "servo-canvas-traits",
  "servo-config",
@@ -6511,7 +6584,7 @@ dependencies = [
  "log",
  "parking_lot",
  "rand 0.10.1",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "serde",
  "servo-background-hang-monitor",
  "servo-background-hang-monitor-api",
@@ -6551,7 +6624,7 @@ dependencies = [
  "ipc-channel",
  "log",
  "malloc_size_of_derive",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "serde",
  "servo-base",
  "servo-canvas-traits",
@@ -6606,7 +6679,7 @@ dependencies = [
  "malloc_size_of_derive",
  "parking_lot",
  "rand 0.10.1",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "serde",
  "serde_json",
  "servo-base",
@@ -6666,7 +6739,7 @@ dependencies = [
  "keyboard-types",
  "log",
  "malloc_size_of_derive",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "serde",
  "servo-base",
  "servo-geometry",
@@ -6713,7 +6786,7 @@ dependencies = [
  "parking_lot",
  "postcard",
  "read-fonts 0.39.2",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "serde",
  "servo-allocator",
  "servo-base",
@@ -6824,7 +6897,7 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "rayon",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "selectors",
  "serde",
  "servo-base",
@@ -6871,7 +6944,7 @@ dependencies = [
  "libc",
  "malloc_size_of_derive",
  "parking_lot",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "selectors",
  "serde",
  "servo-background-hang-monitor-api",
@@ -7116,7 +7189,7 @@ dependencies = [
  "ipc-channel",
  "log",
  "malloc_size_of_derive",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "serde",
  "servo-config",
  "servo-malloc-size-of",
@@ -7196,7 +7269,7 @@ dependencies = [
  "quick_cache",
  "regex",
  "resvg",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
@@ -7249,7 +7322,7 @@ dependencies = [
  "parking_lot",
  "percent-encoding",
  "rand 0.10.1",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "rustls-pki-types",
  "serde",
  "servo-base",
@@ -7283,7 +7356,7 @@ dependencies = [
  "ipc-channel",
  "log",
  "rayon",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "servo-allocator",
  "servo-base",
  "servo-canvas-traits",
@@ -7323,7 +7396,7 @@ dependencies = [
  "malloc_size_of_derive",
  "parking_lot",
  "raw-window-handle",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "serde",
  "serde_bytes",
  "servo-base",
@@ -7465,7 +7538,7 @@ dependencies = [
  "rand 0.10.1",
  "regex",
  "rsa",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "sec1",
  "selectors",
  "seq-macro",
@@ -7579,7 +7652,7 @@ dependencies = [
  "euclid",
  "keyboard-types",
  "malloc_size_of_derive",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "serde",
  "servo-base",
  "servo-canvas-traits",
@@ -7613,7 +7686,7 @@ dependencies = [
  "malloc_size_of_derive",
  "postcard",
  "rusqlite",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "sea-query",
  "sea-query-rusqlite",
  "serde",
@@ -7700,7 +7773,7 @@ dependencies = [
  "log",
  "num-traits",
  "parking_lot",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "servo-base",
  "servo-canvas-traits",
  "servo-paint-api",
@@ -8182,7 +8255,7 @@ dependencies = [
  "precomputed-hash",
  "rayon",
  "rayon-core",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "selectors",
  "serde",
  "servo_arc",
@@ -9557,7 +9630,7 @@ dependencies = [
  "plane-split",
  "rayon",
  "ron",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "serde",
  "smallvec",
  "svg_fmt",
@@ -10092,7 +10165,7 @@ dependencies = [
  "malloc_size_of_derive",
  "objc",
  "rayon",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "serde",
  "smallvec",
  "tracy-rs",

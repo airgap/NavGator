@@ -1,0 +1,87 @@
+! NavGator default blocklist — a curated starter set of the most common ad / tracker
+! network endpoints, in EasyList (adblock-rust) syntax. `||domain^` blocks all requests to
+! that domain and its subdomains. This is a small bundled default so blocking works out of the
+! box; the full EasyList/EasyPrivacy fetch is a follow-up. One rule per line; `!` is a comment.
+
+! --- Google advertising + analytics ---
+||doubleclick.net^
+||googlesyndication.com^
+||googleadservices.com^
+||googletagservices.com^
+||googletagmanager.com^
+||google-analytics.com^
+||analytics.google.com^
+||adservice.google.com^
+||pagead2.googlesyndication.com^
+||partner.googleadservices.com^
+||2mdn.net^
+||app-measurement.com^
+
+! --- Facebook / Meta tracking ---
+||connect.facebook.net^
+||facebook.com/tr^
+||graph.facebook.com/*/activities^
+
+! --- Amazon ads ---
+||amazon-adsystem.com^
+
+! --- Major programmatic ad exchanges / SSPs ---
+||adnxs.com^
+||adsrvr.org^
+||pubmatic.com^
+||rubiconproject.com^
+||openx.net^
+||casalemedia.com^
+||bidswitch.net^
+||criteo.com^
+||criteo.net^
+||adform.net^
+||smartadserver.com^
+||serving-sys.com^
+||3lift.com^
+||33across.com^
+||indexww.com^
+||yieldmo.com^
+||sharethrough.com^
+||teads.tv^
+||gumgum.com^
+||sonobi.com^
+||districtm.io^
+
+! --- Content-recommendation ad widgets ---
+||taboola.com^
+||outbrain.com^
+||revcontent.com^
+||mgid.com^
+
+! --- Ad verification / viewability ---
+||moatads.com^
+||doubleverify.com^
+||adsafeprotected.com^
+||scorecardresearch.com^
+
+! --- Analytics / session-replay / product trackers ---
+||quantserve.com^
+||quantcount.com^
+||hotjar.com^
+||hotjar.io^
+||mouseflow.com^
+||crazyegg.com^
+||fullstory.com^
+||mixpanel.com^
+||segment.com^
+||segment.io^
+||amplitude.com^
+||heap.io^
+||heapanalytics.com^
+||chartbeat.com^
+||parsely.com^
+||newrelic.com^
+||nr-data.net^
+
+! --- Mobile attribution / marketing automation ---
+||branch.io^
+||adjust.com^
+||appsflyer.com^
+||braze.com^
+||clarity.ms^
