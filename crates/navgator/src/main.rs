@@ -43,8 +43,8 @@ use navgator_engine::{
     NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, PermissionRequest,
     PixelFormat, Preferences, RenderingContext,
     RgbColor, SelectElement, SelectElementOptionOrOptgroup, Servo, ServoBuilder, SimpleDialog,
-    WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WheelDelta,
-    WheelEvent, WheelMode, WindowRenderingContext,
+    UserContentManager, UserScript, WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder,
+    WebViewDelegate, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
 };
 // `http` types for building the WebResourceResponse served to gator:// internal pages.
 use navgator_engine::http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE};
@@ -537,6 +537,38 @@ fn load_filter_rules() -> Vec<String> {
         }
     }
     rules
+}
+
+/// Directory holding user-provided *.js userscripts (Greasemonkey-style). Each file is
+/// injected into every page on load via Servo's UserContentManager.
+fn userscripts_dir() -> Option<PathBuf> {
+    config_file("userscripts")
+}
+
+/// Read every `*.js` file in the userscripts dir (non-recursive), returning (path, source)
+/// pairs. Best-effort: unreadable files are skipped. The dir is created if missing so the
+/// path shown in Settings is real.
+fn load_userscripts() -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    let Some(dir) = userscripts_dir() else {
+        return out;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return out;
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "js"))
+        .collect();
+    paths.sort(); // deterministic injection order
+    for p in paths {
+        if let Ok(src) = std::fs::read_to_string(&p) {
+            out.push((p, src));
+        }
+    }
+    out
 }
 
 /// Refresh the cached EasyList / EasyPrivacy in the background (best-effort), re-fetching any
@@ -1062,6 +1094,11 @@ enum TabAction {
 
 struct AppState {
     servo: Servo,
+    /// Shared UserContentManager carrying every loaded userscript; cloned (Rc) onto each
+    /// new tab/popup WebView so scripts inject on all pages. None when no *.js userscripts exist.
+    userscripts: Option<Rc<UserContentManager>>,
+    /// Count of loaded userscripts, shown in Settings (cheap, read once at startup).
+    userscripts_count: usize,
     window_context: Rc<WindowRenderingContext>,
     content_context: Rc<OffscreenRenderingContext>,
     egui: RefCell<EguiGlow>,
@@ -2406,6 +2443,27 @@ impl AppState {
                     .weak(),
                 );
 
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Userscripts").strong());
+                let usdir = userscripts_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} userscript(s) loaded from {}",
+                        self.userscripts_count, usdir
+                    ))
+                    .small()
+                    .weak(),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Drop *.js files there and restart to inject them on every page.",
+                    )
+                    .small()
+                    .weak(),
+                );
+
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(4.0);
@@ -2863,11 +2921,14 @@ impl AppState {
         let Some(me) = self.weak_self.borrow().upgrade() else {
             return;
         };
-        let webview = WebViewBuilder::new(&self.servo, self.content_context.clone())
+        let mut builder = WebViewBuilder::new(&self.servo, self.content_context.clone())
             .url(url)
             .hidpi_scale_factor(Scale::new(self.scale.get() as f32))
-            .delegate(me)
-            .build();
+            .delegate(me);
+        if let Some(ucm) = &self.userscripts {
+            builder = builder.user_content_manager(ucm.clone());
+        }
+        let webview = builder.build();
         self.adopt_tab(webview);
     }
 
@@ -3817,11 +3878,14 @@ impl WebViewDelegate for AppState {
         let Some(me) = self.weak_self.borrow().upgrade() else {
             return;
         };
-        let webview = request
+        let mut builder = request
             .builder(self.content_context.clone())
             .hidpi_scale_factor(Scale::new(self.scale.get() as f32))
-            .delegate(me)
-            .build();
+            .delegate(me);
+        if let Some(ucm) = &self.userscripts {
+            builder = builder.user_content_manager(ucm.clone());
+        }
+        let webview = builder.build();
         self.adopt_tab(webview);
     }
 
@@ -4030,6 +4094,21 @@ impl ApplicationHandler<WakeUp> for App {
             .build();
         servo.setup_logging();
 
+        // Build the shared UserContentManager from the live Servo and load every *.js
+        // userscript into it. The same Rc is cloned onto each tab/popup WebView so scripts
+        // inject on all pages. None when the dir holds no readable *.js files.
+        let loaded_scripts = load_userscripts();
+        let userscripts_count = loaded_scripts.len();
+        let userscripts = if loaded_scripts.is_empty() {
+            None
+        } else {
+            let ucm = UserContentManager::new(&servo);
+            for (path, src) in loaded_scripts {
+                ucm.add_script(Rc::new(UserScript::new(src, Some(path))));
+            }
+            Some(Rc::new(ucm))
+        };
+
         let _ = content_context.make_current();
         let egui = EguiGlow::new(event_loop, content_context.glow_gl_api(), None, None, false);
         egui.egui_ctx.options_mut(|o| {
@@ -4040,6 +4119,8 @@ impl ApplicationHandler<WakeUp> for App {
         let (sync_cb, sync_ch, sync_cp) = load_sync_cursors();
         let state = Rc::new(AppState {
             servo,
+            userscripts,
+            userscripts_count,
             window_context,
             content_context,
             egui: RefCell::new(egui),

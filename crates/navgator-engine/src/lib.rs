@@ -13,7 +13,10 @@ pub use servo::{
     CreateNewWebViewRequest, DevicePoint, InputEvent, Key, KeyState, KeyboardEvent, LoadStatus,
     MouseButton, MouseButtonAction,
     MouseButtonEvent, MouseMoveEvent, NamedKey, NavigationRequest, OffscreenRenderingContext,
-    Preferences, RenderingContext, Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate,
+    Preferences, RenderingContext, Servo, ServoBuilder,
+    // Userscript injection (UserContentManager-based) — gator-side feature, see main.rs.
+    UserContentManager, UserScript,
+    WebView, WebViewBuilder, WebViewDelegate,
     WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
 };
 
