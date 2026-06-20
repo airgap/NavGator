@@ -154,6 +154,54 @@ fn load_session() -> Vec<Url> {
     urls
 }
 
+/// Scan installed Chromium-family browsers for their JSON `Bookmarks` file and return every
+/// bookmarked (url, title). Read-only, no SQLite, no lock — Chrome stores bookmarks as plain JSON.
+fn import_chrome_bookmarks() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+        return out;
+    };
+    let candidates = [
+        ".config/google-chrome/Default/Bookmarks",
+        ".config/chromium/Default/Bookmarks",
+        ".config/BraveSoftware/Brave-Browser/Default/Bookmarks",
+        ".config/microsoft-edge/Default/Bookmarks",
+        ".config/vivaldi/Default/Bookmarks",
+    ];
+    for rel in candidates {
+        let Ok(text) = std::fs::read_to_string(home.join(rel)) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if let Some(roots) = json.get("roots").and_then(|r| r.as_object()) {
+            for node in roots.values() {
+                collect_chrome_bookmarks(node, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Recursively walk a Chrome bookmark node, pushing every `type:"url"` entry.
+fn collect_chrome_bookmarks(node: &serde_json::Value, out: &mut Vec<(String, String)>) {
+    if node.get("type").and_then(|t| t.as_str()) == Some("url") {
+        if let Some(url) = node.get("url").and_then(|u| u.as_str()) {
+            if url.starts_with("http") {
+                let name = node.get("name").and_then(|n| n.as_str()).unwrap_or(url);
+                out.push((url.to_string(), name.to_string()));
+            }
+        }
+        return;
+    }
+    if let Some(children) = node.get("children").and_then(|c| c.as_array()) {
+        for child in children {
+            collect_chrome_bookmarks(child, out);
+        }
+    }
+}
+
 /// User settings, persisted to a small `key=value` config file.
 #[derive(Clone)]
 struct Settings {
@@ -854,6 +902,8 @@ struct AppState {
     password_store: RefCell<password::PasswordStore>,
     password_input: RefCell<String>,
     password_msg: RefCell<Option<String>>,
+    /// Result of the last bookmark import (shown in Settings).
+    import_msg: RefCell<Option<String>>,
     event_proxy: EventLoopProxy<WakeUp>,
     /// Declared last so the GL contexts (which borrow the window) drop before it.
     window: Window,
@@ -1646,6 +1696,7 @@ impl AppState {
         let mut open = true;
         let mut sync_clicked = false;
         let mut unlock_pass: Option<String> = None;
+        let mut import_clicked = false;
         egui::Window::new("Settings")
             .collapsible(false)
             .resizable(false)
@@ -1714,6 +1765,21 @@ impl AppState {
                     .small()
                     .weak(),
                 );
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Import").strong());
+                if ui
+                    .button("Import bookmarks (Chrome / Brave / Edge)")
+                    .clicked()
+                {
+                    import_clicked = true;
+                }
+                if let Some(msg) = self.import_msg.borrow().clone() {
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new(msg).small().weak());
+                }
 
                 ui.add_space(10.0);
                 ui.separator();
@@ -1815,6 +1881,9 @@ impl AppState {
         if let Some(p) = unlock_pass {
             self.unlock_passwords(&p);
             self.password_input.borrow_mut().clear();
+        }
+        if import_clicked {
+            self.import_bookmarks();
         }
         if sync_clicked {
             self.start_sync();
@@ -2513,6 +2582,32 @@ impl AppState {
             });
         }
         save_bookmarks(&p);
+    }
+
+    /// Import bookmarks from any installed Chromium-family browser (deduped by URL).
+    fn import_bookmarks(&self) {
+        let imported = import_chrome_bookmarks();
+        let mut added = 0;
+        {
+            let mut p = self.profile.borrow_mut();
+            for (url, title) in imported {
+                if !p.bookmarks.iter().any(|b| b.url == url) {
+                    p.bookmarks.push(Bookmark {
+                        url,
+                        title,
+                        updated: now_ms(),
+                    });
+                    added += 1;
+                }
+            }
+            save_bookmarks(&p);
+        }
+        *self.import_msg.borrow_mut() = Some(if added > 0 {
+            format!("Imported {added} bookmark(s) from Chrome/Brave/Edge.")
+        } else {
+            "No new Chrome/Brave/Edge bookmarks found.".to_string()
+        });
+        self.window.request_redraw();
     }
 
     /// Run the find highlighter for `query`; the async JS result updates find_matches.
@@ -3219,6 +3314,7 @@ impl ApplicationHandler<WakeUp> for App {
             )),
             password_input: RefCell::new(String::new()),
             password_msg: RefCell::new(None),
+            import_msg: RefCell::new(None),
             dialogs: RefCell::new(Vec::new()),
             closed_tabs: RefCell::new(Vec::new()),
             find_open: Cell::new(false),
@@ -3653,5 +3749,27 @@ mod adblock_tests {
             !engine.check_network_request(&page).matched,
             "first-party content must not be blocked"
         );
+    }
+
+    #[test]
+    fn parses_chrome_bookmark_tree() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{ "roots": { "bookmark_bar": { "type":"folder", "children": [
+                {"type":"url","name":"Example","url":"https://example.com"},
+                {"type":"folder","name":"Sub","children":[
+                    {"type":"url","name":"Inner","url":"https://inner.test/page"},
+                    {"type":"url","name":"Internal","url":"chrome://settings"}
+                ]}
+            ]}}}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        for node in json.get("roots").unwrap().as_object().unwrap().values() {
+            super::collect_chrome_bookmarks(node, &mut out);
+        }
+        // two http(s) bookmarks recursed out of the tree; chrome:// filtered
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().any(|(u, n)| u == "https://example.com" && n == "Example"));
+        assert!(out.iter().any(|(u, _)| u == "https://inner.test/page"));
     }
 }
