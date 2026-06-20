@@ -68,8 +68,13 @@ pub struct SyncSnapshot {
     pub sync_history: bool,
     pub bookmarks: Vec<(String, String, i64)>, // (url, title, updated)
     pub history: Vec<(String, String, u32, i64)>, // (url, title, visits, updated)
+    pub sync_passwords: bool,
+    /// Pre-encrypted on the UI thread: (itemId, hex ciphertext, updated). The sync thread only
+    /// moves opaque ciphertext — the passphrase + plaintext never leave the UI thread.
+    pub passwords: Vec<(String, String, i64)>,
     pub cursor_bookmarks: i64,
     pub cursor_history: i64,
+    pub cursor_passwords: i64,
 }
 
 #[derive(Debug)]
@@ -88,7 +93,15 @@ pub struct PulledHistory {
     pub deleted: bool,
 }
 
-/// Result of a sync, applied to the `Profile` on the UI thread.
+#[derive(Debug)]
+pub struct PulledPassword {
+    pub item_id: String,
+    pub payload: String, // hex ciphertext — decrypted on the UI thread into the store
+    pub updated: i64,
+    pub deleted: bool,
+}
+
+/// Result of a sync, applied to the `Profile`/password store on the UI thread.
 #[derive(Debug)]
 pub struct SyncOutcome {
     pub ok: bool,
@@ -96,8 +109,10 @@ pub struct SyncOutcome {
     pub pushed: usize,
     pub bookmarks: Vec<PulledBookmark>,
     pub history: Vec<PulledHistory>,
+    pub passwords: Vec<PulledPassword>,
     pub cursor_bookmarks: i64,
     pub cursor_history: i64,
+    pub cursor_passwords: i64,
 }
 
 fn err_str(e: ureq::Error) -> String {
@@ -146,8 +161,10 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
         pushed: 0,
         bookmarks: Vec::new(),
         history: Vec::new(),
+        passwords: Vec::new(),
         cursor_bookmarks: snap.cursor_bookmarks,
         cursor_history: snap.cursor_history,
+        cursor_passwords: snap.cursor_passwords,
     };
     if snap.api_key.trim().is_empty() {
         return SyncOutcome {
@@ -270,12 +287,58 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
         }
     }
 
+    if snap.sync_passwords {
+        let items = snap
+            .passwords
+            .iter()
+            .map(|(id, payload, updated)| WireItem {
+                collection: "passwords".into(),
+                item_id: id.clone(),
+                payload: payload.clone(),
+                deleted: false,
+                updated: *updated,
+            })
+            .collect();
+        match push(&snap.api_key, items) {
+            Ok(n) => out.pushed += n,
+            Err(e) => {
+                return SyncOutcome {
+                    ok: false,
+                    message: format!("push passwords: {e}"),
+                    ..out
+                };
+            }
+        }
+        match pull(&snap.api_key, "passwords", snap.cursor_passwords) {
+            Ok(items) => {
+                for it in items {
+                    if it.updated > out.cursor_passwords {
+                        out.cursor_passwords = it.updated;
+                    }
+                    out.passwords.push(PulledPassword {
+                        item_id: it.item_id,
+                        payload: it.payload,
+                        updated: it.updated,
+                        deleted: it.deleted,
+                    });
+                }
+            }
+            Err(e) => {
+                return SyncOutcome {
+                    ok: false,
+                    message: format!("pull passwords: {e}"),
+                    ..out
+                };
+            }
+        }
+    }
+
     out.message = format!(
-        "Synced — pushed {}, pulled {} bookmark(s) + {} history entr{}.",
+        "Synced — pushed {}, pulled {} bookmark(s), {} history, {} password(s).",
         out.pushed,
         out.bookmarks.len(),
         out.history.len(),
-        if out.history.len() == 1 { "y" } else { "ies" }
+        out.passwords.len(),
     );
     out
 }

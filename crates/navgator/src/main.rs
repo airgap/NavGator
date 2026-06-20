@@ -51,6 +51,7 @@ use navgator_engine::http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_
 use navgator_protocol::IpcCommand;
 
 mod sync;
+mod password;
 use url::Url;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
@@ -162,6 +163,7 @@ struct Settings {
     sync_api_key: String,
     sync_bookmarks: bool,
     sync_history: bool,
+    sync_passwords: bool,
 }
 
 impl Default for Settings {
@@ -173,6 +175,7 @@ impl Default for Settings {
             sync_api_key: String::new(),
             sync_bookmarks: false,
             sync_history: false,
+            sync_passwords: false,
         }
     }
 }
@@ -196,6 +199,7 @@ fn load_settings() -> Settings {
                     "sync_api_key" => s.sync_api_key = v.trim().to_string(),
                     "sync_bookmarks" => s.sync_bookmarks = v.trim() == "true",
                     "sync_history" => s.sync_history = v.trim() == "true",
+                    "sync_passwords" => s.sync_passwords = v.trim() == "true",
                     _ => {}
                 }
             }
@@ -212,16 +216,22 @@ fn save_settings(s: &Settings) {
         let _ = std::fs::write(
             &path,
             format!(
-                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\n",
-                s.search, s.accent, s.dark, s.sync_api_key, s.sync_bookmarks, s.sync_history
+                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\n",
+                s.search,
+                s.accent,
+                s.dark,
+                s.sync_api_key,
+                s.sync_bookmarks,
+                s.sync_history,
+                s.sync_passwords
             ),
         );
     }
 }
 
 /// Load the per-collection Lyku-sync pull cursors (max `updated` last seen); 0 if unset.
-fn load_sync_cursors() -> (i64, i64) {
-    let (mut b, mut h) = (0i64, 0i64);
+fn load_sync_cursors() -> (i64, i64, i64) {
+    let (mut b, mut h, mut p) = (0i64, 0i64, 0i64);
     if let Some(text) = config_file("sync-state.tsv").and_then(|p| std::fs::read_to_string(p).ok())
     {
         for line in text.lines() {
@@ -229,20 +239,24 @@ fn load_sync_cursors() -> (i64, i64) {
                 match k.trim() {
                     "bookmarks" => b = v.trim().parse().unwrap_or(0),
                     "history" => h = v.trim().parse().unwrap_or(0),
+                    "passwords" => p = v.trim().parse().unwrap_or(0),
                     _ => {}
                 }
             }
         }
     }
-    (b, h)
+    (b, h, p)
 }
 
-fn save_sync_cursors(bookmarks: i64, history: i64) {
+fn save_sync_cursors(bookmarks: i64, history: i64, passwords: i64) {
     if let Some(path) = config_file("sync-state.tsv") {
         if let Some(d) = path.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        let _ = std::fs::write(path, format!("bookmarks={bookmarks}\nhistory={history}\n"));
+        let _ = std::fs::write(
+            path,
+            format!("bookmarks={bookmarks}\nhistory={history}\npasswords={passwords}\n"),
+        );
     }
 }
 
@@ -459,6 +473,25 @@ fn url_encode(s: &str) -> String {
     out
 }
 
+/// Hex-encode bytes (for carrying the password ciphertext in a text sync payload).
+fn hex_encode(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for byte in b {
+        s.push_str(&format!("{byte:02x}"));
+    }
+    s
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
 /// Escape text for safe interpolation into HTML (the gator://welcome template).
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -528,6 +561,40 @@ fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
 }
 
 /// Escape a string into a JS double-quoted string literal.
+/// Autofill JS: fill a login form's username + password. Called as `(AUTOFILL_JS)(u, p)`.
+const AUTOFILL_JS: &str = r#"function(u,p){
+  var pw=document.querySelector('input[type="password"]');
+  if(!pw)return 0;
+  var scope=pw.form||document;
+  pw.value=p;
+  var un=scope.querySelector('input[autocomplete="username"],input[type="email"],input[type="text"]');
+  if(un)un.value=u;
+  [un,pw].forEach(function(f){if(f){f.dispatchEvent(new Event('input',{bubbles:true}));f.dispatchEvent(new Event('change',{bubbles:true}));}});
+  return 1;
+}"#;
+
+/// Read the active login form's username + password (for manual save). Returns JSON or "".
+const READ_FORM_JS: &str = r#"(function(){
+  var pw=document.querySelector('input[type="password"]');
+  if(!pw||!pw.value)return "";
+  var scope=pw.form||document;
+  var un=scope.querySelector('input[autocomplete="username"],input[type="email"],input[type="text"]');
+  return JSON.stringify({u:un?un.value:"",p:pw.value});
+})()"#;
+
+/// The origin (`scheme://host[:port]`) of a URL, for matching saved logins. None for non-web.
+fn origin_of(url: &str) -> Option<String> {
+    let u = Url::parse(url).ok()?;
+    if !matches!(u.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = u.host_str()?;
+    Some(match u.port() {
+        Some(p) => format!("{}://{}:{}", u.scheme(), host, p),
+        None => format!("{}://{}", u.scheme(), host),
+    })
+}
+
 fn js_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -695,11 +762,16 @@ struct AppState {
     /// Lyku sync (early access): per-collection pull cursors, a status line, an in-flight guard.
     sync_cursor_bookmarks: Cell<i64>,
     sync_cursor_history: Cell<i64>,
+    sync_cursor_passwords: Cell<i64>,
     sync_status: RefCell<String>,
     syncing: Cell<bool>,
     /// Downloads (engine-streamed to ~/Downloads) + a transient toast for the latest one.
     downloads: RefCell<Vec<Download>>,
     download_toast: RefCell<Option<String>>,
+    /// E2EE password store, the Settings passphrase input buffer, and a transient status line.
+    password_store: RefCell<password::PasswordStore>,
+    password_input: RefCell<String>,
+    password_msg: RefCell<Option<String>>,
     event_proxy: EventLoopProxy<WakeUp>,
     /// Declared last so the GL contexts (which borrow the window) drop before it.
     window: Window,
@@ -1026,6 +1098,24 @@ impl AppState {
                 }
             }
 
+            // Password action message (bottom-center), dismissible.
+            let pmsg = self.password_msg.borrow().clone();
+            if let Some(pmsg) = pmsg {
+                egui::Area::new(egui::Id::new("password_msg"))
+                    .order(egui::Order::Foreground)
+                    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -14.0))
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(format!("🔑  {pmsg}")));
+                                if ui.small_button("×").clicked() {
+                                    *self.password_msg.borrow_mut() = None;
+                                }
+                            });
+                        });
+                    });
+            }
+
             // Find-in-page bar (Ctrl+F), floating top-right under the chrome.
             if self.find_open.get() {
                 egui::Area::new(egui::Id::new("findbar"))
@@ -1190,6 +1280,14 @@ impl AppState {
                     }
                     if ui.add(egui::Button::new("☰").frame(false).min_size(egui::vec2(28.0, 24.0))).clicked() {
                         self.show_settings.set(!self.show_settings.get());
+                    }
+                    if self.password_store.borrow().is_unlocked()
+                        && ui
+                            .add(egui::Button::new("🔑").frame(false).min_size(egui::vec2(28.0, 24.0)))
+                            .on_hover_text("Save this page's login")
+                            .clicked()
+                    {
+                        self.save_login_active();
                     }
                     // Zoom indicator: only shown when the active tab isn't at 100%.
                     // Click resets the page zoom; in the right-to-left layout this sits
@@ -1416,6 +1514,7 @@ impl AppState {
         }
         let mut open = true;
         let mut sync_clicked = false;
+        let mut unlock_pass: Option<String> = None;
         egui::Window::new("Settings")
             .collapsible(false)
             .resizable(false)
@@ -1492,6 +1591,9 @@ impl AppState {
                 ui.add_space(2.0);
                 changed |= ui.checkbox(&mut s.sync_bookmarks, "Sync bookmarks").changed();
                 changed |= ui.checkbox(&mut s.sync_history, "Sync history").changed();
+                changed |= ui
+                    .checkbox(&mut s.sync_passwords, "Sync passwords (E2EE — unlock below)")
+                    .changed();
                 if changed {
                     save_settings(&s);
                 }
@@ -1511,7 +1613,51 @@ impl AppState {
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new(status.as_str()).small().weak());
                 }
+
+                // Passwords (E2EE) — unlock the store to enable autofill + saving.
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Passwords (E2EE)").strong());
+                if self.password_store.borrow().is_unlocked() {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Unlocked — {} saved. Use the 🔑 toolbar button to save the current page's login.",
+                            self.password_store.borrow().len()
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                    if ui.button("Lock").clicked() {
+                        self.password_store.borrow_mut().lock();
+                        *self.password_msg.borrow_mut() = Some("Password store locked.".into());
+                    }
+                } else {
+                    ui.label(
+                        egui::RichText::new(
+                            "Unlock with your sync passphrase to enable login autofill + saving.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut *self.password_input.borrow_mut())
+                            .password(true)
+                            .hint_text("sync passphrase"),
+                    );
+                    if ui.button("Unlock").clicked() {
+                        unlock_pass = Some(self.password_input.borrow().clone());
+                    }
+                }
+                if let Some(msg) = self.password_msg.borrow().clone() {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(msg).small().weak());
+                }
             });
+        if let Some(p) = unlock_pass {
+            self.unlock_passwords(&p);
+            self.password_input.borrow_mut().clear();
+        }
         if sync_clicked {
             self.start_sync();
         }
@@ -2010,24 +2156,51 @@ impl AppState {
         if self.syncing.get() {
             return;
         }
-        let (api_key, sync_bookmarks, sync_history) = {
+        let (api_key, sync_bookmarks, sync_history, sync_passwords) = {
             let s = self.settings.borrow();
-            (s.sync_api_key.clone(), s.sync_bookmarks, s.sync_history)
+            (
+                s.sync_api_key.clone(),
+                s.sync_bookmarks,
+                s.sync_history,
+                s.sync_passwords,
+            )
         };
         if api_key.trim().is_empty() {
             *self.sync_status.borrow_mut() = "Set a Lyku API key first.".into();
             return;
         }
-        if !sync_bookmarks && !sync_history {
-            *self.sync_status.borrow_mut() = "Enable bookmarks and/or history first.".into();
+        if !sync_bookmarks && !sync_history && !sync_passwords {
+            *self.sync_status.borrow_mut() = "Enable a collection to sync first.".into();
             return;
         }
         let snap = {
             let p = self.profile.borrow();
+            // Passwords are encrypted HERE (UI thread) — the sync thread only sees ciphertext,
+            // and only when the store is unlocked.
+            let store = self.password_store.borrow();
+            let sync_passwords = sync_passwords && store.is_unlocked();
+            let passwords = if sync_passwords {
+                store
+                    .all()
+                    .iter()
+                    .filter_map(|c| {
+                        let blob = store.encrypt_credential(c)?;
+                        Some((
+                            format!("{}\u{1f}{}", c.origin, c.username),
+                            hex_encode(&blob),
+                            c.updated,
+                        ))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             sync::SyncSnapshot {
                 api_key,
                 sync_bookmarks,
                 sync_history,
+                sync_passwords,
+                passwords,
                 bookmarks: p
                     .bookmarks
                     .iter()
@@ -2040,6 +2213,7 @@ impl AppState {
                     .collect(),
                 cursor_bookmarks: self.sync_cursor_bookmarks.get(),
                 cursor_history: self.sync_cursor_history.get(),
+                cursor_passwords: self.sync_cursor_passwords.get(),
             }
         };
         self.syncing.set(true);
@@ -2098,9 +2272,33 @@ impl AppState {
                 save_bookmarks(&p);
                 save_history(&p);
             }
+            // Decrypt + merge pulled passwords into the store (only while unlocked).
+            if self.password_store.borrow().is_unlocked() {
+                let mut changed = false;
+                for pw in &outcome.passwords {
+                    if pw.deleted {
+                        continue;
+                    }
+                    if let Some(blob) = hex_decode(&pw.payload) {
+                        let cred = self.password_store.borrow().decrypt_credential(&blob);
+                        if let Some(cred) = cred {
+                            self.password_store.borrow_mut().upsert(cred);
+                            changed = true;
+                        }
+                    }
+                }
+                if changed {
+                    let _ = self.password_store.borrow().save();
+                }
+            }
             self.sync_cursor_bookmarks.set(outcome.cursor_bookmarks);
             self.sync_cursor_history.set(outcome.cursor_history);
-            save_sync_cursors(outcome.cursor_bookmarks, outcome.cursor_history);
+            self.sync_cursor_passwords.set(outcome.cursor_passwords);
+            save_sync_cursors(
+                outcome.cursor_bookmarks,
+                outcome.cursor_history,
+                outcome.cursor_passwords,
+            );
         }
         self.window.request_redraw();
     }
@@ -2207,6 +2405,105 @@ impl AppState {
             );
         }
         self.window.request_redraw();
+    }
+
+    /// Unlock the E2EE password store with the passphrase (decrypts saved logins into memory).
+    fn unlock_passwords(&self, passphrase: &str) {
+        let result = self.password_store.borrow_mut().unlock(passphrase);
+        let msg = match result {
+            Ok(()) => format!(
+                "Password store unlocked ({} saved).",
+                self.password_store.borrow().len()
+            ),
+            Err(e) => format!("Unlock failed: {e}"),
+        };
+        *self.password_msg.borrow_mut() = Some(msg);
+        self.window.request_redraw();
+    }
+
+    /// Autofill the login form of tab `tab_idx` if the store is unlocked and a saved login
+    /// matches the page origin. The credential goes straight from the store into the form via
+    /// evaluate_javascript — it is never exposed to page-readable storage.
+    fn autofill(&self, tab_idx: usize) {
+        if !self.password_store.borrow().is_unlocked() {
+            return;
+        }
+        let (webview, origin) = {
+            let tabs = self.tabs.borrow();
+            let Some(t) = tabs.get(tab_idx) else {
+                return;
+            };
+            let Some(origin) = origin_of(&t.url) else {
+                return;
+            };
+            (t.webview.clone(), origin)
+        };
+        let cred = self
+            .password_store
+            .borrow()
+            .for_origin(&origin)
+            .first()
+            .map(|c| (c.username.clone(), c.password.clone()));
+        let Some((user, pass)) = cred else {
+            return;
+        };
+        let js = format!("({})({}, {})", AUTOFILL_JS, js_string(&user), js_string(&pass));
+        webview.evaluate_javascript(js, |_| {});
+    }
+
+    /// Read the active page's login form and save it to the (unlocked) store.
+    fn save_login_active(&self) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let origin = self
+            .tabs
+            .borrow()
+            .get(self.active.get())
+            .and_then(|t| origin_of(&t.url));
+        let Some(origin) = origin else {
+            *self.password_msg.borrow_mut() = Some("Logins can only be saved on http(s) pages.".into());
+            self.window.request_redraw();
+            return;
+        };
+        if !self.password_store.borrow().is_unlocked() {
+            *self.password_msg.borrow_mut() =
+                Some("Unlock the password store first (Settings → Passwords).".into());
+            self.window.request_redraw();
+            return;
+        }
+        let me = self.weak_self.borrow().clone();
+        tab.evaluate_javascript(READ_FORM_JS.to_string(), move |res| {
+            let Some(me) = me.upgrade() else {
+                return;
+            };
+            let Ok(JSValue::String(s)) = res else {
+                return;
+            };
+            if s.is_empty() {
+                *me.password_msg.borrow_mut() = Some("No filled password field on this page.".into());
+                me.window.request_redraw();
+                return;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                let user = v.get("u").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let pass = v.get("p").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                if !pass.is_empty() {
+                    {
+                        let mut store = me.password_store.borrow_mut();
+                        store.upsert(password::Credential {
+                            origin: origin.clone(),
+                            username: user,
+                            password: pass,
+                            updated: now_ms(),
+                        });
+                        let _ = store.save();
+                    }
+                    *me.password_msg.borrow_mut() = Some(format!("Saved login for {origin}."));
+                    me.window.request_redraw();
+                }
+            }
+        });
     }
 
     fn handle_ipc(&self, cmd: IpcCommand) {
@@ -2362,6 +2659,9 @@ impl WebViewDelegate for AppState {
                     tabs[i].status_text = None;
                     tabs[i].crashed = false;
                 }
+            }
+            if matches!(status, LoadStatus::Complete) {
+                self.autofill(i);
             }
             if matches!(status, LoadStatus::Complete) && i == self.active.get() {
                 self.location_dirty.set(false);
@@ -2632,7 +2932,7 @@ impl ApplicationHandler<WakeUp> for App {
         });
         window.set_visible(true);
 
-        let (sync_cb, sync_ch) = load_sync_cursors();
+        let (sync_cb, sync_ch, sync_cp) = load_sync_cursors();
         let state = Rc::new(AppState {
             servo,
             window_context,
@@ -2648,10 +2948,16 @@ impl ApplicationHandler<WakeUp> for App {
             show_settings: Cell::new(false),
             sync_cursor_bookmarks: Cell::new(sync_cb),
             sync_cursor_history: Cell::new(sync_ch),
+            sync_cursor_passwords: Cell::new(sync_cp),
             sync_status: RefCell::new(String::new()),
             syncing: Cell::new(false),
             downloads: RefCell::new(Vec::new()),
             download_toast: RefCell::new(None),
+            password_store: RefCell::new(password::PasswordStore::load(
+                config_file("passwords.enc").unwrap_or_else(|| PathBuf::from("passwords.enc")),
+            )),
+            password_input: RefCell::new(String::new()),
+            password_msg: RefCell::new(None),
             dialogs: RefCell::new(Vec::new()),
             closed_tabs: RefCell::new(Vec::new()),
             find_open: Cell::new(false),

@@ -4358,6 +4358,8 @@ checksum = "956787520e75e9bd233246045d19f42fb73242759cc57fba9611d940ae96d4b0"
 name = "navgator"
 version = "0.1.0"
 dependencies = [
+ "argon2",
+ "chacha20poly1305",
  "egui",
  "egui-file-dialog",
  "egui-winit",
@@ -4366,6 +4368,7 @@ dependencies = [
  "glow",
  "navgator-engine",
  "navgator-protocol",
+ "rand_core 0.6.4",
  "rustls",
  "serde",
  "serde_json",
