@@ -775,6 +775,37 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// A single setting change parsed from a `gator://settings?key=value` link. Each rendered link
+/// carries exactly one param, so `load_web_resource` produces exactly one of these per load and
+/// `render_gator_settings` applies it. `Action` carries an imperative button (sync/import/default).
+enum SettingsApply {
+    None,
+    Engine(usize),
+    Search(String),
+    Theme(usize),
+    Accent(String),
+    Dark(bool),
+    BlockAds(bool),
+    SyncBookmarks(bool),
+    SyncHistory(bool),
+    SyncPasswords(bool),
+    SyncApiKey(String),
+    Action(String),
+}
+
+/// A `gator://settings` toggle rendered as a pill that links to the OPPOSITE value. Shared by
+/// the dark/block_ads/sync_* boolean settings on the in-page settings UI.
+fn toggle_link(key: &str, on: bool) -> String {
+    let next = if on { "off" } else { "on" };
+    format!(
+        "<a class=\"pill{}\" href=\"gator://settings?{}={}\">{}</a>",
+        if on { " on" } else { "" },
+        key,
+        next,
+        if on { "On" } else { "Off" },
+    )
+}
+
 /// Truncate a tab title to `max` chars with an ellipsis.
 fn truncate_ellipsis(input: &str, max: usize) -> String {
     if input.chars().count() > max {
@@ -1271,6 +1302,167 @@ impl AppState {
         let html = include_str!("content/passwords.html")
             .replace("__ACCENT__", &accent)
             .replace("__ROWS__", &rows);
+        self.themed(html)
+    }
+
+    /// Render `gator://settings`: every setting the ☰ overlay manages, as a themed page. `apply`
+    /// carries a single `?key=value` change (or an imperative `?action=`); we mutate `Settings`,
+    /// persist, run any action, and request a redraw so `apply_theme` re-themes the egui chrome on
+    /// the next frame — then render the fresh state. Modeled on `render_gator_passwords`' `?remove=`
+    /// flow. The page's own links are bare `gator://settings`, so a reload never re-applies.
+    fn render_gator_settings(&self, apply: SettingsApply) -> Vec<u8> {
+        // 1. Apply the change (if any) and persist. We hold the mut-borrow only for this block and
+        //    drop it BEFORE running any action method — start_sync/import_browser_data/
+        //    make_default_browser all borrow self.settings/self.import_msg, so a held borrow here
+        //    would be a RefCell double-borrow panic.
+        let mut action = None;
+        {
+            let mut s = self.settings.borrow_mut();
+            let mut changed = false;
+            match apply {
+                SettingsApply::None => {}
+                SettingsApply::Engine(i) => {
+                    if let Some((_, t)) = SEARCH_ENGINES.get(i) {
+                        s.search = t.to_string();
+                        changed = true;
+                    }
+                }
+                SettingsApply::Search(v) => {
+                    if !v.trim().is_empty() {
+                        s.search = v;
+                        changed = true;
+                    }
+                }
+                SettingsApply::Theme(i) => {
+                    if let Some((_, a, d)) = THEMES.get(i) {
+                        s.accent = a.to_string();
+                        s.dark = *d;
+                        changed = true;
+                    }
+                }
+                SettingsApply::Accent(v) => {
+                    if v.starts_with('#') {
+                        s.accent = v;
+                        changed = true;
+                    }
+                }
+                SettingsApply::Dark(b) => {
+                    s.dark = b;
+                    changed = true;
+                }
+                SettingsApply::BlockAds(b) => {
+                    s.block_ads = b;
+                    changed = true;
+                }
+                SettingsApply::SyncBookmarks(b) => {
+                    s.sync_bookmarks = b;
+                    changed = true;
+                }
+                SettingsApply::SyncHistory(b) => {
+                    s.sync_history = b;
+                    changed = true;
+                }
+                SettingsApply::SyncPasswords(b) => {
+                    s.sync_passwords = b;
+                    changed = true;
+                }
+                SettingsApply::SyncApiKey(v) => {
+                    // NOTE: this key transits the in-process gator:// query string (and the address
+                    // bar) but never hits the network — load_web_resource intercepts gator:// before
+                    // any fetch. We never echo it back into the form value.
+                    s.sync_api_key = v;
+                    changed = true;
+                }
+                SettingsApply::Action(a) => action = Some(a),
+            }
+            if changed {
+                save_settings(&s);
+            }
+        } // mut-borrow dropped here, before any action method runs.
+        match action.as_deref() {
+            Some("sync") => self.start_sync(),
+            Some("import") => self.import_browser_data(),
+            Some("default") => self.make_default_browser(),
+            _ => {}
+        }
+        // Theme is recomputed from Settings every frame, so a redraw re-themes the chrome.
+        self.window.request_redraw();
+
+        // 2. Build the page from current state (read-only borrow, taken AFTER actions ran).
+        let s = self.settings.borrow();
+        let accent = s.accent.clone();
+        // Engine pills: a preset is active when its template == s.search; otherwise "Custom" shows.
+        let engine_pills: String = SEARCH_ENGINES
+            .iter()
+            .enumerate()
+            .map(|(i, (n, t))| {
+                let on = *t == s.search;
+                format!(
+                    "<a class=\"pill{}\" href=\"gator://settings?engine={}\">{}</a>",
+                    if on { " on" } else { "" },
+                    i,
+                    html_escape(n),
+                )
+            })
+            .chain(std::iter::once({
+                let custom = !SEARCH_ENGINES.iter().any(|(_, t)| *t == s.search);
+                format!(
+                    "<span class=\"pill{}\">Custom</span>",
+                    if custom { " on" } else { "" },
+                )
+            }))
+            .collect();
+        let theme_pills: String = THEMES
+            .iter()
+            .enumerate()
+            .map(|(i, (n, a, d))| {
+                let on = *a == s.accent && *d == s.dark;
+                format!(
+                    "<a class=\"pill{}\" href=\"gator://settings?theme={}\">{}</a>",
+                    if on { " on" } else { "" },
+                    i,
+                    html_escape(n),
+                )
+            })
+            .collect();
+        let dark_toggle = toggle_link("dark", s.dark);
+        let ads_toggle = toggle_link("block_ads", s.block_ads);
+        let sync_bookmarks = toggle_link("sync_bookmarks", s.sync_bookmarks);
+        let sync_history = toggle_link("sync_history", s.sync_history);
+        let sync_passwords = toggle_link("sync_passwords", s.sync_passwords);
+        let key_status = if s.sync_api_key.is_empty() {
+            "Not set"
+        } else {
+            "Set (hidden)"
+        };
+        let blocked = self.adblock_blocked.get();
+        let import_msg = self.import_msg.borrow().clone().unwrap_or_default();
+        let sync_status = self.sync_status.borrow().clone();
+        let pw_state = if self.password_store.borrow().is_unlocked() {
+            format!(
+                "Unlocked — {} saved. Lock or unlock from the ☰ menu.",
+                self.password_store.borrow().len()
+            )
+        } else {
+            "Locked — unlock from the ☰ menu to enable autofill.".to_string()
+        };
+
+        let html = include_str!("content/settings.html")
+            .replace("__ACCENT__", &accent)
+            .replace("__ENGINE_PILLS__", &engine_pills)
+            .replace("__SEARCH_VALUE__", &html_escape(&s.search))
+            .replace("__THEME_PILLS__", &theme_pills)
+            .replace("__ACCENT_VALUE__", &html_escape(&s.accent))
+            .replace("__DARK_TOGGLE__", &dark_toggle)
+            .replace("__ADS_TOGGLE__", &ads_toggle)
+            .replace("__ADS_BLOCKED__", &blocked.to_string())
+            .replace("__SYNC_BOOKMARKS__", &sync_bookmarks)
+            .replace("__SYNC_HISTORY__", &sync_history)
+            .replace("__SYNC_PASSWORDS__", &sync_passwords)
+            .replace("__KEY_STATUS__", key_status)
+            .replace("__IMPORT_MSG__", &html_escape(&import_msg))
+            .replace("__SYNC_STATUS__", &html_escape(&sync_status))
+            .replace("__PW_STATE__", &html_escape(&pw_state));
         self.themed(html)
     }
 
@@ -3127,6 +3319,37 @@ impl WebViewDelegate for AppState {
                     }
                 }
                 self.render_gator_passwords(remove)
+            }
+            "settings" => {
+                // Parse the query into one SettingsApply. query_pairs() already percent-decodes,
+                // so ?accent=%23ff7a45 arrives as '#ff7a45' and a <form> GET encodes itself. Every
+                // rendered link carries exactly one recognized param, so the last-wins fold is fine.
+                let mut apply = SettingsApply::None;
+                for (k, v) in url.query_pairs() {
+                    apply = match k.as_ref() {
+                        "engine" => v
+                            .parse()
+                            .ok()
+                            .map(SettingsApply::Engine)
+                            .unwrap_or(SettingsApply::None),
+                        "search" => SettingsApply::Search(v.into_owned()),
+                        "theme" => v
+                            .parse()
+                            .ok()
+                            .map(SettingsApply::Theme)
+                            .unwrap_or(SettingsApply::None),
+                        "accent" => SettingsApply::Accent(v.into_owned()),
+                        "dark" => SettingsApply::Dark(v == "on"),
+                        "block_ads" => SettingsApply::BlockAds(v == "on"),
+                        "sync_bookmarks" => SettingsApply::SyncBookmarks(v == "on"),
+                        "sync_history" => SettingsApply::SyncHistory(v == "on"),
+                        "sync_passwords" => SettingsApply::SyncPasswords(v == "on"),
+                        "sync_api_key" => SettingsApply::SyncApiKey(v.into_owned()),
+                        "action" => SettingsApply::Action(v.into_owned()),
+                        _ => apply,
+                    };
+                }
+                self.render_gator_settings(apply)
             }
             "crash" => {
                 let mut crashed_url = String::new();

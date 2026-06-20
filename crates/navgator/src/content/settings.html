@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Settings · NavGator</title>
+<style>
+  :root { --accent: __ACCENT__; --bg:__BG__; --panel:__PANEL__; --line:__LINE__; --fg:__FG__; --muted:__MUTED__; }
+  * { box-sizing:border-box; }
+  html,body { height:100%; margin:0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display:flex; flex-direction:column; align-items:center;
+    padding: 7vh 24px 28px; min-height:100%;
+  }
+  .head { width:min(760px,94vw); margin:0 0 24px; }
+  h1 { font-size:34px; font-weight:800; letter-spacing:-1px; margin:0; }
+  h1 .g { color: var(--accent); }
+  .sub { color: var(--muted); margin:6px 0 0; font-size:14px; }
+  .card { width:min(760px,94vw); background: var(--panel); border:1px solid var(--line);
+    border-radius:14px; padding:18px 20px; margin-bottom:16px; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:1px; color: var(--muted);
+    font-weight:700; margin:0 0 12px; }
+  .card .note { color: var(--muted); font-size:13px; margin:0 0 12px; }
+  .card .warn { color:#d69a3c; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:0 0 6px; }
+  .row .lbl { min-width:120px; color: var(--muted); font-size:13px; }
+  .pill { display:inline-block; text-decoration:none; font-size:13px; font-weight:600;
+    color: var(--fg); border:1px solid var(--line); border-radius:999px; padding:6px 14px;
+    transition:border-color .15s; }
+  .pill:hover { border-color: var(--accent); }
+  .pill.on { background: var(--accent); border-color: var(--accent); color:#0e1014; }
+  .field { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:8px 0 0; }
+  .field input[type=text] { flex:1; min-width:200px; background: var(--bg); color: var(--fg);
+    border:1px solid var(--line); border-radius:9px; padding:9px 12px; font:inherit; font-size:14px; }
+  .field input[type=text]:focus { outline:none; border-color: var(--accent); }
+  .field button { background: var(--panel); color: var(--fg); border:1px solid var(--line);
+    border-radius:9px; padding:9px 14px; font:inherit; font-size:14px; font-weight:600; cursor:pointer;
+    transition:border-color .15s; }
+  .field button:hover { border-color: var(--accent); }
+  .status { color: var(--muted); font-size:13px; margin:8px 0 0; }
+  .btnrow { display:flex; flex-wrap:wrap; gap:10px; }
+  .btn { display:inline-block; background: var(--panel); border:1px solid var(--line); border-radius:11px;
+    padding:11px 18px; color: var(--fg); text-decoration:none; font-size:14px; transition:border-color .15s; }
+  .btn:hover { border-color: var(--accent); }
+  footer { margin-top:auto; padding-top:42px; color:var(--muted); font-size:12px; }
+  footer a { color: var(--muted); }
+</style>
+</head>
+<body>
+  <div class="head">
+    <h1>Nav<span class="g">Gator</span> settings</h1>
+    <p class="sub">Everything the ☰ menu manages, on a page. Each change applies instantly and is saved to disk.</p>
+  </div>
+
+  <div class="card">
+    <h2>Search</h2>
+    <div class="row"><span class="lbl">Engine</span>__ENGINE_PILLS__</div>
+    <form class="field" method="get" action="gator://settings">
+      <input type="text" name="search" value="__SEARCH_VALUE__" placeholder="https://example.com/?q=%s" spellcheck="false" autocomplete="off">
+      <button type="submit">Set custom URL</button>
+    </form>
+    <p class="note">Use <code>%s</code> where the query goes. Picking a preset above overwrites this.</p>
+  </div>
+
+  <div class="card">
+    <h2>Appearance</h2>
+    <div class="row"><span class="lbl">Theme</span>__THEME_PILLS__</div>
+    <div class="row"><span class="lbl">Dark mode</span>__DARK_TOGGLE__</div>
+    <form class="field" method="get" action="gator://settings">
+      <input type="text" name="accent" value="__ACCENT_VALUE__" placeholder="#5b8cff" spellcheck="false" autocomplete="off">
+      <button type="submit">Set accent</button>
+    </form>
+    <p class="note">Accent is any CSS <code>#rrggbb</code>. A theme preset sets accent + dark together.</p>
+  </div>
+
+  <div class="card">
+    <h2>Privacy</h2>
+    <div class="row"><span class="lbl">Block ads &amp; trackers</span>__ADS_TOGGLE__</div>
+    <p class="note">__ADS_BLOCKED__ ad/tracker request(s) blocked this session.</p>
+  </div>
+
+  <div class="card">
+    <h2>Setup</h2>
+    <div class="btnrow">
+      <a class="btn" href="gator://settings?action=import">Import bookmarks &amp; history</a>
+      <a class="btn" href="gator://settings?action=default">Set as default browser</a>
+    </div>
+    <p class="status">__IMPORT_MSG__</p>
+  </div>
+
+  <div class="card">
+    <h2>Lyku sync</h2>
+    <p class="note warn">Early access — syncs to your Lyku account. Expect rough edges.</p>
+    <div class="row"><span class="lbl">Sync bookmarks</span>__SYNC_BOOKMARKS__</div>
+    <div class="row"><span class="lbl">Sync history</span>__SYNC_HISTORY__</div>
+    <div class="row"><span class="lbl">Sync passwords</span>__SYNC_PASSWORDS__</div>
+    <form class="field" method="get" action="gator://settings">
+      <input type="text" name="sync_api_key" value="" placeholder="lyk_…" spellcheck="false" autocomplete="off">
+      <button type="submit">Save API key</button>
+    </form>
+    <p class="note">API key: <strong>__KEY_STATUS__</strong>. It is stored locally and never echoed back here.</p>
+    <div class="btnrow">
+      <a class="btn" href="gator://settings?action=sync">Sync now</a>
+    </div>
+    <p class="status">__SYNC_STATUS__</p>
+  </div>
+
+  <div class="card">
+    <h2>Passwords (E2EE)</h2>
+    <p class="note">__PW_STATE__</p>
+    <div class="btnrow">
+      <a class="btn" href="gator://passwords">Manage saved logins</a>
+    </div>
+  </div>
+
+  <footer>gator://settings &middot; <a href="gator://welcome">welcome</a></footer>
+</body>
+</html>

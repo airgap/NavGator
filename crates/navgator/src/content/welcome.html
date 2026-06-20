@@ -29,6 +29,7 @@
   #q::placeholder { color: var(--muted); }
   .hint { color: var(--muted); font-size:13px; margin-top:13px; }
   .hint b { color: var(--fg); font-weight:600; }
+  .hint a { color: var(--accent); text-decoration:none; }
   .links { width:min(680px,92vw); margin-top:42px;
     display:grid; grid-template-columns:repeat(auto-fill,minmax(118px,1fr)); gap:12px; }
   .tile {
@@ -52,7 +53,7 @@
       <input id="q" autofocus autocomplete="off" spellcheck="false" placeholder="Search __SEARCH_ENGINE__ or type a URL">
     </label>
   </form>
-  <p class="hint">Searching with <b>__SEARCH_ENGINE__</b> &middot; change it in Settings</p>
+  <p class="hint">Searching with <b>__SEARCH_ENGINE__</b> &middot; change it in <a href="gator://settings">settings</a></p>
   __BOOKMARKS__
   <footer>NavGator &middot; gator://welcome</footer>
 <script>
