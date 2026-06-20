@@ -368,7 +368,9 @@ confining each content process: it's wired (gaol 0.2.1: user-ns + chroot + secco
 unprivileged namespace creation is denied — containers / AppArmor, observed even with the userns
 sysctls open (EPERM on `unshare`) — which can't be auto-detected. 1.0 bar: a **maintained** sandbox
 on by default on Linux x86-64 (gaol 0.2.1 is unmaintained → fork work), a content-process resource
-profile that reaches fonts, macOS/Windows post-1.0. Network security is sound and inherited (rustls+aws-lc-rs,
+profile that reaches fonts, macOS/Windows post-1.0 — the full gaol→Landlock+seccomp replacement
+plan (verified against the fork + this host) is in [`plan/sandbox-rework.md`](plan/sandbox-rework.md).
+Network security is sound and inherited (rustls+aws-lc-rs,
 HSTS, CSP, CORS, SRI). Residual: no OOPIF / in-broker net+cookies = below Chrome's
 isolation bar; documented, never claimed as near-Chrome safety.
 
