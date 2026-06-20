@@ -109,6 +109,13 @@ All of the following are implemented in `main.rs` and verified in the running ap
 - **Password store — OS-keyring auto-unlock** — optionally remember the sync passphrase in the
   OS keyring (Secret Service); auto-unlocks the store on launch, with a graceful fallback when
   the keyring is unavailable.
+- **Multiprocess content isolation** — page content runs in **separate OS processes** (the
+  constellation re-execs the binary with `--content-process <token>`; `main()` hands off to
+  `run_content_process` before any GUI init), so a content crash/exploit can't reach the chrome's
+  memory. On by default. A per-content-process **OS sandbox** (gaol: user-ns + chroot + seccomp)
+  is opt-in via `NAVGATOR_SANDBOX=1` on Linux x86-64 (see §4 for why it isn't default yet).
+- **Custom new-tab wallpaper** — an image URL set in Settings → Appearance, applied as the
+  `gator://welcome` background (sanitized for CSS `url()` safety).
 
 ### 1.2 `gator://` internal pages
 
@@ -352,12 +359,16 @@ the substrate should grow a sync-record envelope as it moves to a real store.
 ### Security & sandboxing — the release blocker. Full: [`security.md`](plan/security.md)
 The native-chrome pivot already removed the worst pre-pivot hazard: a privileged
 `file://`/HTML chrome receiving web-controlled strings. Privileged actions are now direct
-Rust calls. The remaining load-bearing pre-release requirement is **sandboxed
-multiprocess content** (≥ process-per-registered-domain) — the single most-likely-to-slip
-deliverable. The engine code exists in Servo but is OFF, partly stubbed, and built on the
-unmaintained gaol 0.2.1; the spawn code lives in Servo's constellation, so a pluggable
-sandbox is fork work. 1.0 bar: sandboxed multiprocess on Linux x86-64, on by default,
-with macOS/Windows post-1.0. Network security is sound and inherited (rustls+aws-lc-rs,
+Rust calls. **Multiprocess content isolation now ships, on by default** (§1.1): content runs in
+separate processes (the constellation re-execs the binary with `--content-process`; `main()`
+hands off to `run_content_process`), so a content crash/exploit can't reach the chrome's memory —
+the load-bearing half of "sandboxed multiprocess content." The remaining half is the **OS sandbox**
+confining each content process: it's wired (gaol 0.2.1: user-ns + chroot + seccomp) but **opt-in**
+(`NAVGATOR_SANDBOX=1`, Linux x86-64) because gaol panics the constellation **unrecoverably** where
+unprivileged namespace creation is denied — containers / AppArmor, observed even with the userns
+sysctls open (EPERM on `unshare`) — which can't be auto-detected. 1.0 bar: a **maintained** sandbox
+on by default on Linux x86-64 (gaol 0.2.1 is unmaintained → fork work), a content-process resource
+profile that reaches fonts, macOS/Windows post-1.0. Network security is sound and inherited (rustls+aws-lc-rs,
 HSTS, CSP, CORS, SRI). Residual: no OOPIF / in-broker net+cookies = below Chrome's
 isolation bar; documented, never claimed as near-Chrome safety.
 

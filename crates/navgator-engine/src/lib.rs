@@ -14,6 +14,9 @@ pub use servo::{
     MouseButton, MouseButtonAction,
     MouseButtonEvent, MouseMoveEvent, NamedKey, NavigationRequest, OffscreenRenderingContext,
     Preferences, RenderingContext, Servo, ServoBuilder,
+    // Sandboxed multiprocess content: Opts carries the multiprocess/sandbox flags;
+    // run_content_process is the entry point a re-exec'd content process hands off to.
+    Opts, run_content_process,
     // Userscript injection (UserContentManager-based) — gator-side feature, see main.rs.
     UserContentManager, UserScript,
     WebView, WebViewBuilder, WebViewDelegate,

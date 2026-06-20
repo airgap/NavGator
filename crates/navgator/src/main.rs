@@ -40,8 +40,8 @@ use navgator_engine::{
     EmbedderControlId, EventLoopWaker, FilePicker, FilterPattern, Image, InputEvent, JSValue, Key,
     KeyState, KeyboardEvent, LoadStatus,
     MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
-    NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, PermissionRequest,
-    PixelFormat, Preferences, RenderingContext,
+    NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, Opts, PermissionRequest,
+    PixelFormat, Preferences, RenderingContext, run_content_process,
     RgbColor, SelectElement, SelectElementOptionOrOptgroup, Servo, ServoBuilder, SimpleDialog,
     UserContentManager, UserScript, WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder,
     WebViewDelegate, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
@@ -72,6 +72,18 @@ const ZOOM_MIN: f32 = 0.3;
 const ZOOM_MAX: f32 = 3.0;
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // Multiprocess content: when the engine's constellation needs a content process it re-execs
+    // THIS binary with `--content-process <ipc-token>`. Hand straight off to the engine — before
+    // any winit/egui/rustls init — or the child would try to open its own window.
+    {
+        let mut a = std::env::args();
+        a.next(); // argv[0]
+        if matches!(a.next().as_deref(), Some("--content-process")) {
+            let token = a.next().expect("--content-process requires an IPC token");
+            run_content_process(token);
+            return Ok(());
+        }
+    }
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");
@@ -748,6 +760,18 @@ fn build_visuals(accent: egui::Color32, dark: bool) -> egui::Visuals {
     v.widgets.active.weak_bg_fill = tint(90);
     v.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent);
     v
+}
+
+/// Whether to *additionally* OS-confine content processes (gaol: user-namespace + chroot +
+/// seccomp) on top of multiprocess isolation. gaol 0.2.1 **hard-panics the constellation** when
+/// the host denies unprivileged namespace creation — which happens in many containers and under
+/// AppArmor *even when* the `unprivileged_userns_clone` / `max_user_namespaces` sysctls read OK
+/// (observed: EPERM on `unshare` despite both gates open) — and the failure is unrecoverable.
+/// So the OS sandbox is **opt-in** (`NAVGATOR_SANDBOX=1`, Linux x86-64 only). Multiprocess
+/// process-isolation — the larger security win, and always safe — stays on regardless.
+fn sandbox_enabled() -> bool {
+    cfg!(all(target_os = "linux", target_arch = "x86_64"))
+        && std::env::var_os("NAVGATOR_SANDBOX").is_some()
 }
 
 /// NavGator's web-feature profile: turn on high-value APIs Servo ships disabled by default
@@ -4191,6 +4215,16 @@ impl ApplicationHandler<WakeUp> for App {
         let servo = ServoBuilder::default()
             .event_loop_waker(Box::new(waker))
             .preferences(navgator_preferences())
+            .opts(Opts {
+                // Process-isolate page content — a crash or exploit in a content process can't
+                // take down the chrome (the security half of the pitch).
+                multiprocess: true,
+                // OS-confine each content process (gaol: user namespace + chroot + seccomp).
+                // Opt-in (see sandbox_enabled): gaol panics unrecoverably where unprivileged
+                // namespaces are denied, which sysctls don't reliably predict.
+                sandbox: sandbox_enabled(),
+                ..Default::default()
+            })
             .build();
         servo.setup_logging();
 
