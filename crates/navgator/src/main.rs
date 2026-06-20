@@ -98,6 +98,18 @@ const SEARCH_ENGINES: &[(&str, &str)] = &[
     ("Google", "https://www.google.com/search?q=%s"),
 ];
 
+/// Built-in theme presets: (name, accent `#rrggbb`, dark). The chrome AND the gator:// pages
+/// follow the selected theme.
+const THEMES: &[(&str, &str, bool)] = &[
+    ("Midnight", "#5b8cff", true),
+    ("Synthwave", "#ff4fd8", true),
+    ("Forest", "#3ecf8e", true),
+    ("Ember", "#ff7a45", true),
+    ("Grape", "#a875ff", true),
+    ("Slate", "#8b95a7", true),
+    ("Daylight", "#2f6bff", false),
+];
+
 /// NavGator's internal welcome / new-tab page, served from the `gator://` scheme by
 /// `AppState::load_web_resource`. Works everywhere (no filesystem dependency), unlike a
 /// `file://` home page.
@@ -691,6 +703,34 @@ impl Drop for AppState {
 impl AppState {
     /// Render the `gator://welcome` page, templated with the current accent, the selected
     /// search engine, and the user's bookmarks (as quick-link tiles).
+    /// Substitute the gator:// page theme color placeholders (`__BG__` … `__MUTED__`) for the
+    /// current light/dark setting, so internal pages follow the chrome theme.
+    fn themed(&self, html: String) -> Vec<u8> {
+        let dark = self.settings.borrow().dark;
+        let vars: [(&str, &str); 5] = if dark {
+            [
+                ("__BG__", "#0e1014"),
+                ("__PANEL__", "#171a21"),
+                ("__LINE__", "#262b36"),
+                ("__FG__", "#e8eaed"),
+                ("__MUTED__", "#9aa0aa"),
+            ]
+        } else {
+            [
+                ("__BG__", "#f5f6f8"),
+                ("__PANEL__", "#ffffff"),
+                ("__LINE__", "#e2e5ea"),
+                ("__FG__", "#1b1f27"),
+                ("__MUTED__", "#6b7280"),
+            ]
+        };
+        let mut html = html;
+        for (k, v) in vars {
+            html = html.replace(k, v);
+        }
+        html.into_bytes()
+    }
+
     fn render_gator_welcome(&self) -> Vec<u8> {
         let (search, accent) = {
             let s = self.settings.borrow();
@@ -734,12 +774,12 @@ impl AppState {
                 format!("<div class=\"links\">{tiles}</div>")
             }
         };
-        include_str!("content/welcome.html")
+        let html = include_str!("content/welcome.html")
             .replace("__ACCENT__", &accent)
             .replace("__SEARCH_TEMPLATE__", &search)
             .replace("__SEARCH_ENGINE__", engine)
-            .replace("__BOOKMARKS__", &bookmarks)
-            .into_bytes()
+            .replace("__BOOKMARKS__", &bookmarks);
+        self.themed(html)
     }
 
     /// Render the `gator://crash` recovery page for a tab whose renderer panicked. `url` is
@@ -754,12 +794,12 @@ impl AppState {
         } else {
             reason
         };
-        include_str!("content/crash.html")
+        let html = include_str!("content/crash.html")
             .replace("__ACCENT__", &accent)
             .replace("__CRASH_HREF__", &html_escape(href))
             .replace("__CRASH_URL__", &html_escape(shown_url))
-            .replace("__CRASH_REASON__", &html_escape(reason))
-            .into_bytes()
+            .replace("__CRASH_REASON__", &html_escape(reason));
+        self.themed(html)
     }
 
     /// Render the `gator://history` page: recent visits, newest-first, deduped by URL,
@@ -803,20 +843,20 @@ impl AppState {
                 format!("<div class=\"list\">{out}</div>")
             }
         };
-        include_str!("content/history.html")
+        let html = include_str!("content/history.html")
             .replace("__ACCENT__", &accent)
-            .replace("__ROWS__", &rows)
-            .into_bytes()
+            .replace("__ROWS__", &rows);
+        self.themed(html)
     }
 
     /// Render the `gator://about` page: name, version, a one-line blurb, the keyboard
     /// shortcuts, and links back to welcome/history. Templated like `gator://welcome`.
     fn render_gator_about(&self) -> Vec<u8> {
         let accent = self.settings.borrow().accent.clone();
-        include_str!("content/about.html")
+        let html = include_str!("content/about.html")
             .replace("__ACCENT__", &accent)
-            .replace("__VERSION__", env!("CARGO_PKG_VERSION"))
-            .into_bytes()
+            .replace("__VERSION__", env!("CARGO_PKG_VERSION"));
+        self.themed(html)
     }
 
     fn active_tab(&self) -> Option<WebView> {
@@ -1311,6 +1351,27 @@ impl AppState {
                 ui.add_space(4.0);
                 ui.label("Custom search URL (use %s for the query)");
                 changed |= ui.text_edit_singleline(&mut s.search).changed();
+                ui.add_space(6.0);
+                ui.label("Theme");
+                let cur_theme = THEMES
+                    .iter()
+                    .find(|(_, a, d)| *a == s.accent && *d == s.dark)
+                    .map(|(n, _, _)| *n)
+                    .unwrap_or("Custom");
+                egui::ComboBox::from_id_salt("theme_preset")
+                    .selected_text(cur_theme)
+                    .show_ui(ui, |ui| {
+                        for (name, accent, dark) in THEMES {
+                            if ui
+                                .selectable_label(s.accent == *accent && s.dark == *dark, *name)
+                                .clicked()
+                            {
+                                s.accent = accent.to_string();
+                                s.dark = *dark;
+                                changed = true;
+                            }
+                        }
+                    });
                 ui.add_space(6.0);
                 ui.label("Accent color (#rrggbb)");
                 changed |= ui.text_edit_singleline(&mut s.accent).changed();
