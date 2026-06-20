@@ -202,6 +202,124 @@ fn collect_chrome_bookmarks(node: &serde_json::Value, out: &mut Vec<(String, Str
     }
 }
 
+/// Open a Chrome/Firefox SQLite DB read-only, even while the browser holds it: `immutable=1`
+/// tells SQLite the file won't change, so the live lock + WAL aren't an obstacle for a one-shot
+/// import. Returns None if the file is absent or won't open.
+fn open_browser_db(path: &std::path::Path) -> Option<rusqlite::Connection> {
+    if !path.exists() {
+        return None;
+    }
+    let uri = format!("file:{}?immutable=1", path.display());
+    rusqlite::Connection::open_with_flags(
+        uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .ok()
+}
+
+/// The Firefox profiles' `places.sqlite` paths (each profile dir may have one).
+fn firefox_places() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        if let Ok(entries) = std::fs::read_dir(home.join(".mozilla/firefox")) {
+            for entry in entries.flatten() {
+                let p = entry.path().join("places.sqlite");
+                if p.exists() {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Bookmarks from every Firefox profile (moz_bookmarks joined to moz_places).
+fn import_firefox_bookmarks() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for path in firefox_places() {
+        let Some(conn) = open_browser_db(&path) else {
+            continue;
+        };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT p.url, b.title FROM moz_bookmarks b \
+             JOIN moz_places p ON b.fk = p.id \
+             WHERE b.type = 1 AND p.url LIKE 'http%'",
+        ) else {
+            continue;
+        };
+        if let Ok(rows) = stmt.query_map([], |r| {
+            let url: String = r.get(0)?;
+            let title: String = r.get::<_, Option<String>>(1)?.unwrap_or_else(|| url.clone());
+            Ok((url, title))
+        }) {
+            out.extend(rows.flatten());
+        }
+    }
+    out
+}
+
+/// Recent history (url, title, visits, updated_ms) from Chrome-family + Firefox, newest first.
+fn import_browser_history() -> Vec<(String, String, u32, i64)> {
+    const LIMIT: usize = 2000;
+    let mut out = Vec::new();
+    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+        return out;
+    };
+    // Chrome family: `urls.last_visit_time` is microseconds since 1601.
+    let chrome_dirs = [
+        "google-chrome",
+        "chromium",
+        "BraveSoftware/Brave-Browser",
+        "microsoft-edge",
+        "vivaldi",
+    ];
+    for rel in chrome_dirs {
+        let path = home.join(".config").join(rel).join("Default").join("History");
+        let Some(conn) = open_browser_db(&path) else {
+            continue;
+        };
+        let Ok(mut stmt) = conn.prepare(&format!(
+            "SELECT url, title, visit_count, last_visit_time FROM urls \
+             WHERE url LIKE 'http%' ORDER BY last_visit_time DESC LIMIT {LIMIT}"
+        )) else {
+            continue;
+        };
+        if let Ok(rows) = stmt.query_map([], |r| {
+            let url: String = r.get(0)?;
+            let title: String = r.get::<_, Option<String>>(1)?.unwrap_or_default();
+            let visits: i64 = r.get(2).unwrap_or(1);
+            let t: i64 = r.get(3).unwrap_or(0);
+            let updated = if t > 0 { (t - 11_644_473_600_000_000) / 1000 } else { 0 };
+            Ok((url, title, visits.max(0) as u32, updated))
+        }) {
+            out.extend(rows.flatten());
+        }
+    }
+    // Firefox: `moz_places.last_visit_date` is microseconds since 1970.
+    for path in firefox_places() {
+        let Some(conn) = open_browser_db(&path) else {
+            continue;
+        };
+        let Ok(mut stmt) = conn.prepare(&format!(
+            "SELECT url, title, visit_count, last_visit_date FROM moz_places \
+             WHERE url LIKE 'http%' AND last_visit_date IS NOT NULL \
+             ORDER BY last_visit_date DESC LIMIT {LIMIT}"
+        )) else {
+            continue;
+        };
+        if let Ok(rows) = stmt.query_map([], |r| {
+            let url: String = r.get(0)?;
+            let title: String = r.get::<_, Option<String>>(1)?.unwrap_or_default();
+            let visits: i64 = r.get(2).unwrap_or(1);
+            let t: i64 = r.get(3).unwrap_or(0);
+            Ok((url, title, visits.max(0) as u32, t / 1000))
+        }) {
+            out.extend(rows.flatten());
+        }
+    }
+    out
+}
+
 /// User settings, persisted to a small `key=value` config file.
 #[derive(Clone)]
 struct Settings {
@@ -1771,7 +1889,7 @@ impl AppState {
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new("Import").strong());
                 if ui
-                    .button("Import bookmarks (Chrome / Brave / Edge)")
+                    .button("Import bookmarks & history (Chrome / Firefox / …)")
                     .clicked()
                 {
                     import_clicked = true;
@@ -1883,7 +2001,7 @@ impl AppState {
             self.password_input.borrow_mut().clear();
         }
         if import_clicked {
-            self.import_bookmarks();
+            self.import_browser_data();
         }
         if sync_clicked {
             self.start_sync();
@@ -2584,28 +2702,59 @@ impl AppState {
         save_bookmarks(&p);
     }
 
-    /// Import bookmarks from any installed Chromium-family browser (deduped by URL).
-    fn import_bookmarks(&self) {
-        let imported = import_chrome_bookmarks();
-        let mut added = 0;
+    /// Import bookmarks + recent history from installed Chromium-family browsers and Firefox
+    /// (deduped by URL). Read-only — the source browsers are never modified.
+    fn import_browser_data(&self) {
+        let mut bookmarks = import_chrome_bookmarks();
+        bookmarks.extend(import_firefox_bookmarks());
+        let history = import_browser_history();
+        let (mut b_added, mut h_added) = (0usize, 0usize);
         {
             let mut p = self.profile.borrow_mut();
-            for (url, title) in imported {
-                if !p.bookmarks.iter().any(|b| b.url == url) {
+            let mut seen: std::collections::HashSet<String> =
+                p.bookmarks.iter().map(|b| b.url.clone()).collect();
+            for (url, title) in bookmarks {
+                if seen.insert(url.clone()) {
                     p.bookmarks.push(Bookmark {
                         url,
                         title,
                         updated: now_ms(),
                     });
-                    added += 1;
+                    b_added += 1;
                 }
             }
+            for (url, title, visits, updated) in history {
+                if let Some(e) = p.history.iter_mut().find(|e| e.url == url) {
+                    e.visits = e.visits.max(visits);
+                    if e.title.is_empty() {
+                        e.title = title;
+                    }
+                } else {
+                    p.history.push(HistoryEntry {
+                        url,
+                        title,
+                        visits,
+                        updated,
+                    });
+                    h_added += 1;
+                }
+            }
+            // Keep history bounded to the most-recent entries.
+            const MAX_HISTORY: usize = 3000;
+            if p.history.len() > MAX_HISTORY {
+                p.history.sort_by(|a, b| b.updated.cmp(&a.updated));
+                p.history.truncate(MAX_HISTORY);
+            }
             save_bookmarks(&p);
+            save_history(&p);
         }
-        *self.import_msg.borrow_mut() = Some(if added > 0 {
-            format!("Imported {added} bookmark(s) from Chrome/Brave/Edge.")
+        *self.import_msg.borrow_mut() = Some(if b_added + h_added > 0 {
+            format!(
+                "Imported {b_added} bookmark(s) + {h_added} history entr{}.",
+                if h_added == 1 { "y" } else { "ies" }
+            )
         } else {
-            "No new Chrome/Brave/Edge bookmarks found.".to_string()
+            "No new bookmarks or history found (Chrome / Firefox / …).".to_string()
         });
         self.window.request_redraw();
     }

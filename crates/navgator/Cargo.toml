@@ -44,6 +44,11 @@ argon2 = "=0.6.0-rc.8"
 chacha20poly1305 = "=0.11.0-rc.3"
 rand_core = { version = "0.6", features = ["getrandom"] }
 
+# Read Chrome/Firefox History + places.sqlite for import (already in the lock via the
+# engine's IndexedDB backend). Opened read-only + immutable so a running browser's lock is
+# not an obstacle.
+rusqlite = "0.37"
+
 # Content blocking: Brave's adblock-rust — EasyList-syntax network filtering, checked in
 # load_web_resource (which already intercepts every request).
 adblock = { version = "0.12", default-features = false, features = ["embedded-domain-resolver"] }
