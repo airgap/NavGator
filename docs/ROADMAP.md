@@ -98,6 +98,17 @@ All of the following are implemented in `main.rs` and verified in the running ap
   deduped. The first-run adoption hook.
 - **Default-browser registration** — Settings → Setup writes a `navgator.desktop` launcher
   and registers it via `xdg-settings`/`xdg-mime` (Linux).
+- **gator://settings** — a full themed in-page settings surface (search engine, theme presets,
+  accent, dark, privacy, sync toggles, import + default-browser actions), each change applied via
+  a `?key=value` link. Page-initiated navigation to `gator://` is **denied** (a CSRF guard, so a
+  web page can't drive the chrome's internal pages); the omnibox + internal links stay allowed.
+- **Tab-strip depth** — horizontal overflow/scroll, **drag-reorder**, and a toggleable
+  **vertical-tabs** side-strip (persisted), atop the existing pinning + background-throttling.
+- **Userscripts** — Greasemonkey-style: every `*.js` in `~/.config/navgator/userscripts/` is
+  injected on all pages via Servo's `UserContentManager` (re-exported through navgator-engine).
+- **Password store — OS-keyring auto-unlock** — optionally remember the sync passphrase in the
+  OS keyring (Secret Service); auto-unlocks the store on launch, with a graceful fallback when
+  the keyring is unavailable.
 
 ### 1.2 `gator://` internal pages
 
@@ -107,14 +118,11 @@ HTML built with the engine `http` types (re-exported through `navgator-engine`):
 
 - **`gator://welcome`** — the new-tab page / NTP, templated with the accent color, search
   engine, and bookmarks as quick-link tiles.
-- **`gator://history`** (recent visits), **`gator://downloads`** (download manager),
-  **`gator://passwords`** (the masked saved-login manager), **`gator://about`**, and
-  **`gator://crash`** (the sad-tab page) — all themed through the same `load_web_resource`
-  match + templating.
+- **`gator://settings`** (the full themed settings surface), **`gator://history`** (recent
+  visits), **`gator://downloads`** (download manager), **`gator://passwords`** (the masked
+  saved-login manager), **`gator://about`**, and **`gator://crash`** (the sad-tab page) — all
+  themed through the same `load_web_resource` match + templating.
 - Unknown `gator://` paths return a small "no such internal page" fallback.
-
-Still to add: **`gator://settings`** — a full in-page settings surface beyond the egui
-overlay.
 
 ### 1.3 Engine-gap work landed (the NavGator default web-feature profile)
 
@@ -164,19 +172,12 @@ are **engine-blocked** (libservo at this rev lacks the primitive) vs. **embedder
 
 ### 2.1 Core product features still missing (embedder work)
 
-- **`gator://settings` + a full in-page settings page** — settings persist and the egui
-  overlay manages them, but there's no themed in-page settings surface yet.
-- **Tab strip depth** — **pinning, overflow/scroll, drag-reorder, and vertical tabs.** The
-  strip overflows with many tabs; reordering is unbuilt. Vertical tabs are a natural
-  differentiator now that the chrome is native.
 - **Theming depth** — beyond accent + dark: a token catalog, per-site themes, wallpapers
   (a `gator://`/asset handler), a validated theme package format (`theming.md`), and a
   CI-enforced perf budget measured against the 1.0-feature build.
-- **Userscripts** — the native add-on type via `UserContentManager` (`extensions.md`),
-  layered on the shipped ad/tracker blocker.
-- **Password-manager depth** — auto-offer-save on form submit (a `UserScript`/engine form
-  hook), an OS-keyring for the sync passphrase, and **importing saved passwords** from other
-  browsers (the keychain/DPAPI-gated sub-track).
+- **Password-manager depth** — **auto-offer-save** on form submit (a `UserScript`/engine form
+  hook) and **importing saved passwords** from other browsers (the keychain/DPAPI-gated
+  sub-track). (OS-keyring auto-unlock + the userscript mechanism it builds on now ship, §1.1.)
 - **Protocol/deep-link handlers** — `request_protocol_handler` is not yet implemented
   (default-browser registration itself now ships, §1.1).
 - **Live-sync hardening** — deploy the Lyku `navgator-sync` server branch for a live
