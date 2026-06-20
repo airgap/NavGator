@@ -49,6 +49,8 @@ use navgator_engine::{
 // `http` types for building the WebResourceResponse served to gator:// internal pages.
 use navgator_engine::http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE};
 use navgator_protocol::IpcCommand;
+
+mod sync;
 use url::Url;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
@@ -144,6 +146,10 @@ struct Settings {
     accent: String,
     /// Dark chrome theme (vs light).
     dark: bool,
+    /// Lyku sync (early access): the `lyk_` API key (stored locally) + per-collection opt-ins.
+    sync_api_key: String,
+    sync_bookmarks: bool,
+    sync_history: bool,
 }
 
 impl Default for Settings {
@@ -152,6 +158,9 @@ impl Default for Settings {
             search: "https://duckduckgo.com/?q=%s".to_string(),
             accent: "#5b8cff".to_string(),
             dark: true,
+            sync_api_key: String::new(),
+            sync_bookmarks: false,
+            sync_history: false,
         }
     }
 }
@@ -172,6 +181,9 @@ fn load_settings() -> Settings {
                     "search" => s.search = v.trim().to_string(),
                     "accent" => s.accent = v.trim().to_string(),
                     "dark" => s.dark = v.trim() == "true",
+                    "sync_api_key" => s.sync_api_key = v.trim().to_string(),
+                    "sync_bookmarks" => s.sync_bookmarks = v.trim() == "true",
+                    "sync_history" => s.sync_history = v.trim() == "true",
                     _ => {}
                 }
             }
@@ -187,8 +199,38 @@ fn save_settings(s: &Settings) {
         }
         let _ = std::fs::write(
             &path,
-            format!("search={}\naccent={}\ndark={}\n", s.search, s.accent, s.dark),
+            format!(
+                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\n",
+                s.search, s.accent, s.dark, s.sync_api_key, s.sync_bookmarks, s.sync_history
+            ),
         );
+    }
+}
+
+/// Load the per-collection Lyku-sync pull cursors (max `updated` last seen); 0 if unset.
+fn load_sync_cursors() -> (i64, i64) {
+    let (mut b, mut h) = (0i64, 0i64);
+    if let Some(text) = config_file("sync-state.tsv").and_then(|p| std::fs::read_to_string(p).ok())
+    {
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                match k.trim() {
+                    "bookmarks" => b = v.trim().parse().unwrap_or(0),
+                    "history" => h = v.trim().parse().unwrap_or(0),
+                    _ => {}
+                }
+            }
+        }
+    }
+    (b, h)
+}
+
+fn save_sync_cursors(bookmarks: i64, history: i64) {
+    if let Some(path) = config_file("sync-state.tsv") {
+        if let Some(d) = path.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(path, format!("bookmarks={bookmarks}\nhistory={history}\n"));
     }
 }
 
@@ -197,11 +239,15 @@ struct HistoryEntry {
     url: String,
     title: String,
     visits: u32,
+    /// Last-modified time (ms) for last-write-wins sync; 0 for rows from before sync existed.
+    updated: i64,
 }
 
 struct Bookmark {
     url: String,
     title: String,
+    /// Last-modified time (ms) for last-write-wins sync.
+    updated: i64,
 }
 
 /// Persisted browsing profile (history + bookmarks), stored as TSV under the config dir.
@@ -223,27 +269,38 @@ fn tsv_field(s: &str) -> String {
     s.replace(['\t', '\n'], " ")
 }
 
+/// Current time in milliseconds since the epoch — the per-item modification stamp used for
+/// last-write-wins sync.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 fn load_profile() -> Profile {
     let mut p = Profile::default();
     if let Some(text) = config_file("history.tsv").and_then(|p| std::fs::read_to_string(p).ok()) {
         for line in text.lines() {
-            let mut it = line.splitn(3, '\t');
+            let mut it = line.splitn(4, '\t');
             if let (Some(u), Some(t), Some(v)) = (it.next(), it.next(), it.next()) {
                 p.history.push(HistoryEntry {
                     url: u.to_string(),
                     title: t.to_string(),
                     visits: v.parse().unwrap_or(1),
+                    updated: it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
                 });
             }
         }
     }
     if let Some(text) = config_file("bookmarks.tsv").and_then(|p| std::fs::read_to_string(p).ok()) {
         for line in text.lines() {
-            let mut it = line.splitn(2, '\t');
+            let mut it = line.splitn(3, '\t');
             if let (Some(u), Some(t)) = (it.next(), it.next()) {
                 p.bookmarks.push(Bookmark {
                     url: u.to_string(),
                     title: t.to_string(),
+                    updated: it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
                 });
             }
         }
@@ -259,7 +316,15 @@ fn save_history(p: &Profile) {
         let s: String = p
             .history
             .iter()
-            .map(|e| format!("{}\t{}\t{}\n", tsv_field(&e.url), tsv_field(&e.title), e.visits))
+            .map(|e| {
+                format!(
+                    "{}\t{}\t{}\t{}\n",
+                    tsv_field(&e.url),
+                    tsv_field(&e.title),
+                    e.visits,
+                    e.updated
+                )
+            })
             .collect();
         let _ = std::fs::write(path, s);
     }
@@ -273,7 +338,7 @@ fn save_bookmarks(p: &Profile) {
         let s: String = p
             .bookmarks
             .iter()
-            .map(|b| format!("{}\t{}\n", tsv_field(&b.url), tsv_field(&b.title)))
+            .map(|b| format!("{}\t{}\t{}\n", tsv_field(&b.url), tsv_field(&b.title), b.updated))
             .collect();
         let _ = std::fs::write(path, s);
     }
@@ -606,6 +671,11 @@ struct AppState {
     settings: RefCell<Settings>,
     /// Persisted history + bookmarks.
     profile: RefCell<Profile>,
+    /// Lyku sync (early access): per-collection pull cursors, a status line, an in-flight guard.
+    sync_cursor_bookmarks: Cell<i64>,
+    sync_cursor_history: Cell<i64>,
+    sync_status: RefCell<String>,
+    syncing: Cell<bool>,
     event_proxy: EventLoopProxy<WakeUp>,
     /// Declared last so the GL contexts (which borrow the window) drop before it.
     window: Window,
@@ -1214,6 +1284,7 @@ impl AppState {
             return;
         }
         let mut open = true;
+        let mut sync_clicked = false;
         egui::Window::new("Settings")
             .collapsible(false)
             .resizable(false)
@@ -1245,10 +1316,53 @@ impl AppState {
                 changed |= ui.text_edit_singleline(&mut s.accent).changed();
                 ui.add_space(6.0);
                 changed |= ui.checkbox(&mut s.dark, "Dark theme").changed();
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Lyku sync").strong());
+                ui.label(
+                    egui::RichText::new(
+                        "Early access — syncs to your Lyku account. Expect rough edges.",
+                    )
+                    .small()
+                    .color(egui::Color32::from_rgb(0xd6, 0x9a, 0x3c)),
+                );
+                ui.add_space(4.0);
+                ui.label("Lyku API key");
+                changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut s.sync_api_key)
+                            .password(true)
+                            .hint_text("lyk_…"),
+                    )
+                    .changed();
+                ui.add_space(2.0);
+                changed |= ui.checkbox(&mut s.sync_bookmarks, "Sync bookmarks").changed();
+                changed |= ui.checkbox(&mut s.sync_history, "Sync history").changed();
                 if changed {
                     save_settings(&s);
                 }
+                ui.add_space(6.0);
+                let busy = self.syncing.get();
+                if ui
+                    .add_enabled(
+                        !busy,
+                        egui::Button::new(if busy { "Syncing…" } else { "Sync now" }),
+                    )
+                    .clicked()
+                {
+                    sync_clicked = true;
+                }
+                let status = self.sync_status.borrow();
+                if !status.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(status.as_str()).small().weak());
+                }
             });
+        if sync_clicked {
+            self.start_sync();
+        }
         if !open {
             self.show_settings.set(false);
         }
@@ -1739,6 +1853,106 @@ impl AppState {
     }
 
     /// Record a page visit in history (deduped by URL; frecency = visit count).
+    /// Kick off a background Lyku sync — push local bookmarks/history, pull remote changes.
+    fn start_sync(&self) {
+        if self.syncing.get() {
+            return;
+        }
+        let (api_key, sync_bookmarks, sync_history) = {
+            let s = self.settings.borrow();
+            (s.sync_api_key.clone(), s.sync_bookmarks, s.sync_history)
+        };
+        if api_key.trim().is_empty() {
+            *self.sync_status.borrow_mut() = "Set a Lyku API key first.".into();
+            return;
+        }
+        if !sync_bookmarks && !sync_history {
+            *self.sync_status.borrow_mut() = "Enable bookmarks and/or history first.".into();
+            return;
+        }
+        let snap = {
+            let p = self.profile.borrow();
+            sync::SyncSnapshot {
+                api_key,
+                sync_bookmarks,
+                sync_history,
+                bookmarks: p
+                    .bookmarks
+                    .iter()
+                    .map(|b| (b.url.clone(), b.title.clone(), b.updated))
+                    .collect(),
+                history: p
+                    .history
+                    .iter()
+                    .map(|e| (e.url.clone(), e.title.clone(), e.visits, e.updated))
+                    .collect(),
+                cursor_bookmarks: self.sync_cursor_bookmarks.get(),
+                cursor_history: self.sync_cursor_history.get(),
+            }
+        };
+        self.syncing.set(true);
+        *self.sync_status.borrow_mut() = "Syncing…".into();
+        let proxy = self.event_proxy.clone();
+        std::thread::spawn(move || {
+            let outcome = sync::run_sync(snap);
+            let _ = proxy.send_event(WakeUp::SyncDone(outcome));
+        });
+    }
+
+    /// Apply a finished background sync to the local stores (UI thread). Last-write-wins by
+    /// `updated`; deletes are not propagated in early access.
+    fn apply_sync(&self, outcome: sync::SyncOutcome) {
+        self.syncing.set(false);
+        *self.sync_status.borrow_mut() = outcome.message.clone();
+        if outcome.ok {
+            {
+                let mut p = self.profile.borrow_mut();
+                for b in &outcome.bookmarks {
+                    if b.deleted {
+                        continue;
+                    }
+                    if let Some(local) = p.bookmarks.iter_mut().find(|x| x.url == b.url) {
+                        if local.updated < b.updated {
+                            local.title = b.title.clone();
+                            local.updated = b.updated;
+                        }
+                    } else {
+                        p.bookmarks.push(Bookmark {
+                            url: b.url.clone(),
+                            title: b.title.clone(),
+                            updated: b.updated,
+                        });
+                    }
+                }
+                for h in &outcome.history {
+                    if h.deleted {
+                        continue;
+                    }
+                    if let Some(local) = p.history.iter_mut().find(|x| x.url == h.url) {
+                        if local.updated < h.updated {
+                            local.title = h.title.clone();
+                            local.visits = local.visits.max(h.visits);
+                            local.updated = h.updated;
+                        }
+                    } else {
+                        p.history.push(HistoryEntry {
+                            url: h.url.clone(),
+                            title: h.title.clone(),
+                            visits: h.visits,
+                            updated: h.updated,
+                        });
+                    }
+                }
+                save_bookmarks(&p);
+                save_history(&p);
+            }
+            self.sync_cursor_bookmarks.set(outcome.cursor_bookmarks);
+            self.sync_cursor_history.set(outcome.cursor_history);
+            save_sync_cursors(outcome.cursor_bookmarks, outcome.cursor_history);
+        }
+        self.window.request_redraw();
+    }
+
     fn record_visit(&self, url: &str, title: &str) {
         if url.is_empty()
             || url.starts_with("gator:")
@@ -1754,11 +1968,13 @@ impl AppState {
             if !title.is_empty() {
                 e.title = title.to_string();
             }
+            e.updated = now_ms();
         } else {
             p.history.push(HistoryEntry {
                 url: url.to_string(),
                 title: title.to_string(),
                 visits: 1,
+                updated: now_ms(),
             });
             const MAX_HISTORY: usize = 2000;
             if p.history.len() > MAX_HISTORY {
@@ -1782,7 +1998,11 @@ impl AppState {
         if let Some(pos) = p.bookmarks.iter().position(|b| b.url == url) {
             p.bookmarks.remove(pos);
         } else {
-            p.bookmarks.push(Bookmark { url, title });
+            p.bookmarks.push(Bookmark {
+                url,
+                title,
+                updated: now_ms(),
+            });
         }
         save_bookmarks(&p);
     }
@@ -2228,6 +2448,7 @@ impl ApplicationHandler<WakeUp> for App {
         });
         window.set_visible(true);
 
+        let (sync_cb, sync_ch) = load_sync_cursors();
         let state = Rc::new(AppState {
             servo,
             window_context,
@@ -2241,6 +2462,10 @@ impl ApplicationHandler<WakeUp> for App {
             location_dirty: Cell::new(false),
             focus_omnibox: Cell::new(false),
             show_settings: Cell::new(false),
+            sync_cursor_bookmarks: Cell::new(sync_cb),
+            sync_cursor_history: Cell::new(sync_ch),
+            sync_status: RefCell::new(String::new()),
+            syncing: Cell::new(false),
             dialogs: RefCell::new(Vec::new()),
             closed_tabs: RefCell::new(Vec::new()),
             find_open: Cell::new(false),
@@ -2289,6 +2514,7 @@ impl ApplicationHandler<WakeUp> for App {
                     return;
                 }
                 WakeUp::Ipc(cmd) => state.handle_ipc(cmd),
+                WakeUp::SyncDone(outcome) => state.apply_sync(outcome),
                 WakeUp::Wake => {}
             }
             state.servo.spin_event_loop();
@@ -2590,6 +2816,8 @@ enum WakeUp {
     Ipc(IpcCommand),
     /// A window-control/close request; exit the event loop.
     Exit,
+    /// A background Lyku sync finished; apply the result on the UI thread.
+    SyncDone(sync::SyncOutcome),
 }
 
 impl EventLoopWaker for Waker {
