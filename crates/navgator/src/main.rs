@@ -715,7 +715,7 @@ fn suggestions(history: &[HistoryEntry], query: &str) -> Vec<(String, String)> {
 /// Parse a `#rrggbb` accent into an egui color (Color32 has no hex constructor).
 fn accent_color32(hex: &str) -> egui::Color32 {
     let s = hex.trim().trim_start_matches('#');
-    if s.len() == 6 {
+    if s.len() == 6 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
         if let (Ok(r), Ok(g), Ok(b)) = (
             u8::from_str_radix(&s[0..2], 16),
             u8::from_str_radix(&s[2..4], 16),
@@ -832,7 +832,6 @@ enum SettingsApply {
     SyncBookmarks(bool),
     SyncHistory(bool),
     SyncPasswords(bool),
-    SyncApiKey(String),
     Action(String),
 }
 
@@ -1435,13 +1434,6 @@ impl AppState {
                 }
                 SettingsApply::SyncPasswords(b) => {
                     s.sync_passwords = b;
-                    changed = true;
-                }
-                SettingsApply::SyncApiKey(v) => {
-                    // NOTE: this key transits the in-process gator:// query string (and the address
-                    // bar) but never hits the network — load_web_resource intercepts gator:// before
-                    // any fetch. We never echo it back into the form value.
-                    s.sync_api_key = v;
                     changed = true;
                 }
                 SettingsApply::Action(a) => action = Some(a),
@@ -3794,7 +3786,6 @@ impl WebViewDelegate for AppState {
                         "sync_bookmarks" => SettingsApply::SyncBookmarks(v == "on"),
                         "sync_history" => SettingsApply::SyncHistory(v == "on"),
                         "sync_passwords" => SettingsApply::SyncPasswords(v == "on"),
-                        "sync_api_key" => SettingsApply::SyncApiKey(v.into_owned()),
                         "action" => SettingsApply::Action(v.into_owned()),
                         _ => apply,
                     };
@@ -4110,7 +4101,22 @@ impl WebViewDelegate for AppState {
         self.window.request_redraw();
     }
 
-    fn request_navigation(&self, _webview: WebView, navigation_request: NavigationRequest) {
+    fn request_navigation(&self, webview: WebView, navigation_request: NavigationRequest) {
+        // Block web pages from *navigating* to gator:// internal pages. Several of them mutate
+        // chrome state from query params (gator://settings?…, gator://passwords?remove=…), so a
+        // page-initiated navigation there would be a CSRF on the browser itself. Navigation that
+        // originates in a gator:// page (internal links) stays allowed, and the omnibox uses
+        // tab.load() — which bypasses this delegate entirely — so user navigation is unaffected.
+        if navigation_request.url.scheme() == "gator" {
+            let from_web = self
+                .tab_index(&webview)
+                .and_then(|i| self.tabs.borrow().get(i).map(|t| t.url.clone()))
+                .is_some_and(|u| u.starts_with("http://") || u.starts_with("https://"));
+            if from_web {
+                navigation_request.deny();
+                return;
+            }
+        }
         navigation_request.allow();
     }
 }

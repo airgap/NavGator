@@ -96,11 +96,7 @@
     <div class="row"><span class="lbl">Sync bookmarks</span>__SYNC_BOOKMARKS__</div>
     <div class="row"><span class="lbl">Sync history</span>__SYNC_HISTORY__</div>
     <div class="row"><span class="lbl">Sync passwords</span>__SYNC_PASSWORDS__</div>
-    <form class="field" method="get" action="gator://settings">
-      <input type="text" name="sync_api_key" value="" placeholder="lyk_…" spellcheck="false" autocomplete="off">
-      <button type="submit">Save API key</button>
-    </form>
-    <p class="note">API key: <strong>__KEY_STATUS__</strong>. It is stored locally and never echoed back here.</p>
+    <p class="note">API key: <strong>__KEY_STATUS__</strong>. Set it from the <strong>☰ menu → Lyku sync</strong> — entering a key in a page URL would leak it into the address bar and session.</p>
     <div class="btnrow">
       <a class="btn" href="gator://settings?action=sync">Sync now</a>
     </div>
