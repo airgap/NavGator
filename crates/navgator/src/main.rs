@@ -645,6 +645,19 @@ const READ_FORM_JS: &str = r#"(function(){
   return JSON.stringify({u:un?un.value:"",p:pw.value});
 })()"#;
 
+/// Collect the page's distinct class names + ids, so the cosmetic filter can decide which
+/// generic element-hiding rules apply. Returns JSON `{c:[classes], i:[ids]}`.
+const COSMETIC_COLLECT_JS: &str = r#"(function(){
+  var c={},i={},els=document.querySelectorAll('[class],[id]');
+  for(var k=0;k<els.length;k++){
+    var e=els[k];
+    if(e.id)i[e.id]=1;
+    var cl=e.classList;
+    if(cl)for(var j=0;j<cl.length;j++)c[cl[j]]=1;
+  }
+  return JSON.stringify({c:Object.keys(c),i:Object.keys(i)});
+})()"#;
+
 /// The origin (`scheme://host[:port]`) of a URL, for matching saved logins. None for non-web.
 fn origin_of(url: &str) -> Option<String> {
     let u = Url::parse(url).ok()?;
@@ -829,6 +842,9 @@ struct AppState {
     /// Ad/tracker blocking engine (adblock-rust) + a session blocked counter.
     adblock: adblock::Engine,
     adblock_blocked: Cell<u64>,
+    /// Cosmetic-filter CSS pending injection, deferred out of the eval callback to avoid
+    /// re-entering Servo's JS evaluator. Each entry is `(webview, css)`.
+    pending_cosmetic: RefCell<Vec<(WebView, String)>>,
     sync_status: RefCell<String>,
     syncing: Cell<bool>,
     /// Downloads (engine-streamed to ~/Downloads) + a transient toast for the latest one.
@@ -2648,6 +2664,74 @@ impl AppState {
         });
     }
 
+    /// Hide ad/clutter elements using EasyList's cosmetic (element-hiding) rules. Two evals:
+    /// collect the page's class/id set, then inject a `<style>` hiding the matching selectors —
+    /// generic rules are filtered to the page's actual classes/ids, so this stays cheap.
+    fn apply_cosmetic(&self, tab_idx: usize) {
+        if !self.settings.borrow().block_ads {
+            return;
+        }
+        let (webview, url) = {
+            let tabs = self.tabs.borrow();
+            let Some(t) = tabs.get(tab_idx) else {
+                return;
+            };
+            if origin_of(&t.url).is_none() {
+                return; // http(s) pages only
+            }
+            (t.webview.clone(), t.url.clone())
+        };
+        let inject = webview.clone();
+        let me = self.weak_self.borrow().clone();
+        webview.evaluate_javascript(COSMETIC_COLLECT_JS.to_string(), move |res| {
+            let Some(me) = me.upgrade() else {
+                return;
+            };
+            let Ok(JSValue::String(s)) = res else {
+                return;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
+                return;
+            };
+            let arr = |k: &str| -> Vec<String> {
+                v.get(k)
+                    .and_then(|x| x.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .unwrap_or_default()
+            };
+            let (classes, ids) = (arr("c"), arr("i"));
+            let cosmetic = me.adblock.url_cosmetic_resources(&url);
+            let generic = me
+                .adblock
+                .hidden_class_id_selectors(&classes, &ids, &cosmetic.exceptions);
+            let mut selectors: Vec<String> = cosmetic.hide_selectors.into_iter().collect();
+            // generichide is ignored for v1: it is unreliable here (true even for localhost) and
+            // the publisher opt-outs it guards are rare.
+            selectors.extend(generic);
+            if selectors.is_empty() {
+                return;
+            }
+            let css = format!("{}{{display:none!important}}", selectors.join(","));
+            // We're inside an eval callback (Servo's JS-evaluator RefCell is borrowed), so the
+            // inject is deferred to the event loop via WakeUp::CosmeticReady.
+            me.pending_cosmetic.borrow_mut().push((inject, css));
+            let _ = me.event_proxy.send_event(WakeUp::CosmeticReady);
+        });
+    }
+
+    /// Inject queued cosmetic-filter CSS. Called from the event loop (the JS evaluator is free
+    /// there, unlike inside an eval callback). Each entry is `(webview, css)`.
+    fn flush_cosmetic(&self) {
+        let pending = std::mem::take(&mut *self.pending_cosmetic.borrow_mut());
+        for (wv, css) in pending {
+            let js = format!(
+                "(function(c){{var s=document.getElementById('__ng_cos')||document.createElement('style');s.id='__ng_cos';s.textContent=c;(document.head||document.documentElement).appendChild(s);}})({})",
+                js_string(&css)
+            );
+            wv.evaluate_javascript(js, |_| {});
+        }
+    }
+
     fn handle_ipc(&self, cmd: IpcCommand) {
         match cmd {
             IpcCommand::Navigate(url) => {
@@ -2832,6 +2916,7 @@ impl WebViewDelegate for AppState {
             }
             if matches!(status, LoadStatus::Complete) {
                 self.autofill(i);
+                self.apply_cosmetic(i);
             }
             if matches!(status, LoadStatus::Complete) && i == self.active.get() {
                 self.location_dirty.set(false);
@@ -3124,6 +3209,7 @@ impl ApplicationHandler<WakeUp> for App {
                 adblock::lists::ParseOptions::default(),
             ),
             adblock_blocked: Cell::new(0),
+            pending_cosmetic: RefCell::new(Vec::new()),
             sync_status: RefCell::new(String::new()),
             syncing: Cell::new(false),
             downloads: RefCell::new(Vec::new()),
@@ -3182,6 +3268,7 @@ impl ApplicationHandler<WakeUp> for App {
                 }
                 WakeUp::Ipc(cmd) => state.handle_ipc(cmd),
                 WakeUp::SyncDone(outcome) => state.apply_sync(outcome),
+                WakeUp::CosmeticReady => state.flush_cosmetic(),
                 WakeUp::Wake => {}
             }
             state.servo.spin_event_loop();
@@ -3494,6 +3581,8 @@ enum WakeUp {
     Exit,
     /// A background Lyku sync finished; apply the result on the UI thread.
     SyncDone(sync::SyncOutcome),
+    /// Cosmetic-filter CSS is ready to inject (deferred out of the JS-eval callback).
+    CosmeticReady,
 }
 
 impl EventLoopWaker for Waker {
