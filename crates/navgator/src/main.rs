@@ -382,6 +382,8 @@ struct Settings {
     sync_passwords: bool,
     /// Block ads + trackers (adblock-rust). On by default — it's the pitch.
     block_ads: bool,
+    /// Vertical tab strip (left SidePanel) instead of the horizontal top strip.
+    vertical_tabs: bool,
 }
 
 impl Default for Settings {
@@ -395,6 +397,7 @@ impl Default for Settings {
             sync_history: false,
             sync_passwords: false,
             block_ads: true,
+            vertical_tabs: false,
         }
     }
 }
@@ -420,6 +423,7 @@ fn load_settings() -> Settings {
                     "sync_history" => s.sync_history = v.trim() == "true",
                     "sync_passwords" => s.sync_passwords = v.trim() == "true",
                     "block_ads" => s.block_ads = v.trim() == "true",
+                    "vertical_tabs" => s.vertical_tabs = v.trim() == "true",
                     _ => {}
                 }
             }
@@ -436,7 +440,7 @@ fn save_settings(s: &Settings) {
         let _ = std::fs::write(
             &path,
             format!(
-                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nblock_ads={}\n",
+                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nblock_ads={}\nvertical_tabs={}\n",
                 s.search,
                 s.accent,
                 s.dark,
@@ -444,7 +448,8 @@ fn save_settings(s: &Settings) {
                 s.sync_bookmarks,
                 s.sync_history,
                 s.sync_passwords,
-                s.block_ads
+                s.block_ads,
+                s.vertical_tabs
             ),
         );
     }
@@ -1040,6 +1045,21 @@ enum Dialog {
     },
 }
 
+/// What a single tab row's interaction asks the strip to do this frame. Shared by both the
+/// horizontal and vertical tab layouts so they behave identically. The `usize` is the
+/// underlying tab index (not render order).
+#[derive(Clone, Copy)]
+enum TabAction {
+    None,
+    Select(usize),
+    Close(usize),
+    CloseOthers(usize),
+    TogglePin(usize),
+    NewTab,
+    /// Toggle horizontal/vertical tab orientation (from the context menu).
+    ToggleOrientation,
+}
+
 struct AppState {
     servo: Servo,
     window_context: Rc<WindowRenderingContext>,
@@ -1047,8 +1067,16 @@ struct AppState {
     egui: RefCell<EguiGlow>,
     /// Height (logical px) of the egui chrome panels; the page begins below this.
     toolbar_height: Cell<f32>,
+    /// Logical-px width of the left vertical-tabs SidePanel (0 when horizontal); the page
+    /// begins to the right of this. Mirrors `toolbar_height` for the x axis.
+    content_left: Cell<f32>,
     /// The content webviews' current device-px size (page area), to avoid redundant resizes.
     content_px: Cell<(u32, u32)>,
+    /// Underlying tab index currently being drag-reordered (None when not dragging).
+    drag_tab: Cell<Option<usize>>,
+    /// Set when the active tab changes; the tab strip consumes it to scroll the active tab
+    /// into view exactly once (not every frame, which would fight the user's own scrolling).
+    scroll_active_into_view: Cell<bool>,
     tabs: RefCell<Vec<Tab>>,
     active: Cell<usize>,
     /// Address-bar text + whether the user has edited it without navigating.
@@ -1576,6 +1604,7 @@ impl AppState {
                 self.draw_chrome(ctx);
             } else {
                 self.toolbar_height.set(0.0);
+                self.content_left.set(0.0);
             }
             self.draw_settings(ctx);
             self.draw_dialogs(ctx);
@@ -1703,8 +1732,9 @@ impl AppState {
             // level egui's available_rect doesn't reflect panel reservations, so derive
             // the content rect from the toolbar height measured during draw_chrome.)
             let top = self.toolbar_height.get();
+            let left = self.content_left.get();
             let screen = ctx.content_rect();
-            let avail = egui::Rect::from_min_max(egui::pos2(0.0, top), screen.max);
+            let avail = egui::Rect::from_min_max(egui::pos2(left, top), screen.max);
             let scale = ctx.pixels_per_point();
             let w = (avail.width() * scale).round().max(1.0) as u32;
             let h = (avail.height() * scale).round().max(1.0) as u32;
@@ -1777,7 +1807,7 @@ impl AppState {
         let frame = egui::Frame::default()
             .fill(ctx.global_style().visuals.window_fill)
             .inner_margin(6.0);
-        egui::TopBottomPanel::top("toolbar").frame(frame).show(ctx, |ui| {
+        let toolbar = egui::TopBottomPanel::top("toolbar").frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let (cb, cf) = self.active_nav();
                 if ui
@@ -1908,110 +1938,16 @@ impl AppState {
             });
         });
 
-        let outer = egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
-            egui::ScrollArea::horizontal()
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let active = self.active.get();
-                        // Pinned tabs sort ahead of the rest; `order` is render order, the
-                        // underlying tab indices (used by select/close) are unchanged.
-                        let order: Vec<usize> = {
-                            let tabs = self.tabs.borrow();
-                            let n = tabs.len();
-                            let mut o: Vec<usize> = (0..n).filter(|&i| tabs[i].pinned).collect();
-                            o.extend((0..n).filter(|&i| !tabs[i].pinned));
-                            o
-                        };
-                        for &i in &order {
-                            let (title, fav, loading, pinned) = {
-                                let tabs = self.tabs.borrow();
-                                let fav = tabs[i].favicon_tex.as_ref().map(|t| {
-                                    egui::load::SizedTexture::new(t.id(), egui::vec2(16.0, 16.0))
-                                });
-                                (tabs[i].title.clone(), fav, tabs[i].loading, tabs[i].pinned)
-                            };
-                            let has_icon = loading || fav.is_some();
-                            if loading {
-                                ui.add(egui::Spinner::new().size(14.0));
-                            } else if let Some(sized) = fav {
-                                ui.add(
-                                    egui::Image::from_texture(sized)
-                                        .fit_to_exact_size(egui::vec2(16.0, 16.0)),
-                                );
-                            }
-                            // Pinned tabs are compact: the favicon is the identity, so the
-                            // button carries no title (one glyph as a fallback if no icon).
-                            let label = if pinned {
-                                if has_icon {
-                                    String::new()
-                                } else {
-                                    title.chars().next().map(|c| c.to_string()).unwrap_or_default()
-                                }
-                            } else {
-                                truncate_ellipsis(&title, 20)
-                            };
-                            let tab = ui
-                                .add(egui::Button::selectable(i == active, label))
-                                .on_hover_text(&title);
-                            if tab.clicked() && i != active {
-                                self.select_tab(i);
-                            }
-                            if tab.middle_clicked() && !pinned {
-                                self.close_tab(i);
-                                break;
-                            }
-                            let mut menu_act = 0u8;
-                            tab.context_menu(|ui| {
-                                if ui.button("New tab").clicked() {
-                                    menu_act = 1;
-                                }
-                                if ui
-                                    .button(if pinned { "Unpin tab" } else { "Pin tab" })
-                                    .clicked()
-                                {
-                                    menu_act = 4;
-                                }
-                                if ui.button("Close tab").clicked() {
-                                    menu_act = 2;
-                                }
-                                if ui.button("Close other tabs").clicked() {
-                                    menu_act = 3;
-                                }
-                            });
-                            match menu_act {
-                                1 => {
-                                    self.new_tab(content_url());
-                                    break;
-                                }
-                                2 => {
-                                    self.close_tab(i);
-                                    break;
-                                }
-                                3 => {
-                                    self.close_others(i);
-                                    break;
-                                }
-                                4 => {
-                                    self.toggle_pin(i);
-                                    break;
-                                }
-                                _ => {}
-                            }
-                            if !pinned
-                                && ui.add(egui::Button::new("×").frame(false)).clicked()
-                            {
-                                self.close_tab(i);
-                                break;
-                            }
-                        }
-                        if ui.add(egui::Button::new("+").frame(false)).clicked() {
-                            self.new_tab(content_url());
-                        }
-                    });
-                });
-        });
-        let mut bottom = outer.response.rect.max.y;
+        let vertical = self.settings.borrow().vertical_tabs;
+        let mut bottom = if vertical {
+            // No top tab strip; the left SidePanel sets `content_left`. The page begins
+            // below the toolbar, whose bottom we captured above.
+            self.draw_tabs_vertical(ctx);
+            toolbar.response.rect.max.y
+        } else {
+            self.content_left.set(0.0);
+            self.draw_tabs_horizontal(ctx)
+        };
 
         // Bookmarks bar (only when there are bookmarks), below the tab strip.
         let have_bookmarks = !self.profile.borrow().bookmarks.is_empty();
@@ -2043,6 +1979,350 @@ impl AppState {
             bottom = bm.response.rect.max.y;
         }
         self.toolbar_height.set(bottom);
+    }
+
+    /// Render-order tab indices: pinned first (in tab order), then the rest. This is the
+    /// shared ordering both tab layouts iterate; underlying indices (used by
+    /// select/close/move) are unchanged.
+    fn tab_order(&self) -> Vec<usize> {
+        let tabs = self.tabs.borrow();
+        let n = tabs.len();
+        let mut o: Vec<usize> = (0..n).filter(|&i| tabs[i].pinned).collect();
+        o.extend((0..n).filter(|&i| !tabs[i].pinned));
+        o
+    }
+
+    /// Render one tab's favicon/spinner + selectable button (+ trailing × when unpinned),
+    /// wired with click→select, middle-click→close, the shared context menu, and
+    /// drag-to-reorder. Returns the requested action and the main button's response (whose
+    /// rect the strip uses for the insertion indicator + scroll-into-view). `vertical`
+    /// selects the row layout (full-width row vs compact horizontal chip) and the
+    /// orientation-toggle menu label.
+    ///
+    /// Both layouts call this so their select/close/menu/pin/drag behavior is identical.
+    fn tab_row(&self, ui: &mut egui::Ui, i: usize, active: usize, vertical: bool) -> (TabAction, egui::Response) {
+        let (title, fav, loading, pinned) = {
+            let tabs = self.tabs.borrow();
+            let fav = tabs[i].favicon_tex.as_ref().map(|t| {
+                egui::load::SizedTexture::new(t.id(), egui::vec2(16.0, 16.0))
+            });
+            (tabs[i].title.clone(), fav, tabs[i].loading, tabs[i].pinned)
+        };
+        let has_icon = loading || fav.is_some();
+        let mut act = TabAction::None;
+
+        // The drag/click sense is shared by both orientations: egui only fires drag events
+        // after the drag threshold, so a plain click still yields `clicked()` (just-select).
+        let render = |ui: &mut egui::Ui| -> egui::Response {
+            if loading {
+                ui.add(egui::Spinner::new().size(14.0));
+            } else if let Some(sized) = fav {
+                ui.add(
+                    egui::Image::from_texture(sized).fit_to_exact_size(egui::vec2(16.0, 16.0)),
+                );
+            }
+            // Pinned tabs are compact: the favicon is the identity, so the horizontal chip
+            // carries no title (one glyph fallback if no icon). Vertical rows always show
+            // the title (there's room).
+            let label = if pinned && !vertical {
+                if has_icon {
+                    String::new()
+                } else {
+                    title.chars().next().map(|c| c.to_string()).unwrap_or_default()
+                }
+            } else {
+                truncate_ellipsis(&title, if vertical { 26 } else { 20 })
+            };
+            let mut btn = egui::Button::selectable(i == active, label)
+                .sense(egui::Sense::click_and_drag());
+            if vertical {
+                // Fill the row, reserving ~22px on the right for the × close button.
+                let w = (ui.available_width() - if pinned { 0.0 } else { 22.0 }).max(0.0);
+                btn = btn.min_size(egui::vec2(w, 0.0));
+            }
+            ui.add(btn).on_hover_text(&title)
+        };
+
+        let tab = if vertical {
+            // One full-width row: favicon + title + trailing ×, laid out left-to-right.
+            let inner = ui.horizontal(|ui| {
+                let resp = render(ui);
+                if !pinned && ui.add(egui::Button::new("×").frame(false)).clicked() {
+                    act = TabAction::Close(i);
+                }
+                resp
+            });
+            inner.inner
+        } else {
+            let resp = render(ui);
+            if !pinned && ui.add(egui::Button::new("×").frame(false)).clicked() {
+                act = TabAction::Close(i);
+            }
+            resp
+        };
+
+        if tab.clicked() && i != active {
+            act = TabAction::Select(i);
+        }
+        if tab.middle_clicked() && !pinned {
+            act = TabAction::Close(i);
+        }
+        // Drag-reorder: begin on threshold-crossing drag start; the strip paints the
+        // insertion indicator + commits the move on release (it knows every tab's rect).
+        if tab.drag_started() {
+            self.drag_tab.set(Some(i));
+        }
+
+        let mut menu_act = 0u8;
+        tab.context_menu(|ui| {
+            if ui.button("New tab").clicked() {
+                menu_act = 1;
+            }
+            if ui
+                .button(if pinned { "Unpin tab" } else { "Pin tab" })
+                .clicked()
+            {
+                menu_act = 4;
+            }
+            if ui.button("Close tab").clicked() {
+                menu_act = 2;
+            }
+            if ui.button("Close other tabs").clicked() {
+                menu_act = 3;
+            }
+            if ui
+                .button(if vertical { "Horizontal tabs" } else { "Vertical tabs" })
+                .clicked()
+            {
+                menu_act = 5;
+            }
+        });
+        match menu_act {
+            1 => act = TabAction::NewTab,
+            2 => act = TabAction::Close(i),
+            3 => act = TabAction::CloseOthers(i),
+            4 => act = TabAction::TogglePin(i),
+            5 => act = TabAction::ToggleOrientation,
+            _ => {}
+        }
+
+        (act, tab)
+    }
+
+    /// Apply the action a tab row requested. Returns true if it mutated the tab set (so the
+    /// caller should stop iterating this frame, matching the old `break` after each mutation).
+    fn apply_tab_action(&self, act: TabAction) -> bool {
+        match act {
+            TabAction::None => false,
+            TabAction::Select(i) => {
+                self.select_tab(i);
+                false
+            }
+            TabAction::Close(i) => {
+                self.close_tab(i);
+                true
+            }
+            TabAction::CloseOthers(i) => {
+                self.close_others(i);
+                true
+            }
+            TabAction::TogglePin(i) => {
+                self.toggle_pin(i);
+                true
+            }
+            TabAction::NewTab => {
+                self.new_tab(content_url());
+                true
+            }
+            TabAction::ToggleOrientation => {
+                {
+                    let mut s = self.settings.borrow_mut();
+                    s.vertical_tabs = !s.vertical_tabs;
+                    save_settings(&s);
+                }
+                self.window.request_redraw();
+                true
+            }
+        }
+    }
+
+    /// Commit a drag-reorder: translate the rendered slot the pointer is over into an
+    /// underlying tab index and move the dragged tab there. `rects` are the rendered tab
+    /// rects in `order` sequence; `main` reads the relevant axis (x for horizontal, y for
+    /// vertical). Returns the candidate render-slot for the insertion indicator while
+    /// dragging (so the caller can paint it), or None when not dragging.
+    fn drag_target_slot(
+        &self,
+        order: &[usize],
+        rects: &[egui::Rect],
+        pointer: egui::Pos2,
+        vertical: bool,
+    ) -> Option<usize> {
+        let dragged = self.drag_tab.get()?;
+        order.iter().position(|&i| i == dragged)?; // dragged tab must be in render order
+        // Candidate slot = first tab whose center is past the pointer on the main axis.
+        let coord = |r: &egui::Rect| if vertical { r.center().y } else { r.center().x };
+        let p = if vertical { pointer.y } else { pointer.x };
+        let mut slot = rects.len();
+        for (k, r) in rects.iter().enumerate() {
+            if p < coord(r) {
+                slot = k;
+                break;
+            }
+        }
+        // Clamp to the dragged tab's pinned-group (v1: reorder only within the group).
+        let (group_lo, group_hi) = {
+            let tabs = self.tabs.borrow();
+            let lo = order.iter().position(|&i| tabs[i].pinned == tabs[dragged].pinned).unwrap_or(0);
+            let hi = order.iter().rposition(|&i| tabs[i].pinned == tabs[dragged].pinned).map(|p| p + 1).unwrap_or(order.len());
+            (lo, hi)
+        };
+        slot = slot.clamp(group_lo, group_hi);
+        Some(slot)
+    }
+
+    /// Horizontal top tab strip (default). Returns the panel's bottom y (the page top).
+    fn draw_tabs_horizontal(&self, ctx: &egui::Context) -> f32 {
+        let active = self.active.get();
+        let scroll_active = self.scroll_active_into_view.take();
+        let order = self.tab_order();
+        let mut rects: Vec<egui::Rect> = Vec::with_capacity(order.len());
+        let mut pending: Option<TabAction> = None;
+
+        let outer = egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                // Trailing fixed `+` (always reachable, outside the scrolled region).
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new("+").frame(false)).clicked() {
+                        pending = Some(TabAction::NewTab);
+                    }
+                    // The scrolled strip fills the remaining width to the left of `+`.
+                    egui::ScrollArea::horizontal()
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                        )
+                        .show(ui, |ui| {
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    for &i in &order {
+                                        let (act, resp) = self.tab_row(ui, i, active, false);
+                                        rects.push(resp.rect);
+                                        if i == active && scroll_active {
+                                            resp.scroll_to_me(None);
+                                        }
+                                        if !matches!(act, TabAction::None) && pending.is_none() {
+                                            pending = Some(act);
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                });
+            });
+        });
+
+        self.handle_drag(ctx, &order, &rects, false);
+        if let Some(act) = pending {
+            self.apply_tab_action(act);
+        }
+        outer.response.rect.max.y
+    }
+
+    /// Vertical left tab strip (a resizable SidePanel). Sets `content_left` to its width so
+    /// the page area shifts right by exactly the panel width.
+    fn draw_tabs_vertical(&self, ctx: &egui::Context) {
+        let active = self.active.get();
+        let scroll_active = self.scroll_active_into_view.take();
+        let order = self.tab_order();
+        let mut rects: Vec<egui::Rect> = Vec::with_capacity(order.len());
+        let mut pending: Option<TabAction> = None;
+
+        let panel = egui::SidePanel::left("tabs_vertical")
+            .resizable(true)
+            .default_width(200.0)
+            .show(ctx, |ui| {
+                if ui
+                    .add(egui::Button::new("+ New tab").frame(false))
+                    .clicked()
+                {
+                    pending = Some(TabAction::NewTab);
+                }
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for &i in &order {
+                        let (act, resp) = self.tab_row(ui, i, active, true);
+                        rects.push(resp.rect);
+                        if i == active && scroll_active {
+                            resp.scroll_to_me(None);
+                        }
+                        if !matches!(act, TabAction::None) && pending.is_none() {
+                            pending = Some(act);
+                        }
+                    }
+                });
+            });
+
+        self.content_left.set(panel.response.rect.width());
+        self.handle_drag(ctx, &order, &rects, true);
+        if let Some(act) = pending {
+            self.apply_tab_action(act);
+        }
+    }
+
+    /// Paint the drag-reorder insertion indicator while a tab is being dragged, and commit
+    /// the move on release. Shared by both layouts.
+    fn handle_drag(&self, ctx: &egui::Context, order: &[usize], rects: &[egui::Rect], vertical: bool) {
+        let Some(dragged) = self.drag_tab.get() else {
+            return;
+        };
+        let pointer = ctx.input(|i| i.pointer.interact_pos());
+        let still_dragging = ctx.input(|i| i.pointer.any_down());
+        let slot = pointer.and_then(|p| self.drag_target_slot(order, rects, p, vertical));
+        if let Some(slot) = slot {
+            // Insertion indicator: a thin line at the candidate slot's leading edge.
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("tab_drop_indicator"),
+            ));
+            let color = ctx.style().visuals.selection.bg_fill;
+            if let Some(strip) = rects.first().map(|r| r.union(*rects.last().unwrap())) {
+                if vertical {
+                    let y = rects.get(slot).map(|r| r.top()).unwrap_or_else(|| {
+                        rects.last().map(|r| r.bottom()).unwrap_or(strip.top())
+                    });
+                    painter.line_segment(
+                        [egui::pos2(strip.left(), y), egui::pos2(strip.right(), y)],
+                        egui::Stroke::new(2.0, color),
+                    );
+                } else {
+                    let x = rects.get(slot).map(|r| r.left()).unwrap_or_else(|| {
+                        rects.last().map(|r| r.right()).unwrap_or(strip.left())
+                    });
+                    painter.line_segment(
+                        [egui::pos2(x, strip.top()), egui::pos2(x, strip.bottom())],
+                        egui::Stroke::new(2.0, color),
+                    );
+                }
+            }
+
+            if !still_dragging {
+                // Released: translate the render slot into an underlying index and move.
+                let dragged_pos = order.iter().position(|&i| i == dragged);
+                if let Some(dragged_pos) = dragged_pos {
+                    // The slot is an insertion point in render order; map it to an
+                    // underlying target index. Account for removing the dragged tab first.
+                    let target_render = if slot > dragged_pos { slot - 1 } else { slot };
+                    let target_render = target_render.min(order.len().saturating_sub(1));
+                    let to = order[target_render];
+                    self.move_tab(dragged, to);
+                }
+                self.drag_tab.set(None);
+            }
+        } else if !still_dragging {
+            self.drag_tab.set(None);
+        }
+        self.window.request_redraw();
     }
 
     fn draw_settings(&self, ctx: &egui::Context) {
@@ -2106,6 +2386,9 @@ impl AppState {
                 changed |= ui.text_edit_singleline(&mut s.accent).changed();
                 ui.add_space(6.0);
                 changed |= ui.checkbox(&mut s.dark, "Dark theme").changed();
+                changed |= ui
+                    .checkbox(&mut s.vertical_tabs, "Vertical tabs (left side)")
+                    .changed();
 
                 ui.add_space(10.0);
                 ui.separator();
@@ -2657,6 +2940,7 @@ impl AppState {
         }
         self.location_dirty.set(false);
         self.active.set(i);
+        self.scroll_active_into_view.set(true);
         self.window.request_redraw();
     }
 
@@ -2696,6 +2980,40 @@ impl AppState {
             t.pinned = !t.pinned;
         }
         self.window.request_redraw();
+    }
+
+    /// Drag-reorder: move the underlying tab at `from` to the position of `to`, preserving
+    /// the pinned-group invariant (v1 only reorders within a group) and keeping `active`
+    /// on the moved tab.
+    fn move_tab(&self, from: usize, to: usize) {
+        {
+            let mut tabs = self.tabs.borrow_mut();
+            if from >= tabs.len() || to >= tabs.len() || from == to {
+                return;
+            }
+            // v1: only reorder within the same pinned group (keeps the pinned-first
+            // `order` invariant trivially correct — a tab can't change pinned-state on drop).
+            if tabs[from].pinned != tabs[to].pinned {
+                return;
+            }
+            let t = tabs.remove(from);
+            tabs.insert(to, t);
+        }
+        // Fix up the active index so the same tab stays selected after the move.
+        let a = self.active.get();
+        let new_a = if a == from {
+            to
+        } else if from < a && a <= to {
+            a - 1
+        } else if to <= a && a < from {
+            a + 1
+        } else {
+            a
+        };
+        self.active.set(new_a);
+        self.scroll_active_into_view.set(true);
+        self.window.request_redraw();
+        self.save_session();
     }
 
     fn close_others(&self, keep: usize) {
@@ -3271,6 +3589,12 @@ impl AppState {
     fn toolbar_dev(&self) -> f64 {
         self.toolbar_height.get() as f64 * self.scale.get()
     }
+
+    /// Device-px x at which the page area begins (right of the left vertical-tabs panel; 0
+    /// in horizontal mode). Mirrors `toolbar_dev` for the x axis.
+    fn content_left_dev(&self) -> f64 {
+        self.content_left.get() as f64 * self.scale.get()
+    }
 }
 
 impl WebViewDelegate for AppState {
@@ -3720,7 +4044,10 @@ impl ApplicationHandler<WakeUp> for App {
             content_context,
             egui: RefCell::new(egui),
             toolbar_height: Cell::new(0.0),
+            content_left: Cell::new(0.0),
             content_px: Cell::new((0, 0)),
+            drag_tab: Cell::new(None),
+            scroll_active_into_view: Cell::new(false),
             tabs: RefCell::new(Vec::new()),
             active: Cell::new(0),
             location: RefCell::new(String::new()),
@@ -3842,8 +4169,12 @@ impl ApplicationHandler<WakeUp> for App {
 
         let scale = state.scale.get();
         let toolbar_dev = state.toolbar_dev();
+        let left_dev = state.content_left_dev();
         let (cx, cy) = state.cursor.get();
         let over_toolbar = cy < toolbar_dev;
+        // The page area is below the toolbar AND right of the vertical-tabs panel. Input
+        // over either chrome region must not leak to the page.
+        let over_chrome = cy < toolbar_dev || cx < left_dev;
         let dialog_open = !state.dialogs.borrow().is_empty();
 
         match event {
@@ -3852,9 +4183,13 @@ impl ApplicationHandler<WakeUp> for App {
                     Some(dir) => state.window.set_cursor(resize_cursor(dir)),
                     None => state.window.set_cursor(CursorIcon::Default),
                 }
-                if !(resp.consumed || over_toolbar || dialog_open) {
+                if !(resp.consumed || over_chrome || dialog_open) {
                     state.forward_to_page(InputEvent::MouseMove(MouseMoveEvent::new(
-                        DevicePoint::new(position.x as f32, (position.y - toolbar_dev) as f32).into(),
+                        DevicePoint::new(
+                            (position.x - left_dev) as f32,
+                            (position.y - toolbar_dev) as f32,
+                        )
+                        .into(),
                     )));
                 }
             }
@@ -3874,7 +4209,7 @@ impl ApplicationHandler<WakeUp> for App {
                 // Right-click over the page → native context menu.
                 if button == MouseButton::Right
                     && bs == ElementState::Pressed
-                    && !over_toolbar
+                    && !over_chrome
                     && !dialog_open
                 {
                     state.push_dialog(Dialog::ContextMenu {
@@ -3891,7 +4226,7 @@ impl ApplicationHandler<WakeUp> for App {
                     let _ = state.window.drag_window();
                     return;
                 }
-                if !(resp.consumed || over_toolbar || dialog_open) {
+                if !(resp.consumed || over_chrome || dialog_open) {
                     let action = match bs {
                         ElementState::Pressed => MouseButtonAction::Down,
                         ElementState::Released => MouseButtonAction::Up,
@@ -3912,7 +4247,7 @@ impl ApplicationHandler<WakeUp> for App {
                     state.forward_to_page(InputEvent::MouseButton(MouseButtonEvent::new(
                         action,
                         servo_button,
-                        DevicePoint::new(cx as f32, (cy - toolbar_dev) as f32).into(),
+                        DevicePoint::new((cx - left_dev) as f32, (cy - toolbar_dev) as f32).into(),
                     )));
                 }
             }
@@ -3930,7 +4265,7 @@ impl ApplicationHandler<WakeUp> for App {
                     }
                     return;
                 }
-                if !(resp.consumed || over_toolbar || dialog_open) {
+                if !(resp.consumed || over_chrome || dialog_open) {
                     let (dx, dy, mode) = match delta {
                         MouseScrollDelta::LineDelta(lx, ly) => {
                             ((lx * 76.0) as f64, (ly * 76.0) as f64, WheelMode::DeltaLine)
@@ -3945,7 +4280,7 @@ impl ApplicationHandler<WakeUp> for App {
                     };
                     state.forward_to_page(InputEvent::Wheel(WheelEvent::new(
                         wheel,
-                        DevicePoint::new(cx as f32, (cy - toolbar_dev) as f32).into(),
+                        DevicePoint::new((cx - left_dev) as f32, (cy - toolbar_dev) as f32).into(),
                     )));
                 }
             }
