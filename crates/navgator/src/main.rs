@@ -320,6 +320,52 @@ fn import_browser_history() -> Vec<(String, String, u32, i64)> {
     out
 }
 
+/// Register NavGator as the system default browser: write a `.desktop` launcher pointing at the
+/// running binary (with `%u`, so links are passed through) and set it via xdg-settings, falling
+/// back to xdg-mime. Returns a human-readable status.
+fn set_default_browser() -> String {
+    let Ok(exe) = std::env::current_exe() else {
+        return "Could not locate the NavGator binary.".into();
+    };
+    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+        return "No HOME directory.".into();
+    };
+    let apps = home.join(".local/share/applications");
+    if std::fs::create_dir_all(&apps).is_err() {
+        return "Could not create ~/.local/share/applications.".into();
+    }
+    let desktop = apps.join("navgator.desktop");
+    let content = format!(
+        "[Desktop Entry]\nVersion=1.0\nName=NavGator\nComment=A fast, private web browser\n\
+         Exec={} %u\nTerminal=false\nType=Application\nCategories=Network;WebBrowser;\n\
+         MimeType=x-scheme-handler/http;x-scheme-handler/https;text/html;\nStartupNotify=true\n",
+        exe.display()
+    );
+    if std::fs::write(&desktop, &content).is_err() {
+        return "Could not write navgator.desktop.".into();
+    }
+    let _ = std::process::Command::new("update-desktop-database")
+        .arg(&apps)
+        .output();
+    let ok = std::process::Command::new("xdg-settings")
+        .args(["set", "default-web-browser", "navgator.desktop"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !ok {
+        let _ = std::process::Command::new("xdg-mime")
+            .args([
+                "default",
+                "navgator.desktop",
+                "x-scheme-handler/http",
+                "x-scheme-handler/https",
+                "text/html",
+            ])
+            .output();
+    }
+    "NavGator is now your default browser — http/https links will open here.".into()
+}
+
 /// User settings, persisted to a small `key=value` config file.
 #[derive(Clone)]
 struct Settings {
@@ -1815,6 +1861,7 @@ impl AppState {
         let mut sync_clicked = false;
         let mut unlock_pass: Option<String> = None;
         let mut import_clicked = false;
+        let mut default_clicked = false;
         egui::Window::new("Settings")
             .collapsible(false)
             .resizable(false)
@@ -1887,12 +1934,15 @@ impl AppState {
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new("Import").strong());
+                ui.label(egui::RichText::new("Setup").strong());
                 if ui
                     .button("Import bookmarks & history (Chrome / Firefox / …)")
                     .clicked()
                 {
                     import_clicked = true;
+                }
+                if ui.button("Set NavGator as default browser").clicked() {
+                    default_clicked = true;
                 }
                 if let Some(msg) = self.import_msg.borrow().clone() {
                     ui.add_space(2.0);
@@ -2002,6 +2052,9 @@ impl AppState {
         }
         if import_clicked {
             self.import_browser_data();
+        }
+        if default_clicked {
+            self.make_default_browser();
         }
         if sync_clicked {
             self.start_sync();
@@ -2756,6 +2809,12 @@ impl AppState {
         } else {
             "No new bookmarks or history found (Chrome / Firefox / …).".to_string()
         });
+        self.window.request_redraw();
+    }
+
+    /// Register NavGator as the system default browser (Settings → Setup).
+    fn make_default_browser(&self) {
+        *self.import_msg.borrow_mut() = Some(set_default_browser());
         self.window.request_redraw();
     }
 
