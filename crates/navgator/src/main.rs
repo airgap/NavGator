@@ -387,6 +387,8 @@ struct Settings {
     block_ads: bool,
     /// Vertical tab strip (left SidePanel) instead of the horizontal top strip.
     vertical_tabs: bool,
+    /// New-tab page wallpaper (image URL); empty = the plain themed background.
+    wallpaper: String,
 }
 
 impl Default for Settings {
@@ -402,6 +404,7 @@ impl Default for Settings {
             remember_passphrase: false,
             block_ads: true,
             vertical_tabs: false,
+            wallpaper: String::new(),
         }
     }
 }
@@ -429,6 +432,7 @@ fn load_settings() -> Settings {
                     "remember_passphrase" => s.remember_passphrase = v.trim() == "true",
                     "block_ads" => s.block_ads = v.trim() == "true",
                     "vertical_tabs" => s.vertical_tabs = v.trim() == "true",
+                    "wallpaper" => s.wallpaper = v.trim().to_string(),
                     _ => {}
                 }
             }
@@ -445,7 +449,7 @@ fn save_settings(s: &Settings) {
         let _ = std::fs::write(
             &path,
             format!(
-                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nremember_passphrase={}\nblock_ads={}\nvertical_tabs={}\n",
+                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nremember_passphrase={}\nblock_ads={}\nvertical_tabs={}\nwallpaper={}\n",
                 s.search,
                 s.accent,
                 s.dark,
@@ -455,7 +459,8 @@ fn save_settings(s: &Settings) {
                 s.sync_passwords,
                 s.remember_passphrase,
                 s.block_ads,
-                s.vertical_tabs
+                s.vertical_tabs,
+                s.wallpaper
             ),
         );
     }
@@ -1213,9 +1218,25 @@ impl AppState {
     }
 
     fn render_gator_welcome(&self) -> Vec<u8> {
-        let (search, accent) = {
+        let (search, accent, wallpaper) = {
             let s = self.settings.borrow();
-            (s.search.clone(), s.accent.clone())
+            (s.search.clone(), s.accent.clone(), s.wallpaper.clone())
+        };
+        // A wallpaper is the user's own setting, but sanitize for CSS url() safety: http(s)/data
+        // only and no character that could break out of the url("…") context.
+        let w = wallpaper.trim();
+        let wallpaper_css = if !w.is_empty()
+            && (w.starts_with("http://") || w.starts_with("https://") || w.starts_with("data:"))
+            && !w.contains('"')
+            && !w.contains(')')
+            && !w.contains('\n')
+        {
+            format!(
+                "background-image:linear-gradient(rgba(0,0,0,.35),rgba(0,0,0,.55)),url(\"{w}\");\
+                 background-size:cover;background-position:center;background-attachment:fixed;"
+            )
+        } else {
+            String::new()
         };
         let engine = SEARCH_ENGINES
             .iter()
@@ -1257,6 +1278,7 @@ impl AppState {
         };
         let html = include_str!("content/welcome.html")
             .replace("__ACCENT__", &accent)
+            .replace("__WALLPAPER__", &wallpaper_css)
             .replace("__SEARCH_TEMPLATE__", &search)
             .replace("__SEARCH_ENGINE__", engine)
             .replace("__BOOKMARKS__", &bookmarks);
@@ -2423,6 +2445,13 @@ impl AppState {
                 ui.add_space(6.0);
                 ui.label("Accent color (#rrggbb)");
                 changed |= ui.text_edit_singleline(&mut s.accent).changed();
+                ui.label("New-tab wallpaper (image URL)");
+                changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut s.wallpaper)
+                            .hint_text("https://…/image.jpg (blank = themed background)"),
+                    )
+                    .changed();
                 ui.add_space(6.0);
                 changed |= ui.checkbox(&mut s.dark, "Dark theme").changed();
                 changed |= ui
