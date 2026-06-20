@@ -1,9 +1,9 @@
 # NavGator master roadmap
 
-Current status + forward plan. Updated **2026-06-19** against the `dev` branch, the
-maintained Servo fork (`airgap/swervo`) pinned at rev `315497b`, stable Rust 1.95, a
-~940-package dep graph, and a native-egui-chrome shell at ~2,375 lines
-(`crates/navgator/src/main.rs`).
+Current status + forward plan. Updated **2026-06-20** against the `dev` branch, the
+maintained Servo fork (`airgap/swervo`) pinned at rev `33abd9` (carrying the UA + downloads
+patches), stable Rust 1.95, a ~940-package dep graph, and a native-egui-chrome shell at
+~3,980 lines (`crates/navgator/src/main.rs`).
 
 This document is deliberately unhyped: where a thing is engine-blocked, multi-year, or
 not yet feasible it says so. **§R2 (owner decisions) records the locked strategy —
@@ -70,6 +70,34 @@ All of the following are implemented in `main.rs` and verified in the running ap
 - **Borderless window** with resize-from-edges.
 - **Opt-in IPC control socket** (`NAVGATOR_IPC`) — an external process can drive
   navigation / tabs and read state events.
+- **Session restore** — the open-tab set is persisted (`session.tsv`) and restored on
+  launch; an explicit CLI URL takes precedence.
+- **Crash tab** — `notify_crashed` → a `gator://crash` sad-tab page with the failed URL
+  and a reload-back link.
+- **Lyku sync** (early access) — bookmarks + history sync to the user's Lyku account via a
+  blocking HTTPS+JSON client on a background thread, with per-collection opt-ins; merge is
+  last-write-wins by mtime. The server endpoints (`/sync-push`, `/sync-pull`, a `syncItems`
+  table) are built on the Lyku side. *(Live round-trip pending the Lyku deploy.)*
+- **Downloads** — files stream to `~/Downloads` with a click-to-open toast and a
+  `gator://downloads` manager (`Ctrl+J`). This required **NavGator's first carried
+  Servo-fork patch** (a `Content-Disposition`→disk streaming path + a `Download`
+  EmbedderMsg/delegate, `airgap/swervo` @ `33abd9`), since libservo has no download
+  delegate — closing the old §2.2 gap.
+- **E2EE password manager** — an Argon2id + XChaCha20-Poly1305 credential store
+  (`passwords.enc`, zero-knowledge); unlock in Settings; **autofill** on load and **save**
+  via a 🔑 toolbar button (both through `evaluate_javascript`, so the credential never
+  touches page-readable storage); a `gator://passwords` manager; opt-in E2EE sync to Lyku's
+  `passwords` collection (ciphertext only, encrypted on the UI thread).
+- **Ad / tracker blocking** — Brave's `adblock-rust` checked in `load_web_resource`:
+  **network blocking** (matches intercepted with an empty 204), the **full EasyList +
+  EasyPrivacy** (~137k rules, fetched + cached in the background with a weekly refresh and a
+  bundled starter list), and **cosmetic element-hiding** (page class/id set → matching hide
+  selectors → injected `<style>`). On by default; Settings toggle + session counter.
+- **Import from other browsers** — bookmarks (Chrome-family JSON) + bookmarks & history
+  (Firefox + Chrome, read-only/immutable SQLite via `rusqlite`) from Settings → Setup,
+  deduped. The first-run adoption hook.
+- **Default-browser registration** — Settings → Setup writes a `navgator.desktop` launcher
+  and registers it via `xdg-settings`/`xdg-mime` (Linux).
 
 ### 1.2 `gator://` internal pages
 
@@ -77,14 +105,16 @@ A custom **`gator://` internal-page scheme** is the model for all NavGator-serve
 content. `AppState::load_web_resource` intercepts `gator://` loads and returns embedded
 HTML built with the engine `http` types (re-exported through `navgator-engine`):
 
-- **`gator://welcome`** — the new-tab page / NTP (`render_gator_welcome()`,
-  `content/welcome.html`), templated with the current accent color, the selected search
-  engine, and the user's bookmarks as quick-link tiles.
-- Unknown `gator://` paths return a small "no such internal page" fallback that links
-  back to `gator://welcome`.
+- **`gator://welcome`** — the new-tab page / NTP, templated with the accent color, search
+  engine, and bookmarks as quick-link tiles.
+- **`gator://history`** (recent visits), **`gator://downloads`** (download manager),
+  **`gator://passwords`** (the masked saved-login manager), **`gator://about`**, and
+  **`gator://crash`** (the sad-tab page) — all themed through the same `load_web_resource`
+  match + templating.
+- Unknown `gator://` paths return a small "no such internal page" fallback.
 
-This is the foundation for future internal pages (settings, history, downloads) — they
-slot into the same `load_web_resource` match.
+Still to add: **`gator://settings`** — a full in-page settings surface beyond the egui
+overlay.
 
 ### 1.3 Engine-gap work landed (the NavGator default web-feature profile)
 
@@ -134,36 +164,32 @@ are **engine-blocked** (libservo at this rev lacks the primitive) vs. **embedder
 
 ### 2.1 Core product features still missing (embedder work)
 
-- **Session restore** — persist the open-tab set + per-tab URL and restore on launch.
-  (Closed-tab reopen already exists; full session restore does not.)
-- **Crash tab** — implement `notify_crashed` → a sad-tab UI + reload, plus a periodic
-  session snapshot for recovery.
-- **More `gator://` internal pages** — `gator://settings`, `gator://history`,
-  `gator://bookmarks`/downloads, served through the same `load_web_resource` match. The
-  scheme exists; these surfaces don't yet.
-- **Settings UI** — a real settings page bound to the persisted `Settings` (today
-  settings persist, but there is no in-app management page beyond the chrome controls).
-- **Tab pinning + overflow/scroll + drag-reorder + vertical-tabs** — the strip will
-  overflow with many tabs; pinning and reordering are unbuilt. Vertical tabs are a
-  natural differentiator now that the chrome is native.
-- **Default-browser registration + protocol/deep-link handlers** — per-OS
-  registration; `request_protocol_handler` is not yet implemented.
-- **Theming depth** — extend beyond accent + dark to a token catalog, per-site themes,
-  wallpapers (a `gator://`/asset handler), and a validated theme package format
-  (`theming.md`); add a CI-enforced perf budget measured against the 1.0-feature build,
-  not the prototype.
-- **Content blocking + userscripts** — adblock-rust + EasyList/EasyPrivacy via
-  `load_web_resource`, and userscripts as the native add-on type (`extensions.md`).
-  Filter-list redistribution licensing is a gating legal task.
-- **Import from other browsers** — bookmarks/history (tractable) and, as its own
-  keychain/DPAPI-gated sub-track, saved passwords/cookies. The first-run adoption hook.
+- **`gator://settings` + a full in-page settings page** — settings persist and the egui
+  overlay manages them, but there's no themed in-page settings surface yet.
+- **Tab strip depth** — **pinning, overflow/scroll, drag-reorder, and vertical tabs.** The
+  strip overflows with many tabs; reordering is unbuilt. Vertical tabs are a natural
+  differentiator now that the chrome is native.
+- **Theming depth** — beyond accent + dark: a token catalog, per-site themes, wallpapers
+  (a `gator://`/asset handler), a validated theme package format (`theming.md`), and a
+  CI-enforced perf budget measured against the 1.0-feature build.
+- **Userscripts** — the native add-on type via `UserContentManager` (`extensions.md`),
+  layered on the shipped ad/tracker blocker.
+- **Password-manager depth** — auto-offer-save on form submit (a `UserScript`/engine form
+  hook), an OS-keyring for the sync passphrase, and **importing saved passwords** from other
+  browsers (the keychain/DPAPI-gated sub-track).
+- **Protocol/deep-link handlers** — `request_protocol_handler` is not yet implemented
+  (default-browser registration itself now ships, §1.1).
+- **Live-sync hardening** — deploy the Lyku `navgator-sync` server branch for a live
+  round-trip, then add delete tombstones, auto-sync (timer/on-change), and an OS-keyring for
+  the API key.
 
 ### 2.2 Engine-blocked product features (need fork work or a fragile stopgap)
 
-- **Downloads + manager** — libservo exposes **no download delegate**. A stopgap can
-  intercept attachment responses via `load_web_resource`/`WebResourceLoad` and buffer
-  to disk, but that **breaks on large/streaming files**; the real fix is a streaming
-  download API in the fork (a carried patch across every rebase).
+- **Downloads + manager — DONE (the first carried fork patch).** libservo had no download
+  delegate, so NavGator added a `Content-Disposition`→disk **streaming** path + a `Download`
+  EmbedderMsg/delegate in `airgap/swervo` (@ `33abd9`), surfaced as `~/Downloads` saves + a
+  `gator://downloads` manager. v1 limits: attachment-only, no progress %, blank tab after a
+  download. A carried patch across every rebase (§5).
 - **Find-in-page (robust)** — the shipped `Ctrl+F` is a **JS overlay** and is fragile
   on complex DOMs (shadow DOM, virtualized lists, cross-iframe). A native find API in
   the fork is the clean answer.
@@ -274,7 +300,9 @@ DOM APIs on, IndexedDB + WebGL2 on. What remains:
 | IndexedDB, WebGL2 | P1 | **DONE (enabled)** — harden behind a WPT gate. |
 | Permissions / Notifications / Geolocation | P0/P1 | **DONE (exposed + prompted).** |
 | AccessKit a11y | P0 compliance | **Blocked on the egui→accesskit dep wall** (§2.3). |
-| Downloads, find-in-page | P0, **no libservo primitive** | Find ships as a fragile JS overlay; downloads unbuilt. **Fork work** for robust versions. |
+| Downloads | P0, no libservo primitive | **DONE** — carried fork patch (streaming to disk + `Download` delegate). |
+| Find-in-page (robust) | P0, no libservo primitive | Ships as a fragile JS overlay; a native find API is **fork work**. |
+| Ad / tracker blocking | product, embedder | **DONE** — `adblock-rust`: network + full EasyList/EasyPrivacy + cosmetic. |
 | Service Workers, Shared Workers, Worklets, WebGPU | P1/P2, off | **Enable + harden** later. |
 | Cookie/state partitioning (CHIPS) | P2, **engine stub** | **Fork work**; not a 1.0 differentiator. |
 | Passkeys/WebAuthn | P2, **WebIDL absent** | **Fork work** — multi-quarter, not a flip. |
@@ -333,12 +361,12 @@ HSTS, CSP, CORS, SRI). Residual: no OOPIF / in-broker net+cookies = below Chrome
 isolation bar; documented, never claimed as near-Chrome safety.
 
 ### Extensions & content blocking — the MV3-proof win. Full: [`extensions.md`](plan/extensions.md)
-First-class content blocking needs no fork: `load_web_resource` (per-request
-interception) + `UserContentManager` + Brave's `adblock` crate ships network + cosmetic
-blocking in low-thousands of lines. WebExtensions parity is **not** realistic
-(multi-person-year, a fork-magnet). Path: content-blocking first, then userscripts
-(native add-on type), then a small native `navgator.*` API — deliberately not `chrome.*`.
-Default-list redistribution licensing is a gating legal task.
+First-class content blocking needs no fork — and **now ships** (§1.1): `load_web_resource`
+(per-request interception) + Brave's `adblock` crate give network blocking + the full
+EasyList/EasyPrivacy + cosmetic element-hiding. WebExtensions parity is **not** realistic
+(multi-person-year, a fork-magnet). Remaining path: **userscripts** (native add-on type via
+`UserContentManager`), then a small native `navgator.*` API — deliberately not `chrome.*`.
+Default-list redistribution licensing remains a gating legal task.
 
 ---
 
