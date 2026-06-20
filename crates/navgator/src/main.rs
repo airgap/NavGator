@@ -929,6 +929,55 @@ impl AppState {
         self.themed(html)
     }
 
+    /// Render `gator://passwords`: the saved-login manager. Passwords are masked (autofill uses
+    /// them; they're never shown); each row has a Remove link (`?remove=<idx>`). Requires the
+    /// store unlocked to list anything.
+    fn render_gator_passwords(&self, remove: Option<usize>) -> Vec<u8> {
+        if let Some(idx) = remove {
+            let key = self
+                .password_store
+                .borrow()
+                .all()
+                .get(idx)
+                .map(|c| (c.origin.clone(), c.username.clone()));
+            if let Some((origin, username)) = key {
+                self.password_store.borrow_mut().remove(&origin, &username);
+                let _ = self.password_store.borrow().save();
+            }
+        }
+        let accent = self.settings.borrow().accent.clone();
+        let store = self.password_store.borrow();
+        let rows = if !store.is_unlocked() {
+            "<p class=\"empty\">The password store is locked. Unlock it in <strong>Settings → Passwords</strong>.</p>".to_string()
+        } else if store.is_empty() {
+            "<p class=\"empty\">No saved logins yet. On a login page, click 🔑 in the toolbar to save one.</p>".to_string()
+        } else {
+            let mut out = String::new();
+            for (i, c) in store.all().iter().enumerate() {
+                let host = c.origin.split("://").nth(1).unwrap_or(&c.origin);
+                let letter = host
+                    .chars()
+                    .find(|ch| ch.is_alphanumeric())
+                    .map(|ch| ch.to_string())
+                    .unwrap_or_else(|| "•".to_string());
+                out.push_str(&format!(
+                    "<div class=\"row\"><span class=\"ico\">{}</span><div class=\"meta\">\
+                     <div class=\"name\">{}</div><div class=\"path\">{} · ••••••••</div></div>\
+                     <a class=\"rm\" href=\"gator://passwords?remove={}\">Remove</a></div>",
+                    html_escape(&letter),
+                    html_escape(host),
+                    html_escape(&c.username),
+                    i,
+                ));
+            }
+            format!("<div class=\"list\">{out}</div>")
+        };
+        let html = include_str!("content/passwords.html")
+            .replace("__ACCENT__", &accent)
+            .replace("__ROWS__", &rows);
+        self.themed(html)
+    }
+
     /// Render the `gator://history` page: recent visits, newest-first, deduped by URL,
     /// each a clickable link showing title + url. Templated like `gator://welcome`.
     fn render_gator_history(&self) -> Vec<u8> {
@@ -1628,10 +1677,21 @@ impl AppState {
                         .small()
                         .weak(),
                     );
-                    if ui.button("Lock").clicked() {
-                        self.password_store.borrow_mut().lock();
-                        *self.password_msg.borrow_mut() = Some("Password store locked.".into());
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Lock").clicked() {
+                            self.password_store.borrow_mut().lock();
+                            *self.password_msg.borrow_mut() = Some("Password store locked.".into());
+                        }
+                        if ui.button("Manage saved logins").clicked() {
+                            if let (Ok(u), Some(tab)) =
+                                (Url::parse("gator://passwords"), self.active_tab())
+                            {
+                                self.location_dirty.set(false);
+                                tab.load(u);
+                            }
+                            self.show_settings.set(false);
+                        }
+                    });
                 } else {
                     ui.label(
                         egui::RichText::new(
@@ -2571,6 +2631,15 @@ impl WebViewDelegate for AppState {
             "history" => self.render_gator_history(),
             "about" => self.render_gator_about(),
             "downloads" => self.render_gator_downloads(),
+            "passwords" => {
+                let mut remove = None;
+                for (k, v) in url.query_pairs() {
+                    if k == "remove" {
+                        remove = v.parse().ok();
+                    }
+                }
+                self.render_gator_passwords(remove)
+            }
             "crash" => {
                 let mut crashed_url = String::new();
                 let mut reason = String::new();
