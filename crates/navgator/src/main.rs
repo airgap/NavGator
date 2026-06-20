@@ -513,6 +513,9 @@ struct Tab {
     /// Set when Servo reports this tab's renderer pipeline panicked; cleared on the next
     /// fresh load. While set, the tab is showing the `gator://crash` recovery page.
     crashed: bool,
+    /// Pinned tabs sort ahead of the rest, render compact (favicon only), have no close
+    /// button, and survive "close other tabs".
+    pinned: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1075,15 +1078,24 @@ impl AppState {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         let active = self.active.get();
-                        let count = self.tabs.borrow().len();
-                        for i in 0..count {
-                            let (title, fav, loading) = {
+                        // Pinned tabs sort ahead of the rest; `order` is render order, the
+                        // underlying tab indices (used by select/close) are unchanged.
+                        let order: Vec<usize> = {
+                            let tabs = self.tabs.borrow();
+                            let n = tabs.len();
+                            let mut o: Vec<usize> = (0..n).filter(|&i| tabs[i].pinned).collect();
+                            o.extend((0..n).filter(|&i| !tabs[i].pinned));
+                            o
+                        };
+                        for &i in &order {
+                            let (title, fav, loading, pinned) = {
                                 let tabs = self.tabs.borrow();
                                 let fav = tabs[i].favicon_tex.as_ref().map(|t| {
                                     egui::load::SizedTexture::new(t.id(), egui::vec2(16.0, 16.0))
                                 });
-                                (tabs[i].title.clone(), fav, tabs[i].loading)
+                                (tabs[i].title.clone(), fav, tabs[i].loading, tabs[i].pinned)
                             };
+                            let has_icon = loading || fav.is_some();
                             if loading {
                                 ui.add(egui::Spinner::new().size(14.0));
                             } else if let Some(sized) = fav {
@@ -1092,14 +1104,24 @@ impl AppState {
                                         .fit_to_exact_size(egui::vec2(16.0, 16.0)),
                                 );
                             }
-                            let tab = ui.add(egui::Button::selectable(
-                                i == active,
-                                truncate_ellipsis(&title, 20),
-                            ));
+                            // Pinned tabs are compact: the favicon is the identity, so the
+                            // button carries no title (one glyph as a fallback if no icon).
+                            let label = if pinned {
+                                if has_icon {
+                                    String::new()
+                                } else {
+                                    title.chars().next().map(|c| c.to_string()).unwrap_or_default()
+                                }
+                            } else {
+                                truncate_ellipsis(&title, 20)
+                            };
+                            let tab = ui
+                                .add(egui::Button::selectable(i == active, label))
+                                .on_hover_text(&title);
                             if tab.clicked() && i != active {
                                 self.select_tab(i);
                             }
-                            if tab.middle_clicked() {
+                            if tab.middle_clicked() && !pinned {
                                 self.close_tab(i);
                                 break;
                             }
@@ -1107,6 +1129,12 @@ impl AppState {
                             tab.context_menu(|ui| {
                                 if ui.button("New tab").clicked() {
                                     menu_act = 1;
+                                }
+                                if ui
+                                    .button(if pinned { "Unpin tab" } else { "Pin tab" })
+                                    .clicked()
+                                {
+                                    menu_act = 4;
                                 }
                                 if ui.button("Close tab").clicked() {
                                     menu_act = 2;
@@ -1128,9 +1156,15 @@ impl AppState {
                                     self.close_others(i);
                                     break;
                                 }
+                                4 => {
+                                    self.toggle_pin(i);
+                                    break;
+                                }
                                 _ => {}
                             }
-                            if ui.add(egui::Button::new("×").frame(false)).clicked() {
+                            if !pinned
+                                && ui.add(egui::Button::new("×").frame(false)).clicked()
+                            {
                                 self.close_tab(i);
                                 break;
                             }
@@ -1571,6 +1605,7 @@ impl AppState {
                 favicon_pending: None,
                 favicon_tex: None,
                 crashed: false,
+                pinned: false,
             });
             tabs.len() - 1
         };
@@ -1607,8 +1642,12 @@ impl AppState {
             for (j, tab) in tabs.iter().enumerate() {
                 if j == i {
                     tab.webview.show();
+                    tab.webview.set_throttled(false);
                 } else {
+                    // Background tabs are hidden AND throttled — less CPU/battery for tabs you
+                    // aren't looking at (the anti-bloat pitch).
                     tab.webview.hide();
+                    tab.webview.set_throttled(true);
                 }
             }
             tabs[i].webview.focus();
@@ -1649,6 +1688,14 @@ impl AppState {
     }
 
     /// Close every tab except `keep` (tab context menu).
+    /// Toggle the pinned state of tab `i`.
+    fn toggle_pin(&self, i: usize) {
+        if let Some(t) = self.tabs.borrow_mut().get_mut(i) {
+            t.pinned = !t.pinned;
+        }
+        self.window.request_redraw();
+    }
+
     fn close_others(&self, keep: usize) {
         {
             let tabs = self.tabs.borrow();
@@ -1657,19 +1704,27 @@ impl AppState {
             }
             let mut closed = self.closed_tabs.borrow_mut();
             for (j, t) in tabs.iter().enumerate() {
-                if j != keep && !t.url.is_empty() {
+                if j != keep && !t.pinned && !t.url.is_empty() {
                     closed.push(t.url.clone());
                 }
             }
         }
-        {
+        let new_active = {
             let mut tabs = self.tabs.borrow_mut();
-            let kept = tabs.remove(keep);
-            tabs.clear();
-            tabs.push(kept);
-        }
-        self.active.set(0);
-        self.select_tab(0);
+            // Keep the target tab and any pinned tabs; drop the rest (order preserved).
+            let keep_flags: Vec<bool> =
+                (0..tabs.len()).map(|j| j == keep || tabs[j].pinned).collect();
+            let new_active = keep_flags[..=keep].iter().filter(|&&k| k).count() - 1;
+            let mut j = 0;
+            tabs.retain(|_| {
+                let k = keep_flags[j];
+                j += 1;
+                k
+            });
+            new_active
+        };
+        self.active.set(new_active);
+        self.select_tab(new_active);
         self.save_session();
     }
 
