@@ -52,3 +52,8 @@ rusqlite = "0.37"
 # Content blocking: Brave's adblock-rust — EasyList-syntax network filtering, checked in
 # load_web_resource (which already intercepts every request).
 adblock = { version = "0.12", default-features = false, features = ["embedded-domain-resolver"] }
+
+# OS keyring (Linux Secret Service) for remembering the sync passphrase. Optional at
+# runtime — all calls degrade to manual unlock if no secret-service is available.
+# Pure-rust crypto (no system OpenSSL dep); zbus is already in the cache transitively.
+keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }

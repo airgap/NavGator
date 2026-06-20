@@ -52,6 +52,7 @@ use navgator_protocol::IpcCommand;
 
 mod sync;
 mod password;
+mod keyring_store;
 use url::Url;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
@@ -380,6 +381,8 @@ struct Settings {
     sync_bookmarks: bool,
     sync_history: bool,
     sync_passwords: bool,
+    /// Remember the sync passphrase in the OS keyring (Secret Service) for auto-unlock.
+    remember_passphrase: bool,
     /// Block ads + trackers (adblock-rust). On by default — it's the pitch.
     block_ads: bool,
     /// Vertical tab strip (left SidePanel) instead of the horizontal top strip.
@@ -396,6 +399,7 @@ impl Default for Settings {
             sync_bookmarks: false,
             sync_history: false,
             sync_passwords: false,
+            remember_passphrase: false,
             block_ads: true,
             vertical_tabs: false,
         }
@@ -422,6 +426,7 @@ fn load_settings() -> Settings {
                     "sync_bookmarks" => s.sync_bookmarks = v.trim() == "true",
                     "sync_history" => s.sync_history = v.trim() == "true",
                     "sync_passwords" => s.sync_passwords = v.trim() == "true",
+                    "remember_passphrase" => s.remember_passphrase = v.trim() == "true",
                     "block_ads" => s.block_ads = v.trim() == "true",
                     "vertical_tabs" => s.vertical_tabs = v.trim() == "true",
                     _ => {}
@@ -440,7 +445,7 @@ fn save_settings(s: &Settings) {
         let _ = std::fs::write(
             &path,
             format!(
-                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nblock_ads={}\nvertical_tabs={}\n",
+                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nremember_passphrase={}\nblock_ads={}\nvertical_tabs={}\n",
                 s.search,
                 s.accent,
                 s.dark,
@@ -448,6 +453,7 @@ fn save_settings(s: &Settings) {
                 s.sync_bookmarks,
                 s.sync_history,
                 s.sync_passwords,
+                s.remember_passphrase,
                 s.block_ads,
                 s.vertical_tabs
             ),
@@ -2371,6 +2377,10 @@ impl AppState {
         let mut unlock_pass: Option<String> = None;
         let mut import_clicked = false;
         let mut default_clicked = false;
+        // Set to Some(on) when the "Remember passphrase in OS keyring" checkbox is toggled, so the
+        // keyring store/clear (which needs the password_store + settings borrows released) happens
+        // after the Settings window closure below rather than inside it.
+        let mut remember_toggled: Option<bool> = None;
         egui::Window::new("Settings")
             .collapsible(false)
             .resizable(false)
@@ -2557,6 +2567,18 @@ impl AppState {
                             self.show_settings.set(false);
                         }
                     });
+                    // Auto-unlock on launch via the OS keyring. Lock keeps the keyring entry (so a
+                    // relaunch auto-unlocks); only un-checking this box deletes it. Lock != Forget.
+                    if ui
+                        .checkbox(
+                            &mut s.remember_passphrase,
+                            "Remember passphrase in OS keyring",
+                        )
+                        .changed()
+                    {
+                        remember_toggled = Some(s.remember_passphrase);
+                        save_settings(&s);
+                    }
                 } else {
                     ui.label(
                         egui::RichText::new(
@@ -2573,6 +2595,18 @@ impl AppState {
                     if ui.button("Unlock").clicked() {
                         unlock_pass = Some(self.password_input.borrow().clone());
                     }
+                    // Gates future unlocks: when on, the next successful unlock (manual or
+                    // auto-on-launch) stores the passphrase in the OS keyring.
+                    if ui
+                        .checkbox(
+                            &mut s.remember_passphrase,
+                            "Remember passphrase in OS keyring",
+                        )
+                        .changed()
+                    {
+                        remember_toggled = Some(s.remember_passphrase);
+                        save_settings(&s);
+                    }
                 }
                 if let Some(msg) = self.password_msg.borrow().clone() {
                     ui.add_space(4.0);
@@ -2582,6 +2616,18 @@ impl AppState {
         if let Some(p) = unlock_pass {
             self.unlock_passwords(&p);
             self.password_input.borrow_mut().clear();
+        }
+        // Apply the "Remember passphrase" toggle outside the settings/store borrows. Turning it ON
+        // while already unlocked stores the live passphrase immediately; otherwise it'll be stored
+        // on the next unlock. Turning it OFF deletes the keyring entry ("Forget on this device").
+        if let Some(on) = remember_toggled {
+            if on {
+                if let Some(pass) = self.password_store.borrow().passphrase() {
+                    let _ = keyring_store::store(pass);
+                }
+            } else {
+                keyring_store::clear();
+            }
         }
         if import_clicked {
             self.import_browser_data();
@@ -3442,6 +3488,13 @@ impl AppState {
     /// Unlock the E2EE password store with the passphrase (decrypts saved logins into memory).
     fn unlock_passwords(&self, passphrase: &str) {
         let result = self.password_store.borrow_mut().unlock(passphrase);
+        // On a successful unlock, persist the passphrase to the OS keyring iff the user opted in.
+        // This is the only place (besides the checkbox-on path) the plaintext is written out, and
+        // it goes nowhere but the OS keyring. Failure is non-fatal — the user can unlock manually
+        // next time. The auto-unlock-at-launch path re-enters here, harmlessly re-storing.
+        if result.is_ok() && self.settings.borrow().remember_passphrase {
+            let _ = keyring_store::store(passphrase);
+        }
         let msg = match result {
             Ok(()) => format!(
                 "Password store unlocked ({} saved).",
@@ -3482,6 +3535,18 @@ impl AppState {
         let js = format!("({})({}, {})", AUTOFILL_JS, js_string(&user), js_string(&pass));
         webview.evaluate_javascript(js, |_| {});
     }
+
+    // (B) AUTO-OFFER-SAVE — deliberately NOT implemented for v1. A *secure* auto-offer is
+    // possible (reuse READ_FORM_JS, whose eval RESULT channel never touches page-readable
+    // storage), but a *reliable* submit TRIGGER is not cleanly available. The two viable triggers
+    // both fail the bar: (1) injecting a submit-listener that polls a page-readable sentinel
+    // global is fragile, and the post-submit navigation frequently tears down the form before
+    // READ_FORM_JS can run (the chained eval must itself be deferred via the CosmeticReady-style
+    // queue, adding a race); (2) reading on load-START of the next page is too late — the
+    // credentialed document is already gone. A clean, race-free trigger needs an engine event for
+    // form submission (a fork patch surfacing a "form submitted" EmbedderMsg re-exported through
+    // navgator-engine), which is out of scope here. So: ship the OS-keyring auto-unlock (A), keep
+    // the manual 🔑 save button below, and file the engine-patch follow-up.
 
     /// Read the active page's login form and save it to the (unlocked) store.
     fn save_login_active(&self) {
@@ -4174,6 +4239,16 @@ impl ApplicationHandler<WakeUp> for App {
             window,
         });
         *state.weak_self.borrow_mut() = Rc::downgrade(&state);
+
+        // Auto-unlock the password store from the OS keyring if the user opted in. Fully
+        // fallible-safe: `fetch()` returns None on any keyring problem (no secret-service,
+        // headless, NoEntry), so this never blocks or crashes startup. On a wrong/rotated stored
+        // value `unlock_passwords` returns Err, the store stays locked, and a non-fatal toast
+        // shows. This reuses the manual-unlock path, so autofill/save light up exactly as usual.
+        let remember = state.settings.borrow().remember_passphrase;
+        if remember && let Some(pass) = keyring_store::fetch() {
+            state.unlock_passwords(&pass);
+        }
 
         // Restore the previous session's tabs unless the user passed an explicit URL on the
         // command line (which takes precedence). A missing/empty/malformed session yields no

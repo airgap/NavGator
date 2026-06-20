@@ -103,6 +103,13 @@ impl PasswordStore {
         self.passphrase.is_some()
     }
 
+    /// The live passphrase while unlocked (`None` if locked). In-crate accessor used solely to
+    /// hand the plaintext to the OS keyring when "Remember passphrase" is toggled on while already
+    /// unlocked. The plaintext never leaves the process except into the OS keyring.
+    pub fn passphrase(&self) -> Option<&str> {
+        self.passphrase.as_deref()
+    }
+
     pub fn len(&self) -> usize {
         self.creds.len()
     }
