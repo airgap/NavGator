@@ -262,6 +262,15 @@ struct Bookmark {
     updated: i64,
 }
 
+/// A download recorded for the gator://downloads manager. The engine streams the file to disk
+/// (~/Downloads) and reports started/completed via the WebViewDelegate hooks.
+struct Download {
+    url: String,
+    path: String,
+    done: bool,
+    success: bool,
+}
+
 /// Persisted browsing profile (history + bookmarks), stored as TSV under the config dir.
 #[derive(Default)]
 struct Profile {
@@ -688,6 +697,9 @@ struct AppState {
     sync_cursor_history: Cell<i64>,
     sync_status: RefCell<String>,
     syncing: Cell<bool>,
+    /// Downloads (engine-streamed to ~/Downloads) + a transient toast for the latest one.
+    downloads: RefCell<Vec<Download>>,
+    download_toast: RefCell<Option<String>>,
     event_proxy: EventLoopProxy<WakeUp>,
     /// Declared last so the GL contexts (which borrow the window) drop before it.
     window: Window,
@@ -799,6 +811,49 @@ impl AppState {
             .replace("__CRASH_HREF__", &html_escape(href))
             .replace("__CRASH_URL__", &html_escape(shown_url))
             .replace("__CRASH_REASON__", &html_escape(reason));
+        self.themed(html)
+    }
+
+    /// Render the `gator://downloads` page: the session's downloads, newest first.
+    fn render_gator_downloads(&self) -> Vec<u8> {
+        let accent = self.settings.borrow().accent.clone();
+        let rows = {
+            let dl = self.downloads.borrow();
+            if dl.is_empty() {
+                "<p class=\"empty\">No downloads yet. Files you download are saved to ~/Downloads.</p>".to_string()
+            } else {
+                let mut out = String::new();
+                for d in dl.iter().rev() {
+                    let name = d.path.rsplit('/').next().unwrap_or(&d.path);
+                    let (cls, label) = if !d.done {
+                        ("run", "downloading…")
+                    } else if d.success {
+                        ("ok", "done")
+                    } else {
+                        ("err", "failed")
+                    };
+                    let letter = name
+                        .chars()
+                        .find(|c| c.is_alphanumeric())
+                        .map(|c| c.to_uppercase().to_string())
+                        .unwrap_or_else(|| "•".to_string());
+                    out.push_str(&format!(
+                        "<div class=\"row\"><span class=\"ico\">{}</span><div class=\"meta\">\
+                         <div class=\"name\">{}</div><div class=\"path\">{}</div></div>\
+                         <span class=\"state {}\">{}</span></div>",
+                        html_escape(&letter),
+                        html_escape(name),
+                        html_escape(&d.path),
+                        cls,
+                        label,
+                    ));
+                }
+                format!("<div class=\"list\">{out}</div>")
+            }
+        };
+        let html = include_str!("content/downloads.html")
+            .replace("__ACCENT__", &accent)
+            .replace("__ROWS__", &rows);
         self.themed(html)
     }
 
@@ -933,6 +988,42 @@ impl AppState {
                             ui.label(status);
                         });
                     });
+            }
+
+            // Download toast (bottom-right) — click to open gator://downloads.
+            let toast = self.download_toast.borrow().clone();
+            if let Some(toast) = toast {
+                let mut open_dl = false;
+                egui::Area::new(egui::Id::new("download_toast"))
+                    .order(egui::Order::Foreground)
+                    .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-12.0, -12.0))
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(
+                                        egui::Label::new(format!("↓  {toast}"))
+                                            .sense(egui::Sense::click()),
+                                    )
+                                    .clicked()
+                                {
+                                    open_dl = true;
+                                }
+                                if ui.small_button("×").clicked() {
+                                    *self.download_toast.borrow_mut() = None;
+                                }
+                            });
+                        });
+                    });
+                if open_dl {
+                    *self.download_toast.borrow_mut() = None;
+                    if let (Ok(url), Some(tab)) =
+                        (Url::parse("gator://downloads"), self.active_tab())
+                    {
+                        self.location_dirty.set(false);
+                        tab.load(url);
+                    }
+                }
             }
 
             // Find-in-page bar (Ctrl+F), floating top-right under the chrome.
@@ -2182,6 +2273,7 @@ impl WebViewDelegate for AppState {
             "welcome" | "newtab" | "home" => self.render_gator_welcome(),
             "history" => self.render_gator_history(),
             "about" => self.render_gator_about(),
+            "downloads" => self.render_gator_downloads(),
             "crash" => {
                 let mut crashed_url = String::new();
                 let mut reason = String::new();
@@ -2283,6 +2375,37 @@ impl WebViewDelegate for AppState {
             self.tabs.borrow_mut()[i].status_text = status;
             self.window.request_redraw();
         }
+    }
+
+    fn notify_download_started(&self, _webview: WebView, url: String, path: String) {
+        let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+        *self.download_toast.borrow_mut() = Some(format!("Downloading {name}…"));
+        self.downloads.borrow_mut().push(Download {
+            url,
+            path,
+            done: false,
+            success: false,
+        });
+        self.window.request_redraw();
+    }
+
+    fn notify_download_completed(&self, _webview: WebView, path: String, success: bool) {
+        let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+        *self.download_toast.borrow_mut() = Some(if success {
+            format!("Saved {name}")
+        } else {
+            format!("Download failed: {name}")
+        });
+        if let Some(d) = self
+            .downloads
+            .borrow_mut()
+            .iter_mut()
+            .find(|d| d.path == path)
+        {
+            d.done = true;
+            d.success = success;
+        }
+        self.window.request_redraw();
     }
 
     fn request_create_new(&self, _parent: WebView, request: CreateNewWebViewRequest) {
@@ -2527,6 +2650,8 @@ impl ApplicationHandler<WakeUp> for App {
             sync_cursor_history: Cell::new(sync_ch),
             sync_status: RefCell::new(String::new()),
             syncing: Cell::new(false),
+            downloads: RefCell::new(Vec::new()),
+            download_toast: RefCell::new(None),
             dialogs: RefCell::new(Vec::new()),
             closed_tabs: RefCell::new(Vec::new()),
             find_open: Cell::new(false),
@@ -2772,6 +2897,15 @@ impl ApplicationHandler<WakeUp> for App {
                         WinitKey::Character(c) if c.eq_ignore_ascii_case("h") => {
                             if let (Ok(url), Some(tab)) =
                                 (Url::parse("gator://history"), state.active_tab())
+                            {
+                                state.location_dirty.set(false);
+                                tab.load(url);
+                            }
+                            return;
+                        }
+                        WinitKey::Character(c) if c.eq_ignore_ascii_case("j") => {
+                            if let (Ok(url), Some(tab)) =
+                                (Url::parse("gator://downloads"), state.active_tab())
                             {
                                 state.location_dirty.set(false);
                                 tab.load(url);

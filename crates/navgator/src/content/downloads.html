@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Downloads · NavGator</title>
+<style>
+  :root { --accent: __ACCENT__; --bg:__BG__; --panel:__PANEL__; --line:__LINE__; --fg:__FG__; --muted:__MUTED__; }
+  * { box-sizing:border-box; }
+  html,body { height:100%; margin:0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display:flex; flex-direction:column; align-items:center;
+    padding: 7vh 24px 28px; min-height:100%;
+  }
+  .head { width:min(760px,94vw); margin:0 0 24px; }
+  h1 { font-size:34px; font-weight:800; letter-spacing:-1px; margin:0; }
+  h1 .g { color: var(--accent); }
+  .sub { color: var(--muted); margin:6px 0 0; font-size:14px; }
+  .list { width:min(760px,94vw); display:flex; flex-direction:column; gap:8px; }
+  .row {
+    display:flex; align-items:center; gap:14px;
+    background: var(--panel); border:1px solid var(--line); border-radius:11px;
+    padding:13px 16px; overflow:hidden;
+  }
+  .ico { flex:none; width:34px; height:34px; line-height:34px; text-align:center; border-radius:9px;
+    background: var(--line); color: var(--accent); font-weight:700; }
+  .meta { flex:1; min-width:0; }
+  .name { font-size:15px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .path { color: var(--muted); font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .state { flex:none; font-size:12px; font-weight:600; }
+  .state.ok { color:#3ecf8e; }
+  .state.err { color:#ff6b6b; }
+  .state.run { color: var(--muted); }
+  .empty { width:min(760px,94vw); color: var(--muted); font-size:14px;
+    background: var(--panel); border:1px solid var(--line); border-radius:12px; padding:28px; text-align:center; }
+  footer { margin-top:auto; padding-top:42px; color:var(--muted); font-size:12px; }
+  footer a { color: var(--muted); }
+</style>
+</head>
+<body>
+  <div class="head">
+    <h1>Nav<span class="g">Gator</span> downloads</h1>
+    <p class="sub">Files are saved to your <strong>~/Downloads</strong> folder.</p>
+  </div>
+  __ROWS__
+  <footer>gator://downloads &middot; <a href="gator://welcome">welcome</a></footer>
+</body>
+</html>
