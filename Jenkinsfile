@@ -169,6 +169,18 @@ pipeline {
                                   env LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe \
                                   timeout --signal=KILL 30 ./target/release/navgator || true
                             '''
+                            // Content-sandbox confinement gate: applies the production Landlock+seccomp
+                            // policy and asserts the negative-capability battery (unauthorized file read,
+                            // TCP connect, inet-socket creation all DENIED; exit 0 iff caged, no panic).
+                            // UNSTABLE-wrapped until every linux agent's Landlock (kernel >= 5.13) is
+                            // confirmed — per this file's 'UNSTABLE until green, then required' convention;
+                            // then drop the wrapper to make a broken/absent sandbox a hard FAILURE.
+                            catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                                sh '''
+                                    [ -f .ci-env ] && set -a && . ./.ci-env && set +a
+                                    ./target/release/navgator --sandbox-selftest
+                                '''
+                            }
                         }
                     }
                 }
