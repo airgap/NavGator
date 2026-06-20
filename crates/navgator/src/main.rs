@@ -77,6 +77,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let event_loop = EventLoop::with_user_event().build()?;
 
+    // Refresh the ad/tracker blocklists (EasyList/EasyPrivacy) in the background; the cached
+    // copies take effect on the next launch.
+    spawn_filter_update();
+
     let ipc_clients: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
     if let Ok(path) = env::var("NAVGATOR_IPC") {
         start_ipc(path, event_loop.create_proxy(), ipc_clients.clone());
@@ -302,6 +306,60 @@ fn config_file(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
     Some(base.join("navgator").join(name))
+}
+
+/// All adblock filter rules: the bundled starter list plus any cached EasyList / EasyPrivacy.
+fn load_filter_rules() -> Vec<String> {
+    let mut rules: Vec<String> = include_str!("content/blocklist.txt")
+        .lines()
+        .map(String::from)
+        .collect();
+    for name in ["easylist.txt", "easyprivacy.txt"] {
+        if let Some(text) = config_file(name).and_then(|p| std::fs::read_to_string(p).ok()) {
+            rules.extend(text.lines().map(String::from));
+        }
+    }
+    rules
+}
+
+/// Refresh the cached EasyList / EasyPrivacy in the background (best-effort), re-fetching any
+/// list that is missing or older than a week. The fresh lists take effect on the next launch.
+fn spawn_filter_update() {
+    std::thread::spawn(|| {
+        const WEEK: u64 = 7 * 24 * 60 * 60;
+        let lists = [
+            ("easylist.txt", "https://easylist.to/easylist/easylist.txt"),
+            (
+                "easyprivacy.txt",
+                "https://easylist.to/easylist/easyprivacy.txt",
+            ),
+        ];
+        for (name, url) in lists {
+            let Some(path) = config_file(name) else {
+                continue;
+            };
+            let fresh = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .map(|age| age.as_secs() < WEEK)
+                .unwrap_or(false);
+            if fresh {
+                continue;
+            }
+            if let Ok(resp) = ureq::get(url).call() {
+                if let Ok(body) = resp.into_string() {
+                    // sanity-check it's a real filter list, not an error/redirect page
+                    if body.len() > 10_000 && body.contains("[Adblock") {
+                        if let Some(dir) = path.parent() {
+                            let _ = std::fs::create_dir_all(dir);
+                        }
+                        let _ = std::fs::write(&path, body);
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// TSV cell sanitizer — fields can't contain the tab/newline separators.
@@ -3062,7 +3120,7 @@ impl ApplicationHandler<WakeUp> for App {
             sync_cursor_history: Cell::new(sync_ch),
             sync_cursor_passwords: Cell::new(sync_cp),
             adblock: adblock::Engine::from_rules(
-                include_str!("content/blocklist.txt").lines(),
+                load_filter_rules(),
                 adblock::lists::ParseOptions::default(),
             ),
             adblock_blocked: Cell::new(0),
