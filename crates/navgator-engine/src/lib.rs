@@ -17,6 +17,10 @@ pub use servo::{
     // Sandboxed multiprocess content: Opts carries the multiprocess/sandbox flags;
     // run_content_process is the entry point a re-exec'd content process hands off to.
     Opts, run_content_process,
+    // OS sandbox (Landlock + seccomp) production policy builders, re-exported from
+    // servo_constellation::sandbox_backend via servo. The --sandbox-selftest harness applies the
+    // SAME policy create_sandbox() uses (plan §13.5, no drift): apply_sandbox(&content_process_policy()).
+    SandboxOutcome, apply_sandbox, content_process_policy,
     // Userscript injection (UserContentManager-based) — gator-side feature, see main.rs.
     UserContentManager, UserScript,
     WebView, WebViewBuilder, WebViewDelegate,

@@ -42,6 +42,7 @@ use navgator_engine::{
     MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
     NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, Opts, PermissionRequest,
     PixelFormat, Preferences, RenderingContext, run_content_process,
+    SandboxOutcome, apply_sandbox, content_process_policy,
     RgbColor, SelectElement, SelectElementOptionOrOptgroup, Servo, ServoBuilder, SimpleDialog,
     UserContentManager, UserScript, WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder,
     WebViewDelegate, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
@@ -78,10 +79,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     {
         let mut a = std::env::args();
         a.next(); // argv[0]
-        if matches!(a.next().as_deref(), Some("--content-process")) {
-            let token = a.next().expect("--content-process requires an IPC token");
-            run_content_process(token);
-            return Ok(());
+        match a.next().as_deref() {
+            Some("--content-process") => {
+                let token = a.next().expect("--content-process requires an IPC token");
+                run_content_process(token);
+                return Ok(());
+            }
+            // M1/M2 confinement gate (plan §8.1/§13.5): self-applies the SAME production policy in
+            // this process, runs the negative-capability battery, exits 0 iff every hard gate denies.
+            Some("--sandbox-selftest") => run_sandbox_selftest(),
+            _ => {}
         }
     }
     rustls::crypto::aws_lc_rs::default_provider()
@@ -772,6 +779,148 @@ fn build_visuals(accent: egui::Color32, dark: bool) -> egui::Visuals {
 fn sandbox_enabled() -> bool {
     cfg!(all(target_os = "linux", target_arch = "x86_64"))
         && std::env::var_os("NAVGATOR_SANDBOX").is_some()
+}
+
+/// `--sandbox-selftest`: the deterministic, headless confinement gate (plan §8.1, §13.5).
+///
+/// Runs in a *real* process (not a `gator://` probe page, which would execute in the broker and
+/// falsely pass). It applies the **same** policy production uses — `apply_sandbox(
+/// &content_process_policy())`, the identical builders `create_sandbox()` calls in the engine — so
+/// there is no policy drift to test against. Then it runs the negative-capability battery and exits
+/// 0 iff every *hard* gate denies; otherwise 1 with a per-op report.
+///
+/// Hard gates: unauthorized file read (Landlock), TCP connect (Landlock), and AF_INET/UDP
+/// socket creation (seccomp Errno-enforce restricts socket() to AF_UNIX).
+/// Informational: process exec — execve is intentionally allowed (gst-plugin-scanner spawn,
+/// contained by Landlock exec-path + PR_SET_NO_NEW_PRIVS), not denied.
+fn run_sandbox_selftest() -> ! {
+    use std::io::Write as _;
+    use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
+    use std::time::Duration;
+
+    eprintln!("navgator --sandbox-selftest: applying production content-process policy");
+
+    // 1) Apply the EXACT production policy (same builders create_sandbox() uses).
+    let outcome: SandboxOutcome = apply_sandbox(&content_process_policy());
+    eprintln!("navgator --sandbox-selftest: sandbox outcome = {outcome:?}");
+
+    struct Probe {
+        name: &'static str,
+        hard: bool,
+        denied: bool,
+        detail: String,
+    }
+    let mut probes: Vec<Probe> = Vec::new();
+
+    // 2a) Unauthorized file reads -> expect Err (EACCES/EPERM under Landlock). HARD gate.
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    for path in [format!("{home}/.ssh/id_rsa"), "/etc/shadow".to_string()] {
+        let r = std::fs::File::open(&path);
+        let denied = r.is_err();
+        probes.push(Probe {
+            name: "file-read",
+            hard: true,
+            denied,
+            detail: match &r {
+                Ok(_) => format!("{path}: OPENED (leak!)"),
+                Err(e) => format!("{path}: {e}"),
+            },
+        });
+    }
+
+    // 2b) TCP connect -> expect Err (Landlock AccessNet::ConnectTcp handled, no allow rule). HARD.
+    {
+        let target = "1.1.1.1:80";
+        let result = target
+            .to_socket_addrs()
+            .map_err(|e| e.to_string())
+            .and_then(|mut addrs| {
+                addrs
+                    .next()
+                    .ok_or_else(|| "no addr".to_string())
+                    .and_then(|addr| {
+                        TcpStream::connect_timeout(&addr, Duration::from_millis(800))
+                            .map_err(|e| e.to_string())
+                    })
+            });
+        let denied = result.is_err();
+        probes.push(Probe {
+            name: "tcp-connect",
+            hard: true,
+            denied,
+            detail: match &result {
+                Ok(_) => format!("{target}: CONNECTED (leak!)"),
+                Err(e) => format!("{target}: {e}"),
+            },
+        });
+    }
+
+    // 2b-bis) INET socket *creation* -> expect Err (EPERM). HARD gate: proves seccomp
+    // restricts socket() to AF_UNIX, so content cannot even CREATE an AF_INET/UDP/raw
+    // socket (Landlock's AccessNet only denies TCP bind/connect, not the socket() call
+    // nor UDP/raw). UdpSocket::bind() does socket(AF_INET, SOCK_DGRAM) under the hood,
+    // which must now EPERM at the socket() syscall before any bind is attempted.
+    {
+        let result = UdpSocket::bind("127.0.0.1:0");
+        let denied = result.is_err();
+        probes.push(Probe {
+            name: "inet-socket",
+            hard: true,
+            denied,
+            detail: match &result {
+                Ok(_) => "UDP/AF_INET socket: CREATED (leak! socket() not AF_UNIX-restricted)"
+                    .to_string(),
+                Err(e) => format!("UDP/AF_INET bind: {e}"),
+            },
+        });
+    }
+
+    // 2c) Process exec -> INFORMATIONAL: execve is intentionally allowed (gst-plugin-scanner
+    //     spawn), contained by Landlock exec-path + PR_SET_NO_NEW_PRIVS, not seccomp-denied.
+    {
+        let result = std::process::Command::new("/bin/true").spawn();
+        let denied = result.is_err();
+        if let Ok(mut child) = result {
+            let _ = child.wait();
+        }
+        probes.push(Probe {
+            name: "process-exec",
+            hard: false,
+            denied,
+            detail: "/bin/true spawn (informational until seccomp enforce)".to_string(),
+        });
+    }
+
+    // 3) Report.
+    let stderr = std::io::stderr();
+    let mut w = stderr.lock();
+    let _ = writeln!(w, "\n=== navgator sandbox selftest ===");
+    let _ = writeln!(w, "sandbox outcome: {outcome:?}\n");
+    let mut all_hard_denied = true;
+    for p in &probes {
+        let verdict = if p.denied { "DENIED" } else { "ALLOWED" };
+        let tag = if p.hard {
+            if !p.denied {
+                all_hard_denied = false;
+            }
+            "[gate]"
+        } else {
+            "[info]"
+        };
+        let _ = writeln!(w, "  {tag:<6} {:<13} -> {verdict}   ({})", p.name, p.detail);
+    }
+    let _ = writeln!(
+        w,
+        "\nresult: {}",
+        if all_hard_denied {
+            "PASS (all hard gates denied)"
+        } else {
+            "FAIL (a forbidden op was ALLOWED)"
+        }
+    );
+    let _ = w.flush();
+
+    std::process::exit(if all_hard_denied { 0 } else { 1 });
 }
 
 /// NavGator's web-feature profile: turn on high-value APIs Servo ships disabled by default

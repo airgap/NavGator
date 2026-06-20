@@ -4,6 +4,31 @@
 > layer with a maintained, self-applied Rust sandbox (Landlock + seccompiler on
 > Linux), default-on for Linux x86-64 as the 1.0 bar. macOS and Windows are
 > post-1.0.
+
+## Implementation status (Linux x86-64)
+
+**M1 + M2 + enforce step 1 + hardening — DONE and verified on this AppArmor host
+(kernel 6.8, `apparmor_restrict_unprivileged_userns=1`, where gaol EPERM-panics):**
+
+- gaol replaced by `components/constellation/sandbox_backend.rs`: self-applied **Landlock**
+  (FS read rules via `path_beneath_rules` + `AccessNet` TCP-deny) + **seccompiler** filter.
+  Never panics on failure (the anti-gaol contract). gaol kept only on the macOS cfg branch.
+- seccomp default action is **`Errno(EPERM)` enforce** (not Log). Allow-list = §4.2 baseline +
+  empirically-harvested gaps + completeness syscalls; a `debug_assert` guards the deny-set.
+- `socket()` is **restricted to AF_UNIX** (own arg0 rule); inet/UDP/raw/netlink socket creation
+  EPERMs. `execve` allowed (GStreamer's gst-plugin-scanner) — contained by Landlock exec-path +
+  **`PR_SET_NO_NEW_PRIVS`** (the real boundary; voids set-uid), asserted via the no_new_privs check.
+- Landlock reports **`FullyEnforced`** (degraded=false).
+- `navgator --sandbox-selftest` PASS: file-read / TCP-connect / inet-socket all DENIED, no panic.
+  Real content (text + WebGL + IndexedDB + heavy JS) renders under enforce with no crash.
+- Fork commits on `airgap/swervo` branch `sandbox-landlock`, tip
+  `f753d89b4b2b23c10902505ff42c206e00e012c8` (push + rev-bump = the finalize).
+
+**Still OPT-IN** behind `NAVGATOR_SANDBOX` (engine multiprocess split is default-on). **Remaining
+before default-on (1.0 bar):** seccomp `Errno → Kill` ramp + multi-distro/kernel/GPU soak (the
+opt-in dogfood that gates default-on), `ioctl`/clone-flag arg-filtering (step 2), then flip the
+default + a `NAVGATOR_NO_SANDBOX` kill-switch. Cross-platform (macOS Seatbelt, Windows
+AppContainer) is post-1.0 (M4/M5).
 >
 > Fork checkout referenced throughout (rev `33abd93`):
 > `/home/nicole/.cargo/git/checkouts/swervo-2d3e259cb94efe40/33abd93/`
