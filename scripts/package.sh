@@ -34,8 +34,8 @@ _dopsec() {
   else doppler secrets get "$1" --project ci-deploy --config prd --plain 2>/dev/null || true; fi
 }
 
-# Sign (Developer ID Application + hardened runtime + JIT entitlements), notarize (Apple ID +
-# app-specific password) and staple the .app in place. Creds come from the environment, else from
+# Sign (Developer ID Application + hardened runtime + JIT entitlements), notarize (App Store
+# Connect API key) and staple the .app in place. Creds come from the environment, else from
 # Doppler ci-deploy/prd when a token is available. With no creds it logs and leaves the app UNSIGNED
 # (the build still succeeds, so credential-less dev builds keep working). Runs in a subshell so its
 # many fallible `security`/`xcrun` calls never abort the outer `set -e` build.
@@ -51,9 +51,9 @@ sign_and_notarize_macos() {
         DOP_TMPHOME="$(mktemp -d)"
         APPLE_CERTIFICATE_BASE64="$(_dopsec APPLE_CERTIFICATE_BASE64)"
         APPLE_CERTIFICATE_PASSWORD="$(_dopsec APPLE_CERTIFICATE_PASSWORD)"
-        APPLE_ID="$(_dopsec APPLE_ID)"
-        APPLE_APP_SPECIFIC_PASSWORD="$(_dopsec APPLE_APP_SPECIFIC_PASSWORD)"
-        APPLE_TEAM_ID="$(_dopsec APPLE_TEAM_ID)"
+        APPLE_API_KEY_ID="$(_dopsec APPLE_API_KEY_ID)"
+        APPLE_API_ISSUER_ID="$(_dopsec APPLE_API_ISSUER_ID)"
+        APPLE_API_KEY_P8="$(_dopsec APPLE_API_KEY_P8)"
         rm -rf "$DOP_TMPHOME"
       fi
     fi
@@ -63,7 +63,7 @@ sign_and_notarize_macos() {
       exit 0
     fi
     local can_notarize=1 v
-    for v in APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+    for v in APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8; do
       [ -n "${!v:-}" ] || { echo "macOS signing: $v missing — will codesign but NOT notarize (downloads still warn)." >&2; can_notarize=0; }
     done
 
@@ -94,16 +94,17 @@ sign_and_notarize_macos() {
     codesign --verify --strict --verbose=2 "$app" || echo "macOS signing: codesign --verify warned (continuing)." >&2
 
     if [ "$can_notarize" = 1 ]; then
-      local zipdir zip; zipdir="$(mktemp -d)"; zip="$zipdir/NavGator.zip"
+      local zipdir zip p8; zipdir="$(mktemp -d)"; zip="$zipdir/NavGator.zip"
+      p8="$(mktemp)"; printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$p8"; chmod 600 "$p8"
       ditto -c -k --keepParent "$app" "$zip"
       echo "macOS signing: submitting to notarytool (waits for Apple, up to 30m)…"
-      if xcrun notarytool submit "$zip" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
-           --password "$APPLE_APP_SPECIFIC_PASSWORD" --wait --timeout 30m; then
+      if xcrun notarytool submit "$zip" --key "$p8" --key-id "$APPLE_API_KEY_ID" \
+           --issuer "$APPLE_API_ISSUER_ID" --wait --timeout 30m; then
         xcrun stapler staple "$app" && xcrun stapler validate "$app" && echo "macOS signing: notarized + stapled ✓"
       else
         echo "macOS signing: notarization FAILED — signed but not notarized (downloads will warn)." >&2
       fi
-      rm -rf "$zipdir"
+      rm -f "$p8"; rm -rf "$zipdir"
     fi
     security delete-keychain "$kc" 2>/dev/null || true
     rm -rf "$kcdir"
