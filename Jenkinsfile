@@ -73,20 +73,42 @@ pipeline {
                     stage('Checkout') {
                         // Explicit, self-healing checkout (the implicit one is skipped). A corrupt
                         // or locked agent workspace ('.git appears to be corrupt', seen on the
-                        // mac-mini after aborted builds) wipes + re-clones instead of failing the
-                        // cell. Linux is the gate (plain checkout); macOS stays non-blocking.
+                        // mac-mini after abortPrevious kills a build mid-git-write). Linux is the
+                        // gate (plain checkout); macOS stays non-blocking and fast-probes .git first.
                         steps {
                             script {
                                 if (env.PLATFORM == 'linux') {
                                     checkout scm
                                 } else {
+                                    // The git plugin DOES recover from a corrupt .git by re-cloning —
+                                    // but only after its `git rev-parse` probe hangs the full 10-min
+                                    // git-client timeout (status 143). THAT was the per-push stall. So
+                                    // fast-probe .git ourselves (POSIX sleep/kill; macOS ships no
+                                    // `timeout`) and wipe ONLY .git when it's bad — keeps the warm
+                                    // target/ build cache. try/catch stays as a non-blocking backstop.
                                     catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                                        sh '''
+                                            if [ -d .git ]; then
+                                              ( git rev-parse --git-dir >/dev/null 2>&1 ) & probe=$!
+                                              ( sleep 30; kill -9 $probe 2>/dev/null ) & timer=$!
+                                              wait $probe 2>/dev/null; rc=$?
+                                              kill $timer 2>/dev/null || true
+                                              [ $rc -eq 0 ] || { echo "macOS checkout: .git corrupt/locked — wiping .git (keeps target/ cache)"; rm -rf .git; }
+                                            fi
+                                        '''
+                                        // A wedged mac-mini hangs not just `git rev-parse` but the
+                                        // recovery clone too (seen: 30+ min frozen at "Cloning
+                                        // repository"). Bound each attempt so a stuck git op can't eat
+                                        // the 180-min build timeout and jam the lone macOS executor:
+                                        // fail fast, nuke the whole workspace, re-clone once; if that
+                                        // also times out, catchError drops the cell to UNSTABLE
+                                        // (non-blocking) and the build moves on.
                                         try {
-                                            checkout scm
+                                            timeout(time: 8, unit: 'MINUTES') { checkout scm }
                                         } catch (err) {
-                                            echo "checkout failed (${err}); wiping workspace and re-cloning"
+                                            echo "checkout failed/timed out (${err}); nuking workspace and re-cloning"
                                             deleteDir()
-                                            checkout scm
+                                            timeout(time: 12, unit: 'MINUTES') { checkout scm }
                                         }
                                     }
                                 }
