@@ -33,8 +33,8 @@ pipeline {
         // Poll GitHub for new `dev` commits (a localhost Jenkins can't receive a
         // GitHub push webhook); GenericTrigger remains for when a webhook is wired.
         pollSCM('H/5 * * * *')
-        // Nightly full run (TimerTrigger): the macOS matrix cell + the Upstream canary, both
-        // gated below on `triggeredBy 'TimerTrigger'`. Per-push (SCM) builds stay Linux-only/fast.
+        // Nightly TimerTrigger now drives just the Upstream canary (gated below); macOS builds
+        // on every push again, so it's no longer nightly-gated.
         cron('H 3 * * *')
         GenericTrigger(
             genericVariables: [
@@ -63,18 +63,11 @@ pipeline {
                     // here when the runner is online; the windows build branches remain below.
                     axis { name 'PLATFORM'; values 'linux', 'macos' }
                 }
-                // macOS off the per-push hot path: it's a ~1-2h engine build and the matrix
-                // waits for every cell, so per-push builds appeared "stuck for hours". Linux (the
-                // gate) always runs; macOS runs only on the nightly TimerTrigger or on-demand
-                // (params.MACOS). `beforeAgent` so a skipped macOS cell never grabs the mac-mini.
-                when {
-                    beforeAgent true
-                    anyOf {
-                        expression { env.PLATFORM != 'macos' }
-                        triggeredBy 'TimerTrigger'
-                        expression { return params.MACOS == true }
-                    }
-                }
+                // macOS builds on every push again: sccache + warm ~/.cargo make the repeat
+                // engine build fast, and the per-push stall that once justified nightly-only is
+                // now handled by disableConcurrentBuilds(abortPrevious) + the self-healing
+                // checkout below — not by skipping macOS. Linux stays the required gate; macOS is
+                // non-blocking (UNSTABLE) until green.
                 agent { label "${PLATFORM}" }
                 stages {
                     stage('Checkout') {
