@@ -76,7 +76,8 @@ Darwin)
     mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
     cp "$BIN" "$APP/Contents/MacOS/navgator"; stage_resources "$APP/Contents/MacOS"
     sed "s/0\.1\.0/$VERSION/g" packaging/Info.plist > "$APP/Contents/Info.plist"
-    cp packaging/navgator.png "$APP/Contents/Resources/" 2>/dev/null || true
+    # macOS uses the .icns named by CFBundleIconFile (Info.plist) — a bare PNG is ignored.
+    cp packaging/navgator.icns "$APP/Contents/Resources/" 2>/dev/null || true
     tar -C "$DIST" -czf "$DIST/navgator-$VERSION-macos-$ARCH.tar.gz" NavGator.app
 
     # dmg
