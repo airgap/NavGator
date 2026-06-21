@@ -24,12 +24,18 @@ pipeline {
         // "appears to be corrupt", failing the next checkout. One build at a time, supersede
         // cleanly; the engine build is ~1-2h so racing several is pure waste anyway.
         disableConcurrentBuilds(abortPrevious: true)
+        // Each matrix cell does its own self-healing checkout (see the Checkout stage), so a
+        // corrupt agent workspace re-clones instead of failing — disable the implicit checkout.
+        skipDefaultCheckout(true)
     }
 
     triggers {
         // Poll GitHub for new `dev` commits (a localhost Jenkins can't receive a
         // GitHub push webhook); GenericTrigger remains for when a webhook is wired.
         pollSCM('H/5 * * * *')
+        // Nightly full run (TimerTrigger): the macOS matrix cell + the Upstream canary, both
+        // gated below on `triggeredBy 'TimerTrigger'`. Per-push (SCM) builds stay Linux-only/fast.
+        cron('H 3 * * *')
         GenericTrigger(
             genericVariables: [
                 [key: 'ref', value: '$.ref'],
@@ -57,8 +63,44 @@ pipeline {
                     // here when the runner is online; the windows build branches remain below.
                     axis { name 'PLATFORM'; values 'linux', 'macos' }
                 }
+                // macOS off the per-push hot path: it's a ~1-2h engine build and the matrix
+                // waits for every cell, so per-push builds appeared "stuck for hours". Linux (the
+                // gate) always runs; macOS runs only on the nightly TimerTrigger or on-demand
+                // (params.MACOS). `beforeAgent` so a skipped macOS cell never grabs the mac-mini.
+                when {
+                    beforeAgent true
+                    anyOf {
+                        expression { env.PLATFORM != 'macos' }
+                        triggeredBy 'TimerTrigger'
+                        expression { return params.MACOS == true }
+                    }
+                }
                 agent { label "${PLATFORM}" }
                 stages {
+                    stage('Checkout') {
+                        // Explicit, self-healing checkout (the implicit one is skipped). A corrupt
+                        // or locked agent workspace ('.git appears to be corrupt', seen on the
+                        // mac-mini after aborted builds) wipes + re-clones instead of failing the
+                        // cell. Linux is the gate (plain checkout); macOS stays non-blocking.
+                        steps {
+                            script {
+                                if (env.PLATFORM == 'linux') {
+                                    checkout scm
+                                } else {
+                                    catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                                        try {
+                                            checkout scm
+                                        } catch (err) {
+                                            echo "checkout failed (${err}); wiping workspace and re-cloning"
+                                            deleteDir()
+                                            checkout scm
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     stage('Toolchain') {
                         steps {
                             script {
@@ -222,6 +264,7 @@ pipeline {
             agent { label 'linux' }
             when { anyOf { triggeredBy 'TimerTrigger'; expression { params.CANARY == true } } }
             steps {
+                checkout scm
                 catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
                     sh 'bash scripts/sync-forks.sh --check'
                 }
