@@ -804,6 +804,19 @@ fn run_sandbox_selftest() -> ! {
     let outcome: SandboxOutcome = apply_sandbox(&content_process_policy());
     eprintln!("navgator --sandbox-selftest: sandbox outcome = {outcome:?}");
 
+    // The Landlock+seccomp backend is Linux x86-64 only; elsewhere apply_sandbox is a no-op stub
+    // (macOS/Windows OS confinement, if any, flows through a different backend). With nothing
+    // confined the negative-capability battery below would falsely "leak", so skip it cleanly and
+    // exit 0 rather than reporting a confusing failure. (`cfg!` keeps the battery + its imports
+    // compiled on every platform — no unused-import / unreachable warnings.)
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        eprintln!(
+            "navgator --sandbox-selftest: no Landlock+seccomp backend on this platform \
+             (Linux x86-64 only) — nothing to assert; skipping."
+        );
+        std::process::exit(0);
+    }
+
     struct Probe {
         name: &'static str,
         hard: bool,
