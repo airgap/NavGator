@@ -17,6 +17,13 @@ pipeline {
         ansiColor('xterm')
         buildDiscarder(logRotator(numToKeepStr: '20'))
         timeout(time: 180, unit: 'MINUTES')
+        // A new dev push aborts the prior still-running build rather than piling up a 2nd
+        // concurrent build. The pile-up was the root of the "jamming": two builds spawned a
+        // 2nd mac-mini workspace (navgator-ci@2), contended the single macOS executor, and
+        // forced manual mid-build aborts — and an abort mid-git-write leaves the workspace
+        // "appears to be corrupt", failing the next checkout. One build at a time, supersede
+        // cleanly; the engine build is ~1-2h so racing several is pure waste anyway.
+        disableConcurrentBuilds(abortPrevious: true)
     }
 
     triggers {
