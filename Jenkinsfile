@@ -74,39 +74,25 @@ pipeline {
                         // Explicit, self-healing checkout (the implicit one is skipped). A corrupt
                         // or locked agent workspace ('.git appears to be corrupt', seen on the
                         // mac-mini after abortPrevious kills a build mid-git-write). Linux is the
-                        // gate (plain checkout); macOS stays non-blocking and fast-probes .git first.
+                        // gate (plain checkout); macOS stays non-blocking and time-bounded.
                         steps {
                             script {
                                 if (env.PLATFORM == 'linux') {
                                     checkout scm
                                 } else {
-                                    // The git plugin DOES recover from a corrupt .git by re-cloning —
-                                    // but only after its `git rev-parse` probe hangs the full 10-min
-                                    // git-client timeout (status 143). THAT was the per-push stall. So
-                                    // fast-probe .git ourselves (POSIX sleep/kill; macOS ships no
-                                    // `timeout`) and wipe ONLY .git when it's bad — keeps the warm
-                                    // target/ build cache. try/catch stays as a non-blocking backstop.
+                                    // No sh step here: durable-task's sh control-dir setup hangs if the
+                                    // agent's storage is wedged (seen: InterruptedException in
+                                    // FilePath.mkdirs ~5 min in, killing the cell and the whole build).
+                                    // Pure git-plugin + deleteDir steps avoid that. The git plugin
+                                    // self-heals a corrupt .git by re-cloning; the timeouts bound its
+                                    // 10-min `git rev-parse` probe so a bad workspace can't stall the
+                                    // build, and catchError keeps a macOS checkout failure non-blocking
+                                    // (UNSTABLE). Re-clone once into a nuked workspace on the first stall.
                                     catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
-                                        sh '''
-                                            if [ -d .git ]; then
-                                              ( git rev-parse --git-dir >/dev/null 2>&1 ) & probe=$!
-                                              ( sleep 30; kill -9 $probe 2>/dev/null ) & timer=$!
-                                              wait $probe 2>/dev/null; rc=$?
-                                              kill $timer 2>/dev/null || true
-                                              [ $rc -eq 0 ] || { echo "macOS checkout: .git corrupt/locked — wiping .git (keeps target/ cache)"; rm -rf .git; }
-                                            fi
-                                        '''
-                                        // A wedged mac-mini hangs not just `git rev-parse` but the
-                                        // recovery clone too (seen: 30+ min frozen at "Cloning
-                                        // repository"). Bound each attempt so a stuck git op can't eat
-                                        // the 180-min build timeout and jam the lone macOS executor:
-                                        // fail fast, nuke the whole workspace, re-clone once; if that
-                                        // also times out, catchError drops the cell to UNSTABLE
-                                        // (non-blocking) and the build moves on.
                                         try {
                                             timeout(time: 8, unit: 'MINUTES') { checkout scm }
                                         } catch (err) {
-                                            echo "checkout failed/timed out (${err}); nuking workspace and re-cloning"
+                                            echo "macOS checkout failed/timed out (${err}); nuking workspace and re-cloning"
                                             deleteDir()
                                             timeout(time: 12, unit: 'MINUTES') { checkout scm }
                                         }

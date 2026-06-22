@@ -178,7 +178,14 @@ Darwin)
 
     tar -C "$DIST" -czf "$DIST/navgator-$VERSION-macos-$ARCH.tar.gz" NavGator.app
 
-    # dmg
+    # dmg. create-dmg attaches a scratch volume named 'navgator' and detaches it when done — but
+    # if Jenkins SIGKILLs the build mid-package (abortPrevious), the detach never runs and the
+    # mount leaks. Accumulated stale mounts jam diskarbitrationd until even mkdirs hangs and the
+    # agent wedges. SIGKILL can't be trapped, so reap any stale 'navgator' mount up front; this
+    # bounds the leak to at most the one in-flight build.
+    for v in /Volumes/navgator*; do
+        [ -d "$v" ] && hdiutil detach -force "$v" >/dev/null 2>&1 || true
+    done
     if command -v create-dmg >/dev/null; then
         create-dmg --volname navgator --skip-jenkins "$DIST/navgator-$VERSION-macos-$ARCH.dmg" "$APP" \
             || hdiutil create -volname navgator -srcfolder "$APP" -ov -format UDZO "$DIST/navgator-$VERSION-macos-$ARCH.dmg"
