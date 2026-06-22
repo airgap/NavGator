@@ -9,7 +9,7 @@ description = "The only navgator crate that touches the Servo fork — quarantin
 [dependencies]
 # ── Servo embedding (our maintained fork; see docs/FORK.md, ROADMAP §R2) ──────
 # This is the ONLY crate that depends on the engine, so engine churn is isolated
-# here. `servo` is the high-level embedding crate. rev f753d89 (branch sandbox-landlock on
+# here. `servo` is the high-level embedding crate. rev 05aed18 (branch sandbox-landlock on
 # airgap/swervo) carries our fork patches: the UA rebrand + Content-Disposition attachment
 # downloads (ParserContext streams to ~/Downloads + Download EmbedderMsg/delegate) + the
 # content sandbox (gaol -> Landlock + seccomp; sandbox_backend.rs, applied in create_sandbox).
@@ -17,11 +17,11 @@ description = "The only navgator crate that touches the Servo fork — quarantin
 # (baked-in-resources, clipboard, js_jit); `media-gstreamer` is added so <video>/<audio>
 # decode via GStreamer (requires libgstreamer1.0-dev + plugins; engine-gap.md Tier-0 #1).
 # The stylo and webrender forks are wired via the workspace-root `[patch]` tables.
-servo = { git = "https://github.com/airgap/swervo", rev = "f753d89b4b2b23c10902505ff42c206e00e012c8", features = ["media-gstreamer"] }
+servo = { git = "https://github.com/airgap/swervo", rev = "05aed18b97f15e317e12fac47222689e96be6324", features = ["media-gstreamer"] }
 
 # servo-embedder-traits (lib name `embedder_traits`): EventLoopWaker lives here and
 # isn't re-exported by `servo`. Same rev as `servo`.
-embedder_traits = { git = "https://github.com/airgap/swervo", rev = "f753d89b4b2b23c10902505ff42c206e00e012c8", package = "servo-embedder-traits" }
+embedder_traits = { git = "https://github.com/airgap/swervo", rev = "05aed18b97f15e317e12fac47222689e96be6324", package = "servo-embedder-traits" }
 
 # `http` (HeaderMap/StatusCode/HeaderValue) — needed to build WebResourceResponse for the
 # gator:// internal-page interception. Unifies with the engine's own http (servo uses 1.x).
