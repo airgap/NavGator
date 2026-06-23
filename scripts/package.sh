@@ -221,6 +221,21 @@ Darwin)
         echo "macOS icon: no actool (needs full Xcode) — Tahoe will show the legacy plate (.icns only)." >&2
     fi
 
+    # Make the .app self-contained: copy GStreamer + every non-system dylib the engine links
+    # (plus the curated plugins libservo loads from <exe>/lib at runtime) into Contents/MacOS/lib
+    # with @executable_path/lib install names. Without this the download crashes at launch on any
+    # machine lacking Homebrew GStreamer ("Library not loaded: …/libgstplay-1.0.0.dylib"). Must
+    # run BEFORE signing so codesign --deep seals the bundled dylibs.
+    if command -v otool >/dev/null 2>&1 && [ -f scripts/macos-bundle-gst.py ]; then
+        GSTLIBS="/opt/homebrew/lib"; [ -d "$GSTLIBS/gstreamer-1.0" ] || GSTLIBS="$(brew --prefix 2>/dev/null)/lib"
+        PLUGLISTS="$(ls -d "$HOME"/.cargo/git/checkouts/swervo-*/*/components/servo/gstreamer_plugin_lists 2>/dev/null | head -1)"
+        python3 scripts/macos-bundle-gst.py --binary "$APP/Contents/MacOS/navgator" \
+            --lib-dir "$APP/Contents/MacOS/lib" --gst-libs "$GSTLIBS" --plugin-lists "${PLUGLISTS:-}" \
+            || echo "macOS: GStreamer dylib bundling failed — the downloaded app may crash on launch." >&2
+    else
+        echo "macOS: skipping GStreamer bundling (otool/bundler missing) — app may need Homebrew." >&2
+    fi
+
     # Developer ID sign + notarize + staple in place (no-op + warning if creds absent), BEFORE
     # packaging so both the .tar.gz and .dmg carry the signed, stapled app.
     sign_and_notarize_macos "$APP"
