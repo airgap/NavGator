@@ -29,9 +29,18 @@ stage_resources() {
 
 # --- macOS Developer ID signing + notarization -------------------------------------------
 # Fetch one secret from Doppler ci-deploy/prd (isolated HOME, same source as publish.sh).
+# Retries on empty: a transient doppler hiccup under build load would otherwise return
+# "" (errors are swallowed), and an empty APPLE_CERTIFICATE_PASSWORD silently breaks the
+# cert import ("cert import failed (wrong password?)") with no real password problem.
 _dopsec() {
-  if [ -n "${DOP_TOKEN:-}" ]; then HOME="$DOP_TMPHOME" DOPPLER_TOKEN="$DOP_TOKEN" doppler secrets get "$1" --project ci-deploy --config prd --plain 2>/dev/null || true
-  else doppler secrets get "$1" --project ci-deploy --config prd --plain 2>/dev/null || true; fi
+  local _v _i
+  for _i in 1 2 3 4 5; do
+    if [ -n "${DOP_TOKEN:-}" ]; then _v="$(HOME="$DOP_TMPHOME" DOPPLER_TOKEN="$DOP_TOKEN" doppler secrets get "$1" --project ci-deploy --config prd --plain 2>/dev/null)"
+    else _v="$(doppler secrets get "$1" --project ci-deploy --config prd --plain 2>/dev/null)"; fi
+    [ -n "$_v" ] && { printf '%s' "$_v"; return 0; }
+    sleep 2
+  done
+  return 0
 }
 
 # Sign (Developer ID Application + hardened runtime + JIT entitlements), notarize (App Store
