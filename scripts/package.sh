@@ -89,7 +89,10 @@ sign_and_notarize_macos() {
     if ! _imperr="$(security import "$cert" -f pkcs12 -k "$kc" -P "${APPLE_CERTIFICATE_PASSWORD:-}" -T /usr/bin/codesign 2>&1)"; then
       echo "macOS signing: cert import failed — ${_imperr} — unsigned." >&2; security delete-keychain "$kc"; rm -f "$cert"; exit 0
     fi
-    security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kpw" "$kc" >/dev/null 2>&1
+    # Authorize codesign to use the imported key without a GUI prompt (headless agent). If this
+    # silently fails the signing dies later with the opaque "errSecInternalComponent", so log it.
+    _plerr="$(security set-key-partition-list -S apple-tool:,apple: -s -k "$kpw" "$kc" 2>&1)" \
+      || echo "macOS signing: set-key-partition-list WARNING — ${_plerr}" >&2
     rm -f "$cert"
 
     local identity
