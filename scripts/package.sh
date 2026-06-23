@@ -83,8 +83,9 @@ sign_and_notarize_macos() {
     security create-keychain -p "$kpw" "$kc" || { echo "macOS signing: create-keychain failed — unsigned." >&2; exit 0; }
     security set-keychain-settings -lut 21600 "$kc"
     security unlock-keychain -p "$kpw" "$kc"
-    security import "$cert" -k "$kc" -P "${APPLE_CERTIFICATE_PASSWORD:-}" -T /usr/bin/codesign >/dev/null \
-      || { echo "macOS signing: cert import failed (wrong APPLE_CERTIFICATE_PASSWORD?) — unsigned." >&2; security delete-keychain "$kc"; rm -f "$cert"; exit 0; }
+    echo "macOS signing DEBUG: HOME=[${HOME:-UNSET}] cwd=$(pwd) cert_chars=${#APPLE_CERTIFICATE} pw_chars=${#APPLE_CERTIFICATE_PASSWORD} p12_bytes=$(wc -c < "$cert" | tr -d ' ')" >&2
+    _imperr="$(security import "$cert" -k "$kc" -P "${APPLE_CERTIFICATE_PASSWORD:-}" -T /usr/bin/codesign 2>&1)" \
+      || { echo "macOS signing: cert import failed — security: ${_imperr} — unsigned." >&2; security delete-keychain "$kc"; rm -f "$cert"; exit 0; }
     security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kpw" "$kc" >/dev/null 2>&1
     rm -f "$cert"
 
