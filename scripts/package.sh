@@ -93,9 +93,14 @@ sign_and_notarize_macos() {
     rm -f "$cert"
 
     local identity
-    identity="$(security find-identity -v -p codesigning "$kc" | grep -m1 'Developer ID Application' | sed -E 's/^[^"]*"([^"]+)".*/\1/')"
+    # No -v: in this isolated keychain the Apple root isn't in the validation context, so a
+    # valid Developer ID cert reads as "invalid" and -v hides it. codesign embeds the .p12's
+    # intermediates and the chain is validated against Apple's anchors at notarize time, so the
+    # bare identity is what we want. Log what's actually present if we still can't find it.
+    identity="$(security find-identity -p codesigning "$kc" | grep -m1 'Developer ID Application' | sed -E 's/^[^"]*"([^"]+)".*/\1/')"
     if [ -z "$identity" ]; then
-      echo "macOS signing: cert has no 'Developer ID Application' identity (App Store cert?) — unsigned." >&2
+      echo "macOS signing: no 'Developer ID Application' identity in keychain — unsigned. Present:" >&2
+      security find-identity -p codesigning "$kc" >&2
       security delete-keychain "$kc"; exit 0
     fi
     echo "macOS signing: identity = $identity"
