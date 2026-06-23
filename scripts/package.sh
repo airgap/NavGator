@@ -195,6 +195,32 @@ Darwin)
         exit 1
     fi
 
+    # macOS 26 (Tahoe) ignores the raster .icns and reads CFBundleIconName -> an
+    # AppIcon in a compiled Assets.car. Build it from the Icon Composer .icon with
+    # actool (FULL XCODE only — Command Line Tools have no actool). Where actool is
+    # absent (e.g. a CLT-only dev box) we skip this and Tahoe falls back to the
+    # legacy .icns on its grey "squircle jail" plate. Must run BEFORE signing so the
+    # Assets.car + Info.plist change get sealed by codesign.
+    ACTOOL="$(xcrun --find actool 2>/dev/null || true)"
+    if [ -n "$ACTOOL" ] && [ -d packaging/navgator.icon ]; then
+        CARDIR="$(mktemp -d)"
+        if "$ACTOOL" packaging/navgator.icon --compile "$CARDIR" --app-icon navgator \
+              --enable-on-demand-resources NO --development-region en \
+              --target-device mac --platform macosx \
+              --enable-icon-stack-fallback-generation=disabled --include-all-app-icons \
+              --minimum-deployment-target 10.14 --output-partial-info-plist /dev/null >/dev/null 2>&1 \
+           && [ -f "$CARDIR/Assets.car" ]; then
+            cp "$CARDIR/Assets.car" "$APP/Contents/Resources/Assets.car"
+            plutil -replace CFBundleIconName -string navgator "$APP/Contents/Info.plist"
+            echo "macOS icon: Assets.car compiled (Tahoe squircle) + navgator.icns (pre-Tahoe) ✓"
+        else
+            echo "macOS icon: actool failed — Tahoe will show the legacy plate (.icns only)." >&2
+        fi
+        rm -rf "$CARDIR"
+    else
+        echo "macOS icon: no actool (needs full Xcode) — Tahoe will show the legacy plate (.icns only)." >&2
+    fi
+
     # Developer ID sign + notarize + staple in place (no-op + warning if creds absent), BEFORE
     # packaging so both the .tar.gz and .dmg carry the signed, stapled app.
     sign_and_notarize_macos "$APP"
