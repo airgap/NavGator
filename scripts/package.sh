@@ -43,13 +43,13 @@ sign_and_notarize_macos() {
   ( set +e
     local app="$1"
 
-    if [ -z "${APPLE_CERTIFICATE_BASE64:-}" ]; then
+    if [ -z "${APPLE_CERTIFICATE:-}" ]; then
       DOP_TOKEN="${DOPPLER_TOKEN:-}"
       [ -z "$DOP_TOKEN" ] && [ -f /etc/default/jenkins-doppler ] \
         && DOP_TOKEN="$(grep '^DOPPLER_TOKEN_CI_DEPLOY=' /etc/default/jenkins-doppler | cut -d= -f2)"
       if command -v doppler >/dev/null; then   # token from env/file, else the doppler CLI's own login
         DOP_TMPHOME="$(mktemp -d)"
-        APPLE_CERTIFICATE_BASE64="$(_dopsec APPLE_CERTIFICATE_BASE64)"
+        APPLE_CERTIFICATE="$(_dopsec APPLE_CERTIFICATE)"
         APPLE_CERTIFICATE_PASSWORD="$(_dopsec APPLE_CERTIFICATE_PASSWORD)"
         APPLE_API_KEY_ID="$(_dopsec APPLE_API_KEY_ID)"
         APPLE_API_ISSUER_ID="$(_dopsec APPLE_API_ISSUER_ID)"
@@ -58,8 +58,8 @@ sign_and_notarize_macos() {
       fi
     fi
 
-    if [ -z "${APPLE_CERTIFICATE_BASE64:-}" ]; then
-      echo "macOS signing: no Apple cert (APPLE_CERTIFICATE_BASE64) — shipping UNSIGNED; downloads will hit Gatekeeper." >&2
+    if [ -z "${APPLE_CERTIFICATE:-}" ]; then
+      echo "macOS signing: no Apple cert (APPLE_CERTIFICATE) — shipping UNSIGNED; downloads will hit Gatekeeper." >&2
       exit 0
     fi
     local can_notarize=1 v
@@ -70,7 +70,7 @@ sign_and_notarize_macos() {
     # Import the Developer ID cert into a throwaway keychain (referenced directly; search list untouched).
     local kcdir kc kpw cert
     kcdir="$(mktemp -d)"; kc="$kcdir/navgator-sign.keychain-db"; kpw="navgator-$$-${RANDOM}"; cert="$(mktemp)"
-    printf '%s' "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$cert"
+    printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$cert"
     security create-keychain -p "$kpw" "$kc" || { echo "macOS signing: create-keychain failed — unsigned." >&2; exit 0; }
     security set-keychain-settings -lut 21600 "$kc"
     security unlock-keychain -p "$kpw" "$kc"
