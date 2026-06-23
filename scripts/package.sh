@@ -83,9 +83,12 @@ sign_and_notarize_macos() {
     security create-keychain -p "$kpw" "$kc" || { echo "macOS signing: create-keychain failed — unsigned." >&2; exit 0; }
     security set-keychain-settings -lut 21600 "$kc"
     security unlock-keychain -p "$kpw" "$kc"
-    echo "macOS signing DEBUG: HOME=[${HOME:-UNSET}] cwd=$(pwd) cert_chars=${#APPLE_CERTIFICATE} pw_chars=${#APPLE_CERTIFICATE_PASSWORD} p12_bytes=$(wc -c < "$cert" | tr -d ' ')" >&2
-    _imperr="$(security import "$cert" -k "$kc" -P "${APPLE_CERTIFICATE_PASSWORD:-}" -T /usr/bin/codesign 2>&1)" \
-      || { echo "macOS signing: cert import failed — security: ${_imperr} — unsigned." >&2; security delete-keychain "$kc"; rm -f "$cert"; exit 0; }
+    # -f pkcs12: security import infers format from the file EXTENSION, and $cert is an
+    # extension-less mktemp file — without this it fails "Unknown format in import" even
+    # with a perfectly valid .p12 + password. Surface the real security error if it fails.
+    if ! _imperr="$(security import "$cert" -f pkcs12 -k "$kc" -P "${APPLE_CERTIFICATE_PASSWORD:-}" -T /usr/bin/codesign 2>&1)"; then
+      echo "macOS signing: cert import failed — ${_imperr} — unsigned." >&2; security delete-keychain "$kc"; rm -f "$cert"; exit 0
+    fi
     security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kpw" "$kc" >/dev/null 2>&1
     rm -f "$cert"
 
