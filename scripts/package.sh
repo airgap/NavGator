@@ -105,9 +105,16 @@ sign_and_notarize_macos() {
     fi
     echo "macOS signing: identity = $identity"
 
-    if ! codesign --force --deep --options runtime --timestamp \
-        --entitlements packaging/macos-entitlements.plist --sign "$identity" --keychain "$kc" "$app"; then
-      echo "macOS signing: codesign FAILED — unsigned." >&2; security delete-keychain "$kc"; exit 0
+    # codesign resolves the signing identity via the keychain SEARCH LIST, not just --keychain,
+    # so temporarily put the throwaway keychain at the front of the list (restored right after) —
+    # otherwise "The specified item could not be found in the keychain" even though it's there.
+    _origlist="$(security list-keychains -d user | sed -E 's/[[:space:]]*"//g')"
+    security list-keychains -d user -s "$kc" $_origlist >/dev/null 2>&1
+    _cserr="$(codesign --force --deep --options runtime --timestamp \
+        --entitlements packaging/macos-entitlements.plist --sign "$identity" --keychain "$kc" "$app" 2>&1)"; _csrc=$?
+    security list-keychains -d user -s $_origlist >/dev/null 2>&1
+    if [ "$_csrc" != 0 ]; then
+      echo "macOS signing: codesign FAILED — ${_cserr} — unsigned." >&2; security delete-keychain "$kc"; exit 0
     fi
     codesign --verify --strict --verbose=2 "$app" || echo "macOS signing: codesign --verify warned (continuing)." >&2
 
