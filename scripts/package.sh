@@ -76,48 +76,44 @@ sign_and_notarize_macos() {
       [ -n "${!v:-}" ] || { echo "macOS signing: $v missing — will codesign but NOT notarize (downloads still warn)." >&2; can_notarize=0; }
     done
 
-    # Import the Developer ID cert into a throwaway keychain (referenced directly; search list untouched).
-    local kcdir kc kpw cert
-    kcdir="$(mktemp -d)"; kc="$kcdir/navgator-sign.keychain-db"; kpw="navgator-$$-${RANDOM}"; cert="$(mktemp)"
+    # Import the Developer ID cert into a keychain in the STANDARD ~/Library/Keychains location
+    # and make it the default. A keychain in a temp dir does NOT integrate with codesign's trust
+    # evaluation: the chain won't build to the Apple root, `find-identity -v` shows nothing, and
+    # codesign dies with the opaque "errSecInternalComponent". Standard location + default fixes
+    # all of it (this is what Tauri's signer does). The trap restores the prior default keychain
+    # and deletes ours on every exit path.
+    local kc kpw cert origdef
+    kc="navgator-sign-$$.keychain"; kpw="navgator-$$-${RANDOM}"; cert="$(mktemp)"
+    origdef="$(security default-keychain -d user | sed -E 's/[[:space:]]*"//g')"
+    trap 'security default-keychain -s "$origdef" 2>/dev/null; security delete-keychain "$kc" 2>/dev/null; rm -f "$cert"' EXIT
     printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$cert"
     security create-keychain -p "$kpw" "$kc" || { echo "macOS signing: create-keychain failed — unsigned." >&2; exit 0; }
+    security default-keychain -s "$kc"
     security set-keychain-settings -lut 21600 "$kc"
     security unlock-keychain -p "$kpw" "$kc"
-    # -f pkcs12: security import infers format from the file EXTENSION, and $cert is an
-    # extension-less mktemp file — without this it fails "Unknown format in import" even
-    # with a perfectly valid .p12 + password. Surface the real security error if it fails.
+    # -f pkcs12: $cert is an extension-less mktemp file; without it security can't infer the
+    # PKCS#12 format ("Unknown format in import"). Surface the real error on failure.
     if ! _imperr="$(security import "$cert" -f pkcs12 -k "$kc" -P "${APPLE_CERTIFICATE_PASSWORD:-}" -T /usr/bin/codesign 2>&1)"; then
-      echo "macOS signing: cert import failed — ${_imperr} — unsigned." >&2; security delete-keychain "$kc"; rm -f "$cert"; exit 0
+      echo "macOS signing: cert import failed — ${_imperr} — unsigned." >&2; exit 0
     fi
-    # Authorize codesign to use the imported key without a GUI prompt (headless agent). If this
-    # silently fails the signing dies later with the opaque "errSecInternalComponent", so log it.
-    _plerr="$(security set-key-partition-list -S apple-tool:,apple: -s -k "$kpw" "$kc" 2>&1)" \
-      || echo "macOS signing: set-key-partition-list WARNING — ${_plerr}" >&2
+    # Let codesign use the key without a GUI prompt (headless agent).
+    security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kpw" "$kc" >/dev/null 2>&1 \
+      || echo "macOS signing: set-key-partition-list warning (continuing)." >&2
     rm -f "$cert"
 
     local identity
-    # No -v: in this isolated keychain the Apple root isn't in the validation context, so a
-    # valid Developer ID cert reads as "invalid" and -v hides it. codesign embeds the .p12's
-    # intermediates and the chain is validated against Apple's anchors at notarize time, so the
-    # bare identity is what we want. Log what's actually present if we still can't find it.
-    identity="$(security find-identity -p codesigning "$kc" | grep -m1 'Developer ID Application' | sed -E 's/^[^"]*"([^"]+)".*/\1/')"
+    identity="$(security find-identity -v -p codesigning "$kc" | grep -m1 'Developer ID Application' | sed -E 's/^[^"]*"([^"]+)".*/\1/')"
     if [ -z "$identity" ]; then
-      echo "macOS signing: no 'Developer ID Application' identity in keychain — unsigned. Present:" >&2
-      security find-identity -p codesigning "$kc" >&2
-      security delete-keychain "$kc"; exit 0
+      echo "macOS signing: no valid 'Developer ID Application' identity — unsigned. Present:" >&2
+      security find-identity -p codesigning "$kc" >&2; exit 0
     fi
     echo "macOS signing: identity = $identity"
 
-    # codesign resolves the signing identity via the keychain SEARCH LIST, not just --keychain,
-    # so temporarily put the throwaway keychain at the front of the list (restored right after) —
-    # otherwise "The specified item could not be found in the keychain" even though it's there.
-    _origlist="$(security list-keychains -d user | sed -E 's/[[:space:]]*"//g')"
-    security list-keychains -d user -s "$kc" $_origlist >/dev/null 2>&1
+    # $kc is the default keychain, so codesign resolves the identity without --keychain.
     _cserr="$(codesign --force --deep --options runtime --timestamp \
-        --entitlements packaging/macos-entitlements.plist --sign "$identity" --keychain "$kc" "$app" 2>&1)"; _csrc=$?
-    security list-keychains -d user -s $_origlist >/dev/null 2>&1
+        --entitlements packaging/macos-entitlements.plist --sign "$identity" "$app" 2>&1)"; _csrc=$?
     if [ "$_csrc" != 0 ]; then
-      echo "macOS signing: codesign FAILED — ${_cserr} — unsigned." >&2; security delete-keychain "$kc"; exit 0
+      echo "macOS signing: codesign FAILED — ${_cserr} — unsigned." >&2; exit 0
     fi
     codesign --verify --strict --verbose=2 "$app" || echo "macOS signing: codesign --verify warned (continuing)." >&2
 
@@ -134,8 +130,7 @@ sign_and_notarize_macos() {
       fi
       rm -f "$p8"; rm -rf "$zipdir"
     fi
-    security delete-keychain "$kc" 2>/dev/null || true
-    rm -rf "$kcdir"
+    # keychain + default-keychain restore handled by the EXIT trap above
   )
   return 0
 }
