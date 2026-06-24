@@ -464,6 +464,14 @@ fn color_hex(c: egui::Color32) -> String {
     format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
 }
 
+/// True only for a strict CSS hex color (`#rgb` or `#rrggbb`). The legacy `accent` string is
+/// interpolated raw into a `<style>` block on the privileged gator:// pages, so anything looser
+/// (e.g. `#x}</style><script>…`) would be a stored-XSS vector — reject it at every write site.
+fn is_hex_color(s: &str) -> bool {
+    matches!(s.strip_prefix('#'),
+        Some(x) if (x.len() == 3 || x.len() == 6) && x.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// Mirror the live `theme` into the legacy `accent`/`dark` fields the gator://
 /// pages read, so internal pages follow the chrome theme without changes.
 fn sync_legacy_theme(s: &mut Settings) {
@@ -485,7 +493,8 @@ fn load_settings() -> Settings {
             if let Some((k, v)) = line.split_once('=') {
                 match k.trim() {
                     "search" => s.search = v.trim().to_string(),
-                    "accent" => s.accent = v.trim().to_string(),
+                    // Reject a poisoned persisted accent on load too (defense in depth for XSS).
+                    "accent" if is_hex_color(v.trim()) => s.accent = v.trim().to_string(),
                     "dark" => s.dark = v.trim() == "true",
                     "sync_api_key" => s.sync_api_key = v.trim().to_string(),
                     "sync_bookmarks" => s.sync_bookmarks = v.trim() == "true",
@@ -1471,6 +1480,10 @@ fn js_string(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '<' => out.push_str("\\u003c"),
+            // U+2028/U+2029 are string-literal line terminators in pre-ES2019 engines (matches
+            // js_escape in userscripts.rs).
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
             _ => out.push(c),
         }
     }
@@ -2145,7 +2158,8 @@ impl AppState {
                     }
                 }
                 SettingsApply::Accent(v) => {
-                    if v.starts_with('#') {
+                    // Strict hex only — this lands raw in a gator:// page <style> block (XSS guard).
+                    if is_hex_color(&v) {
                         s.accent = v;
                         changed = true;
                     }
@@ -4048,7 +4062,7 @@ impl AppState {
         let mut dialogs = self.dialogs.borrow_mut();
         let mut i = 0;
         while i < dialogs.len() {
-            if self.draw_one_dialog(ctx, &mut dialogs[i]) {
+            if self.draw_one_dialog(ctx, i, &mut dialogs[i]) {
                 i += 1;
             } else {
                 dialogs.remove(i);
@@ -4056,9 +4070,12 @@ impl AppState {
         }
     }
 
-    /// Render one overlay; returns false when it has been resolved (and should be removed).
-    fn draw_one_dialog(&self, ctx: &egui::Context, dialog: &mut Dialog) -> bool {
+    /// Render one overlay; returns false when it has been resolved (and should be removed). `idx`
+    /// is the dialog's queue position — used to give each window a unique egui Id so two dialogs
+    /// of the same kind (two alerts, two auth prompts) don't collide into one ambiguous window.
+    fn draw_one_dialog(&self, ctx: &egui::Context, idx: usize, dialog: &mut Dialog) -> bool {
         let center = egui::Align2::CENTER_CENTER;
+        let win_id = egui::Id::new(("nav_dialog", idx));
         match dialog {
             Dialog::Simple {
                 kind,
@@ -4072,7 +4089,7 @@ impl AppState {
                     SimpleKind::Confirm => "Confirm",
                     SimpleKind::Prompt => "Prompt",
                 };
-                egui::Window::new(title)
+                egui::Window::new(title).id(win_id)
                     .collapsible(false)
                     .resizable(false)
                     .anchor(center, egui::vec2(0.0, 0.0))
@@ -4112,7 +4129,7 @@ impl AppState {
                 handle,
             } => {
                 let mut keep = true;
-                egui::Window::new("Authentication required")
+                egui::Window::new("Authentication required").id(win_id)
                     .collapsible(false)
                     .resizable(false)
                     .anchor(center, egui::vec2(0.0, 0.0))
@@ -4145,7 +4162,7 @@ impl AppState {
             }
             Dialog::Select { options, handle } => {
                 let mut keep = true;
-                egui::Window::new("Select")
+                egui::Window::new("Select").id(win_id)
                     .collapsible(false)
                     .resizable(false)
                     .anchor(center, egui::vec2(0.0, 0.0))
@@ -4178,7 +4195,7 @@ impl AppState {
             }
             Dialog::Color { hex, handle } => {
                 let mut keep = true;
-                egui::Window::new("Choose a color")
+                egui::Window::new("Choose a color").id(win_id)
                     .collapsible(false)
                     .resizable(false)
                     .anchor(center, egui::vec2(0.0, 0.0))
@@ -4253,7 +4270,7 @@ impl AppState {
             }
             Dialog::Permission { message, handle } => {
                 let mut keep = true;
-                egui::Window::new("Permission request")
+                egui::Window::new("Permission request").id(win_id)
                     .collapsible(false)
                     .resizable(false)
                     .anchor(center, egui::vec2(0.0, 0.0))
@@ -4285,7 +4302,7 @@ impl AppState {
                 perms_human,
             } => {
                 let mut keep = true;
-                egui::Window::new("Enable userscript?")
+                egui::Window::new("Enable userscript?").id(win_id)
                     .collapsible(false)
                     .resizable(false)
                     .anchor(center, egui::vec2(0.0, 0.0))
@@ -4363,7 +4380,15 @@ impl AppState {
     }
 
     fn push_dialog(&self, d: Dialog) {
-        self.dialogs.borrow_mut().push(d);
+        {
+            let mut dialogs = self.dialogs.borrow_mut();
+            // Cap the page-driven queue so a misbehaving page (`for(;;)alert()`) can't grow it
+            // unbounded or make the render loop draw hundreds of overlay windows per frame.
+            if dialogs.len() >= 32 {
+                return;
+            }
+            dialogs.push(d);
+        }
         self.window.request_redraw();
     }
 
@@ -4907,7 +4932,13 @@ impl AppState {
             }
             let url = tabs[i].url.clone();
             if !url.is_empty() {
-                self.closed_tabs.borrow_mut().push(url);
+                let mut ct = self.closed_tabs.borrow_mut();
+                ct.push(url);
+                // Bounded "recently closed" stack (reopen with Ctrl+Shift+T).
+                let n = ct.len();
+                if n > 25 {
+                    ct.drain(0..n - 25);
+                }
             }
             tabs.remove(i); // dropping the WebView handle closes the webview
         }
@@ -6819,7 +6850,21 @@ mod adblock_tests {
 
 #[cfg(test)]
 mod chrome_helper_tests {
-    use super::{color_hex, favicon_hue, parse_session};
+    use super::{color_hex, favicon_hue, is_hex_color, parse_session};
+
+    #[test]
+    fn is_hex_color_rejects_injection() {
+        assert!(is_hex_color("#fff"));
+        assert!(is_hex_color("#5b8cff"));
+        assert!(is_hex_color("#ABC123"));
+        // The XSS vector this guards: a value that breaks out of the gator:// page <style>.
+        assert!(!is_hex_color("#fff}</style><script>alert(1)</script>"));
+        assert!(!is_hex_color("#fffe")); // 4 hex digits
+        assert!(!is_hex_color("#xyz")); // non-hex
+        assert!(!is_hex_color("red")); // no leading #
+        assert!(!is_hex_color("#"));
+        assert!(!is_hex_color(""));
+    }
 
     #[test]
     fn parse_session_flat_and_split() {
