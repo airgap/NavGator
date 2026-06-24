@@ -9,6 +9,10 @@
 # Comment this out if you decide to commit a pinned lockfile.
 # /Cargo.lock
 
+# Local machine build env — pins LIBCLANG_PATH for this box's mixed llvm-18/21
+# (mozangle/bindgen otherwise picks the wrong libclang). Linux-specific; not for CI/mac.
+/.cargo/config.toml
+
 # Editor / OS noise
 .DS_Store
 *.swp

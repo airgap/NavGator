@@ -57,3 +57,6 @@ adblock = { version = "0.12", default-features = false, features = ["embedded-do
 # runtime — all calls degrade to manual unlock if no secret-service is available.
 # Pure-rust crypto (no system OpenSSL dep); zbus is already in the cache transitively.
 keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+
+# Local date/time for the native new-tab dashboard clock (already in the lock via the engine).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

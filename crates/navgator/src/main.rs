@@ -54,6 +54,12 @@ use navgator_protocol::IpcCommand;
 mod sync;
 mod password;
 mod keyring_store;
+mod theme;
+mod fonts;
+mod widgets;
+mod studio;
+mod palette;
+mod dashboard;
 use url::Url;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
@@ -62,6 +68,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WinitKey, NamedKey};
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
+use std::collections::HashMap;
 
 /// Width of the invisible window-edge band (logical px) that starts a resize on the
 /// borderless window — OS decorations are off, so we hit-test it and `drag_resize_window`.
@@ -404,10 +411,14 @@ struct Settings {
     remember_passphrase: bool,
     /// Block ads + trackers (adblock-rust). On by default — it's the pitch.
     block_ads: bool,
-    /// Vertical tab strip (left SidePanel) instead of the horizontal top strip.
-    vertical_tabs: bool,
     /// New-tab page wallpaper (image URL); empty = the plain themed background.
     wallpaper: String,
+    /// The live-customization chrome theme (OKLCH base/accent, density, fonts,
+    /// radius, glass, tab placement). The single source of truth for the chrome
+    /// look; `accent`/`dark` above are kept in sync from it for the gator:// pages.
+    theme: theme::Theme,
+    /// New-tab dashboard widget toggles (Studio "New-tab modules" section).
+    modules: theme::Modules,
 }
 
 impl Default for Settings {
@@ -422,10 +433,23 @@ impl Default for Settings {
             sync_passwords: false,
             remember_passphrase: false,
             block_ads: true,
-            vertical_tabs: false,
             wallpaper: String::new(),
+            theme: theme::Theme::default(),
+            modules: theme::Modules::default(),
         }
     }
+}
+
+/// Format an egui color as a `#rrggbb` string (for the gator:// page palette).
+fn color_hex(c: egui::Color32) -> String {
+    format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
+}
+
+/// Mirror the live `theme` into the legacy `accent`/`dark` fields the gator://
+/// pages read, so internal pages follow the chrome theme without changes.
+fn sync_legacy_theme(s: &mut Settings) {
+    s.accent = color_hex(s.theme.palette().accent);
+    s.dark = !s.theme.base.is_light();
 }
 
 fn settings_path() -> Option<PathBuf> {
@@ -450,13 +474,68 @@ fn load_settings() -> Settings {
                     "sync_passwords" => s.sync_passwords = v.trim() == "true",
                     "remember_passphrase" => s.remember_passphrase = v.trim() == "true",
                     "block_ads" => s.block_ads = v.trim() == "true",
-                    "vertical_tabs" => s.vertical_tabs = v.trim() == "true",
                     "wallpaper" => s.wallpaper = v.trim().to_string(),
+                    "th_base" => {
+                        if let Some(b) = theme::Base::from_key(v.trim()) {
+                            s.theme.base = b;
+                        }
+                    }
+                    "th_accent" => {
+                        if let Some(a) = theme::Accent::from_key(v.trim()) {
+                            s.theme.accent = a;
+                        }
+                    }
+                    "th_density" => {
+                        if let Some(d) = theme::Density::from_key(v.trim()) {
+                            s.theme.density = d;
+                        }
+                    }
+                    "th_font" => {
+                        if let Some(f) = theme::FontChoice::from_key(v.trim()) {
+                            s.theme.font = f;
+                        }
+                    }
+                    "th_tabpos" => {
+                        if let Some(p) = theme::TabPos::from_key(v.trim()) {
+                            s.theme.tab_pos = p;
+                        }
+                    }
+                    "th_wallpaper" => {
+                        if let Some(w) = theme::Wallpaper::from_key(v.trim()) {
+                            s.theme.wallpaper = w;
+                        }
+                    }
+                    "th_tabfit" => {
+                        if let Some(f) = theme::TabFit::from_key(v.trim()) {
+                            s.theme.tab_fit = f;
+                        }
+                    }
+                    "th_radius" => {
+                        if let Ok(n) = v.trim().parse::<u8>() {
+                            s.theme.radius = n.min(30);
+                        }
+                    }
+                    "th_glass" => {
+                        if let Ok(n) = v.trim().parse::<u8>() {
+                            s.theme.glass = n.min(60);
+                        }
+                    }
+                    "th_tabmaxw" => {
+                        if let Ok(n) = v.trim().parse::<u16>() {
+                            s.theme.tab_max_w = n.clamp(120, 340);
+                        }
+                    }
+                    "mod_clock" => s.modules.clock = v.trim() == "true",
+                    "mod_search" => s.modules.search = v.trim() == "true",
+                    "mod_sites" => s.modules.sites = v.trim() == "true",
+                    "mod_notes" => s.modules.notes = v.trim() == "true",
+                    "mod_feed" => s.modules.feed = v.trim() == "true",
                     _ => {}
                 }
             }
         }
     }
+    sync_legacy_theme(&mut s);
     s
 }
 
@@ -468,7 +547,7 @@ fn save_settings(s: &Settings) {
         let _ = std::fs::write(
             &path,
             format!(
-                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nremember_passphrase={}\nblock_ads={}\nvertical_tabs={}\nwallpaper={}\n",
+                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nremember_passphrase={}\nblock_ads={}\nwallpaper={}\nth_base={}\nth_accent={}\nth_density={}\nth_font={}\nth_tabpos={}\nth_wallpaper={}\nth_tabfit={}\nth_radius={}\nth_glass={}\nth_tabmaxw={}\nmod_clock={}\nmod_search={}\nmod_sites={}\nmod_notes={}\nmod_feed={}\n",
                 s.search,
                 s.accent,
                 s.dark,
@@ -478,8 +557,22 @@ fn save_settings(s: &Settings) {
                 s.sync_passwords,
                 s.remember_passphrase,
                 s.block_ads,
-                s.vertical_tabs,
-                s.wallpaper
+                s.wallpaper,
+                s.theme.base.key(),
+                s.theme.accent.key(),
+                s.theme.density.key(),
+                s.theme.font.key(),
+                s.theme.tab_pos.key(),
+                s.theme.wallpaper.key(),
+                s.theme.tab_fit.key(),
+                s.theme.radius,
+                s.theme.glass,
+                s.theme.tab_max_w,
+                s.modules.clock,
+                s.modules.search,
+                s.modules.sites,
+                s.modules.notes,
+                s.modules.feed,
             ),
         );
     }
@@ -655,6 +748,33 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// A stable hue (0..360) for a tab's generated favicon square, derived from its title/url
+/// via FNV-1a — so a given site always gets the same color.
+fn favicon_hue(s: &str) -> f32 {
+    let mut h: u32 = 2166136261;
+    for b in s.bytes() {
+        h = (h ^ b as u32).wrapping_mul(16777619);
+    }
+    (h % 360) as f32
+}
+
+/// Current local-time strings for the new-tab dashboard clock: uppercase
+/// `Weekday, Month D`, `HH:MM AM/PM`, and an hour-based greeting.
+fn dash_clock() -> dashboard::DashClock {
+    use chrono::{Local, Timelike};
+    let now = Local::now();
+    let greeting = match now.hour() {
+        5..=11 => "Good morning",
+        12..=17 => "Good afternoon",
+        _ => "Good evening",
+    };
+    dashboard::DashClock {
+        date: now.format("%A, %B %-d").to_string().to_uppercase(),
+        time: now.format("%-I:%M %p").to_string(),
+        greeting,
+    }
+}
+
 fn load_profile() -> Profile {
     let mut p = Profile::default();
     if let Some(text) = config_file("history.tsv").and_then(|p| std::fs::read_to_string(p).ok()) {
@@ -736,38 +856,6 @@ fn suggestions(history: &[HistoryEntry], query: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Parse a `#rrggbb` accent into an egui color (Color32 has no hex constructor).
-fn accent_color32(hex: &str) -> egui::Color32 {
-    let s = hex.trim().trim_start_matches('#');
-    if s.len() == 6 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        if let (Ok(r), Ok(g), Ok(b)) = (
-            u8::from_str_radix(&s[0..2], 16),
-            u8::from_str_radix(&s[2..4], 16),
-            u8::from_str_radix(&s[4..6], 16),
-        ) {
-            return egui::Color32::from_rgb(r, g, b);
-        }
-    }
-    egui::Color32::from_rgb(0x5b, 0x8c, 0xff)
-}
-
-/// Build the chrome's egui visuals from the user's accent + dark/light choice.
-fn build_visuals(accent: egui::Color32, dark: bool) -> egui::Visuals {
-    let mut v = if dark {
-        egui::Visuals::dark()
-    } else {
-        egui::Visuals::light()
-    };
-    let tint = |a: u8| egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), a);
-    v.selection.bg_fill = tint(120);
-    v.selection.stroke = egui::Stroke::new(1.0, accent);
-    v.hyperlink_color = accent;
-    v.text_cursor.stroke = egui::Stroke::new(2.0, accent);
-    v.widgets.hovered.weak_bg_fill = tint(40);
-    v.widgets.active.weak_bg_fill = tint(90);
-    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent);
-    v
-}
 
 /// Whether to *additionally* OS-confine content processes (gaol: user-namespace + chroot +
 /// seccomp) on top of multiprocess isolation. gaol 0.2.1 **hard-panics the constellation** when
@@ -1221,6 +1309,39 @@ struct Tab {
     /// Pinned tabs sort ahead of the rest, render compact (favicon only), have no close
     /// button, and survive "close other tabs".
     pinned: bool,
+    /// Whether the omnibar star is filled for this tab (bookmark-style toggle).
+    starred: bool,
+}
+
+/// One independent pane group: its own tab list, active tab, and offscreen FBO. The browser
+/// has one pane group normally, two when split (each with its own strip + navigation +
+/// back/forward history). All the per-pane tab state lives here so the chrome code can operate
+/// on `pane(i)` uniformly.
+struct PaneGroup {
+    /// The offscreen FBO this pane's webviews render into (one per pane so two can show at once).
+    context: Rc<OffscreenRenderingContext>,
+    /// This pane's content area device-px size, to skip redundant resizes.
+    content_px: Cell<(u32, u32)>,
+    /// This pane's tabs and the active index within them.
+    tabs: RefCell<Vec<Tab>>,
+    active: Cell<usize>,
+    /// Tab index being drag-reordered within this pane (None when idle).
+    drag_tab: Cell<Option<usize>>,
+    /// One-shot: scroll the active tab into view on the next strip draw.
+    scroll_active_into_view: Cell<bool>,
+}
+
+impl PaneGroup {
+    fn new(context: Rc<OffscreenRenderingContext>) -> Self {
+        Self {
+            context,
+            content_px: Cell::new((0, 0)),
+            tabs: RefCell::new(Vec::new()),
+            active: Cell::new(0),
+            drag_tab: Cell::new(None),
+            scroll_active_into_view: Cell::new(false),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1286,55 +1407,20 @@ enum TabAction {
     NewTab,
     /// Toggle horizontal/vertical tab orientation (from the context menu).
     ToggleOrientation,
+    /// Pop this tab out into a brand-new OS window (closes it here, reopens its URL there).
+    PopOut(usize),
 }
 
-struct AppState {
+/// Browser-global state shared by every window via `Rc<BrowserState>`: the single Servo engine
+/// and the app-wide services (settings, profile, adblock, Lyku sync, passwords, downloads, IPC).
+/// One instance for the whole process; each window's `AppState` holds a clone of the `Rc`.
+struct BrowserState {
     servo: Servo,
     /// Shared UserContentManager carrying every loaded userscript; cloned (Rc) onto each
     /// new tab/popup WebView so scripts inject on all pages. None when no *.js userscripts exist.
     userscripts: Option<Rc<UserContentManager>>,
     /// Count of loaded userscripts, shown in Settings (cheap, read once at startup).
     userscripts_count: usize,
-    window_context: Rc<WindowRenderingContext>,
-    content_context: Rc<OffscreenRenderingContext>,
-    egui: RefCell<EguiGlow>,
-    /// Height (logical px) of the egui chrome panels; the page begins below this.
-    toolbar_height: Cell<f32>,
-    /// Logical-px width of the left vertical-tabs SidePanel (0 when horizontal); the page
-    /// begins to the right of this. Mirrors `toolbar_height` for the x axis.
-    content_left: Cell<f32>,
-    /// The content webviews' current device-px size (page area), to avoid redundant resizes.
-    content_px: Cell<(u32, u32)>,
-    /// Underlying tab index currently being drag-reordered (None when not dragging).
-    drag_tab: Cell<Option<usize>>,
-    /// Set when the active tab changes; the tab strip consumes it to scroll the active tab
-    /// into view exactly once (not every frame, which would fight the user's own scrolling).
-    scroll_active_into_view: Cell<bool>,
-    tabs: RefCell<Vec<Tab>>,
-    active: Cell<usize>,
-    /// Address-bar text + whether the user has edited it without navigating.
-    location: RefCell<String>,
-    location_dirty: Cell<bool>,
-    /// Ctrl+L sets this; the next egui frame focuses + selects the address bar.
-    focus_omnibox: Cell<bool>,
-    /// Whether the native settings window is open.
-    show_settings: Cell<bool>,
-    /// Active native overlays (dialogs, pickers, context menu).
-    dialogs: RefCell<Vec<Dialog>>,
-    /// URLs of recently-closed tabs, for Ctrl+Shift+T (reopen most-recent).
-    closed_tabs: RefCell<Vec<String>>,
-    /// Find-in-page (Ctrl+F) state.
-    find_open: Cell<bool>,
-    find_query: RefCell<String>,
-    find_matches: Cell<usize>,
-    find_active: Cell<usize>,
-    find_focus: Cell<bool>,
-    fullscreen: Cell<bool>,
-    scale: Cell<f64>,
-    cursor: Cell<(f64, f64)>,
-    ctrl: Cell<bool>,
-    shift: Cell<bool>,
-    weak_self: RefCell<Weak<AppState>>,
     ipc_clients: Arc<Mutex<Vec<UnixStream>>>,
     settings: RefCell<Settings>,
     /// Persisted history + bookmarks.
@@ -1361,6 +1447,63 @@ struct AppState {
     /// Result of the last bookmark import (shown in Settings).
     import_msg: RefCell<Option<String>>,
     event_proxy: EventLoopProxy<WakeUp>,
+    /// URLs queued to open in brand-new OS windows (Ctrl+N / tab pop-out); drained by the
+    /// event loop on the next redraw, which can create windows (it owns the `windows` map).
+    pending_windows: RefCell<Vec<Url>>,
+}
+
+/// Per-window state: its OS window, render contexts, egui, panes/tabs, and all chrome/overlay
+/// state. Holds an `Rc<BrowserState>` for the shared engine + services. One per OS window;
+/// `AppState` IS the `WebViewDelegate` for the webviews it builds.
+struct AppState {
+    /// The shared browser-global engine + services.
+    browser: Rc<BrowserState>,
+    window_context: Rc<WindowRenderingContext>,
+    content_context: Rc<OffscreenRenderingContext>,
+    egui: RefCell<EguiGlow>,
+    /// Height (logical px) of the egui chrome panels; the page begins below this.
+    toolbar_height: Cell<f32>,
+    /// Logical-px width of the left vertical-tabs SidePanel (0 when horizontal); the page
+    /// begins to the right of this. Mirrors `toolbar_height` for the x axis.
+    content_left: Cell<f32>,
+    /// Logical-px width of the right-hand Studio panel (0 when closed); the page ends to the
+    /// left of this. Mirrors `content_left` for the right edge.
+    content_right: Cell<f32>,
+    /// The two pane groups. `pane0` is always present; `pane1` is populated only while `split`.
+    /// `focused` (0/1) selects which pane the chrome (omnibar, shortcuts, strip) acts on.
+    pane0: PaneGroup,
+    pane1: PaneGroup,
+    split: Cell<bool>,
+    focused: Cell<usize>,
+    /// Address-bar text + whether the user has edited it without navigating.
+    location: RefCell<String>,
+    location_dirty: Cell<bool>,
+    /// Ctrl+L sets this; the next egui frame focuses + selects the address bar.
+    focus_omnibox: Cell<bool>,
+    /// Whether the native settings window is open.
+    show_settings: Cell<bool>,
+    /// Whether the Studio (live interface customization) side panel is open.
+    show_studio: Cell<bool>,
+    /// Search-bar buffer for the native new-tab dashboard.
+    dash_search: RefCell<String>,
+    /// Active native overlays (dialogs, pickers, context menu).
+    dialogs: RefCell<Vec<Dialog>>,
+    /// URLs of recently-closed tabs, for Ctrl+Shift+T (reopen most-recent).
+    closed_tabs: RefCell<Vec<String>>,
+    /// Find-in-page (Ctrl+F) state.
+    find_open: Cell<bool>,
+    find_query: RefCell<String>,
+    find_matches: Cell<usize>,
+    find_active: Cell<usize>,
+    find_focus: Cell<bool>,
+    fullscreen: Cell<bool>,
+    scale: Cell<f64>,
+    cursor: Cell<(f64, f64)>,
+    ctrl: Cell<bool>,
+    shift: Cell<bool>,
+    weak_self: RefCell<Weak<AppState>>,
+    /// Set when this window's last tab closes; the event loop drops the window next redraw.
+    wants_close: Cell<bool>,
     /// Declared last so the GL contexts (which borrow the window) drop before it.
     window: Window,
 }
@@ -1378,34 +1521,26 @@ impl AppState {
     /// Substitute the gator:// page theme color placeholders (`__BG__` … `__MUTED__`) for the
     /// current light/dark setting, so internal pages follow the chrome theme.
     fn themed(&self, html: String) -> Vec<u8> {
-        let dark = self.settings.borrow().dark;
-        let vars: [(&str, &str); 5] = if dark {
-            [
-                ("__BG__", "#0e1014"),
-                ("__PANEL__", "#171a21"),
-                ("__LINE__", "#262b36"),
-                ("__FG__", "#e8eaed"),
-                ("__MUTED__", "#9aa0aa"),
-            ]
-        } else {
-            [
-                ("__BG__", "#f5f6f8"),
-                ("__PANEL__", "#ffffff"),
-                ("__LINE__", "#e2e5ea"),
-                ("__FG__", "#1b1f27"),
-                ("__MUTED__", "#6b7280"),
-            ]
-        };
+        // Derive the gator:// page palette from the live chrome theme so internal
+        // pages follow the full base ramp (not just dark/light).
+        let pal = self.browser.settings.borrow().theme.palette();
+        let vars: [(&str, String); 5] = [
+            ("__BG__", color_hex(pal.bg)),
+            ("__PANEL__", color_hex(pal.bg2)),
+            ("__LINE__", color_hex(pal.border)),
+            ("__FG__", color_hex(pal.text)),
+            ("__MUTED__", color_hex(pal.muted)),
+        ];
         let mut html = html;
         for (k, v) in vars {
-            html = html.replace(k, v);
+            html = html.replace(k, &v);
         }
         html.into_bytes()
     }
 
     fn render_gator_welcome(&self) -> Vec<u8> {
         let (search, accent, wallpaper) = {
-            let s = self.settings.borrow();
+            let s = self.browser.settings.borrow();
             (s.search.clone(), s.accent.clone(), s.wallpaper.clone())
         };
         // A wallpaper is the user's own setting, but sanitize for CSS url() safety: http(s)/data
@@ -1430,7 +1565,7 @@ impl AppState {
             .map(|(n, _)| *n)
             .unwrap_or("the web");
         let bookmarks = {
-            let p = self.profile.borrow();
+            let p = self.browser.profile.borrow();
             if p.bookmarks.is_empty() {
                 "<p class=\"empty\">Bookmark a page with Ctrl+D and it will show up here.</p>"
                     .to_string()
@@ -1475,7 +1610,7 @@ impl AppState {
     /// the address that was loaded when it crashed (the Reload button links back to it) and
     /// `reason` is Servo's panic message (shown under a Details disclosure).
     fn render_gator_crash(&self, url: &str, reason: &str) -> Vec<u8> {
-        let accent = self.settings.borrow().accent.clone();
+        let accent = self.browser.settings.borrow().accent.clone();
         let shown_url = if url.is_empty() { "about:blank" } else { url };
         let href = if url.is_empty() { WELCOME_URL } else { url };
         let reason = if reason.trim().is_empty() {
@@ -1493,9 +1628,9 @@ impl AppState {
 
     /// Render the `gator://downloads` page: the session's downloads, newest first.
     fn render_gator_downloads(&self) -> Vec<u8> {
-        let accent = self.settings.borrow().accent.clone();
+        let accent = self.browser.settings.borrow().accent.clone();
         let rows = {
-            let dl = self.downloads.borrow();
+            let dl = self.browser.downloads.borrow();
             if dl.is_empty() {
                 "<p class=\"empty\">No downloads yet. Files you download are saved to ~/Downloads.</p>".to_string()
             } else {
@@ -1540,18 +1675,19 @@ impl AppState {
     fn render_gator_passwords(&self, remove: Option<usize>) -> Vec<u8> {
         if let Some(idx) = remove {
             let key = self
+                .browser
                 .password_store
                 .borrow()
                 .all()
                 .get(idx)
                 .map(|c| (c.origin.clone(), c.username.clone()));
             if let Some((origin, username)) = key {
-                self.password_store.borrow_mut().remove(&origin, &username);
-                let _ = self.password_store.borrow().save();
+                self.browser.password_store.borrow_mut().remove(&origin, &username);
+                let _ = self.browser.password_store.borrow().save();
             }
         }
-        let accent = self.settings.borrow().accent.clone();
-        let store = self.password_store.borrow();
+        let accent = self.browser.settings.borrow().accent.clone();
+        let store = self.browser.password_store.borrow();
         let rows = if !store.is_unlocked() {
             "<p class=\"empty\">The password store is locked. Unlock it in <strong>Settings → Passwords</strong>.</p>".to_string()
         } else if store.is_empty() {
@@ -1591,11 +1727,11 @@ impl AppState {
     fn render_gator_settings(&self, apply: SettingsApply) -> Vec<u8> {
         // 1. Apply the change (if any) and persist. We hold the mut-borrow only for this block and
         //    drop it BEFORE running any action method — start_sync/import_browser_data/
-        //    make_default_browser all borrow self.settings/self.import_msg, so a held borrow here
+        //    make_default_browser all borrow self.browser.settings/self.browser.import_msg, so a held borrow here
         //    would be a RefCell double-borrow panic.
         let mut action = None;
         {
-            let mut s = self.settings.borrow_mut();
+            let mut s = self.browser.settings.borrow_mut();
             let mut changed = false;
             match apply {
                 SettingsApply::None => {}
@@ -1660,7 +1796,7 @@ impl AppState {
         self.window.request_redraw();
 
         // 2. Build the page from current state (read-only borrow, taken AFTER actions ran).
-        let s = self.settings.borrow();
+        let s = self.browser.settings.borrow();
         let accent = s.accent.clone();
         // Engine pills: a preset is active when its template == s.search; otherwise "Custom" shows.
         let engine_pills: String = SEARCH_ENGINES
@@ -1706,13 +1842,13 @@ impl AppState {
         } else {
             "Set (hidden)"
         };
-        let blocked = self.adblock_blocked.get();
-        let import_msg = self.import_msg.borrow().clone().unwrap_or_default();
-        let sync_status = self.sync_status.borrow().clone();
-        let pw_state = if self.password_store.borrow().is_unlocked() {
+        let blocked = self.browser.adblock_blocked.get();
+        let import_msg = self.browser.import_msg.borrow().clone().unwrap_or_default();
+        let sync_status = self.browser.sync_status.borrow().clone();
+        let pw_state = if self.browser.password_store.borrow().is_unlocked() {
             format!(
                 "Unlocked — {} saved. Lock or unlock from the ☰ menu.",
-                self.password_store.borrow().len()
+                self.browser.password_store.borrow().len()
             )
         } else {
             "Locked — unlock from the ☰ menu to enable autofill.".to_string()
@@ -1740,9 +1876,9 @@ impl AppState {
     /// Render the `gator://history` page: recent visits, newest-first, deduped by URL,
     /// each a clickable link showing title + url. Templated like `gator://welcome`.
     fn render_gator_history(&self) -> Vec<u8> {
-        let accent = self.settings.borrow().accent.clone();
+        let accent = self.browser.settings.borrow().accent.clone();
         let rows = {
-            let p = self.profile.borrow();
+            let p = self.browser.profile.borrow();
             // `history` is append-on-first-visit order; show newest first and keep only the
             // first (most recent) occurrence of each URL.
             let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -1787,28 +1923,54 @@ impl AppState {
     /// Render the `gator://about` page: name, version, a one-line blurb, the keyboard
     /// shortcuts, and links back to welcome/history. Templated like `gator://welcome`.
     fn render_gator_about(&self) -> Vec<u8> {
-        let accent = self.settings.borrow().accent.clone();
+        let accent = self.browser.settings.borrow().accent.clone();
         let html = include_str!("content/about.html")
             .replace("__ACCENT__", &accent)
             .replace("__VERSION__", env!("CARGO_PKG_VERSION"));
         self.themed(html)
     }
 
+    /// The pane group at index `i` (0 = left/primary, 1 = right split pane).
+    fn pane(&self, i: usize) -> &PaneGroup {
+        if i == 1 { &self.pane1 } else { &self.pane0 }
+    }
+
+    /// The pane the chrome currently acts on (the omnibar, shortcuts, strip).
+    fn focused_pane(&self) -> &PaneGroup {
+        self.pane(self.focused.get())
+    }
+
     fn active_tab(&self) -> Option<WebView> {
-        self.tabs
+        self.focused_pane()
+            .tabs
             .borrow()
-            .get(self.active.get())
+            .get(self.focused_pane().active.get())
             .map(|t| t.webview.clone())
     }
 
     fn tab_index(&self, webview: &WebView) -> Option<usize> {
-        self.tabs.borrow().iter().position(|t| &t.webview == webview)
+        self.focused_pane().tabs.borrow().iter().position(|t| &t.webview == webview)
+    }
+
+    /// Whether the active tab is the new-tab page (served the native dashboard instead of a
+    /// Servo document). Matches the `gator://welcome|newtab|home` URLs.
+    fn active_is_newtab(&self) -> bool {
+        self.focused_pane().tabs
+            .borrow()
+            .get(self.focused_pane().active.get())
+            .map(|t| {
+                matches!(
+                    t.url.as_str(),
+                    "gator://welcome" | "gator://newtab" | "gator://home"
+                )
+            })
+            .unwrap_or(false)
     }
 
     fn active_nav(&self) -> (bool, bool) {
-        self.tabs
+        self.focused_pane().tabs
             .borrow()
-            .get(self.active.get())
+            .get(self.focused_pane().active.get())
             .map(|t| (t.can_back, t.can_forward))
             .unwrap_or((false, false))
     }
@@ -1845,18 +2007,21 @@ impl AppState {
             self.load_favicons(ctx);
             if !self.fullscreen.get() {
                 self.draw_chrome(ctx);
+                self.draw_studio(ctx);
             } else {
                 self.toolbar_height.set(0.0);
                 self.content_left.set(0.0);
+                self.content_right.set(0.0);
             }
             self.draw_settings(ctx);
             self.draw_dialogs(ctx);
 
             // Status bar (hovered link URL / load status), bottom-left over the page.
             let status = self
+                .focused_pane()
                 .tabs
                 .borrow()
-                .get(self.active.get())
+                .get(self.focused_pane().active.get())
                 .and_then(|t| t.status_text.clone())
                 .filter(|s| !s.is_empty());
             if let Some(status) = status {
@@ -1872,7 +2037,7 @@ impl AppState {
             }
 
             // Download toast (bottom-right) — click to open gator://downloads.
-            let toast = self.download_toast.borrow().clone();
+            let toast = self.browser.download_toast.borrow().clone();
             if let Some(toast) = toast {
                 let mut open_dl = false;
                 egui::Area::new(egui::Id::new("download_toast"))
@@ -1891,13 +2056,13 @@ impl AppState {
                                     open_dl = true;
                                 }
                                 if ui.small_button("×").clicked() {
-                                    *self.download_toast.borrow_mut() = None;
+                                    *self.browser.download_toast.borrow_mut() = None;
                                 }
                             });
                         });
                     });
                 if open_dl {
-                    *self.download_toast.borrow_mut() = None;
+                    *self.browser.download_toast.borrow_mut() = None;
                     if let (Ok(url), Some(tab)) =
                         (Url::parse("gator://downloads"), self.active_tab())
                     {
@@ -1908,7 +2073,7 @@ impl AppState {
             }
 
             // Password action message (bottom-center), dismissible.
-            let pmsg = self.password_msg.borrow().clone();
+            let pmsg = self.browser.password_msg.borrow().clone();
             if let Some(pmsg) = pmsg {
                 egui::Area::new(egui::Id::new("password_msg"))
                     .order(egui::Order::Foreground)
@@ -1918,7 +2083,7 @@ impl AppState {
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new(format!("🔑  {pmsg}")));
                                 if ui.small_button("×").clicked() {
-                                    *self.password_msg.borrow_mut() = None;
+                                    *self.browser.password_msg.borrow_mut() = None;
                                 }
                             });
                         });
@@ -1976,26 +2141,88 @@ impl AppState {
             // the content rect from the toolbar height measured during draw_chrome.)
             let top = self.toolbar_height.get();
             let left = self.content_left.get();
+            let right = self.content_right.get();
             let screen = ctx.content_rect();
-            let avail = egui::Rect::from_min_max(egui::pos2(left, top), screen.max);
+            let avail = egui::Rect::from_min_max(
+                egui::pos2(left, top),
+                egui::pos2(screen.max.x - right, screen.max.y),
+            );
             let scale = ctx.pixels_per_point();
-            let w = (avail.width() * scale).round().max(1.0) as u32;
-            let h = (avail.height() * scale).round().max(1.0) as u32;
-            if (w, h) != self.content_px.get() {
-                self.content_px.set((w, h));
-                self.content_context.resize(PhysicalSize::new(w, h));
-                for t in self.tabs.borrow().iter() {
-                    t.webview.resize(PhysicalSize::new(w, h));
-                }
+            if self.split.get() {
+                // Two panes side by side, each its own live webview + FBO + history.
+                let mid = ((avail.left() + avail.right()) * 0.5).round();
+                let left_rect =
+                    egui::Rect::from_min_max(avail.min, egui::pos2(mid - 0.5, avail.max.y));
+                let right_rect =
+                    egui::Rect::from_min_max(egui::pos2(mid + 0.5, avail.min.y), avail.max);
+                self.render_pane(ctx, 0, left_rect, scale);
+                self.render_pane(ctx, 1, right_rect, scale);
+                self.draw_split_overlay(ctx, left_rect, right_rect);
+            } else {
+                self.render_pane(ctx, 0, avail, scale);
             }
-            if let Some(tab) = self.active_tab() {
-                tab.paint();
-            }
+        });
+        if egui.egui_ctx.has_requested_repaint() {
+            self.window.request_redraw();
+        }
+    }
 
-            // Blit the page's offscreen FBO onto egui's background layer; chrome draws over it.
-            if let Some(blit) = self.content_context.render_to_parent_callback() {
+    /// Render one pane group's active content into `rect`: (re)size its webviews to the rect,
+    /// then either paint the native new-tab dashboard or blit its live page FBO. Shared by the
+    /// single view and each half of a split — each pane has its own offscreen context, so two
+    /// can show at once.
+    fn render_pane(&self, ctx: &egui::Context, pane: usize, rect: egui::Rect, scale: f32) {
+        let _ = self.pane(pane).context.make_current();
+        let w = (rect.width() * scale).round().max(1.0) as u32;
+        let h = (rect.height() * scale).round().max(1.0) as u32;
+        if (w, h) != self.pane(pane).content_px.get() {
+            self.pane(pane).content_px.set((w, h));
+            self.pane(pane).context.resize(PhysicalSize::new(w, h));
+            for t in self.pane(pane).tabs.borrow().iter() {
+                t.webview.resize(PhysicalSize::new(w, h));
+            }
+        }
+        let is_newtab = self
+            .pane(pane)
+            .tabs
+            .borrow()
+            .get(self.pane(pane).active.get())
+            .map(|t| {
+                matches!(
+                    t.url.as_str(),
+                    "gator://welcome" | "gator://newtab" | "gator://home"
+                )
+            })
+            .unwrap_or(true);
+        if is_newtab {
+            let (th, mods, pal) = {
+                let s = self.browser.settings.borrow();
+                (s.theme, s.modules, s.theme.palette())
+            };
+            let clock = dash_clock();
+            let focused_here = pane == self.focused.get();
+            let nav = if focused_here {
+                let mut search = self.dash_search.borrow_mut();
+                dashboard::draw_dashboard(ctx, rect, &th, &mods, &pal, &clock, &mut search)
+            } else {
+                let mut tmp = String::new();
+                dashboard::draw_dashboard(ctx, rect, &th, &mods, &pal, &clock, &mut tmp)
+            };
+            if let Some(target) = nav {
+                if focused_here {
+                    self.dash_search.borrow_mut().clear();
+                }
+                self.focused.set(pane);
+                self.navigate_from_omnibox(&target);
+            }
+            ctx.request_repaint_after(std::time::Duration::from_secs(10));
+        } else {
+            if let Some(t) = self.pane(pane).tabs.borrow().get(self.pane(pane).active.get()) {
+                t.webview.paint();
+            }
+            if let Some(blit) = self.pane(pane).context.render_to_parent_callback() {
                 ctx.layer_painter(LayerId::background()).add(PaintCallback {
-                    rect: avail,
+                    rect,
                     callback: Arc::new(CallbackFn::new(move |info, painter| {
                         let clip = info.viewport_in_pixels();
                         let target = Rect::new(
@@ -2006,9 +2233,129 @@ impl AppState {
                     })),
                 });
             }
+        }
+    }
+
+    /// Focused-pane outline + the close-split button, drawn over a split.
+    fn draw_split_overlay(&self, ctx: &egui::Context, left_rect: egui::Rect, right_rect: egui::Rect) {
+        let pal = self.browser.settings.borrow().theme.palette();
+        let mid = right_rect.left();
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new("split_divider"),
+        ))
+        .line_segment(
+            [
+                egui::pos2(mid, left_rect.top()),
+                egui::pos2(mid, left_rect.bottom()),
+            ],
+            egui::Stroke::new(1.0, pal.border),
+        );
+        let focused_rect = if self.focused.get() == 1 {
+            right_rect
+        } else {
+            left_rect
+        };
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new("split_focus"),
+        ))
+        .rect_stroke(
+            focused_rect.shrink(1.0),
+            egui::CornerRadius::ZERO,
+            egui::Stroke::new(2.0, pal.accent_dim),
+            egui::StrokeKind::Inside,
+        );
+        egui::Area::new(egui::Id::new("close_split"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(right_rect.right() - 30.0, right_rect.top() + 6.0))
+            .show(ctx, |ui| {
+                if ui
+                    .add(egui::Button::new(
+                        egui::RichText::new("✕").size(14.0).color(pal.muted),
+                    ))
+                    .on_hover_text("Close split")
+                    .clicked()
+                {
+                    self.exit_split();
+                }
+            });
+    }
+
+    /// Enter split: open pane 1 (its own webview + history) seeded from `seed`; pane 0 keeps its
+    /// page. Focus moves to the new pane.
+    fn enter_split(&self, seed: Url) {
+        if self.split.get() {
+            self.focused.set(1);
+            return;
+        }
+        let Some(me) = self.weak_self.borrow().upgrade() else {
+            return;
+        };
+        let mut builder = WebViewBuilder::new(&self.browser.servo, self.pane1.context.clone())
+            .url(seed.clone())
+            .hidpi_scale_factor(Scale::new(self.scale.get() as f32))
+            .delegate(me);
+        if let Some(ucm) = &self.browser.userscripts {
+            builder = builder.user_content_manager(ucm.clone());
+        }
+        let webview = builder.build();
+        let (w, h) = self.pane1.content_px.get();
+        if w > 0 && h > 0 {
+            webview.resize(PhysicalSize::new(w, h));
+        }
+        webview.show();
+        webview.focus();
+        self.pane1.tabs.borrow_mut().push(Tab {
+            webview,
+            url: seed.to_string(),
+            title: "New tab".to_string(),
+            can_back: false,
+            can_forward: false,
+            zoom: 1.0,
+            loading: false,
+            status_text: None,
+            favicon_pending: None,
+            favicon_tex: None,
+            crashed: false,
+            pinned: false,
+            starred: false,
         });
-        if egui.egui_ctx.has_requested_repaint() {
-            self.window.request_redraw();
+        self.pane1.active.set(0);
+        self.split.set(true);
+        self.focused.set(1);
+        self.window.request_redraw();
+    }
+
+    /// Exit split: close pane 1's webviews, return focus to pane 0.
+    fn exit_split(&self) {
+        if !self.split.get() {
+            return;
+        }
+        self.pane1.tabs.borrow_mut().clear();
+        self.pane1.active.set(0);
+        self.split.set(false);
+        self.focused.set(0);
+        if let Some(wv) = self.active_tab() {
+            wv.show();
+            wv.focus();
+        }
+        self.window.request_redraw();
+    }
+
+    /// Toggle split (Ctrl+\\): seed pane 1 from the current page.
+    fn toggle_split(&self) {
+        if self.split.get() {
+            self.exit_split();
+        } else {
+            let seed = self
+                .pane0
+                .tabs
+                .borrow()
+                .get(self.pane0.active.get())
+                .and_then(|t| Url::parse(&t.url).ok())
+                .unwrap_or_else(content_url);
+            self.enter_split(seed);
         }
     }
 
@@ -2019,25 +2366,146 @@ impl AppState {
         self.window_context.present();
     }
 
-    /// Apply the user's accent + dark/light theme to the egui chrome each frame.
+    /// Apply the live customization theme to the egui chrome each frame: OKLCH
+    /// base/accent -> [`egui::Visuals`], density/font/radius -> [`egui::Style`].
     fn apply_theme(&self, ctx: &egui::Context) {
-        let (accent_hex, dark) = {
-            let s = self.settings.borrow();
-            (s.accent.clone(), s.dark)
-        };
-        let accent = accent_color32(&accent_hex);
-        let theme = if dark {
-            egui::Theme::Dark
-        } else {
+        let th = self.browser.settings.borrow().theme;
+        let pal = th.palette();
+        let mode = if th.base.is_light() {
             egui::Theme::Light
+        } else {
+            egui::Theme::Dark
         };
-        ctx.set_theme(theme);
-        ctx.set_visuals_of(theme, build_visuals(accent, dark));
+        ctx.set_theme(mode);
+        ctx.set_visuals_of(mode, theme::build_visuals(&th, &pal));
+        theme::apply_style(ctx, &th);
+    }
+
+    /// The Studio: a right-hand side panel for live interface customization (the design's
+    /// "Interface settings"). Mirrors `draw_settings`' deferred-borrow discipline — it edits
+    /// copies of `theme`/`modules`, then writes back + persists only if something changed.
+    /// Sets `content_right` so the page area shrinks to the panel's left edge (and input over
+    /// the panel is treated as chrome). Reserves no space and paints nothing when closed.
+    fn draw_studio(&self, ctx: &egui::Context) {
+        if !self.show_studio.get() {
+            self.content_right.set(0.0);
+            return;
+        }
+
+        let (mut theme, mut modules) = {
+            let s = self.browser.settings.borrow();
+            (s.theme, s.modules)
+        };
+        let pal = theme.palette();
+        let mut changed = false;
+        let mut close = false;
+
+        let frame = egui::Frame::NONE
+            .fill(pal.bg2)
+            .stroke(egui::Stroke::new(1.0, pal.border))
+            .inner_margin(egui::Margin::same(20))
+            .shadow(egui::Shadow {
+                offset: [-12, 0],
+                blur: 40,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(90),
+            });
+
+        let panel = egui::SidePanel::right("studio")
+            .resizable(false)
+            .exact_width(366.0)
+            .frame(frame)
+            .show(ctx, |ui| {
+                // Header: glowing accent dot + title + close ×.
+                ui.horizontal(|ui| {
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 4.5, pal.accent);
+                    ui.label(
+                        egui::RichText::new("Interface settings")
+                            .size(15.0)
+                            .strong()
+                            .color(pal.text),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("✕").size(15.0)).frame(false))
+                            .clicked()
+                        {
+                            close = true;
+                        }
+                    });
+                });
+                ui.add_space(10.0);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    changed |= studio::studio_body(ui, &mut theme, &mut modules, &pal);
+                });
+            });
+
+        self.content_right.set(panel.response.rect.width());
+
+        if changed {
+            let mut s = self.browser.settings.borrow_mut();
+            s.theme = theme;
+            s.modules = modules;
+            sync_legacy_theme(&mut s);
+            save_settings(&s);
+            drop(s);
+            self.window.request_redraw();
+        }
+        if close {
+            self.show_studio.set(false);
+            self.window.request_redraw();
+        }
+    }
+
+    /// Execute a command-palette action: mutate theme/modules/tabs/studio, persist, repaint.
+    fn run_palette(&self, action: palette::PaletteAction) {
+        use palette::PaletteAction as A;
+        match action {
+            A::NewTab => {
+                self.new_tab(content_url());
+                return;
+            }
+            A::ToggleStudio => {
+                self.show_studio.set(!self.show_studio.get());
+                self.window.request_redraw();
+                return;
+            }
+            _ => {}
+        }
+        {
+            let mut s = self.browser.settings.borrow_mut();
+            match action {
+                A::ToggleVerticalTabs => {
+                    s.theme.tab_pos = match s.theme.tab_pos {
+                        theme::TabPos::Top => theme::TabPos::Left,
+                        theme::TabPos::Left => theme::TabPos::Top,
+                    };
+                }
+                A::ShrinkTabs => {
+                    s.theme.tab_fit = match s.theme.tab_fit {
+                        theme::TabFit::Fill => theme::TabFit::Fit,
+                        theme::TabFit::Fit => theme::TabFit::Fill,
+                    };
+                }
+                A::Density(d) => s.theme.density = d,
+                A::SetAccent(a) => s.theme.accent = a,
+                A::SetWallpaper(w) => s.theme.wallpaper = w,
+                A::ApplyPreset(p) => p.merge_into(&mut s.theme),
+                A::ToggleNotes => s.modules.notes = !s.modules.notes,
+                A::ToggleFeed => s.modules.feed = !s.modules.feed,
+                A::NewTab | A::ToggleStudio => {}
+            }
+            sync_legacy_theme(&mut s);
+            save_settings(&s);
+        }
+        self.window.request_redraw();
     }
 
     /// Upload any decoded favicons to GPU textures (needs the egui Context, so done here).
     fn load_favicons(&self, ctx: &egui::Context) {
-        for (i, tab) in self.tabs.borrow_mut().iter_mut().enumerate() {
+        for (i, tab) in self.focused_pane().tabs.borrow_mut().iter_mut().enumerate() {
             if let Some(img) = tab.favicon_pending.take() {
                 tab.favicon_tex =
                     Some(ctx.load_texture(format!("favicon-{i}"), img, Default::default()));
@@ -2080,7 +2548,9 @@ impl AppState {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add(egui::Button::new("✕").frame(false).min_size(egui::vec2(28.0, 24.0))).clicked() {
-                        let _ = self.event_proxy.send_event(WakeUp::Exit);
+                        // Close THIS window (quits the app only if it's the last one).
+                        self.wants_close.set(true);
+                        self.window.request_redraw();
                     }
                     if ui.add(egui::Button::new("▢").frame(false).min_size(egui::vec2(28.0, 24.0))).clicked() {
                         self.window.set_maximized(!self.window.is_maximized());
@@ -2091,7 +2561,14 @@ impl AppState {
                     if ui.add(egui::Button::new("☰").frame(false).min_size(egui::vec2(28.0, 24.0))).clicked() {
                         self.show_settings.set(!self.show_settings.get());
                     }
-                    if self.password_store.borrow().is_unlocked()
+                    if ui
+                        .add(egui::Button::new("🎨").frame(false).min_size(egui::vec2(28.0, 24.0)))
+                        .on_hover_text("Customize interface (Studio)")
+                        .clicked()
+                    {
+                        self.show_studio.set(!self.show_studio.get());
+                    }
+                    if self.browser.password_store.borrow().is_unlocked()
                         && ui
                             .add(egui::Button::new("🔑").frame(false).min_size(egui::vec2(28.0, 24.0)))
                             .on_hover_text("Save this page's login")
@@ -2116,12 +2593,99 @@ impl AppState {
 
                     let id = egui::Id::new("location_input");
                     let mut loc = self.location.borrow_mut();
-                    let field = ui.add_sized(
-                        ui.available_size(),
-                        egui::TextEdit::singleline(&mut *loc)
-                            .id(id)
-                            .hint_text("Search or enter address"),
-                    );
+                    let (pal, omni_h, omni_px) = {
+                        let s = self.browser.settings.borrow();
+                        let tk = theme::density_tokens(s.theme.density);
+                        (s.theme.palette(), tk.omni_h, tk.omni_px)
+                    };
+                    let rad = (omni_h * 0.5) as u8;
+                    let is_cmd = loc.trim_start().starts_with('>');
+                    let focused = ui.memory(|m| m.has_focus(id));
+
+                    // The omnibar pill: leading indicator · input · star · ⌘K keycap.
+                    let pill = egui::Frame::NONE
+                        .fill(if focused { pal.bg } else { pal.elev })
+                        .stroke(egui::Stroke::new(1.0, if focused { pal.accent } else { pal.border }))
+                        .corner_radius(egui::CornerRadius::same(rad))
+                        .inner_margin(egui::Margin::symmetric(omni_px as i8, 0));
+
+                    let mut star_toggle = false;
+                    let pill_inner = pill.show(ui, |ui| {
+                        ui.set_min_height(omni_h);
+                        ui.horizontal_centered(|ui| {
+                            // Leading indicator: command `>` in accent, else the secure dot.
+                            let (slot, _) =
+                                ui.allocate_exact_size(egui::vec2(16.0, omni_h), egui::Sense::hover());
+                            if is_cmd {
+                                ui.painter().text(
+                                    slot.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    ">",
+                                    egui::FontId::monospace(13.0),
+                                    pal.accent,
+                                );
+                            } else {
+                                ui.painter().circle_filled(
+                                    slot.center(),
+                                    3.5,
+                                    theme::oklch(0.74, 0.15, 145.0),
+                                );
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    egui::Frame::NONE
+                                        .stroke(egui::Stroke::new(1.0, pal.border))
+                                        .corner_radius(egui::CornerRadius::same(5))
+                                        .inner_margin(egui::Margin::symmetric(5, 1))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new("⌘K")
+                                                    .monospace()
+                                                    .size(10.5)
+                                                    .color(pal.muted),
+                                            );
+                                        });
+                                    ui.add_space(4.0);
+                                    let starred = self
+                                        .focused_pane()
+                                        .tabs
+                                        .borrow()
+                                        .get(self.focused_pane().active.get())
+                                        .map(|t| t.starred)
+                                        .unwrap_or(false);
+                                    let (glyph, scol) = if starred {
+                                        ("★", pal.accent)
+                                    } else {
+                                        ("☆", pal.muted)
+                                    };
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new(glyph).size(15.0).color(scol),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .clicked()
+                                    {
+                                        star_toggle = true;
+                                    }
+                                    ui.add_sized(
+                                        egui::vec2(ui.available_width(), omni_h),
+                                        egui::TextEdit::singleline(&mut *loc)
+                                            .id(id)
+                                            .frame(egui::Frame::NONE)
+                                            .hint_text("Search, enter URL, or type  >  for commands"),
+                                    )
+                                },
+                            )
+                            .inner
+                        })
+                        .inner
+                    });
+                    let field = pill_inner.inner;
+                    let pill_rect = pill_inner.response.rect;
+
                     if field.changed() {
                         self.location_dirty.set(true);
                     }
@@ -2130,48 +2694,102 @@ impl AppState {
                     }
                     if field.gained_focus() {
                         if let Some(mut st) = TextEditState::load(ui.ctx(), id) {
-                            st.cursor.set_char_range(Some(CCursorRange::two(
-                                CCursor::new(0),
-                                CCursor::new(loc.len()),
-                            )));
+                            // In command mode (prefilled `>`) place the cursor at the end;
+                            // otherwise select-all so a typed URL replaces the old one.
+                            let range = if is_cmd {
+                                CCursorRange::two(CCursor::new(loc.len()), CCursor::new(loc.len()))
+                            } else {
+                                CCursorRange::two(CCursor::new(0), CCursor::new(loc.len()))
+                            };
+                            st.cursor.set_char_range(Some(range));
                             st.store(ui.ctx(), id);
                         }
                     }
-                    let mut go: Option<String> = None;
-                    if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        go = Some(loc.trim().to_string());
+                    if focused {
+                        // Accent focus ring (drawn on a foreground layer so it isn't clipped).
+                        ui.ctx()
+                            .layer_painter(egui::LayerId::new(
+                                egui::Order::Foreground,
+                                egui::Id::new("omni_ring"),
+                            ))
+                            .rect_stroke(
+                                pill_rect,
+                                egui::CornerRadius::same(rad),
+                                egui::Stroke::new(3.0, pal.accent_soft),
+                                egui::StrokeKind::Outside,
+                            );
                     }
-                    // History-backed autocomplete dropdown under the address bar.
-                    if field.has_focus() && !loc.trim().is_empty() {
-                        let sugg = suggestions(&self.profile.borrow().history, loc.trim());
-                        if !sugg.is_empty() {
-                            egui::Area::new(egui::Id::new("omnibox_suggest"))
-                                .order(egui::Order::Foreground)
-                                .fixed_pos(field.rect.left_bottom())
-                                .show(ui.ctx(), |ui| {
-                                    egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                        ui.set_min_width(field.rect.width().max(220.0));
-                                        for (url, title) in &sugg {
-                                            let label = if title.is_empty() {
-                                                url.clone()
-                                            } else {
-                                                format!("{title}  —  {url}")
-                                            };
-                                            if ui
-                                                .add(
-                                                    egui::Button::new(truncate_ellipsis(&label, 80))
+                    if star_toggle {
+                        if let Some(t) = self.focused_pane().tabs.borrow_mut().get_mut(self.focused_pane().active.get()) {
+                            t.starred = !t.starred;
+                        }
+                        self.window.request_redraw();
+                    }
+
+                    let mut go: Option<String> = None;
+                    let mut run_action: Option<palette::PaletteAction> = None;
+
+                    if is_cmd {
+                        // Command palette: filter the catalog by the text after `>`.
+                        let filter = loc.trim_start().trim_start_matches('>').trim().to_lowercase();
+                        let items: Vec<_> = palette::palette_catalog(self.show_studio.get())
+                            .into_iter()
+                            .filter(|(label, _, _)| label.to_lowercase().contains(&filter))
+                            .collect();
+                        if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            run_action = items.first().map(|(_, _, a)| *a);
+                        }
+                        if field.has_focus() {
+                            if let Some(a) =
+                                palette::draw_palette_dropdown(ui, pill_rect, &items, &pal)
+                            {
+                                run_action = Some(a);
+                            }
+                        }
+                    } else {
+                        if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            go = Some(loc.trim().to_string());
+                        }
+                        // History-backed autocomplete dropdown under the address bar.
+                        if field.has_focus() && !loc.trim().is_empty() {
+                            let sugg = suggestions(&self.browser.profile.borrow().history, loc.trim());
+                            if !sugg.is_empty() {
+                                egui::Area::new(egui::Id::new("omnibox_suggest"))
+                                    .order(egui::Order::Foreground)
+                                    .fixed_pos(pill_rect.left_bottom())
+                                    .show(ui.ctx(), |ui| {
+                                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                            ui.set_min_width(pill_rect.width().max(220.0));
+                                            for (url, title) in &sugg {
+                                                let label = if title.is_empty() {
+                                                    url.clone()
+                                                } else {
+                                                    format!("{title}  —  {url}")
+                                                };
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(truncate_ellipsis(
+                                                            &label, 80,
+                                                        ))
                                                         .frame(false),
-                                                )
-                                                .clicked()
-                                            {
-                                                go = Some(url.clone());
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    go = Some(url.clone());
+                                                }
                                             }
-                                        }
+                                        });
                                     });
-                                });
+                            }
                         }
                     }
-                    if let Some(target) = go {
+
+                    if let Some(a) = run_action {
+                        loc.clear();
+                        drop(loc);
+                        self.location_dirty.set(false);
+                        self.run_palette(a);
+                    } else if let Some(target) = go {
                         *loc = target.clone();
                         drop(loc);
                         self.location_dirty.set(false);
@@ -2181,7 +2799,7 @@ impl AppState {
             });
         });
 
-        let vertical = self.settings.borrow().vertical_tabs;
+        let vertical = self.browser.settings.borrow().theme.tab_pos == theme::TabPos::Left;
         let mut bottom = if vertical {
             // No top tab strip; the left SidePanel sets `content_left`. The page begins
             // below the toolbar, whose bottom we captured above.
@@ -2193,7 +2811,7 @@ impl AppState {
         };
 
         // Bookmarks bar (only when there are bookmarks), below the tab strip.
-        let have_bookmarks = !self.profile.borrow().bookmarks.is_empty();
+        let have_bookmarks = !self.browser.profile.borrow().bookmarks.is_empty();
         if have_bookmarks {
             let bm = egui::TopBottomPanel::top("bookmarks").show(ctx, |ui| {
                 egui::ScrollArea::horizontal()
@@ -2201,6 +2819,7 @@ impl AppState {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let bms: Vec<(String, String)> = self
+                                .browser
                                 .profile
                                 .borrow()
                                 .bookmarks
@@ -2228,7 +2847,7 @@ impl AppState {
     /// shared ordering both tab layouts iterate; underlying indices (used by
     /// select/close/move) are unchanged.
     fn tab_order(&self) -> Vec<usize> {
-        let tabs = self.tabs.borrow();
+        let tabs = self.focused_pane().tabs.borrow();
         let n = tabs.len();
         let mut o: Vec<usize> = (0..n).filter(|&i| tabs[i].pinned).collect();
         o.extend((0..n).filter(|&i| !tabs[i].pinned));
@@ -2243,77 +2862,177 @@ impl AppState {
     /// orientation-toggle menu label.
     ///
     /// Both layouts call this so their select/close/menu/pin/drag behavior is identical.
-    fn tab_row(&self, ui: &mut egui::Ui, i: usize, active: usize, vertical: bool) -> (TabAction, egui::Response) {
-        let (title, fav, loading, pinned) = {
-            let tabs = self.tabs.borrow();
-            let fav = tabs[i].favicon_tex.as_ref().map(|t| {
-                egui::load::SizedTexture::new(t.id(), egui::vec2(16.0, 16.0))
-            });
-            (tabs[i].title.clone(), fav, tabs[i].loading, tabs[i].pinned)
+    fn tab_row(
+        &self,
+        ui: &mut egui::Ui,
+        i: usize,
+        active: usize,
+        vertical: bool,
+        fill_width: Option<f32>,
+    ) -> (TabAction, egui::Response) {
+        let (title, fav_id, loading, pinned) = {
+            let tabs = self.focused_pane().tabs.borrow();
+            (
+                tabs[i].title.clone(),
+                tabs[i].favicon_tex.as_ref().map(|t| t.id()),
+                tabs[i].loading,
+                tabs[i].pinned,
+            )
         };
-        let has_icon = loading || fav.is_some();
+        let (pal, tab_h, rad, fid, tab_max_w) = {
+            let s = self.browser.settings.borrow();
+            let tk = theme::density_tokens(s.theme.density);
+            (
+                s.theme.palette(),
+                tk.tab_h,
+                s.theme.radius_sm(),
+                egui::FontId::new(tk.fs, theme::family(s.theme.font)),
+                s.theme.tab_max_w as f32,
+            )
+        };
+        let dragging = self.focused_pane().drag_tab.get() == Some(i);
+        let opacity = if dragging { 0.45 } else { 1.0 };
         let mut act = TabAction::None;
 
-        // The drag/click sense is shared by both orientations: egui only fires drag events
-        // after the drag threshold, so a plain click still yields `clicked()` (just-select).
-        let render = |ui: &mut egui::Ui| -> egui::Response {
-            if loading {
-                ui.add(egui::Spinner::new().size(14.0));
-            } else if let Some(sized) = fav {
-                ui.add(
-                    egui::Image::from_texture(sized).fit_to_exact_size(egui::vec2(16.0, 16.0)),
+        // Geometry.
+        const PAD: f32 = 11.0;
+        const ICON: f32 = 16.0;
+        const GAP: f32 = 9.0;
+        let close_w = if pinned { 0.0 } else { 18.0 };
+        let label = if pinned && !vertical {
+            String::new()
+        } else {
+            title.clone()
+        };
+        // Cheap width estimate (the text is clipped + the width clamped, so exactness is moot).
+        let text_w = if label.is_empty() {
+            0.0
+        } else {
+            label.chars().count() as f32 * fid.size * 0.55
+        };
+        let content_w = PAD
+            + ICON
+            + if label.is_empty() { 0.0 } else { GAP + text_w }
+            + if close_w > 0.0 { GAP + close_w } else { 0.0 }
+            + PAD;
+        let width = if vertical {
+            ui.available_width().max(ICON + 2.0 * PAD)
+        } else if let Some(w) = fill_width {
+            w.clamp(ICON + 2.0 * PAD, tab_max_w)
+        } else {
+            content_w.clamp(ICON + 2.0 * PAD, tab_max_w)
+        };
+
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(width, tab_h), egui::Sense::click_and_drag());
+        let painter = ui.painter().clone();
+
+        // Tab background: active = accent-soft pill; hover = elevated; else transparent.
+        let fill = if i == active {
+            pal.accent_soft
+        } else if resp.hovered() {
+            pal.elev
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        painter.rect_filled(rect, egui::CornerRadius::same(rad), fill.gamma_multiply(opacity));
+
+        // Favicon chip: real favicon if loaded, else a stable hue-colored rounded square.
+        let fav_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + PAD, rect.center().y - ICON / 2.0),
+            egui::vec2(ICON, ICON),
+        );
+        if let Some(tid) = fav_id.filter(|_| !loading) {
+            painter.image(
+                tid,
+                fav_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE.gamma_multiply(opacity),
+            );
+        } else {
+            let hue = favicon_hue(&title);
+            painter.rect_filled(
+                fav_rect,
+                egui::CornerRadius::same(4),
+                theme::oklch(0.62, 0.15, hue).gamma_multiply(opacity),
+            );
+            painter.rect_stroke(
+                fav_rect,
+                egui::CornerRadius::same(4),
+                egui::Stroke::new(1.0, egui::Color32::from_black_alpha(50)),
+                egui::StrokeKind::Inside,
+            );
+            if let Some(ch) = title.chars().next() {
+                painter.text(
+                    fav_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    ch.to_uppercase().collect::<String>(),
+                    egui::FontId::proportional(9.0),
+                    egui::Color32::WHITE.gamma_multiply(opacity),
                 );
             }
-            // Pinned tabs are compact: the favicon is the identity, so the horizontal chip
-            // carries no title (one glyph fallback if no icon). Vertical rows always show
-            // the title (there's room).
-            let label = if pinned && !vertical {
-                if has_icon {
-                    String::new()
-                } else {
-                    title.chars().next().map(|c| c.to_string()).unwrap_or_default()
-                }
-            } else {
-                truncate_ellipsis(&title, if vertical { 26 } else { 20 })
-            };
-            let mut btn = egui::Button::selectable(i == active, label)
-                .sense(egui::Sense::click_and_drag());
-            if vertical {
-                // Fill the row, reserving ~22px on the right for the × close button.
-                let w = (ui.available_width() - if pinned { 0.0 } else { 22.0 }).max(0.0);
-                btn = btn.min_size(egui::vec2(w, 0.0));
-            }
-            ui.add(btn).on_hover_text(&title)
-        };
+        }
 
-        let tab = if vertical {
-            // One full-width row: favicon + title + trailing ×, laid out left-to-right.
-            let inner = ui.horizontal(|ui| {
-                let resp = render(ui);
-                if !pinned && ui.add(egui::Button::new("×").frame(false)).clicked() {
-                    act = TabAction::Close(i);
-                }
-                resp
-            });
-            inner.inner
-        } else {
-            let resp = render(ui);
-            if !pinned && ui.add(egui::Button::new("×").frame(false)).clicked() {
+        // Title, clipped so it never spills past the close button.
+        if !label.is_empty() {
+            let text_left = fav_rect.right() + GAP;
+            let text_right = rect.right() - PAD - if close_w > 0.0 { close_w + GAP } else { 0.0 };
+            if text_right > text_left {
+                let clip = egui::Rect::from_min_max(
+                    egui::pos2(text_left, rect.top()),
+                    egui::pos2(text_right, rect.bottom()),
+                );
+                painter.with_clip_rect(clip).text(
+                    egui::pos2(text_left, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    &label,
+                    fid.clone(),
+                    pal.text.gamma_multiply(opacity),
+                );
+            }
+        }
+
+        // Close button (its own hit-test, painted manually — no layout interference).
+        if !pinned {
+            let close_rect = egui::Rect::from_center_size(
+                egui::pos2(rect.right() - PAD - close_w / 2.0, rect.center().y),
+                egui::vec2(close_w, close_w),
+            );
+            let cr = ui.interact(close_rect, resp.id.with("close"), egui::Sense::click());
+            if cr.hovered() {
+                painter.rect_filled(
+                    close_rect,
+                    egui::CornerRadius::same(4),
+                    egui::Color32::from_black_alpha(60),
+                );
+            }
+            painter.text(
+                close_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "×",
+                egui::FontId::proportional(15.0),
+                pal.muted.gamma_multiply(opacity),
+            );
+            if cr.clicked() {
                 act = TabAction::Close(i);
             }
-            resp
-        };
-
-        if tab.clicked() && i != active {
-            act = TabAction::Select(i);
         }
-        if tab.middle_clicked() && !pinned {
-            act = TabAction::Close(i);
+
+        let tab = resp.on_hover_text(&title);
+
+        // Close takes priority over select if both registered the click.
+        if matches!(act, TabAction::None) {
+            if tab.clicked() && i != active {
+                act = TabAction::Select(i);
+            }
+            if tab.middle_clicked() && !pinned {
+                act = TabAction::Close(i);
+            }
         }
         // Drag-reorder: begin on threshold-crossing drag start; the strip paints the
         // insertion indicator + commits the move on release (it knows every tab's rect).
         if tab.drag_started() {
-            self.drag_tab.set(Some(i));
+            self.focused_pane().drag_tab.set(Some(i));
         }
 
         let mut menu_act = 0u8;
@@ -2339,6 +3058,9 @@ impl AppState {
             {
                 menu_act = 5;
             }
+            if ui.button("Move tab to new window").clicked() {
+                menu_act = 6;
+            }
         });
         match menu_act {
             1 => act = TabAction::NewTab,
@@ -2346,6 +3068,7 @@ impl AppState {
             3 => act = TabAction::CloseOthers(i),
             4 => act = TabAction::TogglePin(i),
             5 => act = TabAction::ToggleOrientation,
+            6 => act = TabAction::PopOut(i),
             _ => {}
         }
 
@@ -2379,10 +3102,28 @@ impl AppState {
             }
             TabAction::ToggleOrientation => {
                 {
-                    let mut s = self.settings.borrow_mut();
-                    s.vertical_tabs = !s.vertical_tabs;
+                    let mut s = self.browser.settings.borrow_mut();
+                    s.theme.tab_pos = match s.theme.tab_pos {
+                        theme::TabPos::Top => theme::TabPos::Left,
+                        theme::TabPos::Left => theme::TabPos::Top,
+                    };
                     save_settings(&s);
                 }
+                self.window.request_redraw();
+                true
+            }
+            TabAction::PopOut(i) => {
+                // Queue a new window at this tab's URL, then close the tab here. The event loop
+                // (which owns the windows map) creates the window on the next redraw.
+                let url = self
+                    .focused_pane()
+                    .tabs
+                    .borrow()
+                    .get(i)
+                    .and_then(|t| Url::parse(&t.url).ok())
+                    .unwrap_or_else(content_url);
+                self.browser.pending_windows.borrow_mut().push(url);
+                self.close_tab(i);
                 self.window.request_redraw();
                 true
             }
@@ -2401,7 +3142,7 @@ impl AppState {
         pointer: egui::Pos2,
         vertical: bool,
     ) -> Option<usize> {
-        let dragged = self.drag_tab.get()?;
+        let dragged = self.focused_pane().drag_tab.get()?;
         order.iter().position(|&i| i == dragged)?; // dragged tab must be in render order
         // Candidate slot = first tab whose center is past the pointer on the main axis.
         let coord = |r: &egui::Rect| if vertical { r.center().y } else { r.center().x };
@@ -2415,7 +3156,7 @@ impl AppState {
         }
         // Clamp to the dragged tab's pinned-group (v1: reorder only within the group).
         let (group_lo, group_hi) = {
-            let tabs = self.tabs.borrow();
+            let tabs = self.focused_pane().tabs.borrow();
             let lo = order.iter().position(|&i| tabs[i].pinned == tabs[dragged].pinned).unwrap_or(0);
             let hi = order.iter().rposition(|&i| tabs[i].pinned == tabs[dragged].pinned).map(|p| p + 1).unwrap_or(order.len());
             (lo, hi)
@@ -2426,13 +3167,24 @@ impl AppState {
 
     /// Horizontal top tab strip (default). Returns the panel's bottom y (the page top).
     fn draw_tabs_horizontal(&self, ctx: &egui::Context) -> f32 {
-        let active = self.active.get();
-        let scroll_active = self.scroll_active_into_view.take();
+        let active = self.focused_pane().active.get();
+        let scroll_active = self.focused_pane().scroll_active_into_view.take();
         let order = self.tab_order();
         let mut rects: Vec<egui::Rect> = Vec::with_capacity(order.len());
         let mut pending: Option<TabAction> = None;
+        let (fill, tab_max_w) = {
+            let s = self.browser.settings.borrow();
+            (s.theme.tab_fit == theme::TabFit::Fill, s.theme.tab_max_w as f32)
+        };
+        let n = order.len().max(1) as f32;
 
         let outer = egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
+            // In "fill" mode tabs share the strip width evenly (clamped); "fit" uses content width.
+            let fw = if fill {
+                Some((((ui.available_width() - 48.0) / n).clamp(90.0, tab_max_w)).max(90.0))
+            } else {
+                None
+            };
             ui.horizontal(|ui| {
                 // Trailing fixed `+` (always reachable, outside the scrolled region).
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2449,7 +3201,7 @@ impl AppState {
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
                                     for &i in &order {
-                                        let (act, resp) = self.tab_row(ui, i, active, false);
+                                        let (act, resp) = self.tab_row(ui, i, active, false, fw);
                                         rects.push(resp.rect);
                                         if i == active && scroll_active {
                                             resp.scroll_to_me(None);
@@ -2475,8 +3227,8 @@ impl AppState {
     /// Vertical left tab strip (a resizable SidePanel). Sets `content_left` to its width so
     /// the page area shifts right by exactly the panel width.
     fn draw_tabs_vertical(&self, ctx: &egui::Context) {
-        let active = self.active.get();
-        let scroll_active = self.scroll_active_into_view.take();
+        let active = self.focused_pane().active.get();
+        let scroll_active = self.focused_pane().scroll_active_into_view.take();
         let order = self.tab_order();
         let mut rects: Vec<egui::Rect> = Vec::with_capacity(order.len());
         let mut pending: Option<TabAction> = None;
@@ -2494,7 +3246,7 @@ impl AppState {
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for &i in &order {
-                        let (act, resp) = self.tab_row(ui, i, active, true);
+                        let (act, resp) = self.tab_row(ui, i, active, true, None);
                         rects.push(resp.rect);
                         if i == active && scroll_active {
                             resp.scroll_to_me(None);
@@ -2516,7 +3268,7 @@ impl AppState {
     /// Paint the drag-reorder insertion indicator while a tab is being dragged, and commit
     /// the move on release. Shared by both layouts.
     fn handle_drag(&self, ctx: &egui::Context, order: &[usize], rects: &[egui::Rect], vertical: bool) {
-        let Some(dragged) = self.drag_tab.get() else {
+        let Some(dragged) = self.focused_pane().drag_tab.get() else {
             return;
         };
         let pointer = ctx.input(|i| i.pointer.interact_pos());
@@ -2560,10 +3312,10 @@ impl AppState {
                     let to = order[target_render];
                     self.move_tab(dragged, to);
                 }
-                self.drag_tab.set(None);
+                self.focused_pane().drag_tab.set(None);
             }
         } else if !still_dragging {
-            self.drag_tab.set(None);
+            self.focused_pane().drag_tab.set(None);
         }
         self.window.request_redraw();
     }
@@ -2587,7 +3339,7 @@ impl AppState {
             .open(&mut open)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
-                let mut s = self.settings.borrow_mut();
+                let mut s = self.browser.settings.borrow_mut();
                 let mut changed = false;
                 ui.label("Search engine");
                 let current = SEARCH_ENGINES
@@ -2608,40 +3360,24 @@ impl AppState {
                 ui.label("Custom search URL (use %s for the query)");
                 changed |= ui.text_edit_singleline(&mut s.search).changed();
                 ui.add_space(6.0);
-                ui.label("Theme");
-                let cur_theme = THEMES
-                    .iter()
-                    .find(|(_, a, d)| *a == s.accent && *d == s.dark)
-                    .map(|(n, _, _)| *n)
-                    .unwrap_or("Custom");
-                egui::ComboBox::from_id_salt("theme_preset")
-                    .selected_text(cur_theme)
-                    .show_ui(ui, |ui| {
-                        for (name, accent, dark) in THEMES {
-                            if ui
-                                .selectable_label(s.accent == *accent && s.dark == *dark, *name)
-                                .clicked()
-                            {
-                                s.accent = accent.to_string();
-                                s.dark = *dark;
-                                changed = true;
-                            }
-                        }
-                    });
+                ui.label(egui::RichText::new("Appearance").strong());
+                ui.label(
+                    egui::RichText::new("Theme, fonts, density, tabs & more — live.")
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(4.0);
+                if ui.button("🎨  Open the Studio").clicked() {
+                    self.show_studio.set(true);
+                }
                 ui.add_space(6.0);
-                ui.label("Accent color (#rrggbb)");
-                changed |= ui.text_edit_singleline(&mut s.accent).changed();
+
                 ui.label("New-tab wallpaper (image URL)");
                 changed |= ui
                     .add(
                         egui::TextEdit::singleline(&mut s.wallpaper)
                             .hint_text("https://…/image.jpg (blank = themed background)"),
                     )
-                    .changed();
-                ui.add_space(6.0);
-                changed |= ui.checkbox(&mut s.dark, "Dark theme").changed();
-                changed |= ui
-                    .checkbox(&mut s.vertical_tabs, "Vertical tabs (left side)")
                     .changed();
 
                 ui.add_space(10.0);
@@ -2654,7 +3390,7 @@ impl AppState {
                 ui.label(
                     egui::RichText::new(format!(
                         "{} ad/tracker request(s) blocked this session.",
-                        self.adblock_blocked.get()
+                        self.browser.adblock_blocked.get()
                     ))
                     .small()
                     .weak(),
@@ -2668,7 +3404,7 @@ impl AppState {
                 ui.label(
                     egui::RichText::new(format!(
                         "{} userscript(s) loaded from {}",
-                        self.userscripts_count, usdir
+                        self.browser.userscripts_count, usdir
                     ))
                     .small()
                     .weak(),
@@ -2694,7 +3430,7 @@ impl AppState {
                 if ui.button("Set NavGator as default browser").clicked() {
                     default_clicked = true;
                 }
-                if let Some(msg) = self.import_msg.borrow().clone() {
+                if let Some(msg) = self.browser.import_msg.borrow().clone() {
                     ui.add_space(2.0);
                     ui.label(egui::RichText::new(msg).small().weak());
                 }
@@ -2726,10 +3462,11 @@ impl AppState {
                     .checkbox(&mut s.sync_passwords, "Sync passwords (E2EE — unlock below)")
                     .changed();
                 if changed {
+                    sync_legacy_theme(&mut s);
                     save_settings(&s);
                 }
                 ui.add_space(6.0);
-                let busy = self.syncing.get();
+                let busy = self.browser.syncing.get();
                 if ui
                     .add_enabled(
                         !busy,
@@ -2739,7 +3476,7 @@ impl AppState {
                 {
                     sync_clicked = true;
                 }
-                let status = self.sync_status.borrow();
+                let status = self.browser.sync_status.borrow();
                 if !status.is_empty() {
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new(status.as_str()).small().weak());
@@ -2750,19 +3487,19 @@ impl AppState {
                 ui.separator();
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new("Passwords (E2EE)").strong());
-                if self.password_store.borrow().is_unlocked() {
+                if self.browser.password_store.borrow().is_unlocked() {
                     ui.label(
                         egui::RichText::new(format!(
                             "Unlocked — {} saved. Use the 🔑 toolbar button to save the current page's login.",
-                            self.password_store.borrow().len()
+                            self.browser.password_store.borrow().len()
                         ))
                         .small()
                         .weak(),
                     );
                     ui.horizontal(|ui| {
                         if ui.button("Lock").clicked() {
-                            self.password_store.borrow_mut().lock();
-                            *self.password_msg.borrow_mut() = Some("Password store locked.".into());
+                            self.browser.password_store.borrow_mut().lock();
+                            *self.browser.password_msg.borrow_mut() = Some("Password store locked.".into());
                         }
                         if ui.button("Manage saved logins").clicked() {
                             if let (Ok(u), Some(tab)) =
@@ -2795,12 +3532,12 @@ impl AppState {
                         .weak(),
                     );
                     ui.add(
-                        egui::TextEdit::singleline(&mut *self.password_input.borrow_mut())
+                        egui::TextEdit::singleline(&mut *self.browser.password_input.borrow_mut())
                             .password(true)
                             .hint_text("sync passphrase"),
                     );
                     if ui.button("Unlock").clicked() {
-                        unlock_pass = Some(self.password_input.borrow().clone());
+                        unlock_pass = Some(self.browser.password_input.borrow().clone());
                     }
                     // Gates future unlocks: when on, the next successful unlock (manual or
                     // auto-on-launch) stores the passphrase in the OS keyring.
@@ -2815,21 +3552,21 @@ impl AppState {
                         save_settings(&s);
                     }
                 }
-                if let Some(msg) = self.password_msg.borrow().clone() {
+                if let Some(msg) = self.browser.password_msg.borrow().clone() {
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new(msg).small().weak());
                 }
             });
         if let Some(p) = unlock_pass {
             self.unlock_passwords(&p);
-            self.password_input.borrow_mut().clear();
+            self.browser.password_input.borrow_mut().clear();
         }
         // Apply the "Remember passphrase" toggle outside the settings/store borrows. Turning it ON
         // while already unlocked stores the live passphrase immediately; otherwise it'll be stored
         // on the next unlock. Turning it OFF deletes the keyring entry ("Forget on this device").
         if let Some(on) = remember_toggled {
             if on {
-                if let Some(pass) = self.password_store.borrow().passphrase() {
+                if let Some(pass) = self.browser.password_store.borrow().passphrase() {
                     let _ = keyring_store::store(pass);
                 }
             } else {
@@ -3134,7 +3871,7 @@ impl AppState {
         } else if raw.contains('.') && !raw.contains(' ') {
             format!("https://{raw}")
         } else {
-            self.settings.borrow().search.replace("%s", &url_encode(raw))
+            self.browser.settings.borrow().search.replace("%s", &url_encode(raw))
         };
         if let (Ok(url), Some(tab)) = (Url::parse(&target), self.active_tab()) {
             self.location_dirty.set(false);
@@ -3144,16 +3881,16 @@ impl AppState {
 
     // ── Page zoom ──────────────────────────────────────────────────────────────
     fn active_zoom(&self) -> f32 {
-        self.tabs
+        self.focused_pane().tabs
             .borrow()
-            .get(self.active.get())
+            .get(self.focused_pane().active.get())
             .map(|t| t.zoom)
             .unwrap_or(1.0)
     }
 
     fn apply_zoom(&self, zoom: f32) {
         let z = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
-        if let Some(tab) = self.tabs.borrow_mut().get_mut(self.active.get()) {
+        if let Some(tab) = self.focused_pane().tabs.borrow_mut().get_mut(self.focused_pane().active.get()) {
             tab.webview.set_page_zoom(z);
             tab.zoom = z;
         }
@@ -3174,11 +3911,11 @@ impl AppState {
         let Some(me) = self.weak_self.borrow().upgrade() else {
             return;
         };
-        let mut builder = WebViewBuilder::new(&self.servo, self.content_context.clone())
+        let mut builder = WebViewBuilder::new(&self.browser.servo, self.focused_pane().context.clone())
             .url(url)
             .hidpi_scale_factor(Scale::new(self.scale.get() as f32))
             .delegate(me);
-        if let Some(ucm) = &self.userscripts {
+        if let Some(ucm) = &self.browser.userscripts {
             builder = builder.user_content_manager(ucm.clone());
         }
         let webview = builder.build();
@@ -3186,12 +3923,12 @@ impl AppState {
     }
 
     fn adopt_tab(&self, webview: WebView) {
-        let (w, h) = self.content_px.get();
+        let (w, h) = self.focused_pane().content_px.get();
         if w > 0 && h > 0 {
             webview.resize(PhysicalSize::new(w, h));
         }
         let idx = {
-            let mut tabs = self.tabs.borrow_mut();
+            let mut tabs = self.focused_pane().tabs.borrow_mut();
             tabs.push(Tab {
                 webview,
                 url: String::new(),
@@ -3205,6 +3942,7 @@ impl AppState {
                 favicon_tex: None,
                 crashed: false,
                 pinned: false,
+                starred: false,
             });
             tabs.len() - 1
         };
@@ -3223,6 +3961,7 @@ impl AppState {
             let _ = std::fs::create_dir_all(d);
         }
         let s: String = self
+            .focused_pane()
             .tabs
             .borrow()
             .iter()
@@ -3234,7 +3973,7 @@ impl AppState {
 
     fn select_tab(&self, i: usize) {
         {
-            let tabs = self.tabs.borrow();
+            let tabs = self.focused_pane().tabs.borrow();
             if i >= tabs.len() {
                 return;
             }
@@ -3253,14 +3992,14 @@ impl AppState {
             *self.location.borrow_mut() = tabs[i].url.clone();
         }
         self.location_dirty.set(false);
-        self.active.set(i);
-        self.scroll_active_into_view.set(true);
+        self.focused_pane().active.set(i);
+        self.focused_pane().scroll_active_into_view.set(true);
         self.window.request_redraw();
     }
 
     fn close_tab(&self, i: usize) {
         {
-            let mut tabs = self.tabs.borrow_mut();
+            let mut tabs = self.focused_pane().tabs.borrow_mut();
             if i >= tabs.len() {
                 return;
             }
@@ -3270,12 +4009,17 @@ impl AppState {
             }
             tabs.remove(i); // dropping the WebView handle closes the webview
         }
-        if self.tabs.borrow().is_empty() {
-            let _ = self.event_proxy.send_event(WakeUp::Exit);
+        if self.focused_pane().tabs.borrow().is_empty() {
+            // Pane emptied. If the whole window is now tabless, close the window (the loop quits
+            // only if it's the last one); in a split, the other pane keeps the window alive.
+            if self.pane0.tabs.borrow().is_empty() && self.pane1.tabs.borrow().is_empty() {
+                self.wants_close.set(true);
+                self.window.request_redraw();
+            }
             return;
         }
-        let len = self.tabs.borrow().len();
-        let active = self.active.get();
+        let len = self.focused_pane().tabs.borrow().len();
+        let active = self.focused_pane().active.get();
         let new_active = if active >= len {
             len - 1
         } else if active > i {
@@ -3290,7 +4034,7 @@ impl AppState {
     /// Close every tab except `keep` (tab context menu).
     /// Toggle the pinned state of tab `i`.
     fn toggle_pin(&self, i: usize) {
-        if let Some(t) = self.tabs.borrow_mut().get_mut(i) {
+        if let Some(t) = self.focused_pane().tabs.borrow_mut().get_mut(i) {
             t.pinned = !t.pinned;
         }
         self.window.request_redraw();
@@ -3301,7 +4045,7 @@ impl AppState {
     /// on the moved tab.
     fn move_tab(&self, from: usize, to: usize) {
         {
-            let mut tabs = self.tabs.borrow_mut();
+            let mut tabs = self.focused_pane().tabs.borrow_mut();
             if from >= tabs.len() || to >= tabs.len() || from == to {
                 return;
             }
@@ -3314,7 +4058,7 @@ impl AppState {
             tabs.insert(to, t);
         }
         // Fix up the active index so the same tab stays selected after the move.
-        let a = self.active.get();
+        let a = self.focused_pane().active.get();
         let new_a = if a == from {
             to
         } else if from < a && a <= to {
@@ -3324,15 +4068,15 @@ impl AppState {
         } else {
             a
         };
-        self.active.set(new_a);
-        self.scroll_active_into_view.set(true);
+        self.focused_pane().active.set(new_a);
+        self.focused_pane().scroll_active_into_view.set(true);
         self.window.request_redraw();
         self.save_session();
     }
 
     fn close_others(&self, keep: usize) {
         {
-            let tabs = self.tabs.borrow();
+            let tabs = self.focused_pane().tabs.borrow();
             if keep >= tabs.len() {
                 return;
             }
@@ -3344,7 +4088,7 @@ impl AppState {
             }
         }
         let new_active = {
-            let mut tabs = self.tabs.borrow_mut();
+            let mut tabs = self.focused_pane().tabs.borrow_mut();
             // Keep the target tab and any pinned tabs; drop the rest (order preserved).
             let keep_flags: Vec<bool> =
                 (0..tabs.len()).map(|j| j == keep || tabs[j].pinned).collect();
@@ -3357,7 +4101,7 @@ impl AppState {
             });
             new_active
         };
-        self.active.set(new_active);
+        self.focused_pane().active.set(new_active);
         self.select_tab(new_active);
         self.save_session();
     }
@@ -3375,11 +4119,11 @@ impl AppState {
     /// Record a page visit in history (deduped by URL; frecency = visit count).
     /// Kick off a background Lyku sync — push local bookmarks/history, pull remote changes.
     fn start_sync(&self) {
-        if self.syncing.get() {
+        if self.browser.syncing.get() {
             return;
         }
         let (api_key, sync_bookmarks, sync_history, sync_passwords) = {
-            let s = self.settings.borrow();
+            let s = self.browser.settings.borrow();
             (
                 s.sync_api_key.clone(),
                 s.sync_bookmarks,
@@ -3388,18 +4132,18 @@ impl AppState {
             )
         };
         if api_key.trim().is_empty() {
-            *self.sync_status.borrow_mut() = "Set a Lyku API key first.".into();
+            *self.browser.sync_status.borrow_mut() = "Set a Lyku API key first.".into();
             return;
         }
         if !sync_bookmarks && !sync_history && !sync_passwords {
-            *self.sync_status.borrow_mut() = "Enable a collection to sync first.".into();
+            *self.browser.sync_status.borrow_mut() = "Enable a collection to sync first.".into();
             return;
         }
         let snap = {
-            let p = self.profile.borrow();
+            let p = self.browser.profile.borrow();
             // Passwords are encrypted HERE (UI thread) — the sync thread only sees ciphertext,
             // and only when the store is unlocked.
-            let store = self.password_store.borrow();
+            let store = self.browser.password_store.borrow();
             let sync_passwords = sync_passwords && store.is_unlocked();
             let passwords = if sync_passwords {
                 store
@@ -3433,14 +4177,14 @@ impl AppState {
                     .iter()
                     .map(|e| (e.url.clone(), e.title.clone(), e.visits, e.updated))
                     .collect(),
-                cursor_bookmarks: self.sync_cursor_bookmarks.get(),
-                cursor_history: self.sync_cursor_history.get(),
-                cursor_passwords: self.sync_cursor_passwords.get(),
+                cursor_bookmarks: self.browser.sync_cursor_bookmarks.get(),
+                cursor_history: self.browser.sync_cursor_history.get(),
+                cursor_passwords: self.browser.sync_cursor_passwords.get(),
             }
         };
-        self.syncing.set(true);
-        *self.sync_status.borrow_mut() = "Syncing…".into();
-        let proxy = self.event_proxy.clone();
+        self.browser.syncing.set(true);
+        *self.browser.sync_status.borrow_mut() = "Syncing…".into();
+        let proxy = self.browser.event_proxy.clone();
         std::thread::spawn(move || {
             let outcome = sync::run_sync(snap);
             let _ = proxy.send_event(WakeUp::SyncDone(outcome));
@@ -3450,11 +4194,11 @@ impl AppState {
     /// Apply a finished background sync to the local stores (UI thread). Last-write-wins by
     /// `updated`; deletes are not propagated in early access.
     fn apply_sync(&self, outcome: sync::SyncOutcome) {
-        self.syncing.set(false);
-        *self.sync_status.borrow_mut() = outcome.message.clone();
+        self.browser.syncing.set(false);
+        *self.browser.sync_status.borrow_mut() = outcome.message.clone();
         if outcome.ok {
             {
-                let mut p = self.profile.borrow_mut();
+                let mut p = self.browser.profile.borrow_mut();
                 for b in &outcome.bookmarks {
                     if b.deleted {
                         continue;
@@ -3495,27 +4239,27 @@ impl AppState {
                 save_history(&p);
             }
             // Decrypt + merge pulled passwords into the store (only while unlocked).
-            if self.password_store.borrow().is_unlocked() {
+            if self.browser.password_store.borrow().is_unlocked() {
                 let mut changed = false;
                 for pw in &outcome.passwords {
                     if pw.deleted {
                         continue;
                     }
                     if let Some(blob) = hex_decode(&pw.payload) {
-                        let cred = self.password_store.borrow().decrypt_credential(&blob);
+                        let cred = self.browser.password_store.borrow().decrypt_credential(&blob);
                         if let Some(cred) = cred {
-                            self.password_store.borrow_mut().upsert(cred);
+                            self.browser.password_store.borrow_mut().upsert(cred);
                             changed = true;
                         }
                     }
                 }
                 if changed {
-                    let _ = self.password_store.borrow().save();
+                    let _ = self.browser.password_store.borrow().save();
                 }
             }
-            self.sync_cursor_bookmarks.set(outcome.cursor_bookmarks);
-            self.sync_cursor_history.set(outcome.cursor_history);
-            self.sync_cursor_passwords.set(outcome.cursor_passwords);
+            self.browser.sync_cursor_bookmarks.set(outcome.cursor_bookmarks);
+            self.browser.sync_cursor_history.set(outcome.cursor_history);
+            self.browser.sync_cursor_passwords.set(outcome.cursor_passwords);
             save_sync_cursors(
                 outcome.cursor_bookmarks,
                 outcome.cursor_history,
@@ -3534,7 +4278,7 @@ impl AppState {
         {
             return;
         }
-        let mut p = self.profile.borrow_mut();
+        let mut p = self.browser.profile.borrow_mut();
         if let Some(e) = p.history.iter_mut().find(|e| e.url == url) {
             e.visits += 1;
             if !title.is_empty() {
@@ -3559,14 +4303,14 @@ impl AppState {
 
     /// Bookmark or un-bookmark the active tab's page (Ctrl+D).
     fn toggle_bookmark_active(&self) {
-        let (url, title) = match self.tabs.borrow().get(self.active.get()) {
+        let (url, title) = match self.focused_pane().tabs.borrow().get(self.focused_pane().active.get()) {
             Some(t) => (t.url.clone(), t.title.clone()),
             None => return,
         };
         if url.is_empty() {
             return;
         }
-        let mut p = self.profile.borrow_mut();
+        let mut p = self.browser.profile.borrow_mut();
         if let Some(pos) = p.bookmarks.iter().position(|b| b.url == url) {
             p.bookmarks.remove(pos);
         } else {
@@ -3587,7 +4331,7 @@ impl AppState {
         let history = import_browser_history();
         let (mut b_added, mut h_added) = (0usize, 0usize);
         {
-            let mut p = self.profile.borrow_mut();
+            let mut p = self.browser.profile.borrow_mut();
             let mut seen: std::collections::HashSet<String> =
                 p.bookmarks.iter().map(|b| b.url.clone()).collect();
             for (url, title) in bookmarks {
@@ -3625,7 +4369,7 @@ impl AppState {
             save_bookmarks(&p);
             save_history(&p);
         }
-        *self.import_msg.borrow_mut() = Some(if b_added + h_added > 0 {
+        *self.browser.import_msg.borrow_mut() = Some(if b_added + h_added > 0 {
             format!(
                 "Imported {b_added} bookmark(s) + {h_added} history entr{}.",
                 if h_added == 1 { "y" } else { "ies" }
@@ -3638,7 +4382,7 @@ impl AppState {
 
     /// Register NavGator as the system default browser (Settings → Setup).
     fn make_default_browser(&self) {
-        *self.import_msg.borrow_mut() = Some(set_default_browser());
+        *self.browser.import_msg.borrow_mut() = Some(set_default_browser());
         self.window.request_redraw();
     }
 
@@ -3694,22 +4438,22 @@ impl AppState {
 
     /// Unlock the E2EE password store with the passphrase (decrypts saved logins into memory).
     fn unlock_passwords(&self, passphrase: &str) {
-        let result = self.password_store.borrow_mut().unlock(passphrase);
+        let result = self.browser.password_store.borrow_mut().unlock(passphrase);
         // On a successful unlock, persist the passphrase to the OS keyring iff the user opted in.
         // This is the only place (besides the checkbox-on path) the plaintext is written out, and
         // it goes nowhere but the OS keyring. Failure is non-fatal — the user can unlock manually
         // next time. The auto-unlock-at-launch path re-enters here, harmlessly re-storing.
-        if result.is_ok() && self.settings.borrow().remember_passphrase {
+        if result.is_ok() && self.browser.settings.borrow().remember_passphrase {
             let _ = keyring_store::store(passphrase);
         }
         let msg = match result {
             Ok(()) => format!(
                 "Password store unlocked ({} saved).",
-                self.password_store.borrow().len()
+                self.browser.password_store.borrow().len()
             ),
             Err(e) => format!("Unlock failed: {e}"),
         };
-        *self.password_msg.borrow_mut() = Some(msg);
+        *self.browser.password_msg.borrow_mut() = Some(msg);
         self.window.request_redraw();
     }
 
@@ -3717,11 +4461,11 @@ impl AppState {
     /// matches the page origin. The credential goes straight from the store into the form via
     /// evaluate_javascript — it is never exposed to page-readable storage.
     fn autofill(&self, tab_idx: usize) {
-        if !self.password_store.borrow().is_unlocked() {
+        if !self.browser.password_store.borrow().is_unlocked() {
             return;
         }
         let (webview, origin) = {
-            let tabs = self.tabs.borrow();
+            let tabs = self.focused_pane().tabs.borrow();
             let Some(t) = tabs.get(tab_idx) else {
                 return;
             };
@@ -3731,6 +4475,7 @@ impl AppState {
             (t.webview.clone(), origin)
         };
         let cred = self
+            .browser
             .password_store
             .borrow()
             .for_origin(&origin)
@@ -3761,17 +4506,18 @@ impl AppState {
             return;
         };
         let origin = self
+            .focused_pane()
             .tabs
             .borrow()
-            .get(self.active.get())
+            .get(self.focused_pane().active.get())
             .and_then(|t| origin_of(&t.url));
         let Some(origin) = origin else {
-            *self.password_msg.borrow_mut() = Some("Logins can only be saved on http(s) pages.".into());
+            *self.browser.password_msg.borrow_mut() = Some("Logins can only be saved on http(s) pages.".into());
             self.window.request_redraw();
             return;
         };
-        if !self.password_store.borrow().is_unlocked() {
-            *self.password_msg.borrow_mut() =
+        if !self.browser.password_store.borrow().is_unlocked() {
+            *self.browser.password_msg.borrow_mut() =
                 Some("Unlock the password store first (Settings → Passwords).".into());
             self.window.request_redraw();
             return;
@@ -3785,7 +4531,7 @@ impl AppState {
                 return;
             };
             if s.is_empty() {
-                *me.password_msg.borrow_mut() = Some("No filled password field on this page.".into());
+                *me.browser.password_msg.borrow_mut() = Some("No filled password field on this page.".into());
                 me.window.request_redraw();
                 return;
             }
@@ -3794,7 +4540,7 @@ impl AppState {
                 let pass = v.get("p").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 if !pass.is_empty() {
                     {
-                        let mut store = me.password_store.borrow_mut();
+                        let mut store = me.browser.password_store.borrow_mut();
                         store.upsert(password::Credential {
                             origin: origin.clone(),
                             username: user,
@@ -3803,7 +4549,7 @@ impl AppState {
                         });
                         let _ = store.save();
                     }
-                    *me.password_msg.borrow_mut() = Some(format!("Saved login for {origin}."));
+                    *me.browser.password_msg.borrow_mut() = Some(format!("Saved login for {origin}."));
                     me.window.request_redraw();
                 }
             }
@@ -3814,11 +4560,11 @@ impl AppState {
     /// collect the page's class/id set, then inject a `<style>` hiding the matching selectors —
     /// generic rules are filtered to the page's actual classes/ids, so this stays cheap.
     fn apply_cosmetic(&self, tab_idx: usize) {
-        if !self.settings.borrow().block_ads {
+        if !self.browser.settings.borrow().block_ads {
             return;
         }
         let (webview, url) = {
-            let tabs = self.tabs.borrow();
+            let tabs = self.focused_pane().tabs.borrow();
             let Some(t) = tabs.get(tab_idx) else {
                 return;
             };
@@ -3846,8 +4592,9 @@ impl AppState {
                     .unwrap_or_default()
             };
             let (classes, ids) = (arr("c"), arr("i"));
-            let cosmetic = me.adblock.url_cosmetic_resources(&url);
+            let cosmetic = me.browser.adblock.url_cosmetic_resources(&url);
             let generic = me
+                .browser
                 .adblock
                 .hidden_class_id_selectors(&classes, &ids, &cosmetic.exceptions);
             let mut selectors: Vec<String> = cosmetic.hide_selectors.into_iter().collect();
@@ -3860,15 +4607,15 @@ impl AppState {
             let css = format!("{}{{display:none!important}}", selectors.join(","));
             // We're inside an eval callback (Servo's JS-evaluator RefCell is borrowed), so the
             // inject is deferred to the event loop via WakeUp::CosmeticReady.
-            me.pending_cosmetic.borrow_mut().push((inject, css));
-            let _ = me.event_proxy.send_event(WakeUp::CosmeticReady);
+            me.browser.pending_cosmetic.borrow_mut().push((inject, css));
+            let _ = me.browser.event_proxy.send_event(WakeUp::CosmeticReady);
         });
     }
 
     /// Inject queued cosmetic-filter CSS. Called from the event loop (the JS evaluator is free
     /// there, unlike inside an eval callback). Each entry is `(webview, css)`.
     fn flush_cosmetic(&self) {
-        let pending = std::mem::take(&mut *self.pending_cosmetic.borrow_mut());
+        let pending = std::mem::take(&mut *self.browser.pending_cosmetic.borrow_mut());
         for (wv, css) in pending {
             let js = format!(
                 "(function(c){{var s=document.getElementById('__ng_cos')||document.createElement('style');s.id='__ng_cos';s.textContent=c;(document.head||document.documentElement).appendChild(s);}})({})",
@@ -3907,7 +4654,7 @@ impl AppState {
     }
 
     fn ipc_emit(&self, line: &str) {
-        let mut clients = self.ipc_clients.lock().unwrap();
+        let mut clients = self.browser.ipc_clients.lock().unwrap();
         clients.retain_mut(|c| writeln!(c, "{line}").is_ok());
     }
 
@@ -3928,6 +4675,12 @@ impl AppState {
     fn content_left_dev(&self) -> f64 {
         self.content_left.get() as f64 * self.scale.get()
     }
+
+    /// Device-px width of the right-hand Studio panel (0 when closed); the page ends this
+    /// many device px before the window's right edge.
+    fn content_right_dev(&self) -> f64 {
+        self.content_right.get() as f64 * self.scale.get()
+    }
 }
 
 impl WebViewDelegate for AppState {
@@ -3945,14 +4698,14 @@ impl WebViewDelegate for AppState {
             // Ad/tracker blocking. This delegate already intercepts every load, so a matched
             // request is intercepted with an empty 204 instead of being fetched. `source` is the
             // requesting tab's URL, so first-vs-third-party rules resolve correctly.
-            if matches!(url.scheme(), "http" | "https") && self.settings.borrow().block_ads {
+            if matches!(url.scheme(), "http" | "https") && self.browser.settings.borrow().block_ads {
                 let source = self
                     .tab_index(&webview)
-                    .and_then(|i| self.tabs.borrow().get(i).map(|t| t.url.clone()))
+                    .and_then(|i| self.focused_pane().tabs.borrow().get(i).map(|t| t.url.clone()))
                     .unwrap_or_default();
                 if let Ok(req) = adblock::request::Request::new(url.as_str(), &source, "other") {
-                    if self.adblock.check_network_request(&req).matched {
-                        self.adblock_blocked.set(self.adblock_blocked.get() + 1);
+                    if self.browser.adblock.check_network_request(&req).matched {
+                        self.browser.adblock_blocked.set(self.browser.adblock_blocked.get() + 1);
                         let response =
                             WebResourceResponse::new(url).status_code(StatusCode::NO_CONTENT);
                         let mut intercepted = load.intercept(response);
@@ -4043,12 +4796,12 @@ impl WebViewDelegate for AppState {
 
     fn notify_url_changed(&self, webview: WebView, url: Url) {
         if let Some(i) = self.tab_index(&webview) {
-            self.tabs.borrow_mut()[i].url = url.to_string();
+            self.focused_pane().tabs.borrow_mut()[i].url = url.to_string();
             self.ipc_emit(&format!("url {i} {url}"));
-            if i == self.active.get() && !self.location_dirty.get() {
+            if i == self.focused_pane().active.get() && !self.location_dirty.get() {
                 *self.location.borrow_mut() = url.to_string();
             }
-            let title = self.tabs.borrow()[i].title.clone();
+            let title = self.focused_pane().tabs.borrow()[i].title.clone();
             self.record_visit(url.as_str(), &title);
             self.save_session();
             self.window.request_redraw();
@@ -4059,8 +4812,8 @@ impl WebViewDelegate for AppState {
         if let Some(i) = self.tab_index(&webview) {
             let title = title.unwrap_or_else(|| "New tab".to_string());
             self.ipc_emit(&format!("title {i} {title}"));
-            let url = self.tabs.borrow()[i].url.clone();
-            self.tabs.borrow_mut()[i].title = title.clone();
+            let url = self.focused_pane().tabs.borrow()[i].url.clone();
+            self.focused_pane().tabs.borrow_mut()[i].title = title.clone();
             self.record_visit(&url, &title);
             self.window.request_redraw();
         }
@@ -4068,7 +4821,7 @@ impl WebViewDelegate for AppState {
 
     fn notify_history_changed(&self, webview: WebView, entries: Vec<Url>, current: usize) {
         if let Some(i) = self.tab_index(&webview) {
-            let mut tabs = self.tabs.borrow_mut();
+            let mut tabs = self.focused_pane().tabs.borrow_mut();
             tabs[i].can_back = current > 0;
             tabs[i].can_forward = current + 1 < entries.len();
             drop(tabs);
@@ -4079,7 +4832,7 @@ impl WebViewDelegate for AppState {
     fn notify_favicon_changed(&self, webview: WebView) {
         if let Some(i) = self.tab_index(&webview) {
             let img = webview.favicon().map(|f| favicon_color_image(&f));
-            self.tabs.borrow_mut()[i].favicon_pending = img;
+            self.focused_pane().tabs.borrow_mut()[i].favicon_pending = img;
             self.window.request_redraw();
         }
     }
@@ -4087,7 +4840,7 @@ impl WebViewDelegate for AppState {
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
         if let Some(i) = self.tab_index(&webview) {
             {
-                let mut tabs = self.tabs.borrow_mut();
+                let mut tabs = self.focused_pane().tabs.borrow_mut();
                 tabs[i].loading = !matches!(status, LoadStatus::Complete);
                 // A new load clears any stale hover/status text and the crashed state
                 // (a started load means the pipeline is alive again).
@@ -4100,7 +4853,7 @@ impl WebViewDelegate for AppState {
                 self.autofill(i);
                 self.apply_cosmetic(i);
             }
-            if matches!(status, LoadStatus::Complete) && i == self.active.get() {
+            if matches!(status, LoadStatus::Complete) && i == self.focused_pane().active.get() {
                 self.location_dirty.set(false);
             }
             self.window.request_redraw();
@@ -4109,15 +4862,15 @@ impl WebViewDelegate for AppState {
 
     fn notify_status_text_changed(&self, webview: WebView, status: Option<String>) {
         if let Some(i) = self.tab_index(&webview) {
-            self.tabs.borrow_mut()[i].status_text = status;
+            self.focused_pane().tabs.borrow_mut()[i].status_text = status;
             self.window.request_redraw();
         }
     }
 
     fn notify_download_started(&self, _webview: WebView, url: String, path: String) {
         let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-        *self.download_toast.borrow_mut() = Some(format!("Downloading {name}…"));
-        self.downloads.borrow_mut().push(Download {
+        *self.browser.download_toast.borrow_mut() = Some(format!("Downloading {name}…"));
+        self.browser.downloads.borrow_mut().push(Download {
             url,
             path,
             done: false,
@@ -4128,12 +4881,13 @@ impl WebViewDelegate for AppState {
 
     fn notify_download_completed(&self, _webview: WebView, path: String, success: bool) {
         let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-        *self.download_toast.borrow_mut() = Some(if success {
+        *self.browser.download_toast.borrow_mut() = Some(if success {
             format!("Saved {name}")
         } else {
             format!("Download failed: {name}")
         });
         if let Some(d) = self
+            .browser
             .downloads
             .borrow_mut()
             .iter_mut()
@@ -4153,7 +4907,7 @@ impl WebViewDelegate for AppState {
             .builder(self.content_context.clone())
             .hidpi_scale_factor(Scale::new(self.scale.get() as f32))
             .delegate(me);
-        if let Some(ucm) = &self.userscripts {
+        if let Some(ucm) = &self.browser.userscripts {
             builder = builder.user_content_manager(ucm.clone());
         }
         let webview = builder.build();
@@ -4291,7 +5045,7 @@ impl WebViewDelegate for AppState {
             return;
         };
         let crashed_url = {
-            let mut tabs = self.tabs.borrow_mut();
+            let mut tabs = self.focused_pane().tabs.borrow_mut();
             tabs[i].crashed = true;
             tabs[i].loading = false;
             // Don't offer a reload back to our own crash page if it somehow crashes again.
@@ -4325,7 +5079,7 @@ impl WebViewDelegate for AppState {
         if navigation_request.url.scheme() == "gator" {
             let from_web = self
                 .tab_index(&webview)
-                .and_then(|i| self.tabs.borrow().get(i).map(|t| t.url.clone()))
+                .and_then(|i| self.focused_pane().tabs.borrow().get(i).map(|t| t.url.clone()))
                 .is_some_and(|u| u.starts_with("http://") || u.starts_with("https://"));
             if from_web {
                 navigation_request.deny();
@@ -4336,44 +5090,114 @@ impl WebViewDelegate for AppState {
     }
 }
 
+/// Create a brand-new OS window with its own render contexts, egui, and tab set (opening
+/// `urls`, or the welcome page if empty). One `Servo` (in `browser`) drives every window — this
+/// just registers another rendering context with it when the window's first webview is built.
+fn open_window(
+    event_loop: &ActiveEventLoop,
+    browser: &Rc<BrowserState>,
+    urls: Vec<Url>,
+) -> (WindowId, Rc<AppState>) {
+    let display_handle = event_loop.display_handle().expect("no display handle");
+    let window = event_loop
+        .create_window(
+            Window::default_attributes()
+                .with_title("NavGator")
+                .with_decorations(false)
+                .with_visible(false)
+                .with_inner_size(LogicalSize::new(1280.0, 800.0)),
+        )
+        .expect("failed to create window");
+    let window_id = window.id();
+    let window_handle = window.window_handle().expect("no window handle");
+    let inner = window.inner_size();
+    let scale = window.scale_factor();
+
+    let window_context = Rc::new(
+        WindowRenderingContext::new(display_handle, window_handle, inner)
+            .expect("failed to create WindowRenderingContext"),
+    );
+    let _ = window_context.make_current();
+    let content_context = Rc::new(window_context.offscreen_context(inner));
+    // Second offscreen FBO for the right split pane (its own webview + history).
+    let content_context_r = Rc::new(window_context.offscreen_context(inner));
+
+    let _ = content_context.make_current();
+    let egui = EguiGlow::new(event_loop, content_context.glow_gl_api(), None, None, false);
+    egui.egui_ctx.options_mut(|o| {
+        o.zoom_with_keyboard = false;
+    });
+    // Bundle + register the chrome typefaces (Space Grotesk / Outfit / JetBrains Mono).
+    fonts::install_fonts(&egui.egui_ctx);
+    window.set_visible(true);
+
+    let state = Rc::new(AppState {
+        browser: browser.clone(),
+        window_context,
+        content_context: content_context.clone(),
+        egui: RefCell::new(egui),
+        toolbar_height: Cell::new(0.0),
+        content_left: Cell::new(0.0),
+        content_right: Cell::new(0.0),
+        pane0: PaneGroup::new(content_context.clone()),
+        pane1: PaneGroup::new(content_context_r),
+        split: Cell::new(false),
+        focused: Cell::new(0),
+        location: RefCell::new(String::new()),
+        location_dirty: Cell::new(false),
+        focus_omnibox: Cell::new(false),
+        show_settings: Cell::new(false),
+        show_studio: Cell::new(false),
+        dash_search: RefCell::new(String::new()),
+        dialogs: RefCell::new(Vec::new()),
+        closed_tabs: RefCell::new(Vec::new()),
+        find_open: Cell::new(false),
+        find_query: RefCell::new(String::new()),
+        find_matches: Cell::new(0),
+        find_active: Cell::new(0),
+        find_focus: Cell::new(false),
+        fullscreen: Cell::new(false),
+        scale: Cell::new(scale),
+        cursor: Cell::new((0.0, 0.0)),
+        ctrl: Cell::new(false),
+        shift: Cell::new(false),
+        weak_self: RefCell::new(Weak::new()),
+        wants_close: Cell::new(false),
+        window,
+    });
+    *state.weak_self.borrow_mut() = Rc::downgrade(&state);
+
+    if urls.is_empty() {
+        state.new_tab(content_url());
+    } else {
+        for url in urls {
+            state.new_tab(url);
+        }
+    }
+    (window_id, state)
+}
+
 enum App {
     Initial {
         waker: Waker,
         ipc_clients: Arc<Mutex<Vec<UnixStream>>>,
     },
-    Running(Rc<AppState>),
+    Running {
+        browser: Rc<BrowserState>,
+        windows: HashMap<WindowId, Rc<AppState>>,
+    },
 }
 
 impl ApplicationHandler<WakeUp> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let (waker, ipc_clients) = match self {
             App::Initial { waker, ipc_clients } => (waker.clone(), ipc_clients.clone()),
-            App::Running(_) => return,
+            App::Running { .. } => return,
         };
         let event_proxy = waker.0.clone();
 
-        let display_handle = event_loop.display_handle().expect("no display handle");
-        let window = event_loop
-            .create_window(
-                Window::default_attributes()
-                    .with_title("NavGator")
-                    .with_decorations(false)
-                    .with_visible(false)
-                    .with_inner_size(LogicalSize::new(1280.0, 800.0)),
-            )
-            .expect("failed to create window");
-        let window_handle = window.window_handle().expect("no window handle");
-
-        let inner = window.inner_size();
-        let scale = window.scale_factor();
-
-        let window_context = Rc::new(
-            WindowRenderingContext::new(display_handle, window_handle, inner)
-                .expect("failed to create WindowRenderingContext"),
-        );
-        let _ = window_context.make_current();
-        let content_context = Rc::new(window_context.offscreen_context(inner));
-
+        // Build the single Servo engine (window-agnostic — it drives every window's webviews via
+        // one Painter per rendering context) and the browser-global services, ONCE.
         let servo = ServoBuilder::default()
             .event_loop_waker(Box::new(waker))
             .preferences(navgator_preferences())
@@ -4405,32 +5229,14 @@ impl ApplicationHandler<WakeUp> for App {
             Some(Rc::new(ucm))
         };
 
-        let _ = content_context.make_current();
-        let egui = EguiGlow::new(event_loop, content_context.glow_gl_api(), None, None, false);
-        egui.egui_ctx.options_mut(|o| {
-            o.zoom_with_keyboard = false;
-        });
-        window.set_visible(true);
-
         let (sync_cb, sync_ch, sync_cp) = load_sync_cursors();
-        let state = Rc::new(AppState {
+        let browser = Rc::new(BrowserState {
             servo,
             userscripts,
             userscripts_count,
-            window_context,
-            content_context,
-            egui: RefCell::new(egui),
-            toolbar_height: Cell::new(0.0),
-            content_left: Cell::new(0.0),
-            content_px: Cell::new((0, 0)),
-            drag_tab: Cell::new(None),
-            scroll_active_into_view: Cell::new(false),
-            tabs: RefCell::new(Vec::new()),
-            active: Cell::new(0),
-            location: RefCell::new(String::new()),
-            location_dirty: Cell::new(false),
-            focus_omnibox: Cell::new(false),
-            show_settings: Cell::new(false),
+            ipc_clients,
+            settings: RefCell::new(load_settings()),
+            profile: RefCell::new(load_profile()),
             sync_cursor_bookmarks: Cell::new(sync_cb),
             sync_cursor_history: Cell::new(sync_ch),
             sync_cursor_passwords: Cell::new(sync_cp),
@@ -4450,85 +5256,90 @@ impl ApplicationHandler<WakeUp> for App {
             password_input: RefCell::new(String::new()),
             password_msg: RefCell::new(None),
             import_msg: RefCell::new(None),
-            dialogs: RefCell::new(Vec::new()),
-            closed_tabs: RefCell::new(Vec::new()),
-            find_open: Cell::new(false),
-            find_query: RefCell::new(String::new()),
-            find_matches: Cell::new(0),
-            find_active: Cell::new(0),
-            find_focus: Cell::new(false),
-            fullscreen: Cell::new(false),
-            scale: Cell::new(scale),
-            cursor: Cell::new((0.0, 0.0)),
-            ctrl: Cell::new(false),
-            shift: Cell::new(false),
-            weak_self: RefCell::new(Weak::new()),
-            ipc_clients,
-            settings: RefCell::new(load_settings()),
-            profile: RefCell::new(load_profile()),
             event_proxy,
-            window,
+            pending_windows: RefCell::new(Vec::new()),
         });
-        *state.weak_self.borrow_mut() = Rc::downgrade(&state);
-
-        // Auto-unlock the password store from the OS keyring if the user opted in. Fully
-        // fallible-safe: `fetch()` returns None on any keyring problem (no secret-service,
-        // headless, NoEntry), so this never blocks or crashes startup. On a wrong/rotated stored
-        // value `unlock_passwords` returns Err, the store stays locked, and a non-fatal toast
-        // shows. This reuses the manual-unlock path, so autofill/save light up exactly as usual.
-        let remember = state.settings.borrow().remember_passphrase;
-        if remember && let Some(pass) = keyring_store::fetch() {
-            state.unlock_passwords(&pass);
-        }
 
         // Restore the previous session's tabs unless the user passed an explicit URL on the
-        // command line (which takes precedence). A missing/empty/malformed session yields no
-        // tabs, in which case we open the welcome page exactly as before.
+        // command line. A missing/empty session => the welcome page (handled by open_window).
         let restored = if cli_url_given() {
             Vec::new()
         } else {
             load_session()
         };
-        if restored.is_empty() {
-            state.new_tab(content_url());
-        } else {
-            for url in restored {
-                state.new_tab(url);
-            }
+        let (window_id, state) = open_window(event_loop, &browser, restored);
+
+        // Auto-unlock the password store from the OS keyring if the user opted in (browser-global).
+        // Fully fallible-safe: `fetch()` returns None on any keyring problem (no secret-service,
+        // headless, NoEntry), so this never blocks or crashes startup.
+        let remember = browser.settings.borrow().remember_passphrase;
+        if remember && let Some(pass) = keyring_store::fetch() {
+            state.unlock_passwords(&pass);
         }
 
-        *self = App::Running(state);
+        let mut windows = HashMap::new();
+        windows.insert(window_id, state);
+        *self = App::Running { browser, windows };
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WakeUp) {
-        if let App::Running(state) = self {
+        let App::Running { browser, windows } = self else { return };
+        if let WakeUp::Exit = event {
+            event_loop.exit();
+            return;
+        }
+        // These wake-ups act on browser-global data; route through any one window's state, then
+        // refresh all windows so chrome (bookmarks bar, sync status) reflects the change.
+        if let Some(state) = windows.values().next().cloned() {
             match event {
-                WakeUp::Exit => {
-                    event_loop.exit();
-                    return;
-                }
                 WakeUp::Ipc(cmd) => state.handle_ipc(cmd),
                 WakeUp::SyncDone(outcome) => state.apply_sync(outcome),
                 WakeUp::CosmeticReady => state.flush_cosmetic(),
-                WakeUp::Wake => {}
+                WakeUp::Wake | WakeUp::Exit => {}
             }
-            state.servo.spin_event_loop();
         }
+        browser.servo.spin_event_loop();
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let App::Running(state) = self else { return };
-        state.servo.spin_event_loop();
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        let App::Running { browser, windows } = self else { return };
+        let browser = browser.clone();
+        browser.servo.spin_event_loop();
+
+        // Closing a window drops just that window's state (its Drop frees its GL contexts); the
+        // last window closing quits the app.
+        if matches!(event, WindowEvent::CloseRequested) {
+            windows.remove(&id);
+            if windows.is_empty() {
+                event_loop.exit();
+            }
+            return;
+        }
+        let Some(state) = windows.get(&id).cloned() else {
+            return;
+        };
 
         // Window-level events handled before egui.
         match &event {
-            WindowEvent::CloseRequested => {
-                event_loop.exit();
-                return;
-            }
             WindowEvent::RedrawRequested => {
+                // Close this window if requested (✕ button or its last tab closed); quit only if
+                // it was the last window.
+                if state.wants_close.get() {
+                    windows.remove(&id);
+                    if windows.is_empty() {
+                        event_loop.exit();
+                    }
+                    return;
+                }
                 state.update();
                 state.paint();
+                // Open any windows requested during the frame (Ctrl+N / tab pop-out). Done here,
+                // outside the per-window borrow, since this is where we own the `windows` map.
+                let pending: Vec<Url> = browser.pending_windows.borrow_mut().drain(..).collect();
+                for url in pending {
+                    let (wid, ws) = open_window(event_loop, &browser, vec![url]);
+                    windows.insert(wid, ws);
+                }
                 return;
             }
             WindowEvent::Resized(size) => {
@@ -4557,11 +5368,20 @@ impl ApplicationHandler<WakeUp> for App {
         let scale = state.scale.get();
         let toolbar_dev = state.toolbar_dev();
         let left_dev = state.content_left_dev();
+        let right_dev = state.content_right_dev();
+        let win_w = state.window.inner_size().width as f64;
+        // Device-px x of the split divider (matches `mid` in update()); only meaningful while split.
+        let mid_dev = (left_dev + win_w - right_dev) / 2.0;
         let (cx, cy) = state.cursor.get();
         let over_toolbar = cy < toolbar_dev;
-        // The page area is below the toolbar AND right of the vertical-tabs panel. Input
-        // over either chrome region must not leak to the page.
-        let over_chrome = cy < toolbar_dev || cx < left_dev;
+        // The page area is below the toolbar, right of the vertical-tabs panel, and left of
+        // the Studio panel. Input over any chrome region must not leak to the page.
+        // On the native new-tab dashboard the whole page region is egui-owned, so input must
+        // not leak to the (unpainted) welcome WebView underneath.
+        let over_chrome = cy < toolbar_dev
+            || cx < left_dev
+            || cx > win_w - right_dev
+            || state.active_is_newtab();
         let dialog_open = !state.dialogs.borrow().is_empty();
 
         match event {
@@ -4570,10 +5390,13 @@ impl ApplicationHandler<WakeUp> for App {
                     Some(dir) => state.window.set_cursor(resize_cursor(dir)),
                     None => state.window.set_cursor(CursorIcon::Default),
                 }
-                if !(resp.consumed || over_chrome || dialog_open) {
+                let foc = state.focused.get();
+                let off = if state.split.get() && foc == 1 { mid_dev } else { left_dev };
+                let over_focused = !state.split.get() || ((foc == 0) == (cx < mid_dev));
+                if !(resp.consumed || over_chrome || dialog_open) && over_focused {
                     state.forward_to_page(InputEvent::MouseMove(MouseMoveEvent::new(
                         DevicePoint::new(
-                            (position.x - left_dev) as f32,
+                            (position.x - off) as f32,
                             (position.y - toolbar_dev) as f32,
                         )
                         .into(),
@@ -4613,7 +5436,19 @@ impl ApplicationHandler<WakeUp> for App {
                     let _ = state.window.drag_window();
                     return;
                 }
-                if !(resp.consumed || over_chrome || dialog_open) {
+                // Split: a left-press in a pane focuses that pane (so chrome + input follow it).
+                if button == MouseButton::Left
+                    && bs == ElementState::Pressed
+                    && state.split.get()
+                    && !over_chrome
+                    && !over_toolbar
+                {
+                    state.focused.set(if cx < mid_dev { 0 } else { 1 });
+                }
+                let foc = state.focused.get();
+                let off = if state.split.get() && foc == 1 { mid_dev } else { left_dev };
+                let over_focused = !state.split.get() || ((foc == 0) == (cx < mid_dev));
+                if !(resp.consumed || over_chrome || dialog_open) && over_focused {
                     let action = match bs {
                         ElementState::Pressed => MouseButtonAction::Down,
                         ElementState::Released => MouseButtonAction::Up,
@@ -4634,7 +5469,7 @@ impl ApplicationHandler<WakeUp> for App {
                     state.forward_to_page(InputEvent::MouseButton(MouseButtonEvent::new(
                         action,
                         servo_button,
-                        DevicePoint::new((cx - left_dev) as f32, (cy - toolbar_dev) as f32).into(),
+                        DevicePoint::new((cx - off) as f32, (cy - toolbar_dev) as f32).into(),
                     )));
                 }
             }
@@ -4652,7 +5487,10 @@ impl ApplicationHandler<WakeUp> for App {
                     }
                     return;
                 }
-                if !(resp.consumed || over_chrome || dialog_open) {
+                let foc = state.focused.get();
+                let off = if state.split.get() && foc == 1 { mid_dev } else { left_dev };
+                let over_focused = !state.split.get() || ((foc == 0) == (cx < mid_dev));
+                if !(resp.consumed || over_chrome || dialog_open) && over_focused {
                     let (dx, dy, mode) = match delta {
                         MouseScrollDelta::LineDelta(lx, ly) => {
                             ((lx * 76.0) as f64, (ly * 76.0) as f64, WheelMode::DeltaLine)
@@ -4667,7 +5505,7 @@ impl ApplicationHandler<WakeUp> for App {
                     };
                     state.forward_to_page(InputEvent::Wheel(WheelEvent::new(
                         wheel,
-                        DevicePoint::new((cx - left_dev) as f32, (cy - toolbar_dev) as f32).into(),
+                        DevicePoint::new((cx - off) as f32, (cy - toolbar_dev) as f32).into(),
                     )));
                 }
             }
@@ -4687,11 +5525,34 @@ impl ApplicationHandler<WakeUp> for App {
                             return;
                         }
                         WinitKey::Character(c) if c.eq_ignore_ascii_case("w") => {
-                            state.close_tab(state.active.get());
+                            state.close_tab(state.focused_pane().active.get());
                             return;
                         }
                         WinitKey::Character(c) if c.eq_ignore_ascii_case("l") => {
                             state.focus_omnibox.set(true);
+                            state.window.request_redraw();
+                            return;
+                        }
+                        WinitKey::Character(c) if c.eq_ignore_ascii_case("k") => {
+                            // Command palette: prefill `>` and focus the omnibar.
+                            *state.location.borrow_mut() = ">".to_string();
+                            state.location_dirty.set(true);
+                            state.focus_omnibox.set(true);
+                            state.window.request_redraw();
+                            return;
+                        }
+                        WinitKey::Character(c) if c == "\\" => {
+                            // Toggle split view.
+                            state.toggle_split();
+                            return;
+                        }
+                        WinitKey::Character(c) if c.eq_ignore_ascii_case("n") => {
+                            // New OS window (queued; opened by the event loop on the next redraw).
+                            state
+                                .browser
+                                .pending_windows
+                                .borrow_mut()
+                                .push(content_url());
                             state.window.request_redraw();
                             return;
                         }
@@ -4743,7 +5604,7 @@ impl ApplicationHandler<WakeUp> for App {
                         }
                         WinitKey::Character(c) => {
                             if let Ok(n) = c.parse::<usize>() {
-                                let len = state.tabs.borrow().len();
+                                let len = state.focused_pane().tabs.borrow().len();
                                 if n == 9 && len > 0 {
                                     state.select_tab(len - 1);
                                 } else if (1..=8).contains(&n) && n <= len {
@@ -4753,9 +5614,9 @@ impl ApplicationHandler<WakeUp> for App {
                             }
                         }
                         WinitKey::Named(NamedKey::Tab) => {
-                            let len = state.tabs.borrow().len();
+                            let len = state.focused_pane().tabs.borrow().len();
                             if len > 1 {
-                                let cur = state.active.get();
+                                let cur = state.focused_pane().active.get();
                                 let next = if state.shift.get() {
                                     (cur + len - 1) % len
                                 } else {
@@ -4924,5 +5785,28 @@ mod adblock_tests {
         assert_eq!(out.len(), 2);
         assert!(out.iter().any(|(u, n)| u == "https://example.com" && n == "Example"));
         assert!(out.iter().any(|(u, _)| u == "https://inner.test/page"));
+    }
+}
+
+#[cfg(test)]
+mod chrome_helper_tests {
+    use super::{color_hex, favicon_hue};
+
+    #[test]
+    fn favicon_hue_is_stable_and_in_range() {
+        for s in ["figma.com", "github.com", "", "a very long tab title here"] {
+            let h = favicon_hue(s);
+            assert!((0.0..360.0).contains(&h), "{s}: {h}");
+            assert_eq!(h, favicon_hue(s), "must be deterministic");
+        }
+        // distinct strings should (here) give distinct hues
+        assert_ne!(favicon_hue("github.com"), favicon_hue("figma.com"));
+    }
+
+    #[test]
+    fn color_hex_formats_rrggbb() {
+        assert_eq!(color_hex(egui::Color32::from_rgb(0x5b, 0x8c, 0xff)), "#5b8cff");
+        assert_eq!(color_hex(egui::Color32::BLACK), "#000000");
+        assert_eq!(color_hex(egui::Color32::from_rgb(255, 255, 255)), "#ffffff");
     }
 }
