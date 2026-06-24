@@ -59,6 +59,7 @@ mod fonts;
 mod widgets;
 mod studio;
 mod palette;
+mod userscripts;
 use url::Url;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
@@ -667,10 +668,18 @@ fn userscripts_dir() -> Option<PathBuf> {
     config_file("userscripts")
 }
 
-/// Read every `*.js` file in the userscripts dir (non-recursive), returning (path, source)
-/// pairs. Best-effort: unreadable files are skipped. The dir is created if missing so the
-/// path shown in Settings is real.
-fn load_userscripts() -> Vec<(PathBuf, String)> {
+/// Path of the add-on registry file (consent state: enabled/granted/content_hash), a sibling of
+/// passwords.enc under the config dir. The `*.user.js`/`*.js` files remain the source of truth
+/// for code; this JSON holds only state + consent.
+fn addons_path() -> Option<PathBuf> {
+    config_file("addons.json")
+}
+
+/// Read every `*.user.js` (preferred) and bare legacy `*.js` file in the userscripts dir
+/// (non-recursive), returning `(path, source)` pairs in deterministic order. Best-effort:
+/// unreadable files are skipped. The dir is created if missing so the path shown in Settings is
+/// real.
+fn scan_userscript_files() -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
     let Some(dir) = userscripts_dir() else {
         return out;
@@ -691,6 +700,138 @@ fn load_userscripts() -> Vec<(PathBuf, String)> {
         }
     }
     out
+}
+
+/// Build the add-on registry: load persisted consent state, scan the userscripts dir, parse
+/// Greasemonkey metadata, and reconcile (design §3 `discover → parse → diff → persist`).
+///
+/// Reconciliation rules:
+/// * New script id → inserted disabled, `granted` empty (awaits the consent dialog).
+/// * Known id, content_hash unchanged → keep persisted `enabled`/`granted` as-is (silent).
+/// * Known id, content changed → re-parse metadata; keep `enabled` only if the new requested
+///   permission set did **not** grow vs. the old grant (design §3 "no silent privilege creep"),
+///   otherwise force back to disabled-pending-consent. `granted` is clamped to the new
+///   `requested` set.
+/// * Bare legacy `*.js` with no metadata block → treated as a trusted, all-sites, no-grant
+///   add-on (back-compat), enabled by default.
+///
+/// Resilient: a missing dir / missing or malformed registry file yields a best-effort registry
+/// rather than failing startup.
+fn load_addons() -> userscripts::Registry {
+    let mut reg = addons_path()
+        .map(userscripts::Registry::load)
+        .transpose()
+        .ok()
+        .flatten()
+        .unwrap_or_else(userscripts::Registry::new);
+
+    for (path, src) in scan_userscript_files() {
+        let hash = userscripts::content_hash(&src);
+        let is_legacy_bare = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| !n.ends_with(".user.js"));
+
+        let meta = userscripts::parse_metadata(&src);
+        // A legacy bare *.js with no metadata: synthesize an all-sites, no-grant add-on.
+        let meta = match (meta, is_legacy_bare) {
+            (Some(m), _) => m,
+            (None, true) => userscripts::Metadata {
+                name: Some(
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("userscript")
+                        .to_string(),
+                ),
+                includes: vec!["*".to_string()],
+                ..Default::default()
+            },
+            // A *.user.js without a metadata block is malformed; skip it.
+            (None, false) => continue,
+        };
+
+        let fresh = userscripts::Addon::from_metadata(&meta, &path, hash);
+        match reg.get(&fresh.id).cloned() {
+            None => {
+                let mut a = fresh;
+                // Legacy bare scripts are trusted/back-compat: enable on first sight.
+                if is_legacy_bare {
+                    a.enabled = true;
+                }
+                reg.upsert(a);
+            }
+            Some(prev) => {
+                let prev_hash = match &prev.source {
+                    userscripts::AddonSource::Userscript { content_hash, .. } => *content_hash,
+                };
+                let mut a = fresh;
+                if prev_hash == hash {
+                    // Unchanged code: keep prior consent verbatim.
+                    a.enabled = prev.enabled;
+                    a.granted = prev.granted;
+                } else {
+                    // Code changed: clamp granted to the (possibly different) requested set, and
+                    // re-prompt (disable) if the requested permissions grew beyond the old grant.
+                    let mut granted = userscripts::PermissionSet::new();
+                    for p in prev.granted.iter() {
+                        if a.requested.contains(p) {
+                            granted.insert(p);
+                        }
+                    }
+                    let grew = !a.requested.is_subset(&granted);
+                    if grew {
+                        // Requested permissions grew beyond the prior grant — must re-consent.
+                        // CLEAR the grant entirely (not just disable) so `prompt_pending_consents`
+                        // re-queues it via its `granted.is_empty()` filter; otherwise the script
+                        // would be silently disabled with a stale partial grant and never
+                        // re-surfaced (design §3).
+                        a.granted = userscripts::PermissionSet::new();
+                        a.enabled = false;
+                    } else {
+                        a.granted = granted;
+                        a.enabled = prev.enabled;
+                    }
+                }
+                reg.upsert(a);
+            }
+        }
+    }
+
+    // Drop registry entries whose backing file disappeared.
+    let on_disk: std::collections::HashSet<userscripts::AddonId> = scan_userscript_files()
+        .into_iter()
+        .filter_map(|(path, src)| {
+            userscripts::parse_metadata(&src)
+                .map(|m| userscripts::AddonId::for_userscript(&m, &path))
+                .or_else(|| {
+                    let is_legacy_bare = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| !n.ends_with(".user.js"));
+                    if is_legacy_bare {
+                        let m = userscripts::Metadata {
+                            name: Some(
+                                path.file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("userscript")
+                                    .to_string(),
+                            ),
+                            includes: vec!["*".to_string()],
+                            ..Default::default()
+                        };
+                        Some(userscripts::AddonId::for_userscript(&m, &path))
+                    } else {
+                        None
+                    }
+                })
+        })
+        .collect();
+    reg.addons.retain(|a| on_disk.contains(&a.id));
+
+    if let Some(p) = addons_path() {
+        let _ = reg.save(p);
+    }
+    reg
 }
 
 /// Refresh the cached EasyList / EasyPrivacy in the background (best-effort), re-fetching any
@@ -1217,6 +1358,90 @@ fn origin_of(url: &str) -> Option<String> {
     })
 }
 
+/// A capability token for an add-on's GM bridge calls. The token is embedded in the injected
+/// shim and presented back on every `navgator://gm/<cap>/<call>` request; `load_web_resource`
+/// re-derives it from the registry to look up which add-on (and thus which `granted` set) a call
+/// belongs to. Per design §5 this is a *bearer credential in a shared page world* — soft
+/// attribution, not a hard security boundary. URL-path-safe (hex), so it survives the
+/// `navgator://gm/<cap>/...` path without escaping.
+/// The GM bridge token for an add-on: `hash(per-process secret salt ‖ id)`. The salt
+/// (`BrowserState::gm_salt`) is random per process and never persisted, so a web page
+/// CANNOT forge a valid token for an installed add-on from its public `@name`/`@namespace`
+/// (the id is derived from those). Re-derivable within the process, so `load_web_resource`
+/// validates a presented token by recomputing it — no cap→addon map needed. This is a
+/// per-process-per-addon secret, not a per-injection nonce, and it is not secret from a
+/// hostile page sharing the add-on's (page) world — soft attribution, the security boundary
+/// is the unforgeable-from-outside salt (design §5/§11).
+fn addon_cap_token(salt: &[u8; 16], id: &userscripts::AddonId) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    salt.hash(&mut h);
+    id.as_str().hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Path of an add-on's private key-value store file (GM_setValue/getValue). One JSON file per
+/// add-on id under `addon-storage/` in the config dir, isolated from every other add-on.
+fn addon_storage_path(id: &userscripts::AddonId) -> Option<PathBuf> {
+    // The id is `us-<hex>`, filesystem-safe.
+    config_file(&format!("addon-storage/{}.json", id.as_str()))
+}
+
+/// Load an add-on's key-value store (string-keyed JSON map). Missing/malformed → empty.
+fn addon_storage_load(id: &userscripts::AddonId) -> std::collections::BTreeMap<String, serde_json::Value> {
+    addon_storage_path(id)
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Persist an add-on's key-value store (GM_setValue/deleteValue). Creates `addon-storage/` on
+/// demand. Errors (no config dir, write/serialize failure) bubble up so the bridge can report.
+fn addon_storage_save(
+    id: &userscripts::AddonId,
+    map: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    let path = addon_storage_path(id).ok_or("no config dir")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let bytes = serde_json::to_vec_pretty(map).map_err(|e| e.to_string())?;
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())
+}
+
+/// Does an add-on's `@connect` allow-list permit a cross-origin fetch to `host`? `@connect`
+/// must be declared (an empty list denies all). Accepts an exact host, a `*` wildcard, or a
+/// bare/`*.`-prefixed parent domain (matching the domain and its subdomains).
+fn connect_allows(connect: &[String], host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    connect.iter().any(|entry| {
+        let e = entry.trim().trim_start_matches("*.").to_ascii_lowercase();
+        entry.trim() == "*" || e == host || host.ends_with(&format!(".{e}"))
+    })
+}
+
+/// One-line, human-readable description of a userscript match pattern for the consent dialog /
+/// settings page. Pure formatting; mirrors the `userscripts` module's two pattern flavours.
+fn describe_match_pattern(p: &userscripts::MatchPattern) -> String {
+    match p {
+        userscripts::MatchPattern::Match {
+            scheme,
+            host,
+            path,
+            all_urls,
+        } => {
+            if *all_urls {
+                "all sites".to_string()
+            } else {
+                let scheme = if scheme == "*" { "http(s)" } else { scheme.as_str() };
+                format!("{scheme}://{host}{path}")
+            }
+        }
+        userscripts::MatchPattern::Glob(g) => g.clone(),
+    }
+}
+
 fn js_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -1293,6 +1518,15 @@ struct Tab {
     pinned: bool,
     /// Whether the omnibar star is filled for this tab (bookmark-style toggle).
     starred: bool,
+    /// This tab's own UserContentManager (per-site userscript injection, design §4 Option A).
+    /// Built once at tab-creation time and attached to `webview`; the engine captures the UCM at
+    /// build time and offers no post-build setter (Servo `WebView::user_content_manager` is a
+    /// getter only), so we keep the same Rc and `add_script` matching scripts on navigation —
+    /// new scripts take effect on the *next* load (Servo's documented UCM caveat).
+    ucm: Option<Rc<UserContentManager>>,
+    /// Add-on ids already injected into this tab's `ucm`, so repeat navigations don't add the
+    /// same wrapped script twice (the engine has no "clear UCM" primitive).
+    injected_addons: RefCell<Vec<userscripts::AddonId>>,
 }
 
 /// One independent pane group: its own tab list, active tab, and offscreen FBO. The browser
@@ -1371,6 +1605,17 @@ enum Dialog {
         message: String,
         handle: Option<PermissionRequest>,
     },
+    /// Userscript install/permission consent (design §6). On Enable we set
+    /// `granted = requested` and `enabled = true` on the registry add-on and persist.
+    AddonConsent {
+        addon_id: userscripts::AddonId,
+        name: String,
+        version: String,
+        /// Human-readable site-access lines (one per `@match`/`@include`).
+        sites_human: Vec<String>,
+        /// Human-readable capability lines (one per requested `Permission`).
+        perms_human: Vec<String>,
+    },
     ContextMenu {
         pos: egui::Pos2,
     },
@@ -1398,10 +1643,16 @@ enum TabAction {
 /// One instance for the whole process; each window's `AppState` holds a clone of the `Rc`.
 struct BrowserState {
     servo: Servo,
-    /// Shared UserContentManager carrying every loaded userscript; cloned (Rc) onto each
-    /// new tab/popup WebView so scripts inject on all pages. None when no *.js userscripts exist.
-    userscripts: Option<Rc<UserContentManager>>,
-    /// Count of loaded userscripts, shown in Settings (cheap, read once at startup).
+    /// The metadata-aware, permission-gated add-on registry (userscripts today; forward-compat
+    /// for WebExtensions). Replaces the old single shared UserContentManager: per-tab injection
+    /// now selects the matching enabled add-ons per navigation (see `inject_userscripts`). The
+    /// `*.user.js`/`*.js` files on disk are the source of truth for code; this registry (persisted
+    /// to `addons.json`) holds consent state (`enabled`/`granted`/`content_hash`).
+    addons: RefCell<userscripts::Registry>,
+    /// Per-process random secret salt for GM bridge cap tokens (see `addon_cap_token`). Random
+    /// at startup, never persisted — makes bridge tokens unforgeable from a page's public view.
+    gm_salt: [u8; 16],
+    /// Count of installed add-ons, shown in Settings (cheap, recomputed from the registry len).
     userscripts_count: usize,
     ipc_clients: Arc<Mutex<Vec<UnixStream>>>,
     settings: RefCell<Settings>,
@@ -1469,6 +1720,10 @@ struct AppState {
     show_settings: Cell<bool>,
     /// Whether the Studio (live interface customization) side panel is open.
     show_studio: Cell<bool>,
+    /// Whether the 🧩 add-ons popover panel is open.
+    show_addons: Cell<bool>,
+    /// Logical-px rect of the 🧩 toolbar badge, so the add-ons popover anchors under it.
+    addon_badge_rect: Cell<egui::Rect>,
     /// Active native overlays (dialogs, pickers, context menu).
     dialogs: RefCell<Vec<Dialog>>,
     /// URLs of recently-closed tabs, for Ctrl+Shift+T (reopen most-recent).
@@ -1698,6 +1953,76 @@ impl AppState {
             format!("<div class=\"list\">{out}</div>")
         };
         let html = include_str!("content/passwords.html")
+            .replace("__ACCENT__", &accent)
+            .replace("__ROWS__", &rows);
+        self.themed(html)
+    }
+
+    /// Render `gator://extensions`: the installed-add-on manager. Each row shows the add-on name,
+    /// version, an enable/disable toggle pill, the granted capabilities, the `@match` site list,
+    /// and a Remove link — modeled on `render_gator_passwords`. Toggle/remove ride the
+    /// `gator://extensions?enable=/disable=/remove=<id>` command links (applied in
+    /// `load_web_resource` before this renders; CSRF-guarded by `request_navigation`).
+    fn render_gator_extensions(&self) -> Vec<u8> {
+        let accent = self.browser.settings.borrow().accent.clone();
+        let reg = self.browser.addons.borrow();
+        let rows = if reg.addons.is_empty() {
+            "<p class=\"empty\">No userscripts installed. Drop a <code>*.user.js</code> file into the userscripts folder, then relaunch — you'll be asked to approve it.</p>".to_string()
+        } else {
+            let mut out = String::new();
+            for a in reg.addons.iter() {
+                let letter = a
+                    .name
+                    .chars()
+                    .find(|c| c.is_alphanumeric())
+                    .map(|c| c.to_uppercase().to_string())
+                    .unwrap_or_else(|| "•".to_string());
+                let sites = if a.matches.is_empty() {
+                    "no sites".to_string()
+                } else {
+                    a.matches
+                        .iter()
+                        .map(describe_match_pattern)
+                        .map(|s| html_escape(&s))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let perms = if a.granted.is_empty() {
+                    "no extra capabilities".to_string()
+                } else {
+                    html_escape(&a.granted.describe())
+                };
+                // AddonId is always `us-<hex>` (from AddonId::for_userscript) — URL-path-safe,
+                // so it needs no percent-encoding in the command link.
+                let id_enc = a.id.as_str();
+                let toggle = if a.enabled {
+                    format!(
+                        "<a class=\"pill on\" href=\"gator://extensions?disable={id_enc}\">Enabled</a>"
+                    )
+                } else {
+                    format!(
+                        "<a class=\"pill\" href=\"gator://extensions?enable={id_enc}\">Disabled</a>"
+                    )
+                };
+                out.push_str(&format!(
+                    "<div class=\"row\"><span class=\"ico\">{letter}</span><div class=\"meta\">\
+                     <div class=\"name\">{name}<span class=\"ver\">v{ver}</span></div>\
+                     <div class=\"path\">{sites}</div><div class=\"perms\">{perms}</div></div>\
+                     {toggle}\
+                     <a class=\"rm\" href=\"gator://extensions?remove={id_enc}\">Remove</a></div>",
+                    letter = html_escape(&letter),
+                    name = html_escape(&a.name),
+                    ver = html_escape(&a.version),
+                    sites = sites,
+                    perms = perms,
+                    toggle = toggle,
+                    id_enc = id_enc,
+                ));
+            }
+            format!("<div class=\"list\">{out}</div>")
+        };
+        drop(reg);
+        let html = include_str!("content/extensions.html")
             .replace("__ACCENT__", &accent)
             .replace("__ROWS__", &rows);
         self.themed(html)
@@ -2231,7 +2556,8 @@ impl AppState {
             .url(seed.clone())
             .hidpi_scale_factor(Scale::new(self.scale.get() as f32))
             .delegate(me);
-        if let Some(ucm) = &self.browser.userscripts {
+        let ucm = self.make_tab_ucm();
+        if let Some(ucm) = &ucm {
             builder = builder.user_content_manager(ucm.clone());
         }
         let webview = builder.build();
@@ -2255,6 +2581,8 @@ impl AppState {
             crashed: false,
             pinned: false,
             starred: false,
+            ucm,
+            injected_addons: RefCell::new(Vec::new()),
         });
         self.pane1.active.set(0);
         self.split.set(true);
@@ -2503,6 +2831,34 @@ impl AppState {
                     {
                         self.show_studio.set(!self.show_studio.get());
                     }
+                    // 🧩 add-ons (userscripts) badge: toggles the registry-driven popover. A count
+                    // bubble shows how many enabled add-ons match the current tab's URL.
+                    {
+                        let active_count = {
+                            let cur = self.location.borrow().clone();
+                            self.browser.addons.borrow().enabled_matching(&cur).len()
+                        };
+                        let r = ui
+                            .add(egui::Button::new("🧩").frame(false).min_size(egui::vec2(28.0, 24.0)))
+                            .on_hover_text("Userscripts / add-ons");
+                        self.addon_badge_rect.set(r.rect);
+                        if active_count > 0 {
+                            let pal = self.browser.settings.borrow().theme.palette();
+                            let p = ui.painter();
+                            let center = r.rect.right_top() + egui::vec2(-5.0, 6.0);
+                            p.circle_filled(center, 7.0, pal.accent);
+                            p.text(
+                                center,
+                                egui::Align2::CENTER_CENTER,
+                                active_count.to_string(),
+                                egui::FontId::proportional(9.0),
+                                pal.bg,
+                            );
+                        }
+                        if r.clicked() {
+                            self.show_addons.set(!self.show_addons.get());
+                        }
+                    }
                     if self.browser.password_store.borrow().is_unlocked()
                         && ui
                             .add(egui::Button::new("🔑").frame(false).min_size(egui::vec2(28.0, 24.0)))
@@ -2735,6 +3091,9 @@ impl AppState {
                 });
             });
         });
+
+        // 🧩 add-ons popover (registry-driven), anchored under the toolbar badge.
+        self.draw_addons_popover(ctx);
 
         let vertical = self.browser.settings.borrow().theme.tab_pos == theme::TabPos::Left;
         let mut bottom = if vertical {
@@ -3342,7 +3701,7 @@ impl AppState {
                     .unwrap_or_default();
                 ui.label(
                     egui::RichText::new(format!(
-                        "{} userscript(s) loaded from {}",
+                        "{} add-on(s) from {}",
                         self.browser.userscripts_count, usdir
                     ))
                     .small()
@@ -3350,11 +3709,20 @@ impl AppState {
                 );
                 ui.label(
                     egui::RichText::new(
-                        "Drop *.js files there and restart to inject them on every page.",
+                        "Drop *.user.js files there and relaunch — each is permission-gated and \
+                         runs only on its matched sites.",
                     )
                     .small()
                     .weak(),
                 );
+                if ui.button("Manage userscripts…").clicked() {
+                    if let Some(tab) = self.active_tab() {
+                        if let Ok(u) = Url::parse("gator://extensions") {
+                            tab.load(u);
+                        }
+                    }
+                    self.show_settings.set(false);
+                }
 
                 ui.add_space(10.0);
                 ui.separator();
@@ -3759,6 +4127,54 @@ impl AppState {
                     });
                 keep
             }
+            Dialog::AddonConsent {
+                addon_id,
+                name,
+                version,
+                sites_human,
+                perms_human,
+            } => {
+                let mut keep = true;
+                egui::Window::new("Enable userscript?")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(center, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{name}  v{version}")).strong(),
+                        );
+                        ui.add_space(6.0);
+                        ui.label("Runs on:");
+                        for s in sites_human.iter() {
+                            ui.label(egui::RichText::new(format!("  • {s}")).monospace());
+                        }
+                        if !perms_human.is_empty() {
+                            ui.add_space(4.0);
+                            ui.label("Capabilities:");
+                            for p in perms_human.iter() {
+                                ui.label(format!("  • {p}"));
+                            }
+                        }
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "⚠ Runs as code on those pages — it is not sandboxed from them.",
+                            )
+                            .weak(),
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Enable").clicked() {
+                                self.set_addon_consent(addon_id, true);
+                                keep = false;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                keep = false;
+                            }
+                        });
+                    });
+                keep
+            }
             Dialog::ContextMenu { pos } => {
                 let mut keep = true;
                 let r = egui::Area::new(egui::Id::new("context_menu"))
@@ -3799,6 +4215,372 @@ impl AppState {
     fn push_dialog(&self, d: Dialog) {
         self.dialogs.borrow_mut().push(d);
         self.window.request_redraw();
+    }
+
+    // ── Userscripts / add-ons ─────────────────────────────────────────────────
+
+    /// Persist the add-on registry to disk (best-effort, matches save_history/save_passwords).
+    fn save_addons(&self) {
+        if let Some(p) = addons_path() {
+            let _ = self.browser.addons.borrow().save(p);
+        }
+    }
+
+    /// Enable or disable an add-on and persist. On enable, copy the full `requested` set into
+    /// `granted` (design §6 — Allow grants everything the script asked for; subset grants are a
+    /// later refinement). Drops the registry borrow before persisting/redraw.
+    fn set_addon_consent(&self, id: &userscripts::AddonId, enable: bool) {
+        {
+            let mut reg = self.browser.addons.borrow_mut();
+            if let Some(a) = reg.get_mut(id) {
+                a.enabled = enable;
+                if enable {
+                    a.granted = a.requested.clone();
+                }
+            }
+        }
+        self.save_addons();
+        self.window.request_redraw();
+    }
+
+    /// Remove an add-on from the registry (consent state only — the *.user.js file on disk is
+    /// left untouched, so a re-scan would re-discover it disabled-pending-consent).
+    fn remove_addon(&self, id: &userscripts::AddonId) {
+        {
+            let mut reg = self.browser.addons.borrow_mut();
+            reg.remove(id);
+        }
+        self.save_addons();
+        self.window.request_redraw();
+    }
+
+    /// Queue an install-consent dialog for any installed-but-not-yet-decided add-on (disabled +
+    /// empty grant + non-empty requested OR simply never consented). Called once after startup so
+    /// new userscripts surface their consent prompt. Skips add-ons already enabled, and ones that
+    /// request no capabilities and are bare-legacy (those auto-enable in `load_addons`).
+    fn prompt_pending_consents(&self) {
+        let pending: Vec<Dialog> = {
+            let reg = self.browser.addons.borrow();
+            reg.addons
+                .iter()
+                .filter(|a| !a.enabled && a.granted.is_empty())
+                .map(|a| Dialog::AddonConsent {
+                    addon_id: a.id.clone(),
+                    name: a.name.clone(),
+                    version: a.version.clone(),
+                    sites_human: a
+                        .matches
+                        .iter()
+                        .map(describe_match_pattern)
+                        .collect::<Vec<_>>(),
+                    perms_human: a.requested.iter().map(|p| p.describe().to_string()).collect(),
+                })
+                .collect()
+        };
+        for d in pending {
+            self.push_dialog(d);
+        }
+    }
+
+    /// Per-site userscript injection (design §4 Option A). For the navigated `url`, find the
+    /// enabled add-ons whose `@match` accepts it (and `@exclude` doesn't), wrap each via
+    /// `userscripts::wrap_userscript` with a per-injection capability token bound to the add-on
+    /// id, and `add_script` them into this tab's `UserContentManager` (skipping any already
+    /// injected into this tab). Servo applies new UCM scripts on the *next* load, so we inject
+    /// from `request_navigation` *before* the load is allowed — but because the engine offers no
+    /// way to swap or clear a UCM after build, scripts accumulate in the tab's UCM across its
+    /// lifetime; `@match` filtering for the *current* navigation is enforced here at add time.
+    fn inject_userscripts(&self, webview: &WebView, url: &str) {
+        let Some(tab_idx) = self.tab_index(webview) else {
+            return;
+        };
+        // Collect the wrapped scripts to add (id + js), reading source files outside the borrow.
+        let salt = self.browser.gm_salt; // [u8; 16] is Copy — avoids borrowing self in the closure.
+        let to_add: Vec<(userscripts::AddonId, String)> = {
+            let reg = self.browser.addons.borrow();
+            let already = {
+                let tabs = self.focused_pane().tabs.borrow();
+                match tabs.get(tab_idx) {
+                    Some(t) => t.injected_addons.borrow().clone(),
+                    None => return,
+                }
+            };
+            reg.enabled_matching(url)
+                .into_iter()
+                .filter(|a| !already.contains(&a.id))
+                .filter_map(|a| {
+                    // Refutable destructure (`else`) so adding AddonSource::WebExtension later is
+                    // additive, not a compile break here (forward-compat, design §8). The `else`
+                    // is unreachable while Userscript is the only variant — allow that until then.
+                    #[allow(irrefutable_let_patterns)]
+                    let userscripts::AddonSource::Userscript { path, .. } = &a.source else {
+                        return None;
+                    };
+                    let src = std::fs::read_to_string(path).ok()?;
+                    let cap = addon_cap_token(&salt, &a.id);
+                    Some((a.id.clone(), userscripts::wrap_userscript(a, &src, &cap)))
+                })
+                .collect()
+        };
+        if to_add.is_empty() {
+            return;
+        }
+        let tabs = self.focused_pane().tabs.borrow();
+        let Some(tab) = tabs.get(tab_idx) else {
+            return;
+        };
+        let Some(ucm) = &tab.ucm else {
+            return;
+        };
+        for (id, js) in to_add {
+            ucm.add_script(Rc::new(UserScript::new(js, None)));
+            tab.injected_addons.borrow_mut().push(id);
+        }
+    }
+
+    /// Handle a `navgator://gm/<cap>/<call>?a=<json-args>` bridge request (design §5). Returns the
+    /// JSON response body bytes. Validates `<cap>` (the per-process secret token, see
+    /// `addon_cap_token`) against the registry to find the calling add-on, then checks the add-on's
+    /// `granted` permission for the capability before performing it.
+    ///
+    /// Call arguments travel in the URL `?a=` query (URL-encoded JSON) rather than a request body,
+    /// because Servo's `WebResourceRequest` exposes only method/headers/url to `load_web_resource`
+    /// — never the body. `storage.{list,set,get,delete}` are fully implemented here (local per-add-on
+    /// JSON store). `net.fetch` enforces the capability AND the `@connect` host allow-list, but the
+    /// actual cross-origin fetch is not yet wired (needs an async HTTP client off the UI thread) and
+    /// returns `net-fetch-unimplemented` once it passes the gates. `notify.show`/`tabs.open`/
+    /// `clipboard.set` are gated but not yet performed (`not-implemented`).
+    ///
+    /// NOTE (unverified): this assumes Servo delivers a page-issued `fetch()` to the custom
+    /// `navgator://` scheme into this embedder intercept (as it does for the `gator://` page path).
+    /// That has not been confirmed against a running build; if Servo rejects the scheme earlier, the
+    /// whole bridge channel never fires (the capability gate above still holds regardless).
+    fn handle_gm_bridge(&self, url: &Url) -> Vec<u8> {
+        use userscripts::Permission;
+        let deny = |msg: &str| -> Vec<u8> {
+            format!("{{\"ok\":false,\"error\":\"{msg}\"}}").into_bytes()
+        };
+        // Path is `/<cap>/<call>` (host is "gm"). path_segments splits on '/'.
+        let mut segs = match url.path_segments() {
+            Some(s) => s,
+            None => return deny("bad-path"),
+        };
+        let cap = match segs.next() {
+            Some(c) if !c.is_empty() => c.to_string(),
+            _ => return deny("no-cap"),
+        };
+        let call = segs.next().unwrap_or("").to_string();
+
+        // Call args: URL-encoded JSON in the `a` query param (see wrap_userscript's __ep).
+        let args: serde_json::Value = url
+            .query_pairs()
+            .find(|(k, _)| &**k == "a")
+            .and_then(|(_, v)| serde_json::from_str(&v).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let arg_key = || args.get("key").and_then(|v| v.as_str()).map(str::to_string);
+
+        // Resolve cap → add-on via the per-process secret salt (unforgeable from a page's public
+        // view of the add-on id; design §5/§11). Clone the bits we need so we don't hold the
+        // registry borrow across the action.
+        let salt = self.browser.gm_salt;
+        let resolved = {
+            let reg = self.browser.addons.borrow();
+            reg.addons
+                .iter()
+                .find(|a| a.enabled && addon_cap_token(&salt, &a.id) == cap)
+                .map(|a| (a.id.clone(), a.granted.clone(), a.connect.clone()))
+        };
+        let Some((id, granted, connect)) = resolved else {
+            return deny("bad-cap");
+        };
+
+        match call.as_str() {
+            "storage.list" => {
+                if !granted.contains(Permission::Storage) {
+                    return deny("permission-denied");
+                }
+                let keys = addon_storage_load(&id);
+                let list: Vec<String> = keys.keys().cloned().collect();
+                serde_json::to_vec(&serde_json::json!({ "ok": true, "keys": list }))
+                    .unwrap_or_else(|_| deny("serialize"))
+            }
+            "storage.get" => {
+                if !granted.contains(Permission::Storage) {
+                    return deny("permission-denied");
+                }
+                let Some(key) = arg_key() else { return deny("bad-args") };
+                let map = addon_storage_load(&id);
+                let resp = match map.get(&key) {
+                    Some(v) => serde_json::json!({ "ok": true, "value": v }),
+                    None => serde_json::json!({ "ok": true }),
+                };
+                serde_json::to_vec(&resp).unwrap_or_else(|_| deny("serialize"))
+            }
+            "storage.set" => {
+                if !granted.contains(Permission::Storage) {
+                    return deny("permission-denied");
+                }
+                let Some(key) = arg_key() else { return deny("bad-args") };
+                let value = args.get("value").cloned().unwrap_or(serde_json::Value::Null);
+                let mut map = addon_storage_load(&id);
+                map.insert(key, value);
+                if addon_storage_save(&id, &map).is_err() {
+                    return deny("storage-write");
+                }
+                b"{\"ok\":true}".to_vec()
+            }
+            "storage.delete" => {
+                if !granted.contains(Permission::Storage) {
+                    return deny("permission-denied");
+                }
+                let Some(key) = arg_key() else { return deny("bad-args") };
+                let mut map = addon_storage_load(&id);
+                map.remove(&key);
+                if addon_storage_save(&id, &map).is_err() {
+                    return deny("storage-write");
+                }
+                b"{\"ok\":true}".to_vec()
+            }
+            "net.fetch" => {
+                if !granted.contains(Permission::CrossOriginFetch) {
+                    return deny("permission-denied");
+                }
+                // Enforce the @connect host allow-list — without this the one genuinely
+                // CORS-bypassing capability would be an unrestricted exfil primitive.
+                let Some(target) = args.get("url").and_then(|v| v.as_str()) else {
+                    return deny("bad-args");
+                };
+                let host = Url::parse(target).ok().and_then(|u| u.host_str().map(str::to_string));
+                let Some(host) = host else { return deny("bad-url") };
+                if !connect_allows(&connect, &host) {
+                    return deny("connect-not-allowed");
+                }
+                // Gate passed; the actual cross-origin fetch is not yet wired (needs async HTTP).
+                deny("net-fetch-unimplemented")
+            }
+            "notify.show" => {
+                if !granted.contains(Permission::Notifications) {
+                    return deny("permission-denied");
+                }
+                deny("not-implemented")
+            }
+            "tabs.open" => {
+                if !granted.contains(Permission::TabControl) {
+                    return deny("permission-denied");
+                }
+                deny("not-implemented")
+            }
+            "clipboard.set" => {
+                if !granted.contains(Permission::Clipboard) {
+                    return deny("permission-denied");
+                }
+                deny("not-implemented")
+            }
+            _ => deny("unknown-call"),
+        }
+    }
+
+    /// The 🧩 add-ons popover: a theme-matched panel under the toolbar badge listing every
+    /// installed add-on with an "active on this page" dot and a quick enable/disable toggle, plus
+    /// a footer link to the full manager (gator://extensions). Toggled by `show_addons`; dismissed
+    /// on outside click (context-menu pattern). Registry-driven, so it's kind-agnostic.
+    fn draw_addons_popover(&self, ctx: &egui::Context) {
+        if !self.show_addons.get() {
+            return;
+        }
+        let anchor = self.addon_badge_rect.get();
+        if anchor == egui::Rect::NOTHING {
+            return;
+        }
+        let pal = self.browser.settings.borrow().theme.palette();
+        let cur_url = self.location.borrow().clone();
+
+        // Snapshot the rows to draw (avoid holding the registry borrow across UI/actions).
+        let rows: Vec<(userscripts::AddonId, String, bool, bool)> = {
+            let reg = self.browser.addons.borrow();
+            let active: std::collections::HashSet<userscripts::AddonId> = reg
+                .enabled_matching(&cur_url)
+                .into_iter()
+                .map(|a| a.id.clone())
+                .collect();
+            reg.addons
+                .iter()
+                .map(|a| (a.id.clone(), a.name.clone(), a.enabled, active.contains(&a.id)))
+                .collect()
+        };
+
+        let mut toggle: Option<(userscripts::AddonId, bool)> = None;
+        let mut open_manager = false;
+        let r = egui::Area::new(egui::Id::new("addons_popover"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(anchor.left_bottom() + egui::vec2(0.0, 6.0))
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(pal.bg2)
+                    .stroke(egui::Stroke::new(1.0, pal.border))
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.set_min_width(240.0);
+                        ui.label(egui::RichText::new("Userscripts").strong().color(pal.text));
+                        ui.add_space(4.0);
+                        if rows.is_empty() {
+                            ui.label(
+                                egui::RichText::new("No userscripts installed.")
+                                    .small()
+                                    .color(pal.muted),
+                            );
+                        }
+                        for (id, name, enabled, active) in rows.iter() {
+                            ui.horizontal(|ui| {
+                                let dot = if *active { pal.accent } else { pal.border };
+                                let (slot, _) = ui.allocate_exact_size(
+                                    egui::vec2(12.0, 16.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().circle_filled(slot.center(), 3.5, dot);
+                                ui.label(
+                                    egui::RichText::new(truncate_ellipsis(name, 28)).color(pal.text),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let label = if *enabled { "On" } else { "Off" };
+                                        if ui
+                                            .add(egui::Button::new(label).frame(false))
+                                            .clicked()
+                                        {
+                                            toggle = Some((id.clone(), !*enabled));
+                                        }
+                                    },
+                                );
+                            });
+                        }
+                        ui.add_space(6.0);
+                        ui.separator();
+                        if ui
+                            .add(egui::Button::new("Manage add-ons…").frame(false))
+                            .clicked()
+                        {
+                            open_manager = true;
+                        }
+                    });
+            });
+
+        if let Some((id, enable)) = toggle {
+            self.set_addon_consent(&id, enable);
+        }
+        if open_manager {
+            self.show_addons.set(false);
+            if let Some(tab) = self.active_tab() {
+                if let Ok(u) = Url::parse("gator://extensions") {
+                    tab.load(u);
+                }
+            }
+        }
+        if r.response.clicked_elsewhere() {
+            self.show_addons.set(false);
+        }
     }
 
     fn navigate_from_omnibox(&self, raw: &str) {
@@ -3846,22 +4628,35 @@ impl AppState {
     }
 
     // ── Tab management ────────────────────────────────────────────────────────
+    /// Build a fresh, empty per-tab `UserContentManager` to attach at WebView-build time.
+    /// Returns `None` when no add-ons are installed (so a script-less profile keeps the old
+    /// no-UCM behavior). The UCM starts empty; `inject_userscripts` later `add_script`s the
+    /// add-ons whose `@match` accepts each navigated URL (the engine captures the UCM at build
+    /// time and has no post-build setter, so we keep this Rc per tab and grow it on navigation).
+    fn make_tab_ucm(&self) -> Option<Rc<UserContentManager>> {
+        if self.browser.addons.borrow().addons.is_empty() {
+            return None;
+        }
+        Some(Rc::new(UserContentManager::new(&self.browser.servo)))
+    }
+
     fn new_tab(&self, url: Url) {
         let Some(me) = self.weak_self.borrow().upgrade() else {
             return;
         };
+        let ucm = self.make_tab_ucm();
         let mut builder = WebViewBuilder::new(&self.browser.servo, self.focused_pane().context.clone())
             .url(url)
             .hidpi_scale_factor(Scale::new(self.scale.get() as f32))
             .delegate(me);
-        if let Some(ucm) = &self.browser.userscripts {
+        if let Some(ucm) = &ucm {
             builder = builder.user_content_manager(ucm.clone());
         }
         let webview = builder.build();
-        self.adopt_tab(webview);
+        self.adopt_tab(webview, ucm);
     }
 
-    fn adopt_tab(&self, webview: WebView) {
+    fn adopt_tab(&self, webview: WebView, ucm: Option<Rc<UserContentManager>>) {
         let (w, h) = self.focused_pane().content_px.get();
         if w > 0 && h > 0 {
             webview.resize(PhysicalSize::new(w, h));
@@ -3882,6 +4677,8 @@ impl AppState {
                 crashed: false,
                 pinned: false,
                 starred: false,
+                ucm,
+                injected_addons: RefCell::new(Vec::new()),
             });
             tabs.len() - 1
         };
@@ -4633,6 +5430,25 @@ impl WebViewDelegate for AppState {
     /// we don't recognise are left alone (dropping `load` signals "do not intercept").
     fn load_web_resource(&self, webview: WebView, load: WebResourceLoad) {
         let url = load.request().url.clone();
+        // GM_* capability bridge (design §5): the injected shim issues
+        // `navgator://gm/<cap>/<call>` fetches. Intercept BEFORE adblock so the hot path for
+        // ordinary http(s)/gator loads is one extra cheap scheme compare. The <cap> token
+        // identifies the calling add-on and is validated against its `granted` set.
+        if url.scheme() == "navgator" && url.host_str() == Some("gm") {
+            let body = self.handle_gm_bridge(&url);
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/json; charset=utf-8"),
+            );
+            let response = WebResourceResponse::new(url)
+                .status_code(StatusCode::OK)
+                .headers(headers);
+            let mut intercepted = load.intercept(response);
+            intercepted.send_body_data(body);
+            intercepted.finish();
+            return;
+        }
         if url.scheme() != "gator" {
             // Ad/tracker blocking. This delegate already intercepts every load, so a matched
             // request is intercepted with an empty 204 instead of being fetched. `source` is the
@@ -4647,7 +5463,7 @@ impl WebViewDelegate for AppState {
                         self.browser.adblock_blocked.set(self.browser.adblock_blocked.get() + 1);
                         let response =
                             WebResourceResponse::new(url).status_code(StatusCode::NO_CONTENT);
-                        let mut intercepted = load.intercept(response);
+                        let intercepted = load.intercept(response);
                         intercepted.finish();
                         return;
                     }
@@ -4668,6 +5484,29 @@ impl WebViewDelegate for AppState {
                     }
                 }
                 self.render_gator_passwords(remove)
+            }
+            "extensions" | "addons" => {
+                // Command links: ?enable=<id> / ?disable=<id> / ?remove=<id>. query_pairs() is
+                // already percent-decoded. Apply at most one (each rendered link carries one).
+                let mut enable: Option<String> = None;
+                let mut disable: Option<String> = None;
+                let mut remove: Option<String> = None;
+                for (k, v) in url.query_pairs() {
+                    match k.as_ref() {
+                        "enable" => enable = Some(v.into_owned()),
+                        "disable" => disable = Some(v.into_owned()),
+                        "remove" => remove = Some(v.into_owned()),
+                        _ => {}
+                    }
+                }
+                if let Some(id) = enable {
+                    self.set_addon_consent(&userscripts::AddonId(id), true);
+                } else if let Some(id) = disable {
+                    self.set_addon_consent(&userscripts::AddonId(id), false);
+                } else if let Some(id) = remove {
+                    self.remove_addon(&userscripts::AddonId(id));
+                }
+                self.render_gator_extensions()
             }
             "settings" => {
                 // Parse the query into one SettingsApply. query_pairs() already percent-decodes,
@@ -4743,6 +5582,12 @@ impl WebViewDelegate for AppState {
             let title = self.focused_pane().tabs.borrow()[i].title.clone();
             self.record_visit(url.as_str(), &title);
             self.save_session();
+            // Also recompute matching userscripts here: omnibox navigation uses tab.load(), which
+            // bypasses request_navigation, so this is the only injection hook for those. (UCM
+            // scripts apply on the next load regardless of which hook adds them — Servo caveat.)
+            if matches!(url.scheme(), "http" | "https") {
+                self.inject_userscripts(&webview, url.as_str());
+            }
             self.window.request_redraw();
         }
     }
@@ -4842,15 +5687,16 @@ impl WebViewDelegate for AppState {
         let Some(me) = self.weak_self.borrow().upgrade() else {
             return;
         };
+        let ucm = self.make_tab_ucm();
         let mut builder = request
             .builder(self.content_context.clone())
             .hidpi_scale_factor(Scale::new(self.scale.get() as f32))
             .delegate(me);
-        if let Some(ucm) = &self.browser.userscripts {
+        if let Some(ucm) = &ucm {
             builder = builder.user_content_manager(ucm.clone());
         }
         let webview = builder.build();
-        self.adopt_tab(webview);
+        self.adopt_tab(webview, ucm);
     }
 
     fn notify_closed(&self, webview: WebView) {
@@ -5036,6 +5882,14 @@ impl WebViewDelegate for AppState {
                 return;
             }
         }
+        // Per-site userscript injection (design §4 Option A): compute the matching enabled add-ons
+        // for the target URL and add their wrapped scripts to this tab's UCM *before* allowing the
+        // load, so document-start injection beats page scripts. (Servo applies new UCM scripts on
+        // the next load; this hook runs before that load proceeds.)
+        if matches!(navigation_request.url.scheme(), "http" | "https") {
+            let url = navigation_request.url.as_str().to_string();
+            self.inject_userscripts(&webview, &url);
+        }
         navigation_request.allow();
     }
 }
@@ -5099,6 +5953,8 @@ fn open_window(
         focus_omnibox: Cell::new(false),
         show_settings: Cell::new(false),
         show_studio: Cell::new(false),
+        show_addons: Cell::new(false),
+        addon_badge_rect: Cell::new(egui::Rect::NOTHING),
         dialogs: RefCell::new(Vec::new()),
         closed_tabs: RefCell::new(Vec::new()),
         find_open: Cell::new(false),
@@ -5164,25 +6020,18 @@ impl ApplicationHandler<WakeUp> for App {
             .build();
         servo.setup_logging();
 
-        // Build the shared UserContentManager from the live Servo and load every *.js
-        // userscript into it. The same Rc is cloned onto each tab/popup WebView so scripts
-        // inject on all pages. None when the dir holds no readable *.js files.
-        let loaded_scripts = load_userscripts();
-        let userscripts_count = loaded_scripts.len();
-        let userscripts = if loaded_scripts.is_empty() {
-            None
-        } else {
-            let ucm = UserContentManager::new(&servo);
-            for (path, src) in loaded_scripts {
-                ucm.add_script(Rc::new(UserScript::new(src, Some(path))));
-            }
-            Some(Rc::new(ucm))
-        };
+        // Load the add-on registry: scan the userscripts dir, parse Greasemonkey metadata,
+        // reconcile with the persisted consent state in addons.json. New/changed scripts default
+        // to disabled-pending-consent. Per-tab injection (not a single shared UCM) selects the
+        // matching enabled add-ons per navigation (see `inject_userscripts`).
+        let addons = load_addons();
+        let userscripts_count = addons.addons.len();
 
         let (sync_cb, sync_ch, sync_cp) = load_sync_cursors();
         let browser = Rc::new(BrowserState {
             servo,
-            userscripts,
+            addons: RefCell::new(addons),
+            gm_salt: password::random_salt(),
             userscripts_count,
             ipc_clients,
             settings: RefCell::new(load_settings()),
@@ -5226,6 +6075,10 @@ impl ApplicationHandler<WakeUp> for App {
         if remember && let Some(pass) = keyring_store::fetch() {
             state.unlock_passwords(&pass);
         }
+
+        // Surface an install-consent prompt for any userscript that's installed but not yet
+        // decided (new/changed scripts default to disabled-pending-consent in load_addons).
+        state.prompt_pending_consents();
 
         let mut windows = HashMap::new();
         windows.insert(window_id, state);
