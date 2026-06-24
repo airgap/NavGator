@@ -472,6 +472,20 @@ fn is_hex_color(s: &str) -> bool {
         Some(x) if (x.len() == 3 || x.len() == 6) && x.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+/// Resolve an omnibar entry to a load target: a literal URL, a bare domain promoted to https, or
+/// a search via `search_template` (`%s` placeholder). A `javascript:` entry is ALWAYS routed to
+/// search — never loaded — so address-bar `javascript:`/`javascript://…` self-XSS can't fire.
+fn omnibox_target(raw: &str, search_template: &str) -> String {
+    let is_js = raw.trim_start().to_ascii_lowercase().starts_with("javascript:");
+    if raw.contains("://") && !is_js {
+        raw.to_string()
+    } else if raw.contains('.') && !raw.contains(' ') && !is_js {
+        format!("https://{raw}")
+    } else {
+        search_template.replace("%s", &url_encode(raw))
+    }
+}
+
 /// Mirror the live `theme` into the legacy `accent`/`dark` fields the gator://
 /// pages read, so internal pages follow the chrome theme without changes.
 fn sync_legacy_theme(s: &mut Settings) {
@@ -4762,13 +4776,7 @@ impl AppState {
         if raw.is_empty() {
             return;
         }
-        let target = if raw.contains("://") {
-            raw.to_string()
-        } else if raw.contains('.') && !raw.contains(' ') {
-            format!("https://{raw}")
-        } else {
-            self.browser.settings.borrow().search.replace("%s", &url_encode(raw))
-        };
+        let target = omnibox_target(raw, &self.browser.settings.borrow().search);
         if let (Ok(url), Some(tab)) = (Url::parse(&target), self.active_tab()) {
             self.location_dirty.set(false);
             tab.load(url);
@@ -6850,7 +6858,30 @@ mod adblock_tests {
 
 #[cfg(test)]
 mod chrome_helper_tests {
-    use super::{color_hex, favicon_hue, is_hex_color, parse_session};
+    use super::{color_hex, favicon_hue, is_hex_color, omnibox_target, parse_session};
+
+    #[test]
+    fn omnibox_target_classifies_and_blocks_javascript() {
+        let s = "https://duck.com/?q=%s";
+        // A real URL passes through unchanged.
+        assert_eq!(omnibox_target("https://example.com", s), "https://example.com");
+        // A bare domain is promoted to https.
+        assert_eq!(omnibox_target("example.com", s), "https://example.com");
+        // Free text becomes a search.
+        assert!(omnibox_target("hello world", s).starts_with("https://duck.com/?q="));
+        // javascript: is ALWAYS routed to search, never loaded — including the `://` variant and
+        // mixed case / leading whitespace.
+        for js in [
+            "javascript:alert(1)",
+            "javascript://%0aalert(1)",
+            "  JavaScript:alert(document.domain)",
+        ] {
+            assert!(
+                omnibox_target(js, s).starts_with("https://duck.com/?q="),
+                "{js} should be searched, not loaded"
+            );
+        }
+    }
 
     #[test]
     fn is_hex_color_rejects_injection() {
