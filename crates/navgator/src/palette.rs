@@ -21,6 +21,7 @@ pub(crate) enum PaletteAction {
     ApplyPreset(Preset),
     ToggleNotes,
     ToggleFeed,
+    OpenWhy,
 }
 
 /// The full command catalog: (label, right-aligned mono hint, action). `studio_open`
@@ -28,6 +29,11 @@ pub(crate) enum PaletteAction {
 pub(crate) fn palette_catalog(studio_open: bool) -> Vec<(String, &'static str, PaletteAction)> {
     vec![
         ("New tab".to_string(), "⌘T", PaletteAction::NewTab),
+        (
+            "Show blocked requests (gator://why)".to_string(),
+            "Privacy",
+            PaletteAction::OpenWhy,
+        ),
         (
             "Toggle vertical tabs".to_string(),
             "Layout",

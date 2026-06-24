@@ -1615,6 +1615,9 @@ struct Tab {
     /// Add-on ids already injected into this tab's `ucm`, so repeat navigations don't add the
     /// same wrapped script twice (the engine has no "clear UCM" primitive).
     injected_addons: RefCell<Vec<userscripts::AddonId>>,
+    /// URLs blocked by the adblocker on the CURRENT page (cleared on navigation), surfaced by
+    /// the gator://why "block receipt". Capped to bound a tracker-heavy page.
+    blocked: RefCell<Vec<String>>,
 }
 
 /// One independent pane group: its own tab list, active tab, and offscreen FBO. The browser
@@ -1816,6 +1819,9 @@ struct AppState {
     dialogs: RefCell<Vec<Dialog>>,
     /// URLs of recently-closed tabs, for Ctrl+Shift+T (reopen most-recent).
     closed_tabs: RefCell<Vec<String>>,
+    /// Snapshot of a tab's blocked-request log, taken when the user opens gator://why (so the
+    /// receipt survives the navigation to the receipt page itself).
+    why_log: RefCell<Vec<String>>,
     /// Find-in-page (Ctrl+F) state.
     find_open: Cell<bool>,
     find_query: RefCell<String>,
@@ -1992,6 +1998,78 @@ impl AppState {
             .replace("__SITES_HIDE__", hide(modules.sites))
             .replace("__NOTES_HIDE__", hide(modules.notes))
             .replace("__FEED_HIDE__", hide(modules.feed));
+        self.themed(html)
+    }
+
+    /// Snapshot the focused tab's blocked-request log and open the gator://why receipt in a new
+    /// tab (snapshotting first so the data survives the navigation to the receipt page).
+    fn open_why(&self) {
+        let snap = self
+            .focused_pane()
+            .tabs
+            .borrow()
+            .get(self.focused_pane().active.get())
+            .map(|t| t.blocked.borrow().clone())
+            .unwrap_or_default();
+        *self.why_log.borrow_mut() = snap;
+        if let Ok(u) = Url::parse("gator://why") {
+            self.new_tab(u);
+        }
+    }
+
+    /// Render `gator://why`: the per-page "block receipt" — every request the ad/tracker blocker
+    /// stopped on the page the user was viewing, grouped by host. Surfaces data the interceptor
+    /// already computes; nothing leaves the machine.
+    fn render_gator_why(&self) -> Vec<u8> {
+        use std::collections::BTreeMap;
+        let log = self.why_log.borrow();
+        let total = log.len();
+        let mut by_host: BTreeMap<String, Vec<&String>> = BTreeMap::new();
+        for u in log.iter() {
+            let host = Url::parse(u)
+                .ok()
+                .and_then(|p| p.host_str().map(|h| h.trim_start_matches("www.").to_string()))
+                .unwrap_or_else(|| "(other)".to_string());
+            by_host.entry(host).or_default().push(u);
+        }
+        let body = if total == 0 {
+            "<p class=\"empty\">Nothing was blocked on that page.</p>".to_string()
+        } else {
+            by_host
+                .iter()
+                .map(|(host, urls)| {
+                    let items: String =
+                        urls.iter().map(|u| format!("<li>{}</li>", html_escape(u))).collect();
+                    format!(
+                        "<details><summary><span>{}</span><span class=\"n\">{}</span></summary>\
+                         <ul>{}</ul></details>",
+                        html_escape(host),
+                        urls.len(),
+                        items
+                    )
+                })
+                .collect()
+        };
+        let html = format!(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+             <title>Block receipt</title><style>\
+             :root{{--accent:__ACCENT__;--bg:__BG__;--panel:__PANEL__;--line:__LINE__;--fg:__FG__;--muted:__MUTED__;}}\
+             *{{box-sizing:border-box}}body{{background:var(--bg);color:var(--fg);\
+             font:15px/1.5 system-ui,-apple-system,sans-serif;max-width:760px;margin:0 auto;padding:8vh 24px}}\
+             h1{{font-size:26px;margin:0 0 4px}}.sub{{color:var(--muted);margin:0 0 28px;font-size:14px}}\
+             details{{background:var(--panel);border:1px solid var(--line);border-radius:12px;\
+             padding:12px 16px;margin:8px 0}}\
+             summary{{cursor:pointer;display:flex;justify-content:space-between;align-items:center;\
+             list-style:none;font-weight:600}}\
+             .n{{color:var(--accent);font:13px ui-monospace,monospace}}\
+             ul{{margin:10px 0 0;padding-left:18px;color:var(--muted);\
+             font:12px ui-monospace,monospace;word-break:break-all}}li{{margin:3px 0}}\
+             .empty{{color:var(--muted)}}</style></head><body>\
+             <h1>Block receipt</h1>\
+             <p class=\"sub\">{} request(s) the ad/tracker blocker stopped on the page you were \
+             viewing, grouped by host. Computed on-device; nothing left the machine.</p>{}</body></html>",
+            total, body
+        );
         self.themed(html)
     }
 
@@ -2755,6 +2833,7 @@ impl AppState {
             starred: false,
             ucm,
             injected_addons: RefCell::new(Vec::new()),
+            blocked: RefCell::new(Vec::new()),
         });
         self.pane1.active.set(0);
         self.split.set(true);
@@ -2801,6 +2880,7 @@ impl AppState {
                 starred: false,
                 ucm,
                 injected_addons: RefCell::new(Vec::new()),
+                blocked: RefCell::new(Vec::new()),
             });
         }
         self.pane1.active.set(0);
@@ -2955,6 +3035,10 @@ impl AppState {
                 self.window.request_redraw();
                 return;
             }
+            A::OpenWhy => {
+                self.open_why();
+                return;
+            }
             _ => {}
         }
         {
@@ -2978,7 +3062,7 @@ impl AppState {
                 A::ApplyPreset(p) => p.merge_into(&mut s.theme),
                 A::ToggleNotes => s.modules.notes = !s.modules.notes,
                 A::ToggleFeed => s.modules.feed = !s.modules.feed,
-                A::NewTab | A::ToggleStudio => {}
+                A::NewTab | A::ToggleStudio | A::OpenWhy => {}
             }
             sync_legacy_theme(&mut s);
             save_settings(&s);
@@ -4904,6 +4988,7 @@ impl AppState {
                 starred: false,
                 ucm,
                 injected_addons: RefCell::new(Vec::new()),
+                blocked: RefCell::new(Vec::new()),
             });
             tabs.len() - 1
         };
@@ -5713,13 +5798,22 @@ impl WebViewDelegate for AppState {
             // request is intercepted with an empty 204 instead of being fetched. `source` is the
             // requesting tab's URL, so first-vs-third-party rules resolve correctly.
             if matches!(url.scheme(), "http" | "https") && self.browser.settings.borrow().block_ads {
-                let source = self
-                    .locate_tab(&webview)
+                let loc = self.locate_tab(&webview);
+                let source = loc
                     .and_then(|(p, i)| self.pane(p).tabs.borrow().get(i).map(|t| t.url.clone()))
                     .unwrap_or_default();
                 if let Ok(req) = adblock::request::Request::new(url.as_str(), &source, "other") {
                     if self.browser.adblock.check_network_request(&req).matched {
                         self.browser.adblock_blocked.set(self.browser.adblock_blocked.get() + 1);
+                        // Record for the gator://why receipt (per-page, capped).
+                        if let Some((p, i)) = loc {
+                            if let Some(t) = self.pane(p).tabs.borrow().get(i) {
+                                let mut log = t.blocked.borrow_mut();
+                                if log.len() < 500 {
+                                    log.push(url.as_str().to_string());
+                                }
+                            }
+                        }
                         let response =
                             WebResourceResponse::new(url).status_code(StatusCode::NO_CONTENT);
                         let intercepted = load.intercept(response);
@@ -5732,6 +5826,7 @@ impl WebViewDelegate for AppState {
         }
         let body = match url.host_str().unwrap_or("welcome") {
             "welcome" | "newtab" | "home" => self.render_gator_welcome(),
+            "why" => self.render_gator_why(),
             "history" => self.render_gator_history(),
             "about" => self.render_gator_about(),
             "downloads" => self.render_gator_downloads(),
@@ -5861,6 +5956,10 @@ impl WebViewDelegate for AppState {
     fn notify_url_changed(&self, webview: WebView, url: Url) {
         if let Some((p, i)) = self.locate_tab(&webview) {
             self.pane(p).tabs.borrow_mut()[i].url = url.to_string();
+            // New page → reset its gator://why block receipt (it accumulates as resources load).
+            if matches!(url.scheme(), "http" | "https") {
+                self.pane(p).tabs.borrow()[i].blocked.borrow_mut().clear();
+            }
             let focused = p == self.focused.get();
             if focused {
                 self.ipc_emit(&format!("url {i} {url}"));
@@ -6272,6 +6371,7 @@ fn open_window(
         addon_badge_rect: Cell::new(egui::Rect::NOTHING),
         dialogs: RefCell::new(Vec::new()),
         closed_tabs: RefCell::new(Vec::new()),
+        why_log: RefCell::new(Vec::new()),
         find_open: Cell::new(false),
         find_query: RefCell::new(String::new()),
         find_matches: Cell::new(0),
