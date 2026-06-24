@@ -5,13 +5,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NavGator</title>
 <style>
+  /* The chrome's bundled fonts, served by the engine from gator://font/* so the page matches
+     the native chrome exactly. System families remain as fallback if a load fails. */
+  @font-face { font-family:'NavGrotesk'; src:url('gator://font/grotesk') format('truetype'); font-weight:300 700; font-display:swap; }
+  @font-face { font-family:'NavSans';    src:url('gator://font/outfit')  format('truetype'); font-weight:300 700; font-display:swap; }
+  @font-face { font-family:'NavMono';    src:url('gator://font/mono')    format('truetype'); font-weight:400 700; font-display:swap; }
   /* Theme tokens are substituted from the live OKLCH chrome theme (see themed()). */
   :root {
     --accent: __ACCENT__; --accent-rgb: __ACCENT_RGB__;
     --bg:__BG__; --panel:__PANEL__; --elev:__ELEV__; --line:__LINE__; --fg:__FG__; --muted:__MUTED__;
-    /* TODO: serve bundled Space Grotesk / JetBrains Mono via gator://font for exact chrome parity. */
-    --sans: ui-rounded, "SF Pro Rounded", "Segoe UI", system-ui, -apple-system, sans-serif;
-    --mono: ui-monospace, "JetBrains Mono", "SF Mono", "Cascadia Code", Menlo, monospace;
+    --display: 'NavGrotesk', ui-rounded, "SF Pro Rounded", "Segoe UI", system-ui, sans-serif;
+    --sans: 'NavSans', system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: 'NavMono', ui-monospace, "JetBrains Mono", "SF Mono", "Cascadia Code", Menlo, monospace;
   }
   * { box-sizing:border-box; }
   html,body { height:100%; margin:0; }
@@ -33,7 +38,7 @@
   /* Clock + greeting */
   .date { font: 600 12px/1 var(--mono); letter-spacing:1.5px; color: var(--muted); text-transform:uppercase; }
   .clock { display:flex; align-items:baseline; gap:20px; margin:14px 0 40px; flex-wrap:wrap; }
-  .time { font: 300 78px/1 var(--sans); letter-spacing:-2px; color: var(--fg); }
+  .time { font: 300 78px/1 var(--display); letter-spacing:-2px; color: var(--fg); }
   .greet { font-size:26px; color: var(--muted); }
 
   /* Search box — focuses the native omnibar (gator://omnibar is intercepted by the chrome) */

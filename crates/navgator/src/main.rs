@@ -1805,34 +1805,84 @@ impl AppState {
         } else {
             String::new()
         };
-        // Top-site tiles. Demo set for now (matches the design); avatar colors come from the
-        // OKLCH ramp so they track the chrome theme. (TODO: source from real history/bookmarks.)
-        const SITES: &[(&str, &str, f32, &str)] = &[
-            ("Figma", "F", 200.0, "figma.com"),
-            ("GitHub", "G", 285.0, "github.com"),
-            ("Linear", "L", 270.0, "linear.app"),
-            ("Notion", "N", 40.0, "notion.so"),
-            ("Vercel", "V", 280.0, "vercel.com"),
-            ("Arc", "A", 330.0, "arc.net"),
-            ("Raycast", "R", 25.0, "raycast.com"),
-            ("Spotify", "S", 145.0, "open.spotify.com"),
-            ("Reader", "R", 55.0, "getpocket.com"),
-            ("Maps", "M", 230.0, "maps.google.com"),
-        ];
-        let topsites: String = SITES
-            .iter()
-            .map(|(name, letter, hue, domain)| {
-                format!(
-                    "<a class=\"tile\" href=\"https://{dom}\">\
-                     <span class=\"av\" style=\"background:{col}\">{ltr}</span>\
-                     <span class=\"nm\">{nm}</span></a>",
-                    dom = html_escape(domain),
-                    col = color_hex(theme::oklch(0.6, 0.16, *hue)),
-                    ltr = html_escape(letter),
-                    nm = html_escape(name),
-                )
-            })
-            .collect();
+        // Top-site tiles. Avatar colors come from the OKLCH ramp (via favicon_hue, matching the
+        // tab favicon chips) so they track the chrome theme.
+        let tile = |href: &str, hue: f32, letter: &str, name: &str| {
+            format!(
+                "<a class=\"tile\" href=\"{href}\">\
+                 <span class=\"av\" style=\"background:{col}\">{ltr}</span>\
+                 <span class=\"nm\">{nm}</span></a>",
+                href = html_escape(href),
+                col = color_hex(theme::oklch(0.6, 0.16, hue)),
+                ltr = html_escape(letter),
+                nm = html_escape(name),
+            )
+        };
+        // Real top sites: most-visited history, deduped by host, top 10.
+        let topsites = {
+            let p = self.browser.profile.borrow();
+            let mut ranked: Vec<&HistoryEntry> = p
+                .history
+                .iter()
+                .filter(|e| e.url.starts_with("http://") || e.url.starts_with("https://"))
+                .collect();
+            ranked.sort_by(|a, b| b.visits.cmp(&a.visits));
+            let mut seen = std::collections::HashSet::new();
+            let mut out = String::new();
+            for e in ranked {
+                if seen.len() >= 10 {
+                    break;
+                }
+                let Some(host) = Url::parse(&e.url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.trim_start_matches("www.").to_string()))
+                else {
+                    continue;
+                };
+                if !seen.insert(host.clone()) {
+                    continue;
+                }
+                let title = if e.title.trim().is_empty() {
+                    host.clone()
+                } else {
+                    e.title.clone()
+                };
+                let letter = title
+                    .chars()
+                    .find(|c| c.is_alphanumeric())
+                    .map(|c| c.to_uppercase().to_string())
+                    .unwrap_or_else(|| "•".to_string());
+                out.push_str(&tile(
+                    &e.url,
+                    favicon_hue(&host),
+                    &letter,
+                    &truncate_ellipsis(&title, 14),
+                ));
+            }
+            out
+        };
+        // Fresh profile (no history yet): a demo set so the page isn't empty out of the box.
+        let topsites = if topsites.is_empty() {
+            const DEMO: &[(&str, &str, &str)] = &[
+                ("Figma", "F", "figma.com"),
+                ("GitHub", "G", "github.com"),
+                ("Linear", "L", "linear.app"),
+                ("Notion", "N", "notion.so"),
+                ("Vercel", "V", "vercel.com"),
+                ("Arc", "A", "arc.net"),
+                ("Raycast", "R", "raycast.com"),
+                ("Spotify", "S", "open.spotify.com"),
+                ("Reader", "R", "getpocket.com"),
+                ("Maps", "M", "maps.google.com"),
+            ];
+            DEMO.iter()
+                .map(|(name, letter, domain)| {
+                    tile(&format!("https://{domain}"), favicon_hue(domain), letter, name)
+                })
+                .collect::<String>()
+        } else {
+            topsites
+        };
         let hide = |on: bool| if on { "" } else { "hidden" };
         let html = include_str!("content/welcome.html")
             .replace("__WALLPAPER__", &wallpaper_css)
@@ -2257,8 +2307,22 @@ impl AppState {
             .map(|t| t.webview.clone())
     }
 
-    fn tab_index(&self, webview: &WebView) -> Option<usize> {
-        self.focused_pane().tabs.borrow().iter().position(|t| &t.webview == webview)
+    /// Locate a webview across BOTH panes, returning `(pane, tab index)`. Delegate callbacks fire
+    /// for whichever pane owns the webview — not necessarily the focused one — so they must route
+    /// updates here rather than assuming `focused_pane()`.
+    fn locate_tab(&self, webview: &WebView) -> Option<(usize, usize)> {
+        for pane in 0..2 {
+            if let Some(i) = self
+                .pane(pane)
+                .tabs
+                .borrow()
+                .iter()
+                .position(|t| &t.webview == webview)
+            {
+                return Some((pane, i));
+            }
+        }
+        None
     }
 
     fn active_nav(&self) -> (bool, bool) {
@@ -2475,6 +2539,13 @@ impl AppState {
             for t in self.pane(pane).tabs.borrow().iter() {
                 t.webview.resize(PhysicalSize::new(w, h));
             }
+        }
+        // An empty pane (its last tab was closed in a split) paints a clean themed blank rather
+        // than blitting whatever stale frame is still in its FBO.
+        if self.pane(pane).tabs.borrow().get(self.pane(pane).active.get()).is_none() {
+            let bg = self.browser.settings.borrow().theme.palette().bg;
+            ctx.layer_painter(LayerId::background()).rect_filled(rect, 0.0, bg);
+            return;
         }
         // Blit the live Servo page FBO. The new-tab page is now the HTML `gator://welcome`
         // document (rendered by the engine), so it takes this same path — no native dashboard.
@@ -3377,11 +3448,11 @@ impl AppState {
         match act {
             TabAction::None => false,
             TabAction::Select(i) => {
-                self.select_tab(i);
+                self.select_tab(self.focused.get(), i);
                 false
             }
             TabAction::Close(i) => {
-                self.close_tab(i);
+                self.close_tab(self.focused.get(), i);
                 true
             }
             TabAction::CloseOthers(i) => {
@@ -3419,7 +3490,7 @@ impl AppState {
                     .and_then(|t| Url::parse(&t.url).ok())
                     .unwrap_or_else(content_url);
                 self.browser.pending_windows.borrow_mut().push(url);
-                self.close_tab(i);
+                self.close_tab(self.focused.get(), i);
                 self.window.request_redraw();
                 true
             }
@@ -4291,7 +4362,7 @@ impl AppState {
     /// way to swap or clear a UCM after build, scripts accumulate in the tab's UCM across its
     /// lifetime; `@match` filtering for the *current* navigation is enforced here at add time.
     fn inject_userscripts(&self, webview: &WebView, url: &str) {
-        let Some(tab_idx) = self.tab_index(webview) else {
+        let Some((pane, tab_idx)) = self.locate_tab(webview) else {
             return;
         };
         // Collect the wrapped scripts to add (id + js), reading source files outside the borrow.
@@ -4299,7 +4370,7 @@ impl AppState {
         let to_add: Vec<(userscripts::AddonId, String)> = {
             let reg = self.browser.addons.borrow();
             let already = {
-                let tabs = self.focused_pane().tabs.borrow();
+                let tabs = self.pane(pane).tabs.borrow();
                 match tabs.get(tab_idx) {
                     Some(t) => t.injected_addons.borrow().clone(),
                     None => return,
@@ -4325,7 +4396,7 @@ impl AppState {
         if to_add.is_empty() {
             return;
         }
-        let tabs = self.focused_pane().tabs.borrow();
+        let tabs = self.pane(pane).tabs.borrow();
         let Some(tab) = tabs.get(tab_idx) else {
             return;
         };
@@ -4682,7 +4753,7 @@ impl AppState {
             });
             tabs.len() - 1
         };
-        self.select_tab(idx);
+        self.select_tab(self.focused.get(), idx);
         self.save_session();
     }
 
@@ -4696,20 +4767,25 @@ impl AppState {
         if let Some(d) = path.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        let s: String = self
-            .focused_pane()
-            .tabs
-            .borrow()
+        // Persist BOTH panes' tabs (pane1 is empty when not split). Restore opens them into a
+        // single pane — split layout isn't persisted yet — but no tabs are silently lost.
+        let p0 = self.pane0.tabs.borrow();
+        let p1 = self.pane1.tabs.borrow();
+        let s: String = p0
             .iter()
+            .chain(p1.iter())
             .filter(|t| !t.url.is_empty())
             .map(|t| format!("{}\n", tsv_field(&t.url)))
             .collect();
         let _ = std::fs::write(path, s);
     }
 
-    fn select_tab(&self, i: usize) {
+    fn select_tab(&self, pane: usize, i: usize) {
+        // Only the focused pane drives keyboard focus and the address bar; selecting a tab in a
+        // background split pane still shows/throttles its webviews but must not steal either.
+        let is_focused = pane == self.focused.get();
         {
-            let tabs = self.focused_pane().tabs.borrow();
+            let tabs = self.pane(pane).tabs.borrow();
             if i >= tabs.len() {
                 return;
             }
@@ -4724,18 +4800,22 @@ impl AppState {
                     tab.webview.set_throttled(true);
                 }
             }
-            tabs[i].webview.focus();
-            *self.location.borrow_mut() = tabs[i].url.clone();
+            if is_focused {
+                tabs[i].webview.focus();
+                *self.location.borrow_mut() = tabs[i].url.clone();
+            }
         }
-        self.location_dirty.set(false);
-        self.focused_pane().active.set(i);
-        self.focused_pane().scroll_active_into_view.set(true);
+        if is_focused {
+            self.location_dirty.set(false);
+        }
+        self.pane(pane).active.set(i);
+        self.pane(pane).scroll_active_into_view.set(true);
         self.window.request_redraw();
     }
 
-    fn close_tab(&self, i: usize) {
+    fn close_tab(&self, pane: usize, i: usize) {
         {
-            let mut tabs = self.focused_pane().tabs.borrow_mut();
+            let mut tabs = self.pane(pane).tabs.borrow_mut();
             if i >= tabs.len() {
                 return;
             }
@@ -4745,17 +4825,29 @@ impl AppState {
             }
             tabs.remove(i); // dropping the WebView handle closes the webview
         }
-        if self.focused_pane().tabs.borrow().is_empty() {
-            // Pane emptied. If the whole window is now tabless, close the window (the loop quits
-            // only if it's the last one); in a split, the other pane keeps the window alive.
-            if self.pane0.tabs.borrow().is_empty() && self.pane1.tabs.borrow().is_empty() {
+        if self.pane(pane).tabs.borrow().is_empty() {
+            let pane0_empty = self.pane0.tabs.borrow().is_empty();
+            let pane1_empty = self.pane1.tabs.borrow().is_empty();
+            if pane0_empty && pane1_empty {
+                // Whole window is tabless — close it (the loop quits only if it's the last one).
                 self.wants_close.set(true);
                 self.window.request_redraw();
+            } else if self.split.get() {
+                // A split pane emptied but the other still has tabs. Don't leave an empty pane
+                // focused (chrome would act on nothing). Exactly one pane survives: if it's pane0,
+                // collapse the split onto it; if it's pane1, focus pane1 (can't collapse onto it).
+                if pane1_empty {
+                    self.exit_split();
+                } else {
+                    self.focused.set(1);
+                    let n = self.pane1.tabs.borrow().len();
+                    self.select_tab(1, self.pane1.active.get().min(n - 1));
+                }
             }
             return;
         }
-        let len = self.focused_pane().tabs.borrow().len();
-        let active = self.focused_pane().active.get();
+        let len = self.pane(pane).tabs.borrow().len();
+        let active = self.pane(pane).active.get();
         let new_active = if active >= len {
             len - 1
         } else if active > i {
@@ -4763,7 +4855,7 @@ impl AppState {
         } else {
             active
         };
-        self.select_tab(new_active);
+        self.select_tab(pane, new_active);
         self.save_session();
     }
 
@@ -4838,7 +4930,7 @@ impl AppState {
             new_active
         };
         self.focused_pane().active.set(new_active);
-        self.select_tab(new_active);
+        self.select_tab(self.focused.get(), new_active);
         self.save_session();
     }
 
@@ -5196,12 +5288,12 @@ impl AppState {
     /// Autofill the login form of tab `tab_idx` if the store is unlocked and a saved login
     /// matches the page origin. The credential goes straight from the store into the form via
     /// evaluate_javascript — it is never exposed to page-readable storage.
-    fn autofill(&self, tab_idx: usize) {
+    fn autofill(&self, pane: usize, tab_idx: usize) {
         if !self.browser.password_store.borrow().is_unlocked() {
             return;
         }
         let (webview, origin) = {
-            let tabs = self.focused_pane().tabs.borrow();
+            let tabs = self.pane(pane).tabs.borrow();
             let Some(t) = tabs.get(tab_idx) else {
                 return;
             };
@@ -5295,12 +5387,12 @@ impl AppState {
     /// Hide ad/clutter elements using EasyList's cosmetic (element-hiding) rules. Two evals:
     /// collect the page's class/id set, then inject a `<style>` hiding the matching selectors —
     /// generic rules are filtered to the page's actual classes/ids, so this stays cheap.
-    fn apply_cosmetic(&self, tab_idx: usize) {
+    fn apply_cosmetic(&self, pane: usize, tab_idx: usize) {
         if !self.browser.settings.borrow().block_ads {
             return;
         }
         let (webview, url) = {
-            let tabs = self.focused_pane().tabs.borrow();
+            let tabs = self.pane(pane).tabs.borrow();
             let Some(t) = tabs.get(tab_idx) else {
                 return;
             };
@@ -5384,8 +5476,8 @@ impl AppState {
                     tab.go_forward(1);
                 }
             }
-            IpcCommand::SelectTab(i) => self.select_tab(i),
-            IpcCommand::CloseTab(i) => self.close_tab(i),
+            IpcCommand::SelectTab(i) => self.select_tab(self.focused.get(), i),
+            IpcCommand::CloseTab(i) => self.close_tab(self.focused.get(), i),
         }
     }
 
@@ -5455,8 +5547,8 @@ impl WebViewDelegate for AppState {
             // requesting tab's URL, so first-vs-third-party rules resolve correctly.
             if matches!(url.scheme(), "http" | "https") && self.browser.settings.borrow().block_ads {
                 let source = self
-                    .tab_index(&webview)
-                    .and_then(|i| self.focused_pane().tabs.borrow().get(i).map(|t| t.url.clone()))
+                    .locate_tab(&webview)
+                    .and_then(|(p, i)| self.pane(p).tabs.borrow().get(i).map(|t| t.url.clone()))
                     .unwrap_or_default();
                 if let Ok(req) = adblock::request::Request::new(url.as_str(), &source, "other") {
                     if self.browser.adblock.check_network_request(&req).matched {
@@ -5550,6 +5642,24 @@ impl WebViewDelegate for AppState {
                 }
                 self.render_gator_crash(&crashed_url, &reason)
             }
+            // Bundled chrome fonts, served so the HTML new-tab page matches the native chrome
+            // (gator://font/grotesk | /outfit | /mono). Same scheme as the page ⇒ same-origin.
+            "font" => match url.path().trim_start_matches('/') {
+                "outfit" => {
+                    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/Outfit.ttf"))
+                        .to_vec()
+                }
+                "mono" => include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/assets/fonts/JetBrainsMono.ttf"
+                ))
+                .to_vec(),
+                _ => include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/assets/fonts/SpaceGrotesk.ttf"
+                ))
+                .to_vec(),
+            },
             other => format!(
                 "<!doctype html><meta charset=\"utf-8\">\
                  <body style=\"font-family:system-ui;background:#0e1014;color:#e8eaed;padding:48px\">\
@@ -5562,7 +5672,11 @@ impl WebViewDelegate for AppState {
         let mut headers = HeaderMap::new();
         headers.insert(
             CONTENT_TYPE,
-            HeaderValue::from_static("text/html; charset=utf-8"),
+            HeaderValue::from_static(if url.host_str() == Some("font") {
+                "font/ttf"
+            } else {
+                "text/html; charset=utf-8"
+            }),
         );
         let response = WebResourceResponse::new(url)
             .status_code(StatusCode::OK)
@@ -5573,13 +5687,16 @@ impl WebViewDelegate for AppState {
     }
 
     fn notify_url_changed(&self, webview: WebView, url: Url) {
-        if let Some(i) = self.tab_index(&webview) {
-            self.focused_pane().tabs.borrow_mut()[i].url = url.to_string();
-            self.ipc_emit(&format!("url {i} {url}"));
-            if i == self.focused_pane().active.get() && !self.location_dirty.get() {
-                *self.location.borrow_mut() = url.to_string();
+        if let Some((p, i)) = self.locate_tab(&webview) {
+            self.pane(p).tabs.borrow_mut()[i].url = url.to_string();
+            let focused = p == self.focused.get();
+            if focused {
+                self.ipc_emit(&format!("url {i} {url}"));
+                if i == self.pane(p).active.get() && !self.location_dirty.get() {
+                    *self.location.borrow_mut() = url.to_string();
+                }
             }
-            let title = self.focused_pane().tabs.borrow()[i].title.clone();
+            let title = self.pane(p).tabs.borrow()[i].title.clone();
             self.record_visit(url.as_str(), &title);
             self.save_session();
             // Also recompute matching userscripts here: omnibox navigation uses tab.load(), which
@@ -5593,19 +5710,21 @@ impl WebViewDelegate for AppState {
     }
 
     fn notify_page_title_changed(&self, webview: WebView, title: Option<String>) {
-        if let Some(i) = self.tab_index(&webview) {
+        if let Some((p, i)) = self.locate_tab(&webview) {
             let title = title.unwrap_or_else(|| "New tab".to_string());
-            self.ipc_emit(&format!("title {i} {title}"));
-            let url = self.focused_pane().tabs.borrow()[i].url.clone();
-            self.focused_pane().tabs.borrow_mut()[i].title = title.clone();
+            if p == self.focused.get() {
+                self.ipc_emit(&format!("title {i} {title}"));
+            }
+            let url = self.pane(p).tabs.borrow()[i].url.clone();
+            self.pane(p).tabs.borrow_mut()[i].title = title.clone();
             self.record_visit(&url, &title);
             self.window.request_redraw();
         }
     }
 
     fn notify_history_changed(&self, webview: WebView, entries: Vec<Url>, current: usize) {
-        if let Some(i) = self.tab_index(&webview) {
-            let mut tabs = self.focused_pane().tabs.borrow_mut();
+        if let Some((p, i)) = self.locate_tab(&webview) {
+            let mut tabs = self.pane(p).tabs.borrow_mut();
             tabs[i].can_back = current > 0;
             tabs[i].can_forward = current + 1 < entries.len();
             drop(tabs);
@@ -5614,17 +5733,17 @@ impl WebViewDelegate for AppState {
     }
 
     fn notify_favicon_changed(&self, webview: WebView) {
-        if let Some(i) = self.tab_index(&webview) {
+        if let Some((p, i)) = self.locate_tab(&webview) {
             let img = webview.favicon().map(|f| favicon_color_image(&f));
-            self.focused_pane().tabs.borrow_mut()[i].favicon_pending = img;
+            self.pane(p).tabs.borrow_mut()[i].favicon_pending = img;
             self.window.request_redraw();
         }
     }
 
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
-        if let Some(i) = self.tab_index(&webview) {
+        if let Some((p, i)) = self.locate_tab(&webview) {
             {
-                let mut tabs = self.focused_pane().tabs.borrow_mut();
+                let mut tabs = self.pane(p).tabs.borrow_mut();
                 tabs[i].loading = !matches!(status, LoadStatus::Complete);
                 // A new load clears any stale hover/status text and the crashed state
                 // (a started load means the pipeline is alive again).
@@ -5634,10 +5753,13 @@ impl WebViewDelegate for AppState {
                 }
             }
             if matches!(status, LoadStatus::Complete) {
-                self.autofill(i);
-                self.apply_cosmetic(i);
+                self.autofill(p, i);
+                self.apply_cosmetic(p, i);
             }
-            if matches!(status, LoadStatus::Complete) && i == self.focused_pane().active.get() {
+            if matches!(status, LoadStatus::Complete)
+                && p == self.focused.get()
+                && i == self.pane(p).active.get()
+            {
                 self.location_dirty.set(false);
             }
             self.window.request_redraw();
@@ -5645,8 +5767,8 @@ impl WebViewDelegate for AppState {
     }
 
     fn notify_status_text_changed(&self, webview: WebView, status: Option<String>) {
-        if let Some(i) = self.tab_index(&webview) {
-            self.focused_pane().tabs.borrow_mut()[i].status_text = status;
+        if let Some((p, i)) = self.locate_tab(&webview) {
+            self.pane(p).tabs.borrow_mut()[i].status_text = status;
             self.window.request_redraw();
         }
     }
@@ -5688,8 +5810,10 @@ impl WebViewDelegate for AppState {
             return;
         };
         let ucm = self.make_tab_ucm();
+        // Build into the FOCUSED pane's context — `adopt_tab` pushes into `focused_pane()`, so
+        // using pane0's context would bind a popup opened in the right split pane to the wrong FBO.
         let mut builder = request
-            .builder(self.content_context.clone())
+            .builder(self.focused_pane().context.clone())
             .hidpi_scale_factor(Scale::new(self.scale.get() as f32))
             .delegate(me);
         if let Some(ucm) = &ucm {
@@ -5700,8 +5824,8 @@ impl WebViewDelegate for AppState {
     }
 
     fn notify_closed(&self, webview: WebView) {
-        if let Some(i) = self.tab_index(&webview) {
-            self.close_tab(i);
+        if let Some((p, i)) = self.locate_tab(&webview) {
+            self.close_tab(p, i);
         }
     }
 
@@ -5826,11 +5950,11 @@ impl WebViewDelegate for AppState {
     /// crashed URL + panic reason so the page can offer a Reload-back-to-that-URL button.
     /// `tab.load` re-spawns the pipeline, so the tab stays usable.
     fn notify_crashed(&self, webview: WebView, reason: String, _backtrace: Option<String>) {
-        let Some(i) = self.tab_index(&webview) else {
+        let Some((p, i)) = self.locate_tab(&webview) else {
             return;
         };
         let crashed_url = {
-            let mut tabs = self.focused_pane().tabs.borrow_mut();
+            let mut tabs = self.pane(p).tabs.borrow_mut();
             tabs[i].crashed = true;
             tabs[i].loading = false;
             // Don't offer a reload back to our own crash page if it somehow crashes again.
@@ -5874,8 +5998,8 @@ impl WebViewDelegate for AppState {
         // tab.load() — which bypasses this delegate entirely — so user navigation is unaffected.
         if navigation_request.url.scheme() == "gator" {
             let from_web = self
-                .tab_index(&webview)
-                .and_then(|i| self.focused_pane().tabs.borrow().get(i).map(|t| t.url.clone()))
+                .locate_tab(&webview)
+                .and_then(|(p, i)| self.pane(p).tabs.borrow().get(i).map(|t| t.url.clone()))
                 .is_some_and(|u| u.starts_with("http://") || u.starts_with("https://"));
             if from_web {
                 navigation_request.deny();
@@ -6330,7 +6454,7 @@ impl ApplicationHandler<WakeUp> for App {
                             return;
                         }
                         WinitKey::Character(c) if c.eq_ignore_ascii_case("w") => {
-                            state.close_tab(state.focused_pane().active.get());
+                            state.close_tab(state.focused.get(), state.focused_pane().active.get());
                             return;
                         }
                         WinitKey::Character(c) if c.eq_ignore_ascii_case("l") => {
@@ -6411,9 +6535,9 @@ impl ApplicationHandler<WakeUp> for App {
                             if let Ok(n) = c.parse::<usize>() {
                                 let len = state.focused_pane().tabs.borrow().len();
                                 if n == 9 && len > 0 {
-                                    state.select_tab(len - 1);
+                                    state.select_tab(state.focused.get(), len - 1);
                                 } else if (1..=8).contains(&n) && n <= len {
-                                    state.select_tab(n - 1);
+                                    state.select_tab(state.focused.get(), n - 1);
                                 }
                                 return;
                             }
@@ -6427,7 +6551,7 @@ impl ApplicationHandler<WakeUp> for App {
                                 } else {
                                     (cur + 1) % len
                                 };
-                                state.select_tab(next);
+                                state.select_tab(state.focused.get(), next);
                             }
                             return;
                         }
