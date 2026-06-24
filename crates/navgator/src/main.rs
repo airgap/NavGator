@@ -59,7 +59,6 @@ mod fonts;
 mod widgets;
 mod studio;
 mod palette;
-mod dashboard;
 use url::Url;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
@@ -758,23 +757,6 @@ fn favicon_hue(s: &str) -> f32 {
     (h % 360) as f32
 }
 
-/// Current local-time strings for the new-tab dashboard clock: uppercase
-/// `Weekday, Month D`, `HH:MM AM/PM`, and an hour-based greeting.
-fn dash_clock() -> dashboard::DashClock {
-    use chrono::{Local, Timelike};
-    let now = Local::now();
-    let greeting = match now.hour() {
-        5..=11 => "Good morning",
-        12..=17 => "Good afternoon",
-        _ => "Good evening",
-    };
-    dashboard::DashClock {
-        date: now.format("%A, %B %-d").to_string().to_uppercase(),
-        time: now.format("%-I:%M %p").to_string(),
-        greeting,
-    }
-}
-
 fn load_profile() -> Profile {
     let mut p = Profile::default();
     if let Some(text) = config_file("history.tsv").and_then(|p| std::fs::read_to_string(p).ok()) {
@@ -1469,6 +1451,9 @@ struct AppState {
     /// Logical-px width of the right-hand Studio panel (0 when closed); the page ends to the
     /// left of this. Mirrors `content_left` for the right edge.
     content_right: Cell<f32>,
+    /// Logical-px rect of the omnibar pill, so the borderless-window drag excludes it (the
+    /// omnibar must stay clickable, not move the window).
+    omni_rect: Cell<egui::Rect>,
     /// The two pane groups. `pane0` is always present; `pane1` is populated only while `split`.
     /// `focused` (0/1) selects which pane the chrome (omnibar, shortcuts, strip) acts on.
     pane0: PaneGroup,
@@ -1484,8 +1469,6 @@ struct AppState {
     show_settings: Cell<bool>,
     /// Whether the Studio (live interface customization) side panel is open.
     show_studio: Cell<bool>,
-    /// Search-bar buffer for the native new-tab dashboard.
-    dash_search: RefCell<String>,
     /// Active native overlays (dialogs, pickers, context menu).
     dialogs: RefCell<Vec<Dialog>>,
     /// URLs of recently-closed tabs, for Ctrl+Shift+T (reopen most-recent).
@@ -1524,12 +1507,20 @@ impl AppState {
         // Derive the gator:// page palette from the live chrome theme so internal
         // pages follow the full base ramp (not just dark/light).
         let pal = self.browser.settings.borrow().theme.palette();
-        let vars: [(&str, String); 5] = [
+        let vars: [(&str, String); 8] = [
             ("__BG__", color_hex(pal.bg)),
             ("__PANEL__", color_hex(pal.bg2)),
+            ("__ELEV__", color_hex(pal.elev)),
             ("__LINE__", color_hex(pal.border)),
             ("__FG__", color_hex(pal.text)),
             ("__MUTED__", color_hex(pal.muted)),
+            // `__ACCENT__` is also set by some pages from the legacy accent string before
+            // themed() runs; for those this replace is a harmless no-op.
+            ("__ACCENT__", color_hex(pal.accent)),
+            (
+                "__ACCENT_RGB__",
+                format!("{}, {}, {}", pal.accent.r(), pal.accent.g(), pal.accent.b()),
+            ),
         ];
         let mut html = html;
         for (k, v) in vars {
@@ -1539,9 +1530,9 @@ impl AppState {
     }
 
     fn render_gator_welcome(&self) -> Vec<u8> {
-        let (search, accent, wallpaper) = {
+        let (wallpaper, modules) = {
             let s = self.browser.settings.borrow();
-            (s.search.clone(), s.accent.clone(), s.wallpaper.clone())
+            (s.wallpaper.clone(), s.modules)
         };
         // A wallpaper is the user's own setting, but sanitize for CSS url() safety: http(s)/data
         // only and no character that could break out of the url("…") context.
@@ -1559,50 +1550,43 @@ impl AppState {
         } else {
             String::new()
         };
-        let engine = SEARCH_ENGINES
+        // Top-site tiles. Demo set for now (matches the design); avatar colors come from the
+        // OKLCH ramp so they track the chrome theme. (TODO: source from real history/bookmarks.)
+        const SITES: &[(&str, &str, f32, &str)] = &[
+            ("Figma", "F", 200.0, "figma.com"),
+            ("GitHub", "G", 285.0, "github.com"),
+            ("Linear", "L", 270.0, "linear.app"),
+            ("Notion", "N", 40.0, "notion.so"),
+            ("Vercel", "V", 280.0, "vercel.com"),
+            ("Arc", "A", 330.0, "arc.net"),
+            ("Raycast", "R", 25.0, "raycast.com"),
+            ("Spotify", "S", 145.0, "open.spotify.com"),
+            ("Reader", "R", 55.0, "getpocket.com"),
+            ("Maps", "M", 230.0, "maps.google.com"),
+        ];
+        let topsites: String = SITES
             .iter()
-            .find(|(_, t)| *t == search)
-            .map(|(n, _)| *n)
-            .unwrap_or("the web");
-        let bookmarks = {
-            let p = self.browser.profile.borrow();
-            if p.bookmarks.is_empty() {
-                "<p class=\"empty\">Bookmark a page with Ctrl+D and it will show up here.</p>"
-                    .to_string()
-            } else {
-                let tiles: String = p
-                    .bookmarks
-                    .iter()
-                    .take(12)
-                    .map(|b| {
-                        let title = if b.title.trim().is_empty() {
-                            b.url.as_str()
-                        } else {
-                            b.title.as_str()
-                        };
-                        let letter = title
-                            .chars()
-                            .find(|c| c.is_alphanumeric())
-                            .map(|c| c.to_uppercase().to_string())
-                            .unwrap_or_else(|| "•".to_string());
-                        format!(
-                            "<a class=\"tile\" href=\"{}\" title=\"{}\"><span class=\"dot\">{}</span>{}</a>",
-                            html_escape(&b.url),
-                            html_escape(title),
-                            html_escape(&letter),
-                            html_escape(&truncate_ellipsis(title, 18)),
-                        )
-                    })
-                    .collect();
-                format!("<div class=\"links\">{tiles}</div>")
-            }
-        };
+            .map(|(name, letter, hue, domain)| {
+                format!(
+                    "<a class=\"tile\" href=\"https://{dom}\">\
+                     <span class=\"av\" style=\"background:{col}\">{ltr}</span>\
+                     <span class=\"nm\">{nm}</span></a>",
+                    dom = html_escape(domain),
+                    col = color_hex(theme::oklch(0.6, 0.16, *hue)),
+                    ltr = html_escape(letter),
+                    nm = html_escape(name),
+                )
+            })
+            .collect();
+        let hide = |on: bool| if on { "" } else { "hidden" };
         let html = include_str!("content/welcome.html")
-            .replace("__ACCENT__", &accent)
             .replace("__WALLPAPER__", &wallpaper_css)
-            .replace("__SEARCH_TEMPLATE__", &search)
-            .replace("__SEARCH_ENGINE__", engine)
-            .replace("__BOOKMARKS__", &bookmarks);
+            .replace("__TOPSITES__", &topsites)
+            .replace("__CLOCK_HIDE__", hide(modules.clock))
+            .replace("__SEARCH_HIDE__", hide(modules.search))
+            .replace("__SITES_HIDE__", hide(modules.sites))
+            .replace("__NOTES_HIDE__", hide(modules.notes))
+            .replace("__FEED_HIDE__", hide(modules.feed));
         self.themed(html)
     }
 
@@ -1952,21 +1936,6 @@ impl AppState {
         self.focused_pane().tabs.borrow().iter().position(|t| &t.webview == webview)
     }
 
-    /// Whether the active tab is the new-tab page (served the native dashboard instead of a
-    /// Servo document). Matches the `gator://welcome|newtab|home` URLs.
-    fn active_is_newtab(&self) -> bool {
-        self.focused_pane().tabs
-            .borrow()
-            .get(self.focused_pane().active.get())
-            .map(|t| {
-                matches!(
-                    t.url.as_str(),
-                    "gator://welcome" | "gator://newtab" | "gator://home"
-                )
-            })
-            .unwrap_or(false)
-    }
-
     fn active_nav(&self) -> (bool, bool) {
         self.focused_pane().tabs
             .borrow()
@@ -2182,57 +2151,23 @@ impl AppState {
                 t.webview.resize(PhysicalSize::new(w, h));
             }
         }
-        let is_newtab = self
-            .pane(pane)
-            .tabs
-            .borrow()
-            .get(self.pane(pane).active.get())
-            .map(|t| {
-                matches!(
-                    t.url.as_str(),
-                    "gator://welcome" | "gator://newtab" | "gator://home"
-                )
-            })
-            .unwrap_or(true);
-        if is_newtab {
-            let (th, mods, pal) = {
-                let s = self.browser.settings.borrow();
-                (s.theme, s.modules, s.theme.palette())
-            };
-            let clock = dash_clock();
-            let focused_here = pane == self.focused.get();
-            let nav = if focused_here {
-                let mut search = self.dash_search.borrow_mut();
-                dashboard::draw_dashboard(ctx, rect, &th, &mods, &pal, &clock, &mut search)
-            } else {
-                let mut tmp = String::new();
-                dashboard::draw_dashboard(ctx, rect, &th, &mods, &pal, &clock, &mut tmp)
-            };
-            if let Some(target) = nav {
-                if focused_here {
-                    self.dash_search.borrow_mut().clear();
-                }
-                self.focused.set(pane);
-                self.navigate_from_omnibox(&target);
-            }
-            ctx.request_repaint_after(std::time::Duration::from_secs(10));
-        } else {
-            if let Some(t) = self.pane(pane).tabs.borrow().get(self.pane(pane).active.get()) {
-                t.webview.paint();
-            }
-            if let Some(blit) = self.pane(pane).context.render_to_parent_callback() {
-                ctx.layer_painter(LayerId::background()).add(PaintCallback {
-                    rect,
-                    callback: Arc::new(CallbackFn::new(move |info, painter| {
-                        let clip = info.viewport_in_pixels();
-                        let target = Rect::new(
-                            Point2D::new(clip.left_px, clip.from_bottom_px),
-                            Size2D::new(clip.width_px, clip.height_px),
-                        );
-                        blit(painter.gl(), target);
-                    })),
-                });
-            }
+        // Blit the live Servo page FBO. The new-tab page is now the HTML `gator://welcome`
+        // document (rendered by the engine), so it takes this same path — no native dashboard.
+        if let Some(t) = self.pane(pane).tabs.borrow().get(self.pane(pane).active.get()) {
+            t.webview.paint();
+        }
+        if let Some(blit) = self.pane(pane).context.render_to_parent_callback() {
+            ctx.layer_painter(LayerId::background()).add(PaintCallback {
+                rect,
+                callback: Arc::new(CallbackFn::new(move |info, painter| {
+                    let clip = info.viewport_in_pixels();
+                    let target = Rect::new(
+                        Point2D::new(clip.left_px, clip.from_bottom_px),
+                        Size2D::new(clip.width_px, clip.height_px),
+                    );
+                    blit(painter.gl(), target);
+                })),
+            });
         }
     }
 
@@ -2675,6 +2610,7 @@ impl AppState {
                                         egui::TextEdit::singleline(&mut *loc)
                                             .id(id)
                                             .frame(egui::Frame::NONE)
+                                            .vertical_align(egui::Align::Center)
                                             .hint_text("Search, enter URL, or type  >  for commands"),
                                     )
                                 },
@@ -2685,6 +2621,7 @@ impl AppState {
                     });
                     let field = pill_inner.inner;
                     let pill_rect = pill_inner.response.rect;
+                    self.omni_rect.set(pill_rect);
 
                     if field.changed() {
                         self.location_dirty.set(true);
@@ -3191,10 +3128,12 @@ impl AppState {
                     if ui.add(egui::Button::new("+").frame(false)).clicked() {
                         pending = Some(TabAction::NewTab);
                     }
-                    // The scrolled strip fills the remaining width to the left of `+`.
+                    // The scrolled strip fills the remaining width to the left of `+`. The
+                    // scrollbar is hidden — a tab strip shouldn't show one (and VisibleWhenNeeded
+                    // mis-fires on sub-pixel content with a single tab); overflow still wheels.
                     egui::ScrollArea::horizontal()
                         .scroll_bar_visibility(
-                            egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                            egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
                         )
                         .show(ui, |ui| {
                             ui.with_layout(
@@ -5071,6 +5010,17 @@ impl WebViewDelegate for AppState {
     }
 
     fn request_navigation(&self, webview: WebView, navigation_request: NavigationRequest) {
+        // `gator://omnibar` is a synthetic action target, not a page: the HTML new-tab page links
+        // its search box here so a click focuses the real native omnibar. Cancel the navigation
+        // (the new-tab page stays put) and raise the focus flag the next egui frame consumes.
+        if navigation_request.url.scheme() == "gator"
+            && navigation_request.url.host_str() == Some("omnibar")
+        {
+            self.focus_omnibox.set(true);
+            self.window.request_redraw();
+            navigation_request.deny();
+            return;
+        }
         // Block web pages from *navigating* to gator:// internal pages. Several of them mutate
         // chrome state from query params (gator://settings?…, gator://passwords?remove=…), so a
         // page-initiated navigation there would be a CSRF on the browser itself. Navigation that
@@ -5139,6 +5089,7 @@ fn open_window(
         toolbar_height: Cell::new(0.0),
         content_left: Cell::new(0.0),
         content_right: Cell::new(0.0),
+        omni_rect: Cell::new(egui::Rect::ZERO),
         pane0: PaneGroup::new(content_context.clone()),
         pane1: PaneGroup::new(content_context_r),
         split: Cell::new(false),
@@ -5148,7 +5099,6 @@ fn open_window(
         focus_omnibox: Cell::new(false),
         show_settings: Cell::new(false),
         show_studio: Cell::new(false),
-        dash_search: RefCell::new(String::new()),
         dialogs: RefCell::new(Vec::new()),
         closed_tabs: RefCell::new(Vec::new()),
         find_open: Cell::new(false),
@@ -5375,13 +5325,9 @@ impl ApplicationHandler<WakeUp> for App {
         let (cx, cy) = state.cursor.get();
         let over_toolbar = cy < toolbar_dev;
         // The page area is below the toolbar, right of the vertical-tabs panel, and left of
-        // the Studio panel. Input over any chrome region must not leak to the page.
-        // On the native new-tab dashboard the whole page region is egui-owned, so input must
-        // not leak to the (unpainted) welcome WebView underneath.
-        let over_chrome = cy < toolbar_dev
-            || cx < left_dev
-            || cx > win_w - right_dev
-            || state.active_is_newtab();
+        // the Studio panel. Input over any chrome region must not leak to the page. (The new-tab
+        // page is now a real HTML document, so it receives input like any other page.)
+        let over_chrome = cy < toolbar_dev || cx < left_dev || cx > win_w - right_dev;
         let dialog_open = !state.dialogs.borrow().is_empty();
 
         match event {
@@ -5427,11 +5373,17 @@ impl ApplicationHandler<WakeUp> for App {
                     });
                     return;
                 }
-                // Drag the window from empty toolbar space.
+                // Drag the window from empty toolbar/tab-strip space (browser-style) — but never
+                // from the omnibar pill (it must stay clickable) or from any egui widget.
+                let over_omni = state
+                    .omni_rect
+                    .get()
+                    .contains(egui::pos2((cx / scale) as f32, (cy / scale) as f32));
                 if button == MouseButton::Left
                     && bs == ElementState::Pressed
                     && over_toolbar
                     && !resp.consumed
+                    && !over_omni
                 {
                     let _ = state.window.drag_window();
                     return;

@@ -5,70 +5,132 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NavGator</title>
 <style>
-  :root { --accent: __ACCENT__; --bg:__BG__; --panel:__PANEL__; --line:__LINE__; --fg:__FG__; --muted:__MUTED__; }
+  /* Theme tokens are substituted from the live OKLCH chrome theme (see themed()). */
+  :root {
+    --accent: __ACCENT__; --accent-rgb: __ACCENT_RGB__;
+    --bg:__BG__; --panel:__PANEL__; --elev:__ELEV__; --line:__LINE__; --fg:__FG__; --muted:__MUTED__;
+    /* TODO: serve bundled Space Grotesk / JetBrains Mono via gator://font for exact chrome parity. */
+    --sans: ui-rounded, "SF Pro Rounded", "Segoe UI", system-ui, -apple-system, sans-serif;
+    --mono: ui-monospace, "JetBrains Mono", "SF Mono", "Cascadia Code", Menlo, monospace;
+  }
   * { box-sizing:border-box; }
   html,body { height:100%; margin:0; }
   body {
     background: var(--bg); __WALLPAPER__ color: var(--fg);
-    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    display:flex; flex-direction:column; align-items:center;
-    padding: 13vh 24px 28px; min-height:100%;
+    font: 16px/1.5 var(--sans);
+    -webkit-font-smoothing:antialiased;
+    overflow-x:hidden;
   }
-  .brand { font-size:58px; font-weight:800; letter-spacing:-2px; margin:0 0 6px; }
-  .brand .g { color: var(--accent); }
-  .tag { color: var(--muted); margin:0 0 36px; font-size:15px; }
-  form { width:min(680px,92vw); margin:0; }
-  .box {
-    display:flex; align-items:center; gap:11px;
-    background: var(--panel); border:1.5px solid var(--line); border-radius:14px; padding:15px 18px;
-    transition: border-color .15s;
+  /* Subtle decorative wash, lower-right (matches the design). */
+  body::after {
+    content:""; position:fixed; right:-12vw; bottom:-18vh; width:60vw; height:60vw;
+    border-radius:50%; pointer-events:none; z-index:0;
+    background: radial-gradient(circle at 50% 50%, rgba(var(--accent-rgb), .07), transparent 62%);
   }
-  .box:focus-within { border-color: var(--accent); }
-  .box svg { flex:none; color: var(--muted); }
-  #q { flex:1; background:transparent; border:0; outline:0; color: var(--fg); font-size:17px; }
-  #q::placeholder { color: var(--muted); }
-  .hint { color: var(--muted); font-size:13px; margin-top:13px; }
-  .hint b { color: var(--fg); font-weight:600; }
-  .hint a { color: var(--accent); text-decoration:none; }
-  .links { width:min(680px,92vw); margin-top:42px;
-    display:grid; grid-template-columns:repeat(auto-fill,minmax(118px,1fr)); gap:12px; }
-  .tile {
-    display:block; background: var(--panel); border:1px solid var(--line); border-radius:12px;
-    padding:14px 10px; text-align:center; color: var(--fg); text-decoration:none; font-size:13px;
-    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; transition:border-color .15s;
+  .wrap { position:relative; z-index:1; max-width:880px; margin:0 auto; padding: 9vh 28px 64px; }
+  .hidden { display:none !important; }
+
+  /* Clock + greeting */
+  .date { font: 600 12px/1 var(--mono); letter-spacing:1.5px; color: var(--muted); text-transform:uppercase; }
+  .clock { display:flex; align-items:baseline; gap:20px; margin:14px 0 40px; flex-wrap:wrap; }
+  .time { font: 300 78px/1 var(--sans); letter-spacing:-2px; color: var(--fg); }
+  .greet { font-size:26px; color: var(--muted); }
+
+  /* Search box — focuses the native omnibar (gator://omnibar is intercepted by the chrome) */
+  a.search {
+    display:flex; align-items:center; gap:13px; text-decoration:none;
+    background: var(--panel); border:1.5px solid var(--line); border-radius:16px;
+    padding:17px 18px; color: var(--muted); font-size:16px; cursor:text;
+    transition: border-color .15s, box-shadow .15s;
   }
-  .tile:hover { border-color: var(--accent); }
-  .tile .dot { display:block; width:32px; height:32px; line-height:32px; border-radius:9px;
-    margin:0 auto 9px; background: var(--line); color: var(--accent); font-weight:700; font-size:15px; }
-  .empty { color: var(--muted); font-size:13px; margin-top:38px; }
-  footer { margin-top:auto; padding-top:42px; color:#5a606b; font-size:12px; letter-spacing:.3px; }
+  a.search:hover { border-color: rgba(var(--accent-rgb), .55); box-shadow:0 0 0 4px rgba(var(--accent-rgb), .08); }
+  a.search .dot { flex:none; width:9px; height:9px; border-radius:50%; background: var(--accent); }
+  a.search .ph { flex:1; }
+  a.search .kbd { flex:none; font: 600 12px var(--mono); color: var(--muted);
+    border:1px solid var(--line); border-radius:7px; padding:3px 8px; background: var(--bg); }
+
+  /* Section label */
+  .label { font: 600 12px/1 var(--mono); letter-spacing:1.5px; color: var(--muted);
+    text-transform:uppercase; margin:42px 0 14px; }
+
+  /* Top sites */
+  .grid { display:grid; grid-template-columns:repeat(5, 1fr); gap:12px; }
+  a.tile {
+    display:flex; flex-direction:column; align-items:center; gap:9px; text-decoration:none;
+    background: var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px 8px;
+    color: var(--muted); font-size:12px; transition: border-color .15s, transform .12s;
+  }
+  a.tile:hover { border-color: rgba(var(--accent-rgb), .55); transform: translateY(-2px); }
+  a.tile .av { width:42px; height:42px; border-radius:13px; display:flex; align-items:center;
+    justify-content:center; color:#fff; font: 700 18px var(--sans); }
+  a.tile .nm { max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+  /* Notes + reading list */
+  .cards { display:grid; grid-template-columns:1fr 1fr; gap:18px; margin-top:34px; }
+  .card { background: var(--panel); border:1px solid var(--line); border-radius:16px; padding:20px 22px; }
+  .card h2 { font-size:14px; font-weight:600; color: var(--fg); margin:0 0 14px; }
+  .note { display:flex; align-items:center; gap:11px; padding:5px 0; color: var(--fg); font-size:14px; }
+  .note .ck { flex:none; width:18px; height:18px; border-radius:6px; border:1.6px solid var(--line); }
+  .note.done .ck { background: var(--accent); border-color: var(--accent); }
+  .note.done .tx { color: var(--muted); text-decoration:line-through; }
+  .read { padding:10px 0; border-top:1px solid var(--line); }
+  .read:first-of-type { border-top:0; }
+  .read .ti { color: var(--fg); font-size:14px; }
+  .read .me { color: var(--muted); font: 12px var(--mono); margin-top:3px; }
 </style>
 </head>
 <body>
-  <h1 class="brand">Nav<span class="g">Gator</span></h1>
-  <p class="tag">Fast. Private. Yours.</p>
-  <form onsubmit="return go(event)">
-    <label class="box">
-      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.2-4.2"/></svg>
-      <input id="q" autofocus autocomplete="off" spellcheck="false" placeholder="Search __SEARCH_ENGINE__ or type a URL">
-    </label>
-  </form>
-  <p class="hint">Searching with <b>__SEARCH_ENGINE__</b> &middot; change it in <a href="gator://settings">settings</a></p>
-  __BOOKMARKS__
-  <footer>NavGator &middot; gator://welcome</footer>
+  <div class="wrap">
+    <section class="clock-wrap __CLOCK_HIDE__">
+      <div class="date" id="date">&nbsp;</div>
+      <div class="clock">
+        <span class="time" id="time">&nbsp;</span>
+        <span class="greet" id="greet"></span>
+      </div>
+    </section>
+
+    <a class="search __SEARCH_HIDE__" href="gator://omnibar">
+      <span class="dot"></span>
+      <span class="ph">Search the web, your tabs, or type a command&hellip;</span>
+      <span class="kbd">&#8984;K</span>
+    </a>
+
+    <section class="__SITES_HIDE__">
+      <div class="label">Top sites</div>
+      <div class="grid">__TOPSITES__</div>
+    </section>
+
+    <div class="cards">
+      <div class="card __NOTES_HIDE__">
+        <h2>Notes</h2>
+        <div class="note done"><span class="ck"></span><span class="tx">Ship vertical-tabs experiment</span></div>
+        <div class="note"><span class="ck"></span><span class="tx">Review Studio onboarding copy</span></div>
+        <div class="note"><span class="ck"></span><span class="tx">Sync OKLCH token export</span></div>
+      </div>
+      <div class="card __FEED_HIDE__">
+        <h2>Reading list</h2>
+        <div class="read"><div class="ti">The case for native browser chrome</div><div class="me">airgap.dev &middot; 6 min</div></div>
+        <div class="read"><div class="ti">OKLCH theming in practice</div><div class="me">evilmartians.com &middot; 9 min</div></div>
+        <div class="read"><div class="ti">Embedding Servo, lessons</div><div class="me">servo.org &middot; 4 min</div></div>
+      </div>
+    </div>
+  </div>
 <script>
-  var TEMPLATE = "__SEARCH_TEMPLATE__";
-  function go(e){
-    e.preventDefault();
-    var q = document.getElementById('q').value.trim();
-    if(!q) return false;
-    var hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(q);
-    var looksDomain = /^[^\s]+\.[^\s]{2,}$/.test(q) && !/\s/.test(q);
-    if(hasScheme){ window.location.href = q; }
-    else if(looksDomain){ window.location.href = 'https://' + q; }
-    else { window.location.href = TEMPLATE.replace('%s', encodeURIComponent(q)); }
-    return false;
+  function pad(n){ return n < 10 ? '0' + n : '' + n; }
+  function tick(){
+    var d = new Date();
+    var days = ['SUNDAY','MONDAY','TUESDAY','WEDNESDAY','THURSDAY','FRIDAY','SATURDAY'];
+    var mons = ['JANUARY','FEBRUARY','MARCH','APRIL','MAY','JUNE','JULY','AUGUST','SEPTEMBER','OCTOBER','NOVEMBER','DECEMBER'];
+    var date = document.getElementById('date');
+    if (date) date.textContent = days[d.getDay()] + ', ' + mons[d.getMonth()] + ' ' + d.getDate();
+    var h = d.getHours(); var ampm = h < 12 ? 'AM' : 'PM'; var h12 = h % 12; if (h12 === 0) h12 = 12;
+    var time = document.getElementById('time');
+    if (time) time.textContent = h12 + ':' + pad(d.getMinutes()) + ' ' + ampm;
+    var g = h < 5 ? 'Good night' : h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening';
+    var greet = document.getElementById('greet');
+    if (greet) greet.textContent = g;
   }
+  tick(); setInterval(tick, 1000);
 </script>
 </body>
 </html>

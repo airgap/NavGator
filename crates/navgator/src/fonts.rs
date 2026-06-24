@@ -45,19 +45,30 @@ pub(crate) fn install_fonts(ctx: &egui::Context) {
     prepend(&mut defs, FontFamily::Proportional, &["grotesk", "outfit"]);
     prepend(&mut defs, FontFamily::Monospace, &["jetbrains"]);
 
-    // Named families for explicit per-widget selection.
-    defs.families.insert(
-        FontFamily::Name("grotesk".into()),
-        vec!["grotesk".to_owned(), "outfit".to_owned()],
-    );
-    defs.families.insert(
-        FontFamily::Name("outfit".into()),
-        vec!["outfit".to_owned(), "grotesk".to_owned()],
-    );
-    defs.families.insert(
-        FontFamily::Name("jetbrains".into()),
-        vec!["jetbrains".to_owned()],
-    );
+    // Named families for explicit per-widget selection. Each MUST inherit the default fallback
+    // chain (egui's bundled symbol/emoji fonts) so chrome glyphs not in our TTFs — ◀ ▶ ↻ ☰ ✕ ★
+    // — still resolve instead of rendering as tofu boxes.
+    let prop = defs
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    let mono = defs
+        .families
+        .get(&FontFamily::Monospace)
+        .cloned()
+        .unwrap_or_default();
+    let with_primary = |primary: &str, base: &[String]| {
+        let mut v = vec![primary.to_owned()];
+        v.extend(base.iter().filter(|f| f.as_str() != primary).cloned());
+        v
+    };
+    defs.families
+        .insert(FontFamily::Name("grotesk".into()), with_primary("grotesk", &prop));
+    defs.families
+        .insert(FontFamily::Name("outfit".into()), with_primary("outfit", &prop));
+    defs.families
+        .insert(FontFamily::Name("jetbrains".into()), with_primary("jetbrains", &mono));
 
     ctx.set_fonts(defs);
 }
