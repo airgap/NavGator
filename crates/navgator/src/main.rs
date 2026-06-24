@@ -165,20 +165,39 @@ fn cli_url_given() -> bool {
 
 /// Load the previously-saved session: the open tabs' URLs, one per line. Crash-safe — a
 /// missing or malformed file simply yields no tabs (we fall back to the welcome page).
-fn load_session() -> Vec<Url> {
-    let mut urls = Vec::new();
-    if let Some(text) = config_file("session.tsv").and_then(|p| std::fs::read_to_string(p).ok()) {
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Ok(u) = Url::parse(line) {
-                urls.push(u);
+/// Returns `(pane0 urls, pane1 urls)`. A `#PANE1` marker line splits the two; without it (a
+/// non-split session) everything lands in pane 0 and pane 1 is empty.
+fn load_session() -> (Vec<Url>, Vec<Url>) {
+    config_file("session.tsv")
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| parse_session(&t))
+        .unwrap_or_default()
+}
+
+/// Pure parser for the session file (see `load_session` / `save_session`). Lines are URLs; a
+/// `#PANE1` marker switches subsequent URLs to pane 1; non-URL lines are skipped.
+fn parse_session(text: &str) -> (Vec<Url>, Vec<Url>) {
+    let mut p0 = Vec::new();
+    let mut p1 = Vec::new();
+    let mut in_pane1 = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "#PANE1" {
+            in_pane1 = true;
+            continue;
+        }
+        if let Ok(u) = Url::parse(line) {
+            if in_pane1 {
+                p1.push(u);
+            } else {
+                p0.push(u);
             }
         }
     }
-    urls
+    (p0, p1)
 }
 
 /// Scan installed Chromium-family browsers for their JSON `Bookmarks` file and return every
@@ -1807,12 +1826,17 @@ impl AppState {
         };
         // Top-site tiles. Avatar colors come from the OKLCH ramp (via favicon_hue, matching the
         // tab favicon chips) so they track the chrome theme.
-        let tile = |href: &str, hue: f32, letter: &str, name: &str| {
+        let tile = |href: &str, host: &str, hue: f32, letter: &str, name: &str| {
+            // Letter avatar is the base; the site's real favicon overlays it on successful load,
+            // and removes itself on error (404 / no /favicon.ico) so the letter shows through.
             format!(
                 "<a class=\"tile\" href=\"{href}\">\
-                 <span class=\"av\" style=\"background:{col}\">{ltr}</span>\
+                 <span class=\"av\" style=\"background:{col}\">{ltr}\
+                 <img src=\"https://{host}/favicon.ico\" alt=\"\" loading=\"lazy\" \
+                 onerror=\"this.remove()\" onload=\"this.classList.add('on')\"></span>\
                  <span class=\"nm\">{nm}</span></a>",
                 href = html_escape(href),
+                host = html_escape(host),
                 col = color_hex(theme::oklch(0.6, 0.16, hue)),
                 ltr = html_escape(letter),
                 nm = html_escape(name),
@@ -1854,6 +1878,7 @@ impl AppState {
                     .unwrap_or_else(|| "•".to_string());
                 out.push_str(&tile(
                     &e.url,
+                    &host,
                     favicon_hue(&host),
                     &letter,
                     &truncate_ellipsis(&title, 14),
@@ -1877,7 +1902,13 @@ impl AppState {
             ];
             DEMO.iter()
                 .map(|(name, letter, domain)| {
-                    tile(&format!("https://{domain}"), favicon_hue(domain), letter, name)
+                    tile(
+                        &format!("https://{domain}"),
+                        domain,
+                        favicon_hue(domain),
+                        letter,
+                        name,
+                    )
                 })
                 .collect::<String>()
         } else {
@@ -2658,6 +2689,54 @@ impl AppState {
         self.pane1.active.set(0);
         self.split.set(true);
         self.focused.set(1);
+        self.window.request_redraw();
+    }
+
+    /// Restore a split from a saved session: rebuild pane 1's tabs (its own webviews on the second
+    /// FBO) and re-enter split, but land focus on pane 0 (where restore put the primary tabs).
+    fn restore_split(&self, urls: Vec<Url>) {
+        if urls.is_empty() || self.split.get() {
+            return;
+        }
+        let Some(me) = self.weak_self.borrow().upgrade() else {
+            return;
+        };
+        for url in urls {
+            let mut builder = WebViewBuilder::new(&self.browser.servo, self.pane1.context.clone())
+                .url(url.clone())
+                .hidpi_scale_factor(Scale::new(self.scale.get() as f32))
+                .delegate(me.clone());
+            let ucm = self.make_tab_ucm();
+            if let Some(ucm) = &ucm {
+                builder = builder.user_content_manager(ucm.clone());
+            }
+            let webview = builder.build();
+            let (w, h) = self.pane1.content_px.get();
+            if w > 0 && h > 0 {
+                webview.resize(PhysicalSize::new(w, h));
+            }
+            self.pane1.tabs.borrow_mut().push(Tab {
+                webview,
+                url: url.to_string(),
+                title: "New tab".to_string(),
+                can_back: false,
+                can_forward: false,
+                zoom: 1.0,
+                loading: false,
+                status_text: None,
+                favicon_pending: None,
+                favicon_tex: None,
+                crashed: false,
+                pinned: false,
+                starred: false,
+                ucm,
+                injected_addons: RefCell::new(Vec::new()),
+            });
+        }
+        self.pane1.active.set(0);
+        self.split.set(true);
+        // `focused` is still 0 (pane 0); show pane 1's active tab WITHOUT stealing focus.
+        self.select_tab(1, 0);
         self.window.request_redraw();
     }
 
@@ -4767,16 +4846,23 @@ impl AppState {
         if let Some(d) = path.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        // Persist BOTH panes' tabs (pane1 is empty when not split). Restore opens them into a
-        // single pane — split layout isn't persisted yet — but no tabs are silently lost.
+        // Persist pane 0's tabs, then (when split) a `#PANE1` marker + pane 1's tabs, so the split
+        // layout restores. Older readers / a non-split session just see a flat URL list — the
+        // marker line isn't a valid URL, so it's skipped. No tabs are ever silently lost.
         let p0 = self.pane0.tabs.borrow();
         let p1 = self.pane1.tabs.borrow();
-        let s: String = p0
-            .iter()
-            .chain(p1.iter())
-            .filter(|t| !t.url.is_empty())
-            .map(|t| format!("{}\n", tsv_field(&t.url)))
-            .collect();
+        let mut s = String::new();
+        for t in p0.iter().filter(|t| !t.url.is_empty()) {
+            s.push_str(&tsv_field(&t.url));
+            s.push('\n');
+        }
+        if self.split.get() && p1.iter().any(|t| !t.url.is_empty()) {
+            s.push_str("#PANE1\n");
+            for t in p1.iter().filter(|t| !t.url.is_empty()) {
+                s.push_str(&tsv_field(&t.url));
+                s.push('\n');
+            }
+        }
         let _ = std::fs::write(path, s);
     }
 
@@ -6185,12 +6271,16 @@ impl ApplicationHandler<WakeUp> for App {
 
         // Restore the previous session's tabs unless the user passed an explicit URL on the
         // command line. A missing/empty session => the welcome page (handled by open_window).
-        let restored = if cli_url_given() {
-            Vec::new()
+        let (restored, restored_pane1) = if cli_url_given() {
+            (Vec::new(), Vec::new())
         } else {
             load_session()
         };
         let (window_id, state) = open_window(event_loop, &browser, restored);
+        // Re-enter split if the saved session had a second pane.
+        if !restored_pane1.is_empty() {
+            state.restore_split(restored_pane1);
+        }
 
         // Auto-unlock the password store from the OS keyring if the user opted in (browser-global).
         // Fully fallible-safe: `fetch()` returns None on any keyring problem (no secret-service,
@@ -6224,6 +6314,11 @@ impl ApplicationHandler<WakeUp> for App {
                 WakeUp::CosmeticReady => state.flush_cosmetic(),
                 WakeUp::Wake | WakeUp::Exit => {}
             }
+        }
+        // The change above is browser-global (bookmarks bar, sync status, …); refresh EVERY
+        // window's chrome, not just the one we routed it through, so none show stale state.
+        for st in windows.values() {
+            st.window.request_redraw();
         }
         browser.servo.spin_event_loop();
     }
@@ -6455,6 +6550,11 @@ impl ApplicationHandler<WakeUp> for App {
                         }
                         WinitKey::Character(c) if c.eq_ignore_ascii_case("w") => {
                             state.close_tab(state.focused.get(), state.focused_pane().active.get());
+                            return;
+                        }
+                        WinitKey::Character(c) if c.eq_ignore_ascii_case("q") => {
+                            // Quit the whole app (every window). The event loop exits on this.
+                            let _ = state.browser.event_proxy.send_event(WakeUp::Exit);
                             return;
                         }
                         WinitKey::Character(c) if c.eq_ignore_ascii_case("l") => {
@@ -6719,7 +6819,31 @@ mod adblock_tests {
 
 #[cfg(test)]
 mod chrome_helper_tests {
-    use super::{color_hex, favicon_hue};
+    use super::{color_hex, favicon_hue, parse_session};
+
+    #[test]
+    fn parse_session_flat_and_split() {
+        // Flat (non-split) session: every URL lands in pane 0.
+        let (p0, p1) = parse_session("https://a.com\nhttps://b.com\n");
+        assert_eq!(p0.len(), 2);
+        assert!(p1.is_empty());
+
+        // Split session: the #PANE1 marker routes the rest to pane 1.
+        let (p0, p1) = parse_session("https://a.com\nhttps://b.com\n#PANE1\nhttps://c.com\n");
+        assert_eq!(
+            p0.iter().map(|u| u.as_str()).collect::<Vec<_>>(),
+            ["https://a.com/", "https://b.com/"]
+        );
+        assert_eq!(
+            p1.iter().map(|u| u.as_str()).collect::<Vec<_>>(),
+            ["https://c.com/"]
+        );
+
+        // Blank + non-URL lines are skipped (forward/back compatible).
+        let (p0, p1) = parse_session("\nnot a url\nhttps://a.com\n\n");
+        assert_eq!(p0.len(), 1);
+        assert!(p1.is_empty());
+    }
 
     #[test]
     fn favicon_hue_is_stable_and_in_range() {

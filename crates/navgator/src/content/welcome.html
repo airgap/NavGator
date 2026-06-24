@@ -66,22 +66,36 @@
     color: var(--muted); font-size:12px; transition: border-color .15s, transform .12s;
   }
   a.tile:hover { border-color: rgba(var(--accent-rgb), .55); transform: translateY(-2px); }
-  a.tile .av { width:42px; height:42px; border-radius:13px; display:flex; align-items:center;
-    justify-content:center; color:#fff; font: 700 18px var(--sans); }
+  a.tile .av { position:relative; overflow:hidden; width:42px; height:42px; border-radius:13px;
+    display:flex; align-items:center; justify-content:center; color:#fff; font: 700 18px var(--display); }
+  a.tile .av img { position:absolute; inset:0; width:100%; height:100%; object-fit:contain;
+    padding:9px; background:inherit; opacity:0; transition:opacity .12s; }
+  a.tile .av img.on { opacity:1; }
   a.tile .nm { max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
   /* Notes + reading list */
   .cards { display:grid; grid-template-columns:1fr 1fr; gap:18px; margin-top:34px; }
   .card { background: var(--panel); border:1px solid var(--line); border-radius:16px; padding:20px 22px; }
   .card h2 { font-size:14px; font-weight:600; color: var(--fg); margin:0 0 14px; }
-  .note { display:flex; align-items:center; gap:11px; padding:5px 0; color: var(--fg); font-size:14px; }
+  .note { display:flex; align-items:center; gap:11px; padding:5px 0; color: var(--fg); font-size:14px; cursor:pointer; }
   .note .ck { flex:none; width:18px; height:18px; border-radius:6px; border:1.6px solid var(--line); }
   .note.done .ck { background: var(--accent); border-color: var(--accent); }
+  .note .tx { flex:1; }
   .note.done .tx { color: var(--muted); text-decoration:line-through; }
-  .read { padding:10px 0; border-top:1px solid var(--line); }
+  .read { position:relative; padding:10px 26px 10px 0; border-top:1px solid var(--line); }
   .read:first-of-type { border-top:0; }
-  .read .ti { color: var(--fg); font-size:14px; }
+  .read .ti { color: var(--fg); font-size:14px; text-decoration:none; }
+  .read a.ti:hover { color: var(--accent); }
   .read .me { color: var(--muted); font: 12px var(--mono); margin-top:3px; }
+  .rm { color: var(--muted); cursor:pointer; opacity:0; font-size:17px; line-height:1; padding:0 4px; user-select:none; }
+  .note .rm { margin-left:auto; }
+  .read .rm { position:absolute; right:0; top:9px; }
+  .note:hover .rm, .read:hover .rm { opacity:.55; }
+  .rm:hover { opacity:1 !important; color: var(--fg); }
+  .add { width:100%; margin-top:13px; background: var(--bg); border:1px solid var(--line); border-radius:9px;
+    padding:8px 11px; color: var(--fg); font:13px var(--sans); outline:none; }
+  .add:focus { border-color: rgba(var(--accent-rgb), .5); }
+  .add::placeholder { color: var(--muted); }
 </style>
 </head>
 <body>
@@ -108,15 +122,13 @@
     <div class="cards">
       <div class="card __NOTES_HIDE__">
         <h2>Notes</h2>
-        <div class="note done"><span class="ck"></span><span class="tx">Ship vertical-tabs experiment</span></div>
-        <div class="note"><span class="ck"></span><span class="tx">Review Studio onboarding copy</span></div>
-        <div class="note"><span class="ck"></span><span class="tx">Sync OKLCH token export</span></div>
+        <div id="notes"></div>
+        <input id="note-add" class="add" placeholder="Add a note, press Enter&hellip;" autocomplete="off" spellcheck="false">
       </div>
       <div class="card __FEED_HIDE__">
         <h2>Reading list</h2>
-        <div class="read"><div class="ti">The case for native browser chrome</div><div class="me">airgap.dev &middot; 6 min</div></div>
-        <div class="read"><div class="ti">OKLCH theming in practice</div><div class="me">evilmartians.com &middot; 9 min</div></div>
-        <div class="read"><div class="ti">Embedding Servo, lessons</div><div class="me">servo.org &middot; 4 min</div></div>
+        <div id="reading"></div>
+        <input id="read-add" class="add" placeholder="Add a link or note, press Enter&hellip;" autocomplete="off" spellcheck="false">
       </div>
     </div>
   </div>
@@ -136,6 +148,74 @@
     if (greet) greet.textContent = g;
   }
   tick(); setInterval(tick, 1000);
+
+  // Notes + reading list: editable, persisted in this page's localStorage (gator://welcome
+  // origin). All storage access is guarded so it degrades to in-session-only if unavailable.
+  function load(k, d){ try { return JSON.parse(localStorage.getItem(k)) || d; } catch(e){ return d; } }
+  function save(k, v){ try { localStorage.setItem(k, JSON.stringify(v)); } catch(e){} }
+  function esc(s){ return String(s).replace(/[&<>"]/g, function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+  function host(u){ try { return new URL(u).host.replace(/^www\./,''); } catch(e){ return ''; } }
+
+  var NOTES = load('nav_notes', [
+    { t:'Ship vertical-tabs experiment', d:true },
+    { t:'Review Studio onboarding copy', d:false },
+    { t:'Sync OKLCH token export', d:false }
+  ]);
+  var READING = load('nav_reading', [
+    { t:'The case for native browser chrome', u:'https://airgap.dev' },
+    { t:'OKLCH theming in practice', u:'https://evilmartians.com' },
+    { t:'Embedding Servo, lessons', u:'https://servo.org' }
+  ]);
+
+  function renderNotes(){
+    var el = document.getElementById('notes'); if (!el) return;
+    el.innerHTML = NOTES.map(function(n, i){
+      return '<div class="note' + (n.d ? ' done' : '') + '" data-i="' + i + '">' +
+        '<span class="ck"></span><span class="tx">' + esc(n.t) + '</span><span class="rm">&times;</span></div>';
+    }).join('');
+  }
+  function renderReading(){
+    var el = document.getElementById('reading'); if (!el) return;
+    el.innerHTML = READING.map(function(r, i){
+      var h = r.u ? host(r.u) : '';
+      var title = r.u ? '<a class="ti" href="' + esc(r.u) + '">' + esc(r.t) + '</a>'
+                      : '<span class="ti">' + esc(r.t) + '</span>';
+      return '<div class="read" data-i="' + i + '">' + title +
+        (h ? '<div class="me">' + esc(h) + '</div>' : '') + '<span class="rm">&times;</span></div>';
+    }).join('');
+  }
+
+  var notesEl = document.getElementById('notes');
+  if (notesEl) notesEl.addEventListener('click', function(e){
+    var row = e.target.closest('.note'); if (!row) return;
+    var i = +row.dataset.i;
+    if (e.target.classList.contains('rm')) NOTES.splice(i, 1);
+    else NOTES[i].d = !NOTES[i].d;
+    save('nav_notes', NOTES); renderNotes();
+  });
+  var readingEl = document.getElementById('reading');
+  if (readingEl) readingEl.addEventListener('click', function(e){
+    if (!e.target.classList.contains('rm')) return;
+    var row = e.target.closest('.read'); if (!row) return;
+    READING.splice(+row.dataset.i, 1);
+    save('nav_reading', READING); renderReading();
+  });
+  var noteAdd = document.getElementById('note-add');
+  if (noteAdd) noteAdd.addEventListener('keydown', function(e){
+    if (e.key !== 'Enter' || !this.value.trim()) return;
+    NOTES.push({ t:this.value.trim(), d:false }); this.value = '';
+    save('nav_notes', NOTES); renderNotes();
+  });
+  var readAdd = document.getElementById('read-add');
+  if (readAdd) readAdd.addEventListener('keydown', function(e){
+    if (e.key !== 'Enter' || !this.value.trim()) return;
+    var v = this.value.trim();
+    var u = /^https?:\/\//i.test(v) ? v : (/^[^\s]+\.[^\s]{2,}$/.test(v) ? 'https://' + v : '');
+    READING.push({ t: u ? host(u) : v, u: u }); this.value = '';
+    save('nav_reading', READING); renderReading();
+  });
+  renderNotes(); renderReading();
 </script>
 </body>
 </html>
