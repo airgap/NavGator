@@ -8,7 +8,7 @@
     {
       "appearance" : "dark",
       "value" : {
-        "automatic-gradient" : "gray:1.00000,1.00000"
+        "automatic-gradient" : "gray:0.11705,1.00000"
       }
     }
   ],
@@ -16,7 +16,36 @@
     {
       "layers" : [
         {
-          "glass" : false,
+          "blend-mode-specializations" : [
+            {
+              "appearance" : "dark",
+              "value" : "lighten"
+            },
+            {
+              "appearance" : "tinted",
+              "value" : "normal"
+            }
+          ],
+          "fill-specializations" : [
+            {
+              "value" : {
+                "solid" : "gray:0.00000,1.00000"
+              }
+            },
+            {
+              "appearance" : "dark",
+              "value" : {
+                "solid" : "gray:1.00000,1.00000"
+              }
+            },
+            {
+              "appearance" : "tinted",
+              "value" : {
+                "solid" : "gray:1.00000,1.00000"
+              }
+            }
+          ],
+          "glass" : true,
           "image-name" : "gator2.png",
           "name" : "gator2",
           "position" : {
