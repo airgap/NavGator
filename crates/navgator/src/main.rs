@@ -1329,6 +1329,48 @@ fn favicon_color_image(image: &Image) -> egui::ColorImage {
     }
 }
 
+/// Encode a decoded favicon to PNG (straight RGBA8) for the on-disk favicon cache (#14), so the
+/// new-tab tiles can render from cache instead of a live `/favicon.ico` fetch per open.
+fn favicon_to_png(image: &Image) -> Option<Vec<u8>> {
+    let (w, h) = (image.width, image.height);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let d = image.data();
+    let rgba: Vec<u8> = match image.format {
+        PixelFormat::K8 => d.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        PixelFormat::KA8 => d.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect(),
+        PixelFormat::RGB8 => d.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
+        PixelFormat::RGBA8 => d.to_vec(),
+        PixelFormat::BGRA8 => d.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], p[3]]).collect(),
+    };
+    if rgba.len() != w as usize * h as usize * 4 {
+        return None;
+    }
+    let mut buf = Vec::new();
+    let mut enc = png::Encoder::new(&mut buf, w as u32, h as u32);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().ok()?;
+    writer.write_image_data(&rgba).ok()?;
+    writer.finish().ok()?;
+    Some(buf)
+}
+
+/// Path for a host-keyed cached favicon. Sanitizes the host (alphanumerics / `.` / `-` only) so a
+/// crafted gator://favicon/<host> can't escape the cache dir.
+fn favicon_cache_path(host: &str) -> Option<std::path::PathBuf> {
+    if host.is_empty()
+        || host.len() > 100
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    {
+        return None;
+    }
+    config_file(&format!("favicons/{host}.png"))
+}
+
 /// Parse a `#rrggbb` string into an `RgbColor`.
 fn parse_hex_color(s: &str) -> Option<RgbColor> {
     let s = s.trim().trim_start_matches('#');
@@ -1859,7 +1901,7 @@ impl AppState {
             format!(
                 "<a class=\"tile\" href=\"{href}\">\
                  <span class=\"av\" style=\"background:{col}\">{ltr}\
-                 <img src=\"https://{host}/favicon.ico\" alt=\"\" loading=\"lazy\" \
+                 <img src=\"gator://favicon/{host}\" alt=\"\" loading=\"lazy\" \
                  onerror=\"this.remove()\" onload=\"this.classList.add('on')\"></span>\
                  <span class=\"nm\">{nm}</span></a>",
                 href = html_escape(href),
@@ -5785,6 +5827,11 @@ impl WebViewDelegate for AppState {
                 ))
                 .to_vec(),
             },
+            // Cached favicon for the new-tab tiles (gator://favicon/<host>). A miss returns an
+            // empty body, so the tile's <img onerror> drops it and the letter avatar shows (#14).
+            "favicon" => favicon_cache_path(url.path().trim_start_matches('/'))
+                .and_then(|p| std::fs::read(p).ok())
+                .unwrap_or_default(),
             other => format!(
                 "<!doctype html><meta charset=\"utf-8\">\
                  <body style=\"font-family:system-ui;background:#0e1014;color:#e8eaed;padding:48px\">\
@@ -5797,10 +5844,10 @@ impl WebViewDelegate for AppState {
         let mut headers = HeaderMap::new();
         headers.insert(
             CONTENT_TYPE,
-            HeaderValue::from_static(if url.host_str() == Some("font") {
-                "font/ttf"
-            } else {
-                "text/html; charset=utf-8"
+            HeaderValue::from_static(match url.host_str() {
+                Some("font") => "font/ttf",
+                Some("favicon") => "image/png",
+                _ => "text/html; charset=utf-8",
             }),
         );
         let response = WebResourceResponse::new(url)
@@ -5859,8 +5906,27 @@ impl WebViewDelegate for AppState {
 
     fn notify_favicon_changed(&self, webview: WebView) {
         if let Some((p, i)) = self.locate_tab(&webview) {
-            let img = webview.favicon().map(|f| favicon_color_image(&f));
-            self.pane(p).tabs.borrow_mut()[i].favicon_pending = img;
+            let fav = webview.favicon();
+            // Cache the favicon to disk keyed by host, so the new-tab tiles render from cache
+            // (gator://favicon/<host>) instead of a live network fetch (#14).
+            if let Some(f) = &fav {
+                let host = self
+                    .pane(p)
+                    .tabs
+                    .borrow()
+                    .get(i)
+                    .and_then(|t| Url::parse(&t.url).ok())
+                    .and_then(|u| u.host_str().map(|h| h.trim_start_matches("www.").to_string()));
+                if let (Some(host), Some(png)) = (host, favicon_to_png(f)) {
+                    if let Some(path) = favicon_cache_path(&host) {
+                        if let Some(dir) = path.parent() {
+                            let _ = std::fs::create_dir_all(dir);
+                        }
+                        let _ = std::fs::write(path, png);
+                    }
+                }
+            }
+            self.pane(p).tabs.borrow_mut()[i].favicon_pending = fav.map(|f| favicon_color_image(&f));
             self.window.request_redraw();
         }
     }
@@ -6431,8 +6497,11 @@ impl ApplicationHandler<WakeUp> for App {
         let left_dev = state.content_left_dev();
         let right_dev = state.content_right_dev();
         let win_w = state.window.inner_size().width as f64;
-        // Device-px x of the split divider (matches `mid` in update()); only meaningful while split.
-        let mid_dev = (left_dev + win_w - right_dev) / 2.0;
+        // Device-px x of the split divider. Round in LOGICAL space then scale so it lands exactly
+        // on the visual divider (`mid = ((avail.left()+avail.right())*0.5).round()` in update()),
+        // rather than the unrounded device-px midpoint — otherwise the input/visual seam can
+        // disagree by up to ~scale/2 px (#9).
+        let mid_dev = ((left_dev + win_w - right_dev) / (2.0 * scale)).round() * scale;
         let (cx, cy) = state.cursor.get();
         let over_toolbar = cy < toolbar_dev;
         // The page area is below the toolbar, right of the vertical-tabs panel, and left of
