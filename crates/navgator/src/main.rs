@@ -2089,7 +2089,11 @@ impl AppState {
                 if !seen.insert(host.clone()) {
                     continue;
                 }
-                let title = if e.title.trim().is_empty() {
+                // A failed load leaves Servo's "Error loading…" error-page title in history (the
+                // embedder can't tell error from success — it reports Complete either way), so fall
+                // back to the host rather than showing that as a top-site name.
+                let t = e.title.trim();
+                let title = if t.is_empty() || t.starts_with("Error loading") {
                     host.clone()
                 } else {
                     e.title.clone()
