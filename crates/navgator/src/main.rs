@@ -177,6 +177,35 @@ fn load_session() -> (Vec<Url>, Vec<Url>) {
         .unwrap_or_default()
 }
 
+/// Load the permission ledger: `origin \t feature \t 1|0` per line.
+fn load_permission_grants() -> HashMap<(String, String), bool> {
+    let mut m = HashMap::new();
+    if let Some(text) = config_file("permissions.tsv").and_then(|p| std::fs::read_to_string(p).ok()) {
+        for line in text.lines() {
+            let mut it = line.splitn(3, '\t');
+            if let (Some(o), Some(f), Some(v)) = (it.next(), it.next(), it.next()) {
+                m.insert((o.to_string(), f.to_string()), v.trim() == "1");
+            }
+        }
+    }
+    m
+}
+
+/// Persist the permission ledger.
+fn save_permission_grants(m: &HashMap<(String, String), bool>) {
+    let Some(path) = config_file("permissions.tsv") else {
+        return;
+    };
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let s: String = m
+        .iter()
+        .map(|((o, f), v)| format!("{}\t{}\t{}\n", o, f, if *v { "1" } else { "0" }))
+        .collect();
+    let _ = std::fs::write(path, s);
+}
+
 /// Pure parser for the session file (see `load_session` / `save_session`). Lines are URLs; a
 /// `#PANE1` marker switches subsequent URLs to pane 1; non-URL lines are skipped.
 fn parse_session(text: &str) -> (Vec<Url>, Vec<Url>) {
@@ -1764,6 +1793,9 @@ enum Dialog {
     },
     Permission {
         message: String,
+        /// (origin, feature-debug-string) — the key recorded in the ledger on "always".
+        origin: String,
+        feature: String,
         handle: Option<PermissionRequest>,
     },
     /// Userscript install/permission consent (design §6). On Enable we set
@@ -1826,6 +1858,9 @@ struct BrowserState {
     /// Ad/tracker blocking engine (adblock-rust) + a session blocked counter.
     adblock: adblock::Engine,
     adblock_blocked: Cell<u64>,
+    /// Permission ledger: persistent (origin, feature) → allow/deny grants, so a site asked once
+    /// is never asked again. "Allow/Block always" persist here; "once" is not stored.
+    permission_grants: RefCell<HashMap<(String, String), bool>>,
     /// Cosmetic-filter CSS pending injection, deferred out of the eval callback to avoid
     /// re-entering Servo's JS evaluator. Each entry is `(webview, css)`.
     pending_cosmetic: RefCell<Vec<(WebView, String)>>,
@@ -4656,8 +4691,14 @@ impl AppState {
                 }
                 keep
             }
-            Dialog::Permission { message, handle } => {
+            Dialog::Permission {
+                message,
+                origin,
+                feature,
+                handle,
+            } => {
                 let mut keep = true;
+                let mut grant: Option<bool> = None; // Some(allowed) → persist this (origin,feature)
                 egui::Window::new("Permission request").id(win_id)
                     .collapsible(false)
                     .resizable(false)
@@ -4666,10 +4707,24 @@ impl AppState {
                         ui.label(message.as_str());
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            if ui.button("Allow").clicked() {
+                            if ui.button("Allow once").clicked() {
                                 if let Some(r) = handle.take() {
                                     r.allow();
                                 }
+                                keep = false;
+                            }
+                            if ui.button("Allow always").clicked() {
+                                if let Some(r) = handle.take() {
+                                    r.allow();
+                                }
+                                grant = Some(true);
+                                keep = false;
+                            }
+                            if ui.button("Block always").clicked() {
+                                if let Some(r) = handle.take() {
+                                    r.deny();
+                                }
+                                grant = Some(false);
                                 keep = false;
                             }
                             if ui.button("Deny").clicked() {
@@ -4680,6 +4735,14 @@ impl AppState {
                             }
                         });
                     });
+                // Persist an "always" choice outside the closure (avoids borrowing self in it).
+                if let Some(allowed) = grant {
+                    self.browser
+                        .permission_grants
+                        .borrow_mut()
+                        .insert((origin.clone(), feature.clone()), allowed);
+                    save_permission_grants(&self.browser.permission_grants.borrow());
+                }
                 keep
             }
             Dialog::AddonConsent {
@@ -6492,13 +6555,36 @@ impl WebViewDelegate for AppState {
         });
     }
 
-    fn request_permission(&self, _webview: WebView, request: PermissionRequest) {
-        let message = format!(
-            "This site is requesting permission: {:?}",
-            request.feature()
-        );
+    fn request_permission(&self, webview: WebView, request: PermissionRequest) {
+        let origin = self
+            .locate_tab(&webview)
+            .and_then(|(p, i)| self.pane(p).tabs.borrow().get(i).and_then(|t| origin_of(&t.url)))
+            .unwrap_or_default();
+        let feature = format!("{:?}", request.feature());
+        // A standing "always" grant answers without prompting again.
+        if let Some(&allowed) = self
+            .browser
+            .permission_grants
+            .borrow()
+            .get(&(origin.clone(), feature.clone()))
+        {
+            if allowed {
+                request.allow();
+            } else {
+                request.deny();
+            }
+            return;
+        }
+        let who = if origin.is_empty() {
+            "This site".to_string()
+        } else {
+            origin.clone()
+        };
+        let message = format!("{who} is requesting permission: {feature}");
         self.push_dialog(Dialog::Permission {
             message,
+            origin,
+            feature,
             handle: Some(request),
         });
     }
@@ -6727,6 +6813,7 @@ impl ApplicationHandler<WakeUp> for App {
                 adblock::lists::ParseOptions::default(),
             ),
             adblock_blocked: Cell::new(0),
+            permission_grants: RefCell::new(load_permission_grants()),
             pending_cosmetic: RefCell::new(Vec::new()),
             sync_status: RefCell::new(String::new()),
             syncing: Cell::new(false),
