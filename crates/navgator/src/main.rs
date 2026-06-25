@@ -48,7 +48,10 @@ use navgator_engine::{
     WebViewDelegate, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
 };
 // `http` types for building the WebResourceResponse served to gator:// internal pages.
-use navgator_engine::http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE};
+use navgator_engine::http::{
+    HeaderMap, HeaderValue, StatusCode,
+    header::{CONTENT_DISPOSITION, CONTENT_TYPE},
+};
 use navgator_protocol::IpcCommand;
 
 mod sync;
@@ -475,15 +478,56 @@ fn is_hex_color(s: &str) -> bool {
 /// Resolve an omnibar entry to a load target: a literal URL, a bare domain promoted to https, or
 /// a search via `search_template` (`%s` placeholder). A `javascript:` entry is ALWAYS routed to
 /// search — never loaded — so address-bar `javascript:`/`javascript://…` self-XSS can't fire.
+/// URL targets are also run through `strip_tracking_params` (search queries are left intact).
 fn omnibox_target(raw: &str, search_template: &str) -> String {
     let is_js = raw.trim_start().to_ascii_lowercase().starts_with("javascript:");
     if raw.contains("://") && !is_js {
-        raw.to_string()
+        strip_tracking_params(raw)
     } else if raw.contains('.') && !raw.contains(' ') && !is_js {
-        format!("https://{raw}")
+        strip_tracking_params(&format!("https://{raw}"))
     } else {
         search_template.replace("%s", &url_encode(raw))
     }
+}
+
+/// True for a known click/campaign tracking query parameter (case-insensitive).
+fn is_tracking_param(k: &str) -> bool {
+    let k = k.to_ascii_lowercase();
+    k.starts_with("utm_")
+        || matches!(
+            k.as_str(),
+            "fbclid" | "gclid" | "gclsrc" | "dclid" | "wbraid" | "gbraid" | "msclkid" | "yclid"
+                | "twclid" | "ttclid" | "igshid" | "mc_eid" | "mc_cid" | "_hsenc" | "_hsmi"
+                | "vero_id" | "oly_anon_id" | "oly_enc_id" | "rb_clickid" | "s_cid" | "mkt_tok"
+                | "ml_subscriber" | "ml_subscriber_hash" | "spm" | "scm"
+        )
+}
+
+/// Remove known tracking/decoration query params (utm_*, fbclid, gclid, …) from a URL, leaving the
+/// rest intact. Returns the input unchanged if it doesn't parse or has no query.
+fn strip_tracking_params(raw: &str) -> String {
+    let Ok(mut url) = Url::parse(raw) else {
+        return raw.to_string();
+    };
+    if url.query().is_none() {
+        return raw.to_string();
+    }
+    let kept: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(k, _)| !is_tracking_param(k))
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    {
+        let mut qp = url.query_pairs_mut();
+        qp.clear();
+        for (k, v) in &kept {
+            qp.append_pair(k, v);
+        }
+    }
+    if kept.is_empty() {
+        url.set_query(None);
+    }
+    url.to_string()
 }
 
 /// Mirror the live `theme` into the legacy `accent`/`dark` fields the gator://
@@ -2073,6 +2117,66 @@ impl AppState {
         self.themed(html)
     }
 
+    /// `gator://export` landing page: explains what's included and links to the download.
+    fn render_gator_export(&self) -> Vec<u8> {
+        let (nb, nh) = {
+            let p = self.browser.profile.borrow();
+            (p.bookmarks.len(), p.history.len())
+        };
+        let html = format!(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Export your data</title>\
+             <style>:root{{--accent:__ACCENT__;--bg:__BG__;--panel:__PANEL__;--line:__LINE__;--fg:__FG__;--muted:__MUTED__;}}\
+             *{{box-sizing:border-box}}body{{background:var(--bg);color:var(--fg);\
+             font:15px/1.6 system-ui,-apple-system,sans-serif;max-width:640px;margin:0 auto;padding:9vh 24px}}\
+             h1{{font-size:28px;margin:0 0 6px}}p{{color:var(--muted)}}.fg{{color:var(--fg)}}\
+             a.btn{{display:inline-block;margin:22px 0 8px;background:var(--accent);color:#fff;\
+             text-decoration:none;font-weight:600;padding:12px 20px;border-radius:11px}}\
+             ul{{color:var(--muted);font-size:14px;line-height:1.8}}\
+             .note{{margin-top:26px;font-size:13px;color:var(--muted);border-top:1px solid var(--line);padding-top:16px}}\
+             </style></head><body>\
+             <h1>Export your data</h1>\
+             <p>Your data is yours. Download a portable, human-readable copy — no account, no lock-in.</p>\
+             <ul><li><span class=\"fg\">{nb}</span> bookmarks</li><li><span class=\"fg\">{nh}</span> history entries</li>\
+             <li>chrome settings &amp; theme</li></ul>\
+             <a class=\"btn\" href=\"gator://export?get=all\">Download everything (.json)</a>\
+             <p class=\"note\">Not yet included: saved passwords (in the encrypted vault — a separate \
+             encrypted-archive export is planned) and the new-tab notes/reading-list (stored in the \
+             page's own localStorage).</p></body></html>"
+        );
+        self.themed(html)
+    }
+
+    /// Serialize the profile (bookmarks + history) and chrome settings/theme to a portable JSON
+    /// archive. Passwords are intentionally excluded (they live in the E2EE vault).
+    fn export_json(&self) -> Vec<u8> {
+        let p = self.browser.profile.borrow();
+        let s = self.browser.settings.borrow();
+        let bookmarks: Vec<_> = p
+            .bookmarks
+            .iter()
+            .map(|b| serde_json::json!({ "url": b.url, "title": b.title }))
+            .collect();
+        let history: Vec<_> = p
+            .history
+            .iter()
+            .map(|h| serde_json::json!({ "url": h.url, "title": h.title, "visits": h.visits }))
+            .collect();
+        let doc = serde_json::json!({
+            "format": "navgator-export",
+            "version": 1,
+            "settings": {
+                "search": s.search,
+                "accent": s.accent,
+                "dark": s.dark,
+                "block_ads": s.block_ads,
+                "wallpaper": s.wallpaper,
+            },
+            "bookmarks": bookmarks,
+            "history": history,
+        });
+        serde_json::to_vec_pretty(&doc).unwrap_or_default()
+    }
+
     /// Render the `gator://crash` recovery page for a tab whose renderer panicked. `url` is
     /// the address that was loaded when it crashed (the Reload button links back to it) and
     /// `reason` is Servo's panic message (shown under a Details disclosure).
@@ -3039,6 +3143,12 @@ impl AppState {
                 self.open_why();
                 return;
             }
+            A::OpenExport => {
+                if let Ok(u) = Url::parse("gator://export") {
+                    self.new_tab(u);
+                }
+                return;
+            }
             _ => {}
         }
         {
@@ -3062,7 +3172,7 @@ impl AppState {
                 A::ApplyPreset(p) => p.merge_into(&mut s.theme),
                 A::ToggleNotes => s.modules.notes = !s.modules.notes,
                 A::ToggleFeed => s.modules.feed = !s.modules.feed,
-                A::NewTab | A::ToggleStudio | A::OpenWhy => {}
+                A::NewTab | A::ToggleStudio | A::OpenWhy | A::OpenExport => {}
             }
             sync_legacy_theme(&mut s);
             save_settings(&s);
@@ -5827,6 +5937,13 @@ impl WebViewDelegate for AppState {
         let body = match url.host_str().unwrap_or("welcome") {
             "welcome" | "newtab" | "home" => self.render_gator_welcome(),
             "why" => self.render_gator_why(),
+            "export" => {
+                if url.query_pairs().any(|(k, v)| k == "get" && v == "all") {
+                    self.export_json()
+                } else {
+                    self.render_gator_export()
+                }
+            }
             "history" => self.render_gator_history(),
             "about" => self.render_gator_about(),
             "downloads" => self.render_gator_downloads(),
@@ -5937,14 +6054,27 @@ impl WebViewDelegate for AppState {
             .into_bytes(),
         };
         let mut headers = HeaderMap::new();
+        // The export download serves JSON as a file attachment; everything else is a normal page.
+        let is_export_dl =
+            url.host_str() == Some("export") && url.query_pairs().any(|(k, v)| k == "get" && v == "all");
         headers.insert(
             CONTENT_TYPE,
-            HeaderValue::from_static(match url.host_str() {
-                Some("font") => "font/ttf",
-                Some("favicon") => "image/png",
-                _ => "text/html; charset=utf-8",
+            HeaderValue::from_static(if is_export_dl {
+                "application/json; charset=utf-8"
+            } else {
+                match url.host_str() {
+                    Some("font") => "font/ttf",
+                    Some("favicon") => "image/png",
+                    _ => "text/html; charset=utf-8",
+                }
             }),
         );
+        if is_export_dl {
+            headers.insert(
+                CONTENT_DISPOSITION,
+                HeaderValue::from_static("attachment; filename=\"navgator-export.json\""),
+            );
+        }
         let response = WebResourceResponse::new(url)
             .status_code(StatusCode::OK)
             .headers(headers);
@@ -7027,7 +7157,33 @@ mod adblock_tests {
 
 #[cfg(test)]
 mod chrome_helper_tests {
-    use super::{color_hex, favicon_hue, is_hex_color, omnibox_target, parse_session};
+    use super::{
+        color_hex, favicon_hue, is_hex_color, omnibox_target, parse_session, strip_tracking_params,
+    };
+
+    #[test]
+    fn strip_tracking_params_removes_trackers() {
+        // Trackers dropped, real params kept, order preserved.
+        assert_eq!(
+            strip_tracking_params("https://x.com/p?utm_source=a&id=5&fbclid=zz"),
+            "https://x.com/p?id=5"
+        );
+        // All-tracker query collapses to no query (no dangling '?').
+        assert_eq!(
+            strip_tracking_params("https://x.com/p?utm_campaign=a&gclid=b"),
+            "https://x.com/p"
+        );
+        // Untouched when there's nothing to strip / it doesn't parse.
+        assert_eq!(strip_tracking_params("https://x.com/p?id=5"), "https://x.com/p?id=5");
+        assert_eq!(strip_tracking_params("https://x.com/p"), "https://x.com/p");
+        assert_eq!(strip_tracking_params("not a url"), "not a url");
+        // Omnibar URL entries are cleaned; searches are left alone.
+        assert_eq!(
+            omnibox_target("https://x.com/p?utm_medium=x&q=2", "https://d.com/?q=%s"),
+            "https://x.com/p?q=2"
+        );
+        assert!(omnibox_target("hello utm_source", "https://d.com/?q=%s").starts_with("https://d.com/?q="));
+    }
 
     #[test]
     fn omnibox_target_classifies_and_blocks_javascript() {

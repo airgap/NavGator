@@ -22,6 +22,7 @@ pub(crate) enum PaletteAction {
     ToggleNotes,
     ToggleFeed,
     OpenWhy,
+    OpenExport,
 }
 
 /// The full command catalog: (label, right-aligned mono hint, action). `studio_open`
@@ -33,6 +34,11 @@ pub(crate) fn palette_catalog(studio_open: bool) -> Vec<(String, &'static str, P
             "Show blocked requests (gator://why)".to_string(),
             "Privacy",
             PaletteAction::OpenWhy,
+        ),
+        (
+            "Export my data (gator://export)".to_string(),
+            "Data",
+            PaletteAction::OpenExport,
         ),
         (
             "Toggle vertical tabs".to_string(),
