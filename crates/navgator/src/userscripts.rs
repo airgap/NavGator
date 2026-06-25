@@ -841,9 +841,17 @@ pub fn wrap_userscript(addon: &Addon, source: &str, cap_token: &str) -> String {
   const __ep = (call, args) =>
     "navgator://gm/" + __cap + "/" + call +
     "?a=" + encodeURIComponent(JSON.stringify(args == null ? {{}} : args));
-  const __bridge = (call, args) => __nativeFetch(__ep(call, args), {{ method: "GET" }});
+  // Transport: an Image beacon, NOT fetch()/XHR. A live run proved Servo routes NEITHER fetch nor
+  // XHR of a custom (navgator://) scheme to the embedder interceptor (both throw NetworkError) —
+  // but a subresource <img> load DOES reach load_web_resource (same path gator://font/* uses).
+  // Fire-and-forget only: the "image" load fails and the page reads no response body. handle_gm_bridge
+  // still performs the side effect (e.g. storage.set), which is all these calls need.
+  const __bridge = (call, args) => {{ try {{ (new Image()).src = __ep(call, args); }} catch (e) {{}} return Promise.resolve(); }};
+  // Data-returning calls can't use the beacon (no readable body) and fetch/XHR are dead, so they
+  // need a native evaluate_javascript push-path (not yet built — see #4). Reject clearly rather than
+  // surface a confusing NetworkError. __nativeFetch/__XHR are retained above for that future path.
   const __bridgeJson = (call, args) =>
-    __bridge(call, args).then((r) => r.ok ? r.json() : Promise.reject(new Error("gm bridge: " + r.status)));
+    Promise.reject(new Error("gm bridge: data-returning '" + call + "' needs the native push-path (Servo blocks custom-scheme fetch/XHR) — see #4"));
 {gm}  // 3. Original userscript source.
   function __run() {{
 {source}
@@ -1282,7 +1290,8 @@ alert(1);
         // bridge endpoint — args travel in the URL query (Servo exposes no request body)
         assert!(js.contains(r#""navgator://gm/" + __cap + "/" + call"#));
         assert!(js.contains(r#""?a=" + encodeURIComponent(JSON.stringify("#));
-        assert!(js.contains(r#"{ method: "GET" }"#));
+        // Transport is an Image beacon (Servo blocks custom-scheme fetch/XHR), not fetch options.
+        assert!(js.contains("(new Image()).src = __ep(call, args)"));
         assert!(!js.contains(r#"method: "POST""#));
         // granted
         assert!(js.contains("GM_xmlhttpRequest"));

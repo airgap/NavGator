@@ -5131,10 +5131,13 @@ impl AppState {
     /// returns `net-fetch-unimplemented` once it passes the gates. `notify.show`/`tabs.open`/
     /// `clipboard.set` are gated but not yet performed (`not-implemented`).
     ///
-    /// NOTE (unverified): this assumes Servo delivers a page-issued `fetch()` to the custom
-    /// `navgator://` scheme into this embedder intercept (as it does for the `gator://` page path).
-    /// That has not been confirmed against a running build; if Servo rejects the scheme earlier, the
-    /// whole bridge channel never fires (the capability gate above still holds regardless).
+    /// TRANSPORT (verified on a live run): Servo delivers neither a page `fetch()` NOR an XHR of the
+    /// custom `navgator://` scheme to this intercept (both throw NetworkError) — only a subresource
+    /// `<img>` beacon (or a top-level navigation) reaches it. So `wrap_userscript` now fires calls via
+    /// an Image beacon: the side effect below runs, but the returned body is DISCARDED by the page.
+    /// Fire-and-forget calls (`storage.set/delete`, `notify`, `tabs.open`, `clipboard.set`) work;
+    /// data-returning calls (`storage.get/list`, `net.fetch`) need a native `evaluate_javascript`
+    /// push-path back into the page — not yet built (issue #4). The capability gate holds regardless.
     fn handle_gm_bridge(&self, url: &Url) -> Vec<u8> {
         use userscripts::Permission;
         let deny = |msg: &str| -> Vec<u8> {
