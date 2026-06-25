@@ -524,6 +524,137 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// Flat vector chrome icons drawn via the egui painter — native, crisp, theme-coloured, and immune
+/// to missing font glyphs (emoji/symbols like the puzzle, close-✕ and maximize-▢ otherwise render
+/// as `.notdef` squares without an emoji font). Each fn paints into the icon's square bounding box.
+mod icon {
+    use egui::{pos2, vec2, Color32, CornerRadius, Painter, Rect, Stroke, StrokeKind};
+    fn s(c: Color32) -> Stroke {
+        Stroke::new(1.6, c)
+    }
+    pub fn close(p: &Painter, r: Rect, c: Color32) {
+        p.line_segment([r.left_top(), r.right_bottom()], s(c));
+        p.line_segment([r.right_top(), r.left_bottom()], s(c));
+    }
+    pub fn minimize(p: &Painter, r: Rect, c: Color32) {
+        let y = r.center().y;
+        p.line_segment([pos2(r.left(), y), pos2(r.right(), y)], s(c));
+    }
+    /// Single rounded square, or two offset squares ("restore") when the window is maximized.
+    pub fn maximize(p: &Painter, r: Rect, c: Color32, maximized: bool) {
+        if maximized {
+            let d = 3.0;
+            let back = Rect::from_min_size(pos2(r.left() + d, r.top()), vec2(r.width() - d, r.height() - d));
+            let front = Rect::from_min_size(pos2(r.left(), r.top() + d), vec2(r.width() - d, r.height() - d));
+            p.rect_stroke(back, CornerRadius::same(1), s(c), StrokeKind::Inside);
+            p.rect_stroke(front, CornerRadius::same(1), s(c), StrokeKind::Inside);
+        } else {
+            p.rect_stroke(r, CornerRadius::same(2), s(c), StrokeKind::Inside);
+        }
+    }
+    pub fn menu(p: &Painter, r: Rect, c: Color32) {
+        for t in [0.18_f32, 0.5, 0.82] {
+            let y = r.top() + r.height() * t;
+            p.line_segment([pos2(r.left(), y), pos2(r.right(), y)], s(c));
+        }
+    }
+    /// 2×2 swatch grid — "customize / themes" (the Studio).
+    pub fn studio(p: &Painter, r: Rect, c: Color32) {
+        let g = 1.6;
+        let cell = (r.width() - g) / 2.0;
+        for (i, j) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            let tl = pos2(r.left() + i as f32 * (cell + g), r.top() + j as f32 * (cell + g));
+            p.rect_filled(Rect::from_min_size(tl, vec2(cell, cell)), CornerRadius::same(1), c);
+        }
+    }
+    /// Puzzle piece (extensions / add-ons): a rounded square with knobs on the top + right edges.
+    pub fn addons(p: &Painter, r: Rect, c: Color32) {
+        // `</>` code brackets — userscripts / add-ons.
+        let st = Stroke::new(1.7, c);
+        let (yt, yb) = (r.top() + r.height() * 0.16, r.bottom() - r.height() * 0.16);
+        p.line_segment([pos2(r.left() + r.width() * 0.26, yt), pos2(r.left(), r.center().y)], st);
+        p.line_segment([pos2(r.left(), r.center().y), pos2(r.left() + r.width() * 0.26, yb)], st);
+        p.line_segment([pos2(r.right() - r.width() * 0.26, yt), pos2(r.right(), r.center().y)], st);
+        p.line_segment([pos2(r.right(), r.center().y), pos2(r.right() - r.width() * 0.26, yb)], st);
+        p.line_segment([pos2(r.center().x + r.width() * 0.13, yt), pos2(r.center().x - r.width() * 0.13, yb)], st);
+    }
+    /// Left / right chevrons (back / forward).
+    pub fn back(p: &Painter, r: Rect, c: Color32) {
+        chevron(p, r, c, true);
+    }
+    pub fn forward(p: &Painter, r: Rect, c: Color32) {
+        chevron(p, r, c, false);
+    }
+    fn chevron(p: &Painter, r: Rect, c: Color32, left: bool) {
+        let st = Stroke::new(1.8, c);
+        let (tip_x, end_x) = if left {
+            (r.left() + r.width() * 0.34, r.left() + r.width() * 0.62)
+        } else {
+            (r.left() + r.width() * 0.66, r.left() + r.width() * 0.38)
+        };
+        let dy = r.height() * 0.26;
+        p.line_segment([pos2(end_x, r.center().y - dy), pos2(tip_x, r.center().y)], st);
+        p.line_segment([pos2(tip_x, r.center().y), pos2(end_x, r.center().y + dy)], st);
+    }
+    /// Circular reload arrow (a ~300° arc with an arrowhead at the top gap).
+    pub fn reload(p: &Painter, r: Rect, c: Color32) {
+        let st = Stroke::new(1.6, c);
+        let center = r.center();
+        let rad = r.width() * 0.36;
+        let (start, end, steps) = (0.9_f32, 6.0_f32, 20);
+        let pts: Vec<_> = (0..=steps)
+            .map(|i| {
+                let a = start + (end - start) * (i as f32 / steps as f32);
+                pos2(center.x + rad * a.cos(), center.y + rad * a.sin())
+            })
+            .collect();
+        p.add(egui::Shape::line(pts, st));
+        // Arrowhead at the arc start (upper-right), pointing clockwise.
+        let tip = pos2(center.x + rad * start.cos(), center.y + rad * start.sin());
+        p.line_segment([tip, pos2(tip.x - 4.5, tip.y - 1.5)], st);
+        p.line_segment([tip, pos2(tip.x - 1.0, tip.y + 4.5)], st);
+    }
+    /// Key: a ring on the left, a stem to the right, two teeth.
+    pub fn key(p: &Painter, r: Rect, c: Color32) {
+        let rad = r.height() * 0.32;
+        let ring = pos2(r.left() + rad, r.center().y);
+        let y = r.center().y;
+        p.circle_stroke(ring, rad, s(c));
+        p.line_segment([pos2(ring.x + rad, y), pos2(r.right(), y)], s(c));
+        p.line_segment([pos2(r.right() - 1.5, y), pos2(r.right() - 1.5, y + 3.5)], s(c));
+        p.line_segment([pos2(r.right() - 5.0, y), pos2(r.right() - 5.0, y + 3.5)], s(c));
+    }
+}
+
+/// A frameless flat-icon button: a fixed-size clickable cell with the icon painted by `draw`
+/// (muted normally, full text colour on hover). Drop-in replacement for the old emoji/symbol
+/// `egui::Button::new("…")` chrome buttons.
+fn icon_button(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    tip: &str,
+    pal: &theme::Palette,
+    draw: impl FnOnce(&egui::Painter, egui::Rect, egui::Color32),
+) -> egui::Response {
+    // Disabled icons sense hover only (never .clicked()) and render faded.
+    let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 24.0), sense);
+    let col = if !enabled {
+        pal.muted.gamma_multiply(0.4)
+    } else if resp.hovered() {
+        pal.text
+    } else {
+        pal.muted
+    };
+    let icon_box = egui::Rect::from_center_size(rect.center(), egui::vec2(13.0, 13.0));
+    draw(ui.painter(), icon_box, col);
+    if tip.is_empty() {
+        resp
+    } else {
+        resp.on_hover_text(tip)
+    }
+}
+
 /// Resolve an omnibar entry to a load target: a literal URL, a bare domain promoted to https, or
 /// a search via `search_template` (`%s` placeholder). A `javascript:` entry is ALWAYS routed to
 /// search — never loaded — so address-bar `javascript:`/`javascript://…` self-XSS can't fire.
@@ -1950,6 +2081,9 @@ struct AppState {
     /// Logical-px rect of the omnibar pill, so the borderless-window drag excludes it (the
     /// omnibar must stay clickable, not move the window).
     omni_rect: Cell<egui::Rect>,
+    /// Logical-px rect of the reserved window-drag handle (left of the window controls). This is
+    /// the ONLY region that drags the borderless window — nothing else is draggable.
+    drag_rect: Cell<egui::Rect>,
     /// Frame counter throttling tab-preview thumbnail capture (a glReadPixels is not free).
     thumb_tick: Cell<u32>,
     /// The two pane groups. `pane0` is always present; `pane1` is populated only while `split`.
@@ -3406,67 +3540,63 @@ impl AppState {
             .inner_margin(6.0);
         let toolbar = egui::TopBottomPanel::top("toolbar").frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
+                let navpal = self.browser.settings.borrow().theme.palette();
                 let (cb, cf) = self.active_nav();
-                if ui
-                    .add_enabled(cb, egui::Button::new("◀").frame(false).min_size(egui::vec2(24.0, 24.0)))
-                    .clicked()
-                {
+                if icon_button(ui, cb, "Back", &navpal, icon::back).clicked() {
                     if let Some(t) = self.active_tab() {
                         t.go_back(1);
                     }
                 }
-                if ui
-                    .add_enabled(cf, egui::Button::new("▶").frame(false).min_size(egui::vec2(24.0, 24.0)))
-                    .clicked()
-                {
+                if icon_button(ui, cf, "Forward", &navpal, icon::forward).clicked() {
                     if let Some(t) = self.active_tab() {
                         t.go_forward(1);
                     }
                 }
-                if ui
-                    .add(egui::Button::new("↻").frame(false).min_size(egui::vec2(24.0, 24.0)))
-                    .clicked()
-                {
+                if icon_button(ui, true, "Reload", &navpal, icon::reload).clicked() {
                     if let Some(t) = self.active_tab() {
                         t.reload();
                     }
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::Button::new("✕").frame(false).min_size(egui::vec2(28.0, 24.0))).clicked() {
+                    let pal = self.browser.settings.borrow().theme.palette();
+                    if icon_button(ui, true, "Close", &pal, icon::close).clicked() {
                         // Close THIS window (quits the app only if it's the last one).
                         self.wants_close.set(true);
                         self.window.request_redraw();
                     }
-                    if ui.add(egui::Button::new("▢").frame(false).min_size(egui::vec2(28.0, 24.0))).clicked() {
-                        self.window.set_maximized(!self.window.is_maximized());
+                    let maxed = self.window.is_maximized();
+                    if icon_button(ui, true, if maxed { "Restore" } else { "Maximize" }, &pal, |p, r, c| {
+                        icon::maximize(p, r, c, maxed)
+                    })
+                    .clicked()
+                    {
+                        self.window.set_maximized(!maxed);
                     }
-                    if ui.add(egui::Button::new("—").frame(false).min_size(egui::vec2(28.0, 24.0))).clicked() {
+                    if icon_button(ui, true, "Minimize", &pal, icon::minimize).clicked() {
                         self.window.set_minimized(true);
                     }
-                    if ui.add(egui::Button::new("☰").frame(false).min_size(egui::vec2(28.0, 24.0))).clicked() {
+                    // The ONLY draggable region: a reserved handle just left of the window controls
+                    // (browser-style). Recorded so the winit hit-test drags here and nowhere else.
+                    let (drag_handle, _) =
+                        ui.allocate_exact_size(egui::vec2(40.0, 24.0), egui::Sense::hover());
+                    self.drag_rect.set(drag_handle);
+                    if icon_button(ui, true, "Settings", &pal, icon::menu).clicked() {
                         self.show_settings.set(!self.show_settings.get());
                     }
-                    if ui
-                        .add(egui::Button::new("🎨").frame(false).min_size(egui::vec2(28.0, 24.0)))
-                        .on_hover_text("Customize interface (Studio)")
-                        .clicked()
-                    {
+                    if icon_button(ui, true, "Customize interface (Studio)", &pal, icon::studio).clicked() {
                         self.show_studio.set(!self.show_studio.get());
                     }
-                    // 🧩 add-ons (userscripts) badge: toggles the registry-driven popover. A count
-                    // bubble shows how many enabled add-ons match the current tab's URL.
+                    // Add-ons (userscripts) puzzle icon: toggles the registry-driven popover. A
+                    // count bubble shows how many enabled add-ons match the current tab's URL.
                     {
                         let active_count = {
                             let cur = self.location.borrow().clone();
                             self.browser.addons.borrow().enabled_matching(&cur).len()
                         };
-                        let r = ui
-                            .add(egui::Button::new("🧩").frame(false).min_size(egui::vec2(28.0, 24.0)))
-                            .on_hover_text("Userscripts / add-ons");
+                        let r = icon_button(ui, true, "Userscripts / add-ons", &pal, icon::addons);
                         self.addon_badge_rect.set(r.rect);
                         if active_count > 0 {
-                            let pal = self.browser.settings.borrow().theme.palette();
                             let p = ui.painter();
                             let center = r.rect.right_top() + egui::vec2(-5.0, 6.0);
                             p.circle_filled(center, 7.0, pal.accent);
@@ -3483,10 +3613,7 @@ impl AppState {
                         }
                     }
                     if self.browser.password_store.borrow().is_unlocked()
-                        && ui
-                            .add(egui::Button::new("🔑").frame(false).min_size(egui::vec2(28.0, 24.0)))
-                            .on_hover_text("Save this page's login")
-                            .clicked()
+                        && icon_button(ui, true, "Save this page's login", &pal, icon::key).clicked()
                     {
                         self.save_login_active();
                     }
@@ -6976,6 +7103,7 @@ fn open_window(
         content_left: Cell::new(0.0),
         content_right: Cell::new(0.0),
         omni_rect: Cell::new(egui::Rect::ZERO),
+        drag_rect: Cell::new(egui::Rect::ZERO),
         thumb_tick: Cell::new(0),
         pane0: PaneGroup::new(content_context.clone()),
         pane1: PaneGroup::new(content_context_r),
@@ -7273,17 +7401,16 @@ impl ApplicationHandler<WakeUp> for App {
                     });
                     return;
                 }
-                // Drag the window from empty toolbar/tab-strip space (browser-style) — but never
-                // from the omnibar pill (it must stay clickable) or from any egui widget.
-                let over_omni = state
-                    .omni_rect
+                // Drag the window ONLY from the reserved drag handle (left of the window controls).
+                // Nothing else is draggable — not the omnibar, not other toolbar space, not widgets.
+                let over_drag = state
+                    .drag_rect
                     .get()
                     .contains(egui::pos2((cx / scale) as f32, (cy / scale) as f32));
                 if button == MouseButton::Left
                     && bs == ElementState::Pressed
-                    && over_toolbar
+                    && over_drag
                     && !resp.consumed
-                    && !over_omni
                 {
                     let _ = state.window.drag_window();
                     return;
