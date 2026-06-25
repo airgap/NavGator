@@ -1050,6 +1050,32 @@ fn save_bookmarks(p: &Profile) {
     }
 }
 
+/// A row the scoped omnibar launcher can select: switch to an open tab, or load a URL.
+enum OmniPick {
+    Tab(usize),
+    Url(String),
+}
+
+/// Scoped omnibar verbs: a leading `t `/`b ` (tab / bookmark, space-delimited so `t.co` isn't a
+/// verb) or `/` (find-in-page) selects a search scope. Returns `(verb, rest-of-query)`.
+fn omnibar_verb(s: &str) -> Option<(char, &str)> {
+    let s = s.trim_start();
+    if let Some(rest) = s.strip_prefix('/') {
+        return Some(('/', rest));
+    }
+    let mut it = s.char_indices();
+    let (_, first) = it.next()?;
+    let v = first.to_ascii_lowercase();
+    if matches!(v, 't' | 'b') {
+        if let Some((i, c)) = it.next() {
+            if c == ' ' {
+                return Some((v, s[i..].trim_start()));
+            }
+        }
+    }
+    None
+}
+
 /// History-backed omnibox suggestions: entries whose URL/title contains `query`,
 /// ranked by frecency (visit count), top 6.
 fn suggestions(history: &[HistoryEntry], query: &str) -> Vec<(String, String)> {
@@ -3435,8 +3461,104 @@ impl AppState {
 
                     let mut go: Option<String> = None;
                     let mut run_action: Option<palette::PaletteAction> = None;
+                    let mut switch_tab: Option<usize> = None;
+                    let mut start_find: Option<String> = None;
+                    let verb = if is_cmd {
+                        None
+                    } else {
+                        omnibar_verb(loc.trim_start())
+                    };
 
-                    if is_cmd {
+                    if let Some((v, rest)) = verb {
+                        // Scoped launcher: build matching rows, render a dropdown, defer the action.
+                        let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let q = rest.to_lowercase();
+                        // (label, on-select closure result) collected as owned data so no borrow of
+                        // `loc`/tabs/bookmarks is held across the dropdown render.
+                        let rows: Vec<(String, OmniPick)> = match v {
+                            't' => self
+                                .focused_pane()
+                                .tabs
+                                .borrow()
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, t)| {
+                                    q.is_empty()
+                                        || t.title.to_lowercase().contains(&q)
+                                        || t.url.to_lowercase().contains(&q)
+                                })
+                                .map(|(i, t)| {
+                                    let label = if t.title.trim().is_empty() {
+                                        t.url.clone()
+                                    } else {
+                                        format!("{}  —  {}", t.title, t.url)
+                                    };
+                                    (label, OmniPick::Tab(i))
+                                })
+                                .take(8)
+                                .collect(),
+                            'b' => self
+                                .browser
+                                .profile
+                                .borrow()
+                                .bookmarks
+                                .iter()
+                                .filter(|b| {
+                                    q.is_empty()
+                                        || b.title.to_lowercase().contains(&q)
+                                        || b.url.to_lowercase().contains(&q)
+                                })
+                                .map(|b| {
+                                    let label = if b.title.trim().is_empty() {
+                                        b.url.clone()
+                                    } else {
+                                        format!("{}  —  {}", b.title, b.url)
+                                    };
+                                    (label, OmniPick::Url(b.url.clone()))
+                                })
+                                .take(8)
+                                .collect(),
+                            _ => Vec::new(), // '/' = find: no rows, Enter starts the search
+                        };
+                        let apply = |pick: &OmniPick,
+                                     go: &mut Option<String>,
+                                     switch_tab: &mut Option<usize>| match pick {
+                            OmniPick::Tab(i) => *switch_tab = Some(*i),
+                            OmniPick::Url(u) => *go = Some(u.clone()),
+                        };
+                        if v == '/' {
+                            if enter && !rest.is_empty() {
+                                start_find = Some(rest.to_string());
+                            }
+                        } else {
+                            if enter {
+                                if let Some((_, pick)) = rows.first() {
+                                    apply(pick, &mut go, &mut switch_tab);
+                                }
+                            }
+                            if field.has_focus() && !rows.is_empty() {
+                                egui::Area::new(egui::Id::new("omnibox_verb"))
+                                    .order(egui::Order::Foreground)
+                                    .fixed_pos(pill_rect.left_bottom())
+                                    .show(ui.ctx(), |ui| {
+                                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                            ui.set_min_width(pill_rect.width().max(220.0));
+                                            for (label, pick) in &rows {
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(truncate_ellipsis(label, 80))
+                                                            .frame(false),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    apply(pick, &mut go, &mut switch_tab);
+                                                }
+                                            }
+                                        });
+                                    });
+                            }
+                        }
+                    } else if is_cmd {
                         // Command palette: filter the catalog by the text after `>`.
                         let filter = loc.trim_start().trim_start_matches('>').trim().to_lowercase();
                         let items: Vec<_> = palette::palette_catalog(self.show_studio.get())
@@ -3501,6 +3623,22 @@ impl AppState {
                         drop(loc);
                         self.location_dirty.set(false);
                         self.navigate_from_omnibox(&target);
+                    } else if let Some(i) = switch_tab {
+                        // `t ` verb: jump to an open tab in the focused pane.
+                        loc.clear();
+                        drop(loc);
+                        self.location_dirty.set(false);
+                        self.select_tab(self.focused.get(), i);
+                    } else if let Some(query) = start_find {
+                        // `/` verb: open find-in-page and run the query immediately.
+                        loc.clear();
+                        drop(loc);
+                        self.location_dirty.set(false);
+                        *self.find_query.borrow_mut() = query.clone();
+                        self.find_open.set(true);
+                        self.find_focus.set(true);
+                        self.find_run(&query);
+                        self.window.request_redraw();
                     }
                 });
             });
