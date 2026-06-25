@@ -508,6 +508,22 @@ fn is_hex_color(s: &str) -> bool {
         Some(x) if (x.len() == 3 || x.len() == 6) && x.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+/// Levenshtein edit distance between two strings (for the Credential Firewall's typosquat check).
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            cur.push((prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
 /// Resolve an omnibar entry to a load target: a literal URL, a bare domain promoted to https, or
 /// a search via `search_template` (`%s` placeholder). A `javascript:` entry is ALWAYS routed to
 /// search — never loaded — so address-bar `javascript:`/`javascript://…` self-XSS can't fire.
@@ -1540,6 +1556,11 @@ const FORCE_DARK_JS: &str = r#"(function(){var id='__ng_forcedark';if(document.g
 
 /// Remove the force-dark style injected by `FORCE_DARK_JS`.
 const FORCE_DARK_OFF_JS: &str = r#"(function(){var e=document.getElementById('__ng_forcedark');if(e)e.remove();})()"#;
+
+/// Credential Firewall (#19): on a password/card field focus, ping the native side with this
+/// page's origin/host so it can warn if the site is a look-alike of one with a saved login.
+/// Advisory only (runs in the page's world); the bridge fetch is intercepted by load_web_resource.
+const FIREWALL_JS: &str = r#"(function(){if(window.__ngcf)return;window.__ngcf=1;function chk(){try{fetch('navgator://credfw?o='+encodeURIComponent(location.origin)+'&h='+encodeURIComponent(location.hostname))}catch(e){}}document.addEventListener('focusin',function(e){var t=e.target;if(t&&t.tagName==='INPUT'&&(t.type==='password'||/cc-number|cardnumber/i.test(t.getAttribute('autocomplete')||'')))chk()},true)})()"#;
 
 /// The origin (`scheme://host[:port]`) of a URL, for matching saved logins. None for non-web.
 fn origin_of(url: &str) -> Option<String> {
@@ -6085,6 +6106,34 @@ impl AppState {
         webview.evaluate_javascript(js.to_string(), |_| {});
     }
 
+    /// Credential Firewall (#19): a password/card field was focused on `origin`/`host`. If the
+    /// store is unlocked, there's NO saved login for this exact origin, but there IS one for a
+    /// look-alike host (edit distance ≤ 2 — typosquat), warn before the user enters credentials.
+    /// Advisory; relies on the navgator:// bridge fetch reaching this intercept (verify on /run).
+    fn credential_firewall_check(&self, origin: &str, host: &str) {
+        if host.is_empty() {
+            return;
+        }
+        let saved: Vec<String> = {
+            let store = self.browser.password_store.borrow();
+            if !store.is_unlocked() || !store.for_origin(origin).is_empty() {
+                return; // locked, or you legitimately have a login HERE → no warning.
+            }
+            store.all().iter().map(|c| c.origin.clone()).collect()
+        };
+        let lookalike = saved
+            .iter()
+            .filter_map(|o| Url::parse(o).ok().and_then(|u| u.host_str().map(str::to_string)))
+            .find(|s| s != host && levenshtein(s, host) <= 2);
+        if let Some(s) = lookalike {
+            *self.browser.password_msg.borrow_mut() = Some(format!(
+                "⚠ You have a saved login for \"{s}\" — this site (\"{host}\") looks similar. \
+                 Make sure it's the real one before entering your password."
+            ));
+            self.window.request_redraw();
+        }
+    }
+
     /// Toggle force-dark and apply it to every open tab immediately (and future loads pick it up).
     fn toggle_force_dark(&self) {
         {
@@ -6252,6 +6301,24 @@ impl WebViewDelegate for AppState {
                 .headers(headers);
             let mut intercepted = load.intercept(response);
             intercepted.send_body_data(body);
+            intercepted.finish();
+            return;
+        }
+        // Credential Firewall (#19): the injected FIREWALL_JS pings here when a password/card
+        // field is focused, so native can warn on a look-alike origin. Reply is an empty {}.
+        if url.scheme() == "navgator" && url.host_str() == Some("credfw") {
+            let (mut origin, mut host) = (String::new(), String::new());
+            for (k, v) in url.query_pairs() {
+                match k.as_ref() {
+                    "o" => origin = v.into_owned(),
+                    "h" => host = v.into_owned(),
+                    _ => {}
+                }
+            }
+            self.credential_firewall_check(&origin, &host);
+            let response = WebResourceResponse::new(url).status_code(StatusCode::OK);
+            let mut intercepted = load.intercept(response);
+            intercepted.send_body_data(b"{}".to_vec());
             intercepted.finish();
             return;
         }
@@ -6548,8 +6615,13 @@ impl WebViewDelegate for AppState {
             if matches!(status, LoadStatus::Complete) {
                 self.autofill(p, i);
                 self.apply_cosmetic(p, i);
-                if self.browser.settings.borrow().force_dark {
-                    if let Some(t) = self.pane(p).tabs.borrow().get(i) {
+                let force_dark = self.browser.settings.borrow().force_dark;
+                if let Some(t) = self.pane(p).tabs.borrow().get(i) {
+                    if t.url.starts_with("http://") || t.url.starts_with("https://") {
+                        // Credential-firewall sensor (#19).
+                        t.webview.evaluate_javascript(FIREWALL_JS.to_string(), |_| {});
+                    }
+                    if force_dark {
                         self.apply_force_dark(&t.webview, &t.url);
                     }
                 }
@@ -7561,8 +7633,21 @@ mod adblock_tests {
 #[cfg(test)]
 mod chrome_helper_tests {
     use super::{
-        color_hex, favicon_hue, is_hex_color, omnibox_target, parse_session, strip_tracking_params,
+        color_hex, favicon_hue, is_hex_color, levenshtein, omnibox_target, parse_session,
+        strip_tracking_params,
     };
+
+    #[test]
+    fn levenshtein_flags_typosquats() {
+        assert_eq!(levenshtein("github.com", "github.com"), 0);
+        assert_eq!(levenshtein("github.com", "gihub.com"), 1); // dropped a char
+        assert_eq!(levenshtein("paypal.com", "paypa1.com"), 1); // l -> 1
+        assert_eq!(levenshtein("google.com", "gooogle.com"), 1); // extra o
+        // A real firewall trigger (≤ 2) vs clearly-different / subdomain-appended (not).
+        assert!(levenshtein("paypal.com", "paypal.com") <= 2);
+        assert!(levenshtein("apple.com", "microsoft.com") > 2);
+        assert!(levenshtein("bank.com", "bank.com.evil.com") > 2);
+    }
 
     #[test]
     fn strip_tracking_params_removes_trackers() {
