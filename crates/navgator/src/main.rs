@@ -38,7 +38,7 @@ use euclid::default::{Point2D, Rect, Size2D};
 use navgator_engine::{
     AuthenticationRequest, ColorPicker, CreateNewWebViewRequest, DevicePoint, EmbedderControl,
     EmbedderControlId, EventLoopWaker, FilePicker, FilterPattern, Image, InputEvent, JSValue, Key,
-    KeyState, KeyboardEvent, LoadStatus,
+    KeyState, KeyboardEvent, LoadStatus, MediaSessionEvent, MediaSessionPlaybackState,
     MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
     NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, Opts, PermissionRequest,
     PixelFormat, Preferences, RenderingContext, run_content_process,
@@ -1717,6 +1717,9 @@ struct Tab {
     /// URLs blocked by the adblocker on the CURRENT page (cleared on navigation), surfaced by
     /// the gator://why "block receipt". Capped to bound a tracker-heavy page.
     blocked: RefCell<Vec<String>>,
+    /// Whether this tab is currently producing audio (media-session Playing). Audible background
+    /// tabs are NOT throttled, so their playlist/auto-advance JS keeps running at full speed.
+    audible: Cell<bool>,
 }
 
 /// One independent pane group: its own tab list, active tab, and offscreen FBO. The browser
@@ -2999,6 +3002,7 @@ impl AppState {
             ucm,
             injected_addons: RefCell::new(Vec::new()),
             blocked: RefCell::new(Vec::new()),
+            audible: Cell::new(false),
         });
         self.pane1.active.set(0);
         self.split.set(true);
@@ -3046,6 +3050,7 @@ impl AppState {
                 ucm,
                 injected_addons: RefCell::new(Vec::new()),
                 blocked: RefCell::new(Vec::new()),
+                audible: Cell::new(false),
             });
         }
         self.pane1.active.set(0);
@@ -5300,6 +5305,7 @@ impl AppState {
                 ucm,
                 injected_addons: RefCell::new(Vec::new()),
                 blocked: RefCell::new(Vec::new()),
+                audible: Cell::new(false),
             });
             tabs.len() - 1
         };
@@ -5351,10 +5357,11 @@ impl AppState {
                     tab.webview.show();
                     tab.webview.set_throttled(false);
                 } else {
-                    // Background tabs are hidden AND throttled — less CPU/battery for tabs you
-                    // aren't looking at (the anti-bloat pitch).
+                    // Background tabs are hidden (compositor-only, doesn't touch audio) and
+                    // throttled for less CPU/battery — EXCEPT audible ones, which stay un-throttled
+                    // so background media (playlists / auto-advance) keeps running at full speed.
                     tab.webview.hide();
-                    tab.webview.set_throttled(true);
+                    tab.webview.set_throttled(!tab.audible.get());
                 }
             }
             if is_focused {
@@ -6357,6 +6364,27 @@ impl WebViewDelegate for AppState {
                 }
             }
             self.pane(p).tabs.borrow_mut()[i].favicon_pending = fav.map(|f| favicon_color_image(&f));
+            self.window.request_redraw();
+        }
+    }
+
+    /// Track which tabs are producing audio (media-session Playing/Paused). Audible BACKGROUND
+    /// tabs are kept un-throttled so their playlist/auto-advance JS (which runs on ≥1s timers when
+    /// throttled) keeps up — background audio (YouTube Music / Spotify / Plex) stays smooth.
+    fn notify_media_session_event(&self, webview: WebView, event: MediaSessionEvent) {
+        let MediaSessionEvent::PlaybackStateChange(state) = event else {
+            return;
+        };
+        let playing = matches!(state, MediaSessionPlaybackState::Playing);
+        if let Some((p, i)) = self.locate_tab(&webview) {
+            if let Some(t) = self.pane(p).tabs.borrow().get(i) {
+                t.audible.set(playing);
+                // The active tab is never throttled; a background tab follows its audible state.
+                let active = p == self.focused.get() && i == self.pane(p).active.get();
+                if !active {
+                    t.webview.set_throttled(!playing);
+                }
+            }
             self.window.request_redraw();
         }
     }
