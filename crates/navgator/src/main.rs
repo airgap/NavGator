@@ -1560,7 +1560,15 @@ const FORCE_DARK_OFF_JS: &str = r#"(function(){var e=document.getElementById('__
 /// Credential Firewall (#19): on a password/card field focus, ping the native side with this
 /// page's origin/host so it can warn if the site is a look-alike of one with a saved login.
 /// Advisory only (runs in the page's world); the bridge fetch is intercepted by load_web_resource.
-const FIREWALL_JS: &str = r#"(function(){if(window.__ngcf)return;window.__ngcf=1;function chk(){try{fetch('navgator://credfw?o='+encodeURIComponent(location.origin)+'&h='+encodeURIComponent(location.hostname))}catch(e){}}document.addEventListener('focusin',function(e){var t=e.target;if(t&&t.tagName==='INPUT'&&(t.type==='password'||/cc-number|cardnumber/i.test(t.getAttribute('autocomplete')||'')))chk()},true)})()"#;
+// Two Servo realities, both confirmed on a live /run, shaped this:
+//   1. Delivery is an Image beacon, NOT fetch() — Servo's Fetch API does not route custom
+//      (navgator://) schemes to the WebResourceLoad interceptor, but a subresource load (img, like
+//      gator://font/*) does. The "image" load fails harmlessly; the request reaching
+//      load_web_resource is the point. Fire-and-forget: native shows the toast, the page reads
+//      nothing back.
+//   2. The trigger is click/keydown, NOT focusin — Servo doesn't reliably dispatch focus events.
+// Fires at most once per document (the warning is about the site, not each keystroke).
+const FIREWALL_JS: &str = r#"(function(){if(window.__ngcf)return;window.__ngcf=1;function chk(){if(window.__ngck)return;window.__ngck=1;try{(new Image()).src='navgator://credfw?o='+encodeURIComponent(location.origin)+'&h='+encodeURIComponent(location.hostname)}catch(e){}}['click','focusin','keydown'].forEach(function(ev){document.addEventListener(ev,function(e){var t=e.target;if(t&&t.tagName==='INPUT'&&(t.type==='password'||/cc-number|cardnumber/i.test(t.getAttribute('autocomplete')||'')))chk()},true)})})()"#;
 
 /// The origin (`scheme://host[:port]`) of a URL, for matching saved logins. None for non-web.
 fn origin_of(url: &str) -> Option<String> {
