@@ -56,6 +56,17 @@ workstation `$DISPLAY=:0` is the user's actual desktop — **don't launch there*
 NavGator by name (the user runs their own `*.AppImage` builds on :0). The driver only ever touches
 its own Xvfb `:99` and the pid it recorded.
 
+## Compare to Chrome (rendering bug-hunt)
+
+`compare.sh <name> <url>` renders the same page in **google-chrome** (headless baseline) and
+**swervo** (the driver) at the same content viewport, then writes a side-by-side PNG + an SSIM
+score to `/tmp/navgator-compare/<name>_sidebyside.png` (chrome LEFT, swervo RIGHT):
+```bash
+.claude/skills/run-navgator/compare.sh google https://www.google.com/
+# SSIM 0.70 (1.0=identical) -> /tmp/navgator-compare/google_sidebyside.png
+```
+Read the side-by-side (scale it under 2000px wide first — `ffmpeg -i …_sidebyside.png -vf scale=1600:-1 view.png`) and look for divergences = swervo rendering bugs. Known divergences found this way: CSS Grid collapses to a 1-column stack; button/flex text sits too high (vertical-centering offset); `<select>`/range/checkbox styling differs. Note chrome headless defaults to **dark** mode (prefers-color-scheme) while swervo is light — compare *layout*, not colours.
+
 ## Gotchas (battle scars — all hit on a live run)
 
 - **No window manager under Xvfb**, so a click sets *pointer* focus but not X *input* focus.
