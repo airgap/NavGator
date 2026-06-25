@@ -463,6 +463,8 @@ struct Settings {
     remember_passphrase: bool,
     /// Block ads + trackers (adblock-rust). On by default — it's the pitch.
     block_ads: bool,
+    /// Force a dark appearance on http(s) pages (CSS invert + hue-rotate, media re-inverted).
+    force_dark: bool,
     /// New-tab page wallpaper (image URL); empty = the plain themed background.
     wallpaper: String,
     /// The live-customization chrome theme (OKLCH base/accent, density, fonts,
@@ -485,6 +487,7 @@ impl Default for Settings {
             sync_passwords: false,
             remember_passphrase: false,
             block_ads: true,
+            force_dark: false,
             wallpaper: String::new(),
             theme: theme::Theme::default(),
             modules: theme::Modules::default(),
@@ -590,6 +593,7 @@ fn load_settings() -> Settings {
                     "sync_passwords" => s.sync_passwords = v.trim() == "true",
                     "remember_passphrase" => s.remember_passphrase = v.trim() == "true",
                     "block_ads" => s.block_ads = v.trim() == "true",
+                    "force_dark" => s.force_dark = v.trim() == "true",
                     "wallpaper" => s.wallpaper = v.trim().to_string(),
                     "th_base" => {
                         if let Some(b) = theme::Base::from_key(v.trim()) {
@@ -663,7 +667,7 @@ fn save_settings(s: &Settings) {
         let _ = std::fs::write(
             &path,
             format!(
-                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nremember_passphrase={}\nblock_ads={}\nwallpaper={}\nth_base={}\nth_accent={}\nth_density={}\nth_font={}\nth_tabpos={}\nth_wallpaper={}\nth_tabfit={}\nth_radius={}\nth_glass={}\nth_tabmaxw={}\nmod_clock={}\nmod_search={}\nmod_sites={}\nmod_notes={}\nmod_feed={}\n",
+                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nremember_passphrase={}\nblock_ads={}\nforce_dark={}\nwallpaper={}\nth_base={}\nth_accent={}\nth_density={}\nth_font={}\nth_tabpos={}\nth_wallpaper={}\nth_tabfit={}\nth_radius={}\nth_glass={}\nth_tabmaxw={}\nmod_clock={}\nmod_search={}\nmod_sites={}\nmod_notes={}\nmod_feed={}\n",
                 s.search,
                 s.accent,
                 s.dark,
@@ -673,6 +677,7 @@ fn save_settings(s: &Settings) {
                 s.sync_passwords,
                 s.remember_passphrase,
                 s.block_ads,
+                s.force_dark,
                 s.wallpaper,
                 s.theme.base.key(),
                 s.theme.accent.key(),
@@ -1528,6 +1533,13 @@ const COSMETIC_COLLECT_JS: &str = r#"(function(){
   }
   return JSON.stringify({c:Object.keys(c),i:Object.keys(i)});
 })()"#;
+
+/// Force-dark: invert the whole page + hue-rotate to keep hues, then re-invert media so photos
+/// look normal. Crude but universal; idempotent (keyed by the style id).
+const FORCE_DARK_JS: &str = r#"(function(){var id='__ng_forcedark';if(document.getElementById(id))return;var s=document.createElement('style');s.id=id;s.textContent='html{background:#0b0b0d!important;filter:invert(1) hue-rotate(180deg)}img,video,picture,canvas,svg,iframe,embed,object,[style*="background-image"]{filter:invert(1) hue-rotate(180deg)}';(document.head||document.documentElement).appendChild(s);})()"#;
+
+/// Remove the force-dark style injected by `FORCE_DARK_JS`.
+const FORCE_DARK_OFF_JS: &str = r#"(function(){var e=document.getElementById('__ng_forcedark');if(e)e.remove();})()"#;
 
 /// The origin (`scheme://host[:port]`) of a URL, for matching saved logins. None for non-web.
 fn origin_of(url: &str) -> Option<String> {
@@ -3305,6 +3317,10 @@ impl AppState {
                 }
                 return;
             }
+            A::ToggleForceDark => {
+                self.toggle_force_dark();
+                return;
+            }
             _ => {}
         }
         {
@@ -3328,7 +3344,7 @@ impl AppState {
                 A::ApplyPreset(p) => p.merge_into(&mut s.theme),
                 A::ToggleNotes => s.modules.notes = !s.modules.notes,
                 A::ToggleFeed => s.modules.feed = !s.modules.feed,
-                A::NewTab | A::ToggleStudio | A::OpenWhy | A::OpenExport => {}
+                A::NewTab | A::ToggleStudio | A::OpenWhy | A::OpenExport | A::ToggleForceDark => {}
             }
             sync_legacy_theme(&mut s);
             save_settings(&s);
@@ -6059,6 +6075,32 @@ impl AppState {
     /// Hide ad/clutter elements using EasyList's cosmetic (element-hiding) rules. Two evals:
     /// collect the page's class/id set, then inject a `<style>` hiding the matching selectors —
     /// generic rules are filtered to the page's actual classes/ids, so this stays cheap.
+    /// Inject (or remove) the force-dark stylesheet on an http(s) page, per the current setting.
+    fn apply_force_dark(&self, webview: &WebView, url: &str) {
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return; // gator:// pages are already themed — don't invert them.
+        }
+        let on = self.browser.settings.borrow().force_dark;
+        let js = if on { FORCE_DARK_JS } else { FORCE_DARK_OFF_JS };
+        webview.evaluate_javascript(js.to_string(), |_| {});
+    }
+
+    /// Toggle force-dark and apply it to every open tab immediately (and future loads pick it up).
+    fn toggle_force_dark(&self) {
+        {
+            let mut s = self.browser.settings.borrow_mut();
+            s.force_dark = !s.force_dark;
+            save_settings(&s);
+        }
+        for pane in 0..2 {
+            let tabs = self.pane(pane).tabs.borrow();
+            for t in tabs.iter() {
+                self.apply_force_dark(&t.webview, &t.url);
+            }
+        }
+        self.window.request_redraw();
+    }
+
     fn apply_cosmetic(&self, pane: usize, tab_idx: usize) {
         if !self.browser.settings.borrow().block_ads {
             return;
@@ -6506,6 +6548,11 @@ impl WebViewDelegate for AppState {
             if matches!(status, LoadStatus::Complete) {
                 self.autofill(p, i);
                 self.apply_cosmetic(p, i);
+                if self.browser.settings.borrow().force_dark {
+                    if let Some(t) = self.pane(p).tabs.borrow().get(i) {
+                        self.apply_force_dark(&t.webview, &t.url);
+                    }
+                }
             }
             if matches!(status, LoadStatus::Complete)
                 && p == self.focused.get()

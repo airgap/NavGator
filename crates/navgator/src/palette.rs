@@ -23,6 +23,7 @@ pub(crate) enum PaletteAction {
     ToggleFeed,
     OpenWhy,
     OpenExport,
+    ToggleForceDark,
 }
 
 /// The full command catalog: (label, right-aligned mono hint, action). `studio_open`
@@ -39,6 +40,11 @@ pub(crate) fn palette_catalog(studio_open: bool) -> Vec<(String, &'static str, P
             "Export my data (gator://export)".to_string(),
             "Data",
             PaletteAction::OpenExport,
+        ),
+        (
+            "Toggle force-dark mode".to_string(),
+            "Appearance",
+            PaletteAction::ToggleForceDark,
         ),
         (
             "Toggle vertical tabs".to_string(),
