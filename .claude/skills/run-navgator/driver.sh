@@ -60,7 +60,9 @@ case "$cmd" in
 
   shot)
     out="${1:-$STATE/shot.png}"
-    ffmpeg -y -f x11grab -video_size "${W}x${H}" -i "${DISP}.0" -frames:v 1 "$out" >/dev/null 2>&1 \
+    # -draw_mouse 0: do NOT capture the X cursor. Xvfb's default cursor is an X shape that sits at
+    # screen-center on launch — without this it shows up as a bogus "✕ glitch" mid-page (see #41).
+    ffmpeg -y -draw_mouse 0 -f x11grab -video_size "${W}x${H}" -i "${DISP}.0" -frames:v 1 "$out" >/dev/null 2>&1 \
       && echo "$out" || { echo "screenshot failed"; exit 1; }
     ;;
 

@@ -71,13 +71,13 @@ its own Xvfb `:99` and the pid it recorded.
   route custom schemes), but **top-level navigation and subresource loads (img, @font-face) DO**.
   Page→native bridges must use an `<img>`/subresource beacon, not fetch.
 - **Servo doesn't dispatch `focusin`/`focus` reliably** — use `click`/`keydown` for field sensors.
-- **A stray ✕ glyph renders dead-center of the viewport on sparse / blank / error pages** (e.g. the
-  new-tab page's empty area, a "Could not load" error page) — fully-painted pages don't show it. A
-  real, reproducible cosmetic glitch (not the mouse cursor), worth its own ticket; ignore it when
-  validating page content.
+- **The X cursor is an ✕ shape and Xvfb parks it at screen-center (640,400) on launch.** `ffmpeg
+  x11grab` captures it by default, so it looks like a "✕ glitch" mid-page on sparse pages (it's
+  absent on pages where you'd clicked into the toolbar, which moved the cursor away — hence the
+  false "only on sparse pages" pattern). The `shot` subcommand grabs with **`-draw_mouse 0`** so the
+  cursor is never captured. It is NOT a NavGator bug (this was mis-filed as #41, then closed).
 - **Software GL prints `libEGL … DRI3` warnings** to nav.log — harmless (llvmpipe fallback). The
   multiprocess + Landlock/seccomp content-process sandbox starts fine under Xvfb.
-- The black ✕ trailing the cursor in screenshots is just the **Xvfb mouse pointer**, not page content.
 
 ## Troubleshooting
 
