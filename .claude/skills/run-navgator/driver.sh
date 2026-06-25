@@ -43,6 +43,11 @@ case "$cmd" in
 
   start)
     url="${1:-gator://welcome}"
+    # ISOLATE the profile: navgator honors XDG_CONFIG_HOME (main.rs:590,782). Point it at a throwaway
+    # dir so test runs never pollute the user's real ~/.config/navgator (history, permissions, session,
+    # passwords). Persisted across runs under $STATE so the app's own state is stable; wipe with `stop`.
+    export XDG_CONFIG_HOME="$STATE/profile"
+    mkdir -p "$XDG_CONFIG_HOME"
     if ! pgrep -f "Xvfb $DISP " >/dev/null 2>&1; then
       setsid Xvfb "$DISP" -screen 0 "${W}x${H}x24" +extension GLX +render -noreset \
         >"$STATE/xvfb.log" 2>&1 < /dev/null &

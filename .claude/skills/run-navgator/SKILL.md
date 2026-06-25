@@ -76,6 +76,11 @@ its own Xvfb `:99` and the pid it recorded.
   absent on pages where you'd clicked into the toolbar, which moved the cursor away — hence the
   false "only on sparse pages" pattern). The `shot` subcommand grabs with **`-draw_mouse 0`** so the
   cursor is never captured. It is NOT a NavGator bug (this was mis-filed as #41, then closed).
+- **Isolated profile.** `start` exports `XDG_CONFIG_HOME=/tmp/navgator-run/profile` so test runs
+  never touch the user's real `~/.config/navgator` (history/permissions/session/passwords). Upshot:
+  the test app starts with a FRESH profile — top-sites show the demo set, not the user's real
+  history, and saved-password/permission state is empty until you seed it in that run. Don't launch
+  `./target/debug/navgator` by hand without this export, or you'll pollute the real profile.
 - **Software GL prints `libEGL … DRI3` warnings** to nav.log — harmless (llvmpipe fallback). The
   multiprocess + Landlock/seccomp content-process sandbox starts fine under Xvfb.
 
