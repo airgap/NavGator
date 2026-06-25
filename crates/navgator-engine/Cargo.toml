@@ -17,11 +17,11 @@ description = "The only navgator crate that touches the Servo fork — quarantin
 # (baked-in-resources, clipboard, js_jit); `media-gstreamer` is added so <video>/<audio>
 # decode via GStreamer (requires libgstreamer1.0-dev + plugins; engine-gap.md Tier-0 #1).
 # The stylo and webrender forks are wired via the workspace-root `[patch]` tables.
-servo = { git = "https://github.com/airgap/swervo", rev = "9dd4a2de20ddd7545e382ec33c50099384a3fe64", features = ["media-gstreamer"] }
+servo = { git = "https://github.com/airgap/swervo", rev = "5e1b7136b1766b1e143cccec5d07e16df8bdc44a", features = ["media-gstreamer"] }
 
 # servo-embedder-traits (lib name `embedder_traits`): EventLoopWaker lives here and
 # isn't re-exported by `servo`. Same rev as `servo`.
-embedder_traits = { git = "https://github.com/airgap/swervo", rev = "9dd4a2de20ddd7545e382ec33c50099384a3fe64", package = "servo-embedder-traits" }
+embedder_traits = { git = "https://github.com/airgap/swervo", rev = "5e1b7136b1766b1e143cccec5d07e16df8bdc44a", package = "servo-embedder-traits" }
 
 # `http` (HeaderMap/StatusCode/HeaderValue) — needed to build WebResourceResponse for the
 # gator:// internal-page interception. Unifies with the engine's own http (servo uses 1.x).
