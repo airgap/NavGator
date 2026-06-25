@@ -2086,6 +2086,9 @@ struct AppState {
     drag_rect: Cell<egui::Rect>,
     /// Frame counter throttling tab-preview thumbnail capture (a glReadPixels is not free).
     thumb_tick: Cell<u32>,
+    /// Frames of forced redraw remaining after a content-size change, so Servo's async reflow of
+    /// the new size gets blitted (otherwise the stale frame persists until the user interacts).
+    resize_settle: Cell<u32>,
     /// The two pane groups. `pane0` is always present; `pane1` is populated only while `split`.
     /// `focused` (0/1) selects which pane the chrome (omnibar, shortcuts, strip) acts on.
     pane0: PaneGroup,
@@ -2916,13 +2919,17 @@ impl AppState {
                 .and_then(|t| t.status_text.clone())
                 .filter(|s| !s.is_empty());
             if let Some(status) = status {
+                // A long hovered-link URL must stay a single truncated line (browser-style), not
+                // wrap into a tall 1-char-wide column. Cap the width to a fraction of the window.
+                let maxw = (ctx.content_rect().width() * 0.6).clamp(240.0, 760.0);
                 egui::Area::new(egui::Id::new("statusbar"))
                     .order(egui::Order::Foreground)
                     .interactable(false)
                     .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(0.0, 0.0))
                     .show(ctx, |ui| {
                         egui::Frame::popup(ui.style()).show(ui, |ui| {
-                            ui.label(status);
+                            ui.set_max_width(maxw);
+                            ui.add(egui::Label::new(status).truncate());
                         });
                     });
             }
@@ -3056,6 +3063,13 @@ impl AppState {
         if egui.egui_ctx.has_requested_repaint() {
             self.window.request_redraw();
         }
+        // Keep the redraw loop alive for a few frames after any content-size change, so Servo's
+        // async reflow of the new viewport is blitted rather than leaving the stale frame on screen.
+        let settle = self.resize_settle.get();
+        if settle > 0 {
+            self.resize_settle.set(settle - 1);
+            self.window.request_redraw();
+        }
     }
 
     /// Render one pane group's active content into `rect`: (re)size its webviews to the rect,
@@ -3072,6 +3086,11 @@ impl AppState {
             for t in self.pane(pane).tabs.borrow().iter() {
                 t.webview.resize(PhysicalSize::new(w, h));
             }
+            // Servo reflows the new size ASYNCHRONOUSLY, and notify_new_frame_ready only fires when
+            // its event loop is pumped — after a resize nothing reliably pumps it, so the stale
+            // (old-size) frame stays on screen until the user interacts. Keep redrawing for a short
+            // settle window so the reflowed frame gets blitted. Covers initial sizing + every resize.
+            self.resize_settle.set(24);
         }
         // An empty pane (its last tab was closed in a split) paints a clean themed blank rather
         // than blitting whatever stale frame is still in its FBO.
@@ -7105,6 +7124,7 @@ fn open_window(
         omni_rect: Cell::new(egui::Rect::ZERO),
         drag_rect: Cell::new(egui::Rect::ZERO),
         thumb_tick: Cell::new(0),
+        resize_settle: Cell::new(0),
         pane0: PaneGroup::new(content_context.clone()),
         pane1: PaneGroup::new(content_context_r),
         split: Cell::new(false),
