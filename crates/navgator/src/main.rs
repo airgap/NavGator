@@ -36,7 +36,8 @@ use euclid::default::{Point2D, Rect, Size2D};
 // Everything from the engine comes through navgator-engine, the only crate that touches
 // the Servo fork (ROADMAP §R2; docs/FORK.md). IPC wire types come from navgator-protocol.
 use navgator_engine::{
-    AuthenticationRequest, ColorPicker, CreateNewWebViewRequest, DevicePoint, EmbedderControl,
+    AuthenticationRequest, ColorPicker, CreateNewWebViewRequest, DeviceIntRect, DeviceIntSize,
+    DevicePoint, EmbedderControl,
     EmbedderControlId, EventLoopWaker, FilePicker, FilterPattern, Image, InputEvent, JSValue, Key,
     KeyState, KeyboardEvent, LoadStatus, MediaSessionEvent, MediaSessionPlaybackState,
     MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
@@ -1720,6 +1721,10 @@ struct Tab {
     /// Whether this tab is currently producing audio (media-session Playing). Audible background
     /// tabs are NOT throttled, so their playlist/auto-advance JS keeps running at full speed.
     audible: Cell<bool>,
+    /// Snapshot-on-switch preview: a downscaled ColorImage captured from the pane FBO while this
+    /// tab was active (pending GPU upload), and its uploaded texture — shown on tab hover.
+    thumb_pending: Option<egui::ColorImage>,
+    thumb_tex: Option<egui::TextureHandle>,
 }
 
 /// One independent pane group: its own tab list, active tab, and offscreen FBO. The browser
@@ -1904,6 +1909,8 @@ struct AppState {
     /// Logical-px rect of the omnibar pill, so the borderless-window drag excludes it (the
     /// omnibar must stay clickable, not move the window).
     omni_rect: Cell<egui::Rect>,
+    /// Frame counter throttling tab-preview thumbnail capture (a glReadPixels is not free).
+    thumb_tick: Cell<u32>,
     /// The two pane groups. `pane0` is always present; `pane1` is populated only while `split`.
     /// `focused` (0/1) selects which pane the chrome (omnibar, shortcuts, strip) acts on.
     pane0: PaneGroup,
@@ -2899,6 +2906,13 @@ impl AppState {
         if let Some(t) = self.pane(pane).tabs.borrow().get(self.pane(pane).active.get()) {
             t.webview.paint();
         }
+        // Snapshot-on-switch: periodically grab the just-painted frame into a downscaled thumbnail
+        // for the tab-hover preview. Throttled — a glReadPixels every frame would stutter.
+        let tick = self.thumb_tick.get().wrapping_add(1);
+        self.thumb_tick.set(tick);
+        if tick % 24 == 0 {
+            self.capture_thumbnail(pane);
+        }
         if let Some(blit) = self.pane(pane).context.render_to_parent_callback() {
             ctx.layer_painter(LayerId::background()).add(PaintCallback {
                 rect,
@@ -2912,6 +2926,78 @@ impl AppState {
                 })),
             });
         }
+    }
+
+    /// Read the pane's just-painted FBO into a downscaled ColorImage and stash it on the pane's
+    /// active tab (uploaded to a texture next frame). Used for the snapshot-on-switch hover preview.
+    fn capture_thumbnail(&self, pane: usize) {
+        let (w, h) = self.pane(pane).content_px.get();
+        if w == 0 || h == 0 {
+            return;
+        }
+        let _ = self.pane(pane).context.make_current();
+        let rect = DeviceIntRect::from_size(DeviceIntSize::new(w as i32, h as i32));
+        let Some(img) = self.pane(pane).context.read_to_image(rect) else {
+            return;
+        };
+        let (sw, sh) = (img.width() as usize, img.height() as usize);
+        let raw = img.as_raw();
+        if sw == 0 || sh == 0 || raw.len() < sw * sh * 4 {
+            return;
+        }
+        // Nearest-neighbour downscale to ~320px wide to bound texture memory.
+        let tw = sw.min(320);
+        let th = ((tw * sh) / sw).max(1);
+        let mut bytes = Vec::with_capacity(tw * th * 4);
+        for ty in 0..th {
+            let sy = ty * sh / th;
+            for tx in 0..tw {
+                let sx = tx * sw / tw;
+                let o = (sy * sw + sx) * 4;
+                bytes.extend_from_slice(&raw[o..o + 4]);
+            }
+        }
+        let ci = egui::ColorImage::from_rgba_unmultiplied([tw, th], &bytes);
+        let active = self.pane(pane).active.get();
+        if let Some(t) = self.pane(pane).tabs.borrow_mut().get_mut(active) {
+            t.thumb_pending = Some(ci);
+        }
+    }
+
+    /// Tab-hover preview: pop the tab's cached snapshot near the hovered tab (below it for the
+    /// horizontal strip, to its right for the vertical strip). No-op until the tab has a snapshot.
+    fn draw_tab_preview(&self, ui: &egui::Ui, tab_idx: usize, anchor: egui::Rect, vertical: bool) {
+        let Some(tex) = self
+            .focused_pane()
+            .tabs
+            .borrow()
+            .get(tab_idx)
+            .and_then(|t| t.thumb_tex.clone())
+        else {
+            return;
+        };
+        let size = tex.size_vec2();
+        if size.x < 1.0 {
+            return;
+        }
+        let w = 240.0;
+        let h = (w * size.y / size.x).max(1.0);
+        let pos = if vertical {
+            egui::pos2(anchor.right() + 8.0, anchor.top())
+        } else {
+            egui::pos2(anchor.left(), anchor.bottom() + 8.0)
+        };
+        egui::Area::new(egui::Id::new(("tab_preview", tab_idx)))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(pos)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                        tex.id(),
+                        egui::vec2(w, h),
+                    )));
+                });
+            });
     }
 
     /// Focused-pane outline + the close-split button, drawn over a split.
@@ -3003,6 +3089,8 @@ impl AppState {
             injected_addons: RefCell::new(Vec::new()),
             blocked: RefCell::new(Vec::new()),
             audible: Cell::new(false),
+            thumb_pending: None,
+            thumb_tex: None,
         });
         self.pane1.active.set(0);
         self.split.set(true);
@@ -3051,6 +3139,8 @@ impl AppState {
                 injected_addons: RefCell::new(Vec::new()),
                 blocked: RefCell::new(Vec::new()),
                 audible: Cell::new(false),
+                thumb_pending: None,
+                thumb_tex: None,
             });
         }
         self.pane1.active.set(0);
@@ -3252,6 +3342,10 @@ impl AppState {
             if let Some(img) = tab.favicon_pending.take() {
                 tab.favicon_tex =
                     Some(ctx.load_texture(format!("favicon-{i}"), img, Default::default()));
+            }
+            if let Some(img) = tab.thumb_pending.take() {
+                tab.thumb_tex =
+                    Some(ctx.load_texture(format!("thumb-{i}"), img, egui::TextureOptions::LINEAR));
             }
         }
     }
@@ -4093,6 +4187,9 @@ impl AppState {
                                     for &i in &order {
                                         let (act, resp) = self.tab_row(ui, i, active, false, fw);
                                         rects.push(resp.rect);
+                                        if resp.hovered() && i != active {
+                                            self.draw_tab_preview(ui, i, resp.rect, false);
+                                        }
                                         if i == active && scroll_active {
                                             resp.scroll_to_me(None);
                                         }
@@ -4138,6 +4235,9 @@ impl AppState {
                     for &i in &order {
                         let (act, resp) = self.tab_row(ui, i, active, true, None);
                         rects.push(resp.rect);
+                        if resp.hovered() && i != active {
+                            self.draw_tab_preview(ui, i, resp.rect, true);
+                        }
                         if i == active && scroll_active {
                             resp.scroll_to_me(None);
                         }
@@ -5306,6 +5406,8 @@ impl AppState {
                 injected_addons: RefCell::new(Vec::new()),
                 blocked: RefCell::new(Vec::new()),
                 audible: Cell::new(false),
+                thumb_pending: None,
+                thumb_tex: None,
             });
             tabs.len() - 1
         };
@@ -6740,6 +6842,7 @@ fn open_window(
         content_left: Cell::new(0.0),
         content_right: Cell::new(0.0),
         omni_rect: Cell::new(egui::Rect::ZERO),
+        thumb_tick: Cell::new(0),
         pane0: PaneGroup::new(content_context.clone()),
         pane1: PaneGroup::new(content_context_r),
         split: Cell::new(false),
