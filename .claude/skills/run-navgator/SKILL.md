@@ -67,6 +67,22 @@ score to `/tmp/navgator-compare/<name>_sidebyside.png` (chrome LEFT, swervo RIGH
 ```
 Read the side-by-side (scale it under 2000px wide first — `ffmpeg -i …_sidebyside.png -vf scale=1600:-1 view.png`) and look for divergences = swervo rendering bugs. Known divergences found this way: CSS Grid collapses to a 1-column stack; button/flex text sits too high (vertical-centering offset); `<select>`/range/checkbox styling differs. Note chrome headless defaults to **dark** mode (prefers-color-scheme) while swervo is light — compare *layout*, not colours.
 
+## Regression suite (run after every swervo rev bump)
+
+`regression.sh` is a **self-reftest** rendering suite: it renders a `test` page and a `ref` page
+that should look identical in swervo and asserts SSIM — so an engine rev that breaks a rendering
+feature makes the test diverge from its reference. No Chrome, no golden images. Plus a colour
+assertion for cases with no shape-equivalent (form-control accent). **Run it after bumping the
+swervo rev in `crates/navgator-engine/Cargo.toml` and rebuilding:**
+```bash
+cargo build -p navgator
+.claude/skills/run-navgator/regression.sh     # exit 0 = all pass, non-zero = a regression
+```
+Covers (each = a landed swervo fix): `mask_circle` / `mask_chevron` (CSS `mask-image`, LYK-1246)
+and `forms_accent` (checkbox/radio accent colour, LYK-1253). **Add a case** by dropping
+`regression/<name>.test.html` + `<name>.ref.html` and adding `<name>` to the SSIM loop, or a
+colour/pixel assertion for a non-shape case (see `forms_accent`).
+
 ## Gotchas (battle scars — all hit on a live run)
 
 - **No window manager under Xvfb**, so a click sets *pointer* focus but not X *input* focus.
