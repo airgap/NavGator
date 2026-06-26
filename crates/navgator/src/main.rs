@@ -1469,6 +1469,10 @@ fn navgator_preferences() -> Preferences {
     p.dom_sanitizer_enabled = true; // HTML Sanitizer API (security pitch)
     p.dom_exec_command_enabled = true; // contenteditable rich-text editing
     p.dom_storage_manager_api_enabled = true; // navigator.storage
+    // CSS Masking: stylo gates mask-* parsing behind `layout.unimplemented`. swervo now paints
+    // mask-image (single-layer alpha mask → display_list mask clip), so opt in to parsing it.
+    // The other layout.unimplemented-gated properties remain parse-only no-ops.
+    p.layout_unimplemented = true; // CSS `mask-image` (monochrome icons: MDN chevrons, etc.)
     p
 }
 
