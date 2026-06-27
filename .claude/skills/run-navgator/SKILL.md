@@ -78,10 +78,38 @@ swervo rev in `crates/navgator-engine/Cargo.toml` and rebuilding:**
 cargo build -p navgator
 .claude/skills/run-navgator/regression.sh     # exit 0 = all pass, non-zero = a regression
 ```
-Covers (each = a landed swervo fix): `mask_circle` / `mask_chevron` (CSS `mask-image`, LYK-1246)
-and `forms_accent` (checkbox/radio accent colour, LYK-1253). **Add a case** by dropping
-`regression/<name>.test.html` + `<name>.ref.html` and adding `<name>` to the SSIM loop, or a
-colour/pixel assertion for a non-shape case (see `forms_accent`).
+Covers (each = a landed swervo fix): `mask_circle` / `mask_chevron` (CSS `mask-image`, LYK-1246),
+`clip_text` (`background-clip:text`, LYK-1296), `grid_cols` (CSS Grid, LYK-1248), `scheme_light`
+(dark mode, LYK-1295) and `forms_accent` (checkbox/radio accent colour, LYK-1253). **Add a case**
+by dropping `regression/<name>.test.html` + `<name>.ref.html` and adding `<name>` to the SSIM loop,
+or a colour/pixel assertion for a non-shape case (see `forms_accent`).
+
+## Record/replay real pages (deterministic fixtures)
+
+`regression.sh` uses synthetic local HTML. To regression-test **real** pages without content drift
+(ads/articles change every load — that's why a live techcrunch SSIMs ~0.47 vs Chrome), NavGator can
+capture a page + all its loader-driven subresources once and replay them **byte-identically,
+offline**. Driven by two env vars read at startup (no flags):
+
+```bash
+# 1. RECORD: fetch + archive the document, CSS, JS, images, fonts to a dir
+NAVGATOR_ARCHIVE_DIR=/path/fixture NAVGATOR_ARCHIVE_MODE=record \
+  ./target/debug/navgator https://news.ycombinator.com/    # under xvfb; let it settle ~12s
+
+# 2. REPLAY: serve only from the archive — no network, fully deterministic
+NAVGATOR_ARCHIVE_DIR=/path/fixture NAVGATOR_ARCHIVE_MODE=replay \
+  ./target/debug/navgator https://news.ycombinator.com/
+```
+
+Two replays of the same archive are pixel-identical (SSIM 1.000). Commit the archive dir as a
+fixture, snapshot one replay as the golden PNG, and SSIM future replays against it to catch engine
+regressions on real layouts. Implementation: `crates/navgator/src/archive.rs` + the `load_web_resource`
+hook in `main.rs`. End-to-end smoke: `.claude/skills/run-navgator/archive-smoke.sh <url>`
+(record → replay×2 → SSIM; asserts replay determinism).
+
+**Limits (v1):** JS-initiated `fetch()`/XHR don't reach the interceptor, so they aren't captured or
+replayed; cache-busting URLs (timestamp/random params) miss on replay. Both are logged to
+`<dir>/misses.txt` (HN homepage: 0 misses). The archive bypasses adblock so the fixture is complete.
 
 ## Gotchas (battle scars — all hit on a live run)
 

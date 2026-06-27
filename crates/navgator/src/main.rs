@@ -52,7 +52,7 @@ use navgator_engine::{
 // `http` types for building the WebResourceResponse served to gator:// internal pages.
 use navgator_engine::http::{
     HeaderMap, HeaderValue, StatusCode,
-    header::{CONTENT_DISPOSITION, CONTENT_TYPE},
+    header::{CONTENT_DISPOSITION, CONTENT_TYPE, HeaderName, USER_AGENT},
 };
 use navgator_protocol::IpcCommand;
 
@@ -65,6 +65,7 @@ mod widgets;
 mod studio;
 mod palette;
 mod userscripts;
+mod archive;
 use url::Url;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
@@ -2137,6 +2138,9 @@ struct AppState {
     ctrl: Cell<bool>,
     shift: Cell<bool>,
     weak_self: RefCell<Weak<AppState>>,
+    /// Record/replay HTTP archive (regression fixtures), active only when `NAVGATOR_ARCHIVE_DIR` +
+    /// `NAVGATOR_ARCHIVE_MODE` are set. `None` = normal live network loading. See [`archive`].
+    archive: Option<archive::ResourceArchive>,
     /// Set when this window's last tab closes; the event loop drops the window next redraw.
     wants_close: Cell<bool>,
     /// Declared last so the GL contexts (which borrow the window) drop before it.
@@ -6519,6 +6523,54 @@ impl WebViewDelegate for AppState {
             intercepted.finish();
             return;
         }
+        // Record/replay archive (deterministic rendering-regression fixtures). When enabled, every
+        // http(s) load is served from / captured to the on-disk archive instead of the live
+        // network — bypassing adblock so a fixture is complete and reproducible. See `archive`.
+        if let Some(arc) = self.archive.as_ref() {
+            if matches!(url.scheme(), "http" | "https") {
+                let method = load.request().method.as_str().to_owned();
+                let user_agent = load
+                    .request()
+                    .headers
+                    .get(USER_AGENT)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                let stored = match arc.mode() {
+                    archive::Mode::Replay => arc.lookup(&method, url.as_str()),
+                    archive::Mode::Record => arc.capture(&method, url.as_str(), user_agent.as_deref()),
+                };
+                match stored {
+                    Some(s) => {
+                        let mut headers = HeaderMap::new();
+                        for (k, v) in &s.headers {
+                            if let (Ok(name), Ok(val)) =
+                                (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v))
+                            {
+                                headers.insert(name, val);
+                            }
+                        }
+                        let response = WebResourceResponse::new(url.clone())
+                            .status_code(StatusCode::from_u16(s.status).unwrap_or(StatusCode::OK))
+                            .headers(headers);
+                        let mut intercepted = load.intercept(response);
+                        if !s.body.is_empty() {
+                            intercepted.send_body_data(s.body);
+                        }
+                        intercepted.finish();
+                    },
+                    None => {
+                        if arc.mode() == archive::Mode::Replay {
+                            arc.note_miss(&method, url.as_str());
+                        }
+                        // Stay offline: fail the load rather than fall through to the network.
+                        let response = WebResourceResponse::new(url.clone())
+                            .status_code(StatusCode::GATEWAY_TIMEOUT);
+                        load.intercept(response).finish();
+                    },
+                }
+                return;
+            }
+        }
         if url.scheme() != "gator" {
             // Ad/tracker blocking. This delegate already intercepts every load, so a matched
             // request is intercepted with an empty 204 instead of being fetched. `source` is the
@@ -7190,6 +7242,7 @@ fn open_window(
         ctrl: Cell::new(false),
         shift: Cell::new(false),
         weak_self: RefCell::new(Weak::new()),
+        archive: archive::ResourceArchive::from_env(),
         wants_close: Cell::new(false),
         window,
     });
