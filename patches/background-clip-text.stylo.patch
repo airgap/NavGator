@@ -1,0 +1,16 @@
+diff --git a/style/properties/longhands.toml b/style/properties/longhands.toml
+index bd8f336d6..979b54287 100644
+--- a/style/properties/longhands.toml
++++ b/style/properties/longhands.toml
+@@ -3614,7 +3614,10 @@ affects = "paint"
+ extra_prefixes = ["webkit"]
+ servo_restyle_damage = "repaint"
+ vector = {}
+-keyword = { values = ["border-box", "padding-box", "content-box"], extra_gecko_values = ["text"], gecko_enum_prefix = "StyleGeometryBox", gecko_inexhaustive = true }
++# `text` is promoted from `extra_gecko_values` into the shared `values` so that the
++# Servo engine also gets a `Clip::Text` variant. This enables `background-clip: text`
++# (clipping a box's background to its descendant text glyphs) in the Servo display list.
++keyword = { values = ["border-box", "padding-box", "content-box", "text"], gecko_enum_prefix = "StyleGeometryBox", gecko_inexhaustive = true }
+ 
+ [background-origin]
+ struct = "background"

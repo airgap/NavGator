@@ -9,19 +9,21 @@ description = "The only navgator crate that touches the Servo fork — quarantin
 [dependencies]
 # ── Servo embedding (our maintained fork; see docs/FORK.md, ROADMAP §R2) ──────
 # This is the ONLY crate that depends on the engine, so engine churn is isolated
-# here. `servo` is the high-level embedding crate. rev 9dd4a2d (branch sandbox-landlock on
+# here. `servo` is the high-level embedding crate. rev c71716a3a (branch sandbox-landlock on
 # airgap/swervo) carries our fork patches: the UA rebrand + Content-Disposition attachment
 # downloads (ParserContext streams to ~/Downloads + Download EmbedderMsg/delegate) + the
-# content sandbox (gaol -> Landlock + seccomp; sandbox_backend.rs, applied in create_sandbox).
+# content sandbox (gaol -> Landlock + seccomp; sandbox_backend.rs, applied in create_sandbox) +
+# CSS mask-image + form-control accent colour + `background-clip: text` (LYK-1296; needs the
+# matching airgap/stylo rev wired via the workspace `[patch]`).
 # DEFAULT features stay on
 # (baked-in-resources, clipboard, js_jit); `media-gstreamer` is added so <video>/<audio>
 # decode via GStreamer (requires libgstreamer1.0-dev + plugins; engine-gap.md Tier-0 #1).
 # The stylo and webrender forks are wired via the workspace-root `[patch]` tables.
-servo = { git = "https://github.com/airgap/swervo", rev = "59e86011ca84636795292c9266142b39285b9d25", features = ["media-gstreamer"] }
+servo = { git = "https://github.com/airgap/swervo", rev = "c71716a3a60272e4a2b6302f1efbc06470674e2a", features = ["media-gstreamer"] }
 
 # servo-embedder-traits (lib name `embedder_traits`): EventLoopWaker lives here and
 # isn't re-exported by `servo`. Same rev as `servo`.
-embedder_traits = { git = "https://github.com/airgap/swervo", rev = "59e86011ca84636795292c9266142b39285b9d25", package = "servo-embedder-traits" }
+embedder_traits = { git = "https://github.com/airgap/swervo", rev = "c71716a3a60272e4a2b6302f1efbc06470674e2a", package = "servo-embedder-traits" }
 
 # `http` (HeaderMap/StatusCode/HeaderValue) — needed to build WebResourceResponse for the
 # gator:// internal-page interception. Unifies with the engine's own http (servo uses 1.x).

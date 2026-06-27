@@ -1,0 +1,18 @@
+<!doctype html><meta charset="utf-8">
+<title>background-clip:text — test</title>
+<style>
+  html, body { margin: 0; background: #fff; }
+  /* A SOLID background clipped to the text glyphs, with the glyph fill made transparent.
+     This must render the same as painting the same text directly in that solid colour
+     (see clip_text.ref.html) — the gradient case is the same machinery with a gradient. */
+  h1 {
+    margin: 0;
+    padding: 30px;
+    font: 800 90px/1.1 sans-serif;
+    background: #e0218a;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+</style>
+<h1>Refund</h1>

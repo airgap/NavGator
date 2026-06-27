@@ -1,0 +1,549 @@
+diff --git a/components/fonts/font.rs b/components/fonts/font.rs
+index f8a39b95ff6..9e2cb79d1a2 100644
+--- a/components/fonts/font.rs
++++ b/components/fonts/font.rs
+@@ -86,6 +86,24 @@ pub const LAST_RESORT_GLYPH_ADVANCE: FractionalPixel = 10.0;
+ // needed by the text shaper as well as access to the underlying font
+ // resources needed by the graphics layer to draw glyphs.
+ 
++/// A single glyph rasterized to an 8-bit alpha coverage bitmap, at the font's instantiated
++/// size. Produced by [`Font::rasterize_glyph`] and used to build the alpha mask for CSS
++/// `background-clip: text`. Positions are in pixels relative to the glyph's pen origin on the
++/// baseline (matching FreeType's `bitmap_left` / `bitmap_top` conventions).
++#[derive(Clone, Debug)]
++pub struct GlyphRaster {
++    /// Horizontal offset (px) from the pen position to the left edge of `coverage`.
++    pub left: i32,
++    /// Vertical offset (px) from the baseline UP to the top edge of `coverage`.
++    pub top: i32,
++    /// Width of the coverage bitmap in pixels.
++    pub width: u32,
++    /// Height of the coverage bitmap in pixels.
++    pub height: u32,
++    /// Row-major, tightly packed (`width * height`) 8-bit alpha coverage.
++    pub coverage: Vec<u8>,
++}
++
+ pub trait PlatformFontMethods: Sized {
+     #[servo_tracing::instrument(name = "PlatformFontMethods::new_from_template", skip_all)]
+     fn new_from_template(
+@@ -143,6 +161,13 @@ pub trait PlatformFontMethods: Sized {
+     fn table_for_tag(&self, _: Tag) -> Option<FontTable>;
+     fn typographic_bounds(&self, _: GlyphId) -> Rect<f32>;
+ 
++    /// Rasterize a single glyph to an 8-bit alpha coverage bitmap at the font's instantiated
++    /// size. Returns `None` if the glyph cannot be rendered as a simple grayscale coverage
++    /// mask (e.g. color/bitmap glyphs), or on any backend that does not implement this yet.
++    fn rasterize_glyph(&self, _glyph: GlyphId) -> Option<GlyphRaster> {
++        None
++    }
++
+     /// Get the necessary [`FontInstanceFlags`]` for this font.
+     fn webrender_font_instance_flags(&self) -> FontInstanceFlags;
+ 
+@@ -602,6 +627,13 @@ impl Font {
+         self.handle.typographic_bounds(glyph_id)
+     }
+ 
++    /// Rasterize a single glyph to an 8-bit alpha coverage bitmap at this font's instantiated
++    /// size. Used to build the alpha mask for CSS `background-clip: text`. See
++    /// [`GlyphRaster`].
++    pub fn rasterize_glyph(&self, glyph_id: GlyphId) -> Option<GlyphRaster> {
++        self.handle.rasterize_glyph(glyph_id)
++    }
++
+     /// Get the [`FontBaseline`] for this font.
+     pub fn baseline(&self) -> Option<FontBaseline> {
+         self.shaper.get_or_init(|| Shaper::new(self)).baseline()
+diff --git a/components/fonts/lib.rs b/components/fonts/lib.rs
+index 6b41d2163be..679af4a502c 100644
+--- a/components/fonts/lib.rs
++++ b/components/fonts/lib.rs
+@@ -17,8 +17,8 @@ pub(crate) use font::*;
+ // These items are not meant to be part of the public API but are used for integration tests
+ pub use font::{Font, FontFamilyDescriptor, FontSearchScope, PlatformFontMethods};
+ pub use font::{
+-    FontBaseline, FontGroup, FontMetrics, FontRef, LAST_RESORT_GLYPH_ADVANCE, ShapingFlags,
+-    ShapingOptions,
++    FontBaseline, FontGroup, FontMetrics, FontRef, GlyphRaster, LAST_RESORT_GLYPH_ADVANCE,
++    ShapingFlags, ShapingOptions,
+ };
+ pub use font_context::{
+     CspViolationHandler, FontContext, FontContextWebFontMethods, NetworkTimingHandler,
+diff --git a/components/fonts/platform/freetype/font.rs b/components/fonts/platform/freetype/font.rs
+index ce49eed3dc1..7a3041e75e4 100644
+--- a/components/fonts/platform/freetype/font.rs
++++ b/components/fonts/platform/freetype/font.rs
+@@ -10,8 +10,8 @@ use euclid::default::{Point2D, Rect, Size2D};
+ use fonts_traits::{FontIdentifier, FontTemplateDescriptor, LocalFontIdentifier};
+ use freetype_sys::{
+     FT_F26Dot6, FT_Get_Char_Index, FT_Get_Kerning, FT_GlyphSlot, FT_KERNING_DEFAULT,
+-    FT_LOAD_DEFAULT, FT_LOAD_NO_HINTING, FT_Load_Glyph, FT_Size_Metrics, FT_SizeRec, FT_UInt,
+-    FT_ULong, FT_Vector,
++    FT_LOAD_DEFAULT, FT_LOAD_NO_HINTING, FT_Load_Glyph, FT_PIXEL_MODE_GRAY, FT_RENDER_MODE_NORMAL,
++    FT_Render_Glyph, FT_Size_Metrics, FT_SizeRec, FT_UInt, FT_ULong, FT_Vector,
+ };
+ use log::debug;
+ use memmap2::Mmap;
+@@ -25,7 +25,9 @@ use webrender_api::{FontInstanceFlags, FontVariation};
+ 
+ use super::library_handle::FreeTypeLibraryHandle;
+ use crate::FontData;
+-use crate::font::{FontMetrics, FontTableMethods, FractionalPixel, PlatformFontMethods};
++use crate::font::{
++    FontMetrics, FontTableMethods, FractionalPixel, GlyphRaster, PlatformFontMethods,
++};
+ use crate::glyph::GlyphId;
+ use crate::platform::freetype::freetype_face::FreeTypeFace;
+ 
+@@ -211,6 +213,87 @@ impl PlatformFontMethods for PlatformFont {
+         Some(fixed_26_dot_6_to_float(advance) * self.unscalable_font_metrics_scale())
+     }
+ 
++    fn rasterize_glyph(&self, glyph: GlyphId) -> Option<GlyphRaster> {
++        let face = self.face.lock();
++
++        // Load the outline (without rendering yet) so we can optionally embolden it first,
++        // mirroring `glyph_h_advance`.
++        let load_flags = face.glyph_load_flags();
++        let result = unsafe { FT_Load_Glyph(face.as_ptr(), glyph as FT_UInt, load_flags) };
++        if result != 0 {
++            debug!("rasterize_glyph: FT_Load_Glyph({glyph}) failed: {result:?}");
++            return None;
++        }
++
++        let slot: FT_GlyphSlot = face.as_ref().glyph;
++        if slot.is_null() {
++            return None;
++        }
++
++        if self.synthetic_bold {
++            mozilla_glyphslot_embolden_less(slot);
++        }
++
++        let result = unsafe { FT_Render_Glyph(slot, FT_RENDER_MODE_NORMAL) };
++        if result != 0 {
++            debug!("rasterize_glyph: FT_Render_Glyph({glyph}) failed: {result:?}");
++            return None;
++        }
++
++        let bitmap = unsafe { &(*slot).bitmap };
++        // We only handle 8-bit grayscale coverage. Color/bitmap glyphs (e.g. emoji) and other
++        // pixel modes are skipped; the caller treats a missing glyph as contributing no
++        // coverage to the mask.
++        if (bitmap.pixel_mode as u32) != (FT_PIXEL_MODE_GRAY as u32) {
++            return None;
++        }
++
++        let left = unsafe { (*slot).bitmap_left };
++        let top = unsafe { (*slot).bitmap_top };
++        let width = bitmap.width as u32;
++        let height = bitmap.rows as u32;
++        if width == 0 || height == 0 {
++            return Some(GlyphRaster {
++                left,
++                top,
++                width: 0,
++                height: 0,
++                coverage: Vec::new(),
++            });
++        }
++
++        // `pitch` is the number of bytes per bitmap row; its sign indicates row order (positive:
++        // top row first, negative: bottom row first).
++        let pitch = bitmap.pitch;
++        let stride = pitch.unsigned_abs() as usize;
++        let row_len = width as usize;
++        let mut coverage = vec![0u8; row_len * height as usize];
++        // SAFETY: while `face` is locked the glyph slot's bitmap buffer is valid for at least
++        // `stride * height` bytes.
++        let src = unsafe {
++            std::slice::from_raw_parts(bitmap.buffer as *const u8, stride * height as usize)
++        };
++        for row in 0..height as usize {
++            let src_row = if pitch >= 0 {
++                row
++            } else {
++                height as usize - 1 - row
++            };
++            let src_start = src_row * stride;
++            let dst_start = row * row_len;
++            coverage[dst_start..dst_start + row_len]
++                .copy_from_slice(&src[src_start..src_start + row_len]);
++        }
++
++        Some(GlyphRaster {
++            left,
++            top,
++            width,
++            height,
++            coverage,
++        })
++    }
++
+     fn metrics(&self) -> FontMetrics {
+         let face = self.face.lock();
+         let font_ref = self.table_provider_data.font_ref();
+diff --git a/components/layout/display_list/background.rs b/components/layout/display_list/background.rs
+index 4c4cd86a104..10e988ae79c 100644
+--- a/components/layout/display_list/background.rs
++++ b/components/layout/display_list/background.rs
+@@ -74,7 +74,10 @@ impl<'a> BackgroundPainter<'a> {
+         match get_cyclic(&background.background_clip.0, layer_index) {
+             Clip::ContentBox => *fragment_builder.content_rect(),
+             Clip::PaddingBox => *fragment_builder.padding_rect(),
+-            Clip::BorderBox => fragment_builder.border_rect,
++            // `background-clip: text` paints the background over the whole border box; the
++            // glyph-shaped clipping is applied separately as an image-mask stacking context
++            // in `BuilderForBoxFragment::build` (see `build_text_clip_chain`).
++            Clip::BorderBox | Clip::Text => fragment_builder.border_rect,
+         }
+     }
+ 
+@@ -104,7 +107,9 @@ impl<'a> BackgroundPainter<'a> {
+             Clip::PaddingBox => {
+                 fragment_builder.padding_edge_clip(builder, state, force_clip_creation)
+             },
+-            Clip::BorderBox => {
++            // `text` clips to the border box rectangularly here; the glyph-shaped image mask
++            // is layered on by `build_text_clip_chain`.
++            Clip::BorderBox | Clip::Text => {
+                 fragment_builder.border_edge_clip(builder, state, force_clip_creation)
+             },
+         }
+diff --git a/components/layout/display_list/mod.rs b/components/layout/display_list/mod.rs
+index 0bcaff03bc6..274748c84ab 100644
+--- a/components/layout/display_list/mod.rs
++++ b/components/layout/display_list/mod.rs
+@@ -9,19 +9,22 @@ use app_units::{AU_PER_PX, Au};
+ use clip::Clip;
+ pub(crate) use clip::ClipId;
+ use euclid::{Box2D, Point2D, Rect, Scale, SideOffsets2D, Size2D, UnknownUnit, Vector2D};
+-use fonts::ShapedTextSlice;
++use fonts::{FontRef, ShapedTextSlice};
+ use gradient::WebRenderGradient;
+ use layout_api::ReflowStatistics;
+ use net_traits::image_cache::Image as CachedImage;
+ use paint_api::display_list::{PaintDisplayListInfo, SpatialTreeNodeInfo};
++use paint_api::{CrossProcessPaintApi, SerializableImageData};
++use pixels::{CorsStatus, ImageFrame, ImageMetadata, PixelFormat, RasterImage};
+ use servo_arc::Arc as ServoArc;
+-use servo_base::id::{PipelineId, ScrollTreeNodeId};
++use servo_base::id::{PipelineId, ScrollTreeNodeId, WebViewId};
+ use servo_config::opts::{DiagnosticsLogging, DiagnosticsLoggingOption};
+ use servo_config::{pref, prefs};
+ use servo_url::ServoUrl;
+ use style::Zero;
+ use style::color::{AbsoluteColor, ColorSpace};
+ use style::computed_values::background_blend_mode::SingleComputedValue as BackgroundBlendMode;
++use style::computed_values::background_clip::single_value::T as BackgroundClip;
+ use style::computed_values::border_image_outset::T as BorderImageOutset;
+ use style::computed_values::mix_blend_mode::T as ComputedMixBlendMode;
+ use style::computed_values::overflow_x::T as ComputedOverflow;
+@@ -119,6 +122,13 @@ pub(crate) struct DisplayListBuilder<'a> {
+     /// An [`ImageResolver`] to use during display list construction.
+     image_resolver: Arc<ImageResolver>,
+ 
++    /// The cross-process paint API, used to upload rasterized images (e.g. the glyph alpha mask
++    /// for `background-clip: text`) and mint their [`wr::ImageKey`]s during display list building.
++    paint_api: CrossProcessPaintApi,
++
++    /// The [`WebViewId`] this display list belongs to, needed to mint image keys.
++    webview_id: WebViewId,
++
+     /// The device pixel ratio used for this `Document`'s display list.
+     device_pixel_ratio: Scale<f32, StyloCSSPixel, StyloDevicePixel>,
+ 
+@@ -173,6 +183,8 @@ impl DisplayListBuilder<'_> {
+         stacking_context_tree: &mut StackingContextTree,
+         fragment_tree: &FragmentTree,
+         image_resolver: Arc<ImageResolver>,
++        paint_api: CrossProcessPaintApi,
++        webview_id: WebViewId,
+         device_pixel_ratio: Scale<f32, StyloCSSPixel, StyloDevicePixel>,
+         highlighted_dom_node: Option<OpaqueNode>,
+         debug: &DiagnosticsLogging,
+@@ -204,6 +216,8 @@ impl DisplayListBuilder<'_> {
+             paint_body_background: true,
+             clip_map: Default::default(),
+             image_resolver,
++            paint_api,
++            webview_id,
+             device_pixel_ratio,
+             paint_timing_handler,
+             reflow_statistics,
+@@ -1532,6 +1546,137 @@ impl<'a> BuilderForBoxFragment<'a> {
+         None
+     }
+ 
++    /// If this box has `background-clip: text` on any background layer, rasterize its descendant
++    /// text glyphs into an alpha-coverage mask (the union of all glyph coverage, sized to the
++    /// border box), upload it as a WebRender image, and build an image-mask clip chain over the
++    /// border box — to be attached to a stacking context that wraps the background paint. Returns
++    /// `None` when there is no text clip, no rasterizable descendant text, or the upload fails.
++    ///
++    /// The mask is rasterized at CSS-pixel resolution (the fonts' instantiated sizes) and
++    /// WebRender upscales it to device pixels, so on HiDPI displays the clipped edges are slightly
++    /// soft. TODO: rasterize at device resolution for crisp HiDPI edges, and cache the image key
++    /// per (node, size) — deleting it on invalidation — instead of minting a new key each build.
++    fn build_text_clip_chain(
++        &self,
++        builder: &mut DisplayListBuilder,
++        state: &TraversalState,
++    ) -> Option<ClipChainId> {
++        let style = self.fragment.style();
++        let background = style.get_background();
++        if !background
++            .background_clip
++            .0
++            .iter()
++            .any(|clip| matches!(clip, BackgroundClip::Text))
++        {
++            return None;
++        }
++
++        // Gather all descendant text glyphs, positioned in absolute layout-pixel space — the same
++        // coordinate space as `self.border_rect` (see `paint_traversal`'s origin accumulation).
++        let children_origin = state.origin + self.fragment.content_rect().origin.to_vector();
++        let mut runs: Vec<(FontRef, Vec<GlyphInstance>)> = Vec::new();
++        collect_clip_text_glyphs(&self.fragment.children, children_origin, &mut runs);
++        if runs.iter().all(|(_, glyphs)| glyphs.is_empty()) {
++            return None;
++        }
++
++        // The mask spans the border box, rasterized at CSS-pixel resolution (clamped to avoid
++        // pathological allocations for very large text-clipped boxes).
++        const MAX_TEXT_CLIP_DIMENSION: i32 = 4096;
++        let origin = self.border_rect.min;
++        let width = (self.border_rect.width().ceil() as i32).clamp(1, MAX_TEXT_CLIP_DIMENSION);
++        let height = (self.border_rect.height().ceil() as i32).clamp(1, MAX_TEXT_CLIP_DIMENSION);
++        let (w, h) = (width as usize, height as usize);
++
++        // Single-channel coverage, max-blending overlapping glyphs.
++        let mut coverage = vec![0u8; w * h];
++        let mut any_coverage = false;
++        for (font, glyphs) in &runs {
++            for glyph in glyphs {
++                let Some(raster) = font.rasterize_glyph(glyph.index) else {
++                    continue;
++                };
++                if raster.width == 0 || raster.height == 0 {
++                    continue;
++                }
++                // Pen position relative to the border-box origin, in CSS px.
++                let pen_x = (glyph.point.x - origin.x).round() as i32;
++                let pen_y = (glyph.point.y - origin.y).round() as i32;
++                let glyph_left = pen_x + raster.left;
++                let glyph_top = pen_y - raster.top;
++                let gw = raster.width as i32;
++                let gh = raster.height as i32;
++                for row in 0..gh {
++                    let ty = glyph_top + row;
++                    if ty < 0 || ty >= height {
++                        continue;
++                    }
++                    for col in 0..gw {
++                        let tx = glyph_left + col;
++                        if tx < 0 || tx >= width {
++                            continue;
++                        }
++                        let src = raster.coverage[(row * gw + col) as usize];
++                        if src == 0 {
++                            continue;
++                        }
++                        let dst = &mut coverage[ty as usize * w + tx as usize];
++                        if src > *dst {
++                            *dst = src;
++                        }
++                        any_coverage = true;
++                    }
++                }
++            }
++        }
++        if !any_coverage {
++            return None;
++        }
++
++        // Expand to premultiplied RGBA. WebRender samples an image-mask's RED channel as coverage;
++        // storing `(c, c, c, c)` (premultiplied white at alpha `c`) makes red == alpha == coverage,
++        // including anti-aliased glyph edges.
++        let mut rgba = Vec::with_capacity(w * h * 4);
++        for &c in &coverage {
++            rgba.extend_from_slice(&[c, c, c, c]);
++        }
++
++        // Upload the mask as a WebRender image and reference it from an image-mask clip.
++        let image_key = builder
++            .paint_api
++            .generate_image_key_blocking(builder.webview_id)?;
++        let byte_len = rgba.len();
++        let raster_image = RasterImage {
++            metadata: ImageMetadata {
++                width: width as u32,
++                height: height as u32,
++            },
++            format: PixelFormat::RGBA8,
++            id: Some(image_key),
++            cors_status: CorsStatus::Safe,
++            bytes: Arc::new(rgba),
++            frames: vec![ImageFrame {
++                delay: None,
++                byte_range: 0..byte_len,
++                width: width as u32,
++                height: height as u32,
++            }],
++            is_opaque: false,
++            loop_count: None,
++        };
++        let (descriptor, data, is_animated) =
++            raster_image.webrender_image_descriptor_and_data_for_frame(0);
++        builder.paint_api.add_image(
++            image_key,
++            descriptor,
++            SerializableImageData::Raw(data),
++            is_animated,
++        );
++
++        Some(builder.add_image_mask_clip(state, image_key, self.border_rect))
++    }
++
+     fn build(&mut self, builder: &mut DisplayListBuilder, state: &TraversalState) {
+         if self
+             .fragment
+@@ -1564,7 +1709,31 @@ impl<'a> BuilderForBoxFragment<'a> {
+             );
+         }
+ 
++        // CSS `background-clip: text` clips ONLY the background to the descendant text glyphs, so
++        // (unlike `mask-image`) its stacking context wraps just the background paint — not the
++        // box-shadow or border. Like the mask, the image-mask clip must be on a stacking-context
++        // surface to be honored.
++        let text_clip_chain = self.build_text_clip_chain(builder, state);
++        if let Some(chain) = text_clip_chain {
++            let spatial_id = builder.spatial_id(state.spatial_id);
++            builder.wr().push_stacking_context(
++                spatial_id,
++                PrimitiveFlags::empty(),
++                Some(chain),
++                webrender_api::TransformStyle::Flat,
++                wr::MixBlendMode::Normal,
++                &[],
++                &[],
++                RasterSpace::Screen,
++                StackingContextFlags::empty(),
++                None,
++            );
++        }
+         self.build_background(builder, state);
++        if text_clip_chain.is_some() {
++            builder.wr().pop_stacking_context();
++        }
++
+         self.build_box_shadow(builder, state);
+         if !self.fragment.is_table_grid_with_collapsed_borders() {
+             self.build_border(builder, state);
+@@ -2309,6 +2478,56 @@ fn rgba(color: AbsoluteColor) -> wr::ColorF {
+     )
+ }
+ 
++/// Recursively walk a box's descendant fragments to collect their text glyphs for a
++/// `background-clip: text` mask, positioned in absolute layout-pixel space. `origin` is the
++/// absolute origin of `children` (i.e. the parent's content-box origin), accumulated exactly as
++/// the paint traversal does (`content_rect().origin` for boxes, `base.rect().origin` for
++/// positioning fragments — see [`paint_traversal::TraversalState`]). Each entry pairs the font
++/// that shaped a run with that run's positioned [`GlyphInstance`]s.
++fn collect_clip_text_glyphs(
++    children: &[Fragment],
++    origin: PhysicalPoint<Au>,
++    out: &mut Vec<(FontRef, Vec<GlyphInstance>)>,
++) {
++    for child in children {
++        match child {
++            Fragment::Box(box_fragment) => {
++                // Descendants that establish their own stacking context are painted in a separate
++                // pass and aren't part of this box's clipped background.
++                if box_fragment.stacking_context_type().is_some() {
++                    continue;
++                }
++                let child_origin = origin + box_fragment.content_rect().origin.to_vector();
++                collect_clip_text_glyphs(&box_fragment.children, child_origin, out);
++            },
++            Fragment::Positioning(positioning_fragment) => {
++                let child_origin = origin + positioning_fragment.base.rect().origin.to_vector();
++                collect_clip_text_glyphs(&positioning_fragment.children, child_origin, out);
++            },
++            Fragment::Text(text_fragment) => {
++                let mut baseline = origin + text_fragment.base.rect().origin.to_vector();
++                baseline.y += text_fragment.font_metrics.ascent;
++                let (positioned, _) = glyphs(
++                    &text_fragment.glyphs,
++                    baseline,
++                    text_fragment.justification_adjustment,
++                    false,
++                );
++                if !positioned.is_empty() {
++                    out.push((text_fragment.font.clone(), positioned));
++                }
++            },
++            // Floats, replaced content, placeholders and nested layout roots don't contribute to
++            // a box's own text-clip mask.
++            Fragment::LayoutRoot(_) |
++            Fragment::Float(_) |
++            Fragment::AbsoluteOrFixedPositionedPlaceholder(_) |
++            Fragment::Image(_) |
++            Fragment::IFrame(_) => {},
++        }
++    }
++}
++
+ fn glyphs(
+     shaped_text_slices: &[Arc<ShapedTextSlice>],
+     mut baseline_origin: PhysicalPoint<Au>,
+diff --git a/components/layout/flow/inline/line.rs b/components/layout/flow/inline/line.rs
+index fd45b8183a0..4a0822a1445 100644
+--- a/components/layout/flow/inline/line.rs
++++ b/components/layout/flow/inline/line.rs
+@@ -612,6 +612,7 @@ impl LineItemLayout<'_, '_> {
+                 selected_style: text_item.inline_styles.selected.clone(),
+                 font_metrics: font_metrics.clone(),
+                 font_key,
++                font: text_item.info.font.clone(),
+                 glyphs: text_item.text,
+                 justification_adjustment: self.justification_adjustment,
+                 offsets: text_item.offsets,
+diff --git a/components/layout/fragment_tree/fragment.rs b/components/layout/fragment_tree/fragment.rs
+index cc71e7ae407..489db48f706 100644
+--- a/components/layout/fragment_tree/fragment.rs
++++ b/components/layout/fragment_tree/fragment.rs
+@@ -7,7 +7,7 @@ use std::sync::Arc;
+ use app_units::Au;
+ use atomic_refcell::AtomicRef;
+ use euclid::{Point2D, Rect, Size2D};
+-use fonts::{FontMetrics, ShapedTextSlice};
++use fonts::{FontMetrics, FontRef, ShapedTextSlice};
+ use layout_api::BoxAreaType;
+ use malloc_size_of_derive::MallocSizeOf;
+ use servo_base::id::PipelineId;
+@@ -93,6 +93,9 @@ pub(crate) struct TextFragment {
+     #[conditional_malloc_size_of]
+     pub font_metrics: Arc<FontMetrics>,
+     pub font_key: FontInstanceKey,
++    /// The font used to shape `glyphs`. Retained so the display-list builder can rasterize the
++    /// glyphs to an alpha coverage mask for `background-clip: text`.
++    pub font: FontRef,
+     #[conditional_malloc_size_of]
+     pub glyphs: Vec<Arc<ShapedTextSlice>>,
+     /// Extra space to add for each justification opportunity.
+diff --git a/components/layout/layout_impl.rs b/components/layout/layout_impl.rs
+index ceae2710808..0638617999f 100644
+--- a/components/layout/layout_impl.rs
++++ b/components/layout/layout_impl.rs
+@@ -1456,6 +1456,8 @@ impl LayoutThread {
+             stacking_context_tree,
+             fragment_tree,
+             image_resolver.clone(),
++            self.paint_api.clone(),
++            self.webview_id,
+             self.device().device_pixel_ratio(),
+             reflow_request.highlighted_dom_node,
+             &self.debug,
