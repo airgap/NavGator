@@ -36,8 +36,8 @@ use euclid::default::{Point2D, Rect, Size2D};
 // Everything from the engine comes through navgator-engine, the only crate that touches
 // the Servo fork (ROADMAP §R2; docs/FORK.md). IPC wire types come from navgator-protocol.
 use navgator_engine::{
-    AuthenticationRequest, ColorPicker, CreateNewWebViewRequest, DeviceIntRect, DeviceIntSize,
-    DevicePoint, EmbedderControl,
+    AuthenticationRequest, ColorPicker, ConsoleLogLevel, CreateNewWebViewRequest, DeviceIntRect,
+    DeviceIntSize, DevicePoint, EmbedderControl,
     EmbedderControlId, EventLoopWaker, FilePicker, FilterPattern, Image, InputEvent, JSValue, Key,
     KeyState, KeyboardEvent, LoadStatus, MediaSessionEvent, MediaSessionPlaybackState,
     MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
@@ -6480,6 +6480,16 @@ impl WebViewDelegate for AppState {
         self.window.request_redraw();
     }
 
+    /// Surface page `console.*` output and uncaught JS exceptions to the terminal — Servo routes
+    /// them here, and the default is a no-op (silently dropped). Gated behind `NAVGATOR_CONSOLE=1`
+    /// so normal runs stay quiet; invaluable for diagnosing why a real site renders wrong (e.g. a
+    /// JS bundle that throws early, leaving scroll-reveal content stuck at `opacity:0`).
+    fn show_console_message(&self, _webview: WebView, level: ConsoleLogLevel, message: String) {
+        if std::env::var_os("NAVGATOR_CONSOLE").is_some() {
+            eprintln!("[page console {level:?}] {message}");
+        }
+    }
+
     /// Serve NavGator's internal `gator://` pages (e.g. `gator://welcome`). Servo asks the
     /// embedder to intercept every resource load *before* it resolves the scheme, so a custom
     /// scheme works here with no engine fork patch and no net-internal ProtocolHandler. Loads
@@ -7284,8 +7294,10 @@ impl ApplicationHandler<WakeUp> for App {
             .preferences(navgator_preferences())
             .opts(Opts {
                 // Process-isolate page content — a crash or exploit in a content process can't
-                // take down the chrome (the security half of the pitch).
-                multiprocess: true,
+                // take down the chrome (the security half of the pitch). Set
+                // `NAVGATOR_SINGLE_PROCESS=1` to run single-process for diagnostics (so page JS
+                // console errors / panics land in the main log instead of a separate content proc).
+                multiprocess: std::env::var_os("NAVGATOR_SINGLE_PROCESS").is_none(),
                 // OS-confine each content process (gaol: user namespace + chroot + seccomp).
                 // Opt-in (see sandbox_enabled): gaol panics unrecoverably where unprivileged
                 // namespaces are denied, which sysctls don't reliably predict.

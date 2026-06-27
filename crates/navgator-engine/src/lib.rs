@@ -40,7 +40,7 @@ pub use servo::{
 // callers and don't need to be named.
 pub use servo::{WebResourceLoad, WebResourceResponse};
 
-pub use embedder_traits::{EventLoopWaker, JSValue, Theme};
+pub use embedder_traits::{ConsoleLogLevel, EventLoopWaker, JSValue, Theme};
 
 // `http` types (HeaderMap/StatusCode/HeaderValue), version-matched to the engine, for building
 // the WebResourceResponse served to gator:// loads.
