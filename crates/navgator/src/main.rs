@@ -1474,6 +1474,11 @@ fn navgator_preferences() -> Preferences {
     // mask-image (single-layer alpha mask → display_list mask clip), so opt in to parsing it.
     // The other layout.unimplemented-gated properties remain parse-only no-ops.
     p.layout_unimplemented = true; // CSS `mask-image` (monochrome icons: MDN chevrons, etc.)
+    // CSS Grid: swervo lays out grid via taffy, but stylo gates `display:grid` parsing behind
+    // `layout.grid.enabled` (default off) — so without this, `display:grid` is dropped as invalid
+    // and the container falls back to `block` (items collapse to a full-width 1-column stack).
+    // The grid layout path itself is fully implemented; this just opts the parser in.
+    p.layout_grid_enabled = true; // CSS Grid (marketing-site hero/card layouts, etc.)
     p
 }
 

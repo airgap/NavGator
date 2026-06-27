@@ -1,0 +1,12 @@
+<!doctype html><meta charset="utf-8"><title>css grid 3-col — test</title>
+<style>
+  html, body { margin: 0; background: #fff; font: 18px sans-serif; }
+  /* A real CSS grid: 3 equal columns. Must match the flexbox-built reference
+     (grid_cols.ref.html) — if grid layout regresses to a block stack, they diverge. */
+  .g { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; padding: 20px; }
+  .c { background: #4a90d9; color: #fff; padding: 26px 0; text-align: center; font-weight: 700; }
+</style>
+<div class="g">
+  <div class="c">1</div><div class="c">2</div><div class="c">3</div>
+  <div class="c">4</div><div class="c">5</div><div class="c">6</div>
+</div>
