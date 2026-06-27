@@ -45,6 +45,7 @@ use navgator_engine::{
     PixelFormat, Preferences, RenderingContext, run_content_process,
     SandboxOutcome, apply_sandbox, content_process_policy,
     RgbColor, SelectElement, SelectElementOptionOrOptgroup, Servo, ServoBuilder, SimpleDialog,
+    Theme as ServoTheme,
     UserContentManager, UserScript, WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder,
     WebViewDelegate, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
 };
@@ -2691,6 +2692,8 @@ impl AppState {
             Some("default") => self.make_default_browser(),
             _ => {}
         }
+        // Re-advertise the page colour-scheme to open tabs in case the dark/theme setting changed.
+        self.apply_page_color_scheme_all();
         // Theme is recomputed from Settings every frame, so a redraw re-themes the chrome.
         self.window.request_redraw();
 
@@ -2845,6 +2848,30 @@ impl AppState {
             .borrow()
             .get(self.focused_pane().active.get())
             .map(|t| t.webview.clone())
+    }
+
+    /// The page colour-scheme (`prefers-color-scheme`) NavGator advertises to sites. It follows
+    /// the chrome theme, so a dark NavGator asks theme-aware sites for their *native* dark theme
+    /// (clean, unlike `force_dark`, which CSS-inverts pages that have no dark theme of their own).
+    fn page_color_scheme(&self) -> ServoTheme {
+        // Use the SAME signal the chrome's egui theme uses (`apply_theme`: `base.is_light()`), so a
+        // page's `prefers-color-scheme` can never disagree with the visible chrome.
+        if self.browser.settings.borrow().theme.base.is_light() {
+            ServoTheme::Light
+        } else {
+            ServoTheme::Dark
+        }
+    }
+
+    /// Push the current page colour-scheme to every open tab (both panes). Called when the chrome
+    /// theme changes so already-loaded theme-aware pages re-render in the new scheme.
+    fn apply_page_color_scheme_all(&self) {
+        let scheme = self.page_color_scheme();
+        for pane in 0..2 {
+            for tab in self.pane(pane).tabs.borrow().iter() {
+                tab.webview.notify_theme_change(scheme);
+            }
+        }
     }
 
     /// Locate a webview across BOTH panes, returning `(pane, tab index)`. Delegate callbacks fire
@@ -6766,6 +6793,10 @@ impl WebViewDelegate for AppState {
     }
 
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
+        // Advertise the page colour-scheme (prefers-color-scheme) at every load phase: the
+        // HeadParsed phase sets it before the body cascades, so a theme-aware page renders in its
+        // native light/dark scheme from the first paint (a notify after the cascade only relayouts).
+        webview.notify_theme_change(self.page_color_scheme());
         if let Some((p, i)) = self.locate_tab(&webview) {
             {
                 let mut tabs = self.pane(p).tabs.borrow_mut();

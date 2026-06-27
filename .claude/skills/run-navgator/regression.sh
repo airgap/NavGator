@@ -36,7 +36,7 @@ render() { # <name> <page.html>  -> /tmp/reg_<name>_c.png (content region, toolb
 ssim() { ffmpeg -i "$1" -i "$2" -lavfi ssim -f null - 2>&1 | grep -oE 'All:[0-9.]+' | tail -1 | cut -d: -f2; }
 
 # --- self-reftests: <name> renders <name>.test.html, compared to <name>.ref.html ---
-for t in mask_circle mask_chevron; do
+for t in mask_circle mask_chevron scheme_light; do
   render "${t}_t" "${t}.test.html"
   render "${t}_r" "${t}.ref.html"
   s=$(ssim "/tmp/reg_${t}_t_c.png" "/tmp/reg_${t}_r_c.png")
