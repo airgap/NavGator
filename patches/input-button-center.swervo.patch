@@ -1,0 +1,76 @@
+diff --git a/components/script/dom/html/input_element/text_value_widget.rs b/components/script/dom/html/input_element/text_value_widget.rs
+index b8186bfe48e..8e53c3f31bc 100644
+--- a/components/script/dom/html/input_element/text_value_widget.rs
++++ b/components/script/dom/html/input_element/text_value_widget.rs
+@@ -4,14 +4,18 @@
+ 
+ use std::cell::Ref;
+ 
++use html5ever::{local_name, ns};
+ use js::context::JSContext;
++use markup5ever::QualName;
+ use script_bindings::cell::DomRefCell;
+ use script_bindings::codegen::GenericBindings::CharacterDataBinding::CharacterDataMethods;
++use script_bindings::codegen::GenericBindings::NodeBinding::NodeMethods;
+ use script_bindings::root::Dom;
++use style::selector_parser::PseudoElement;
+ 
+ use crate::dom::bindings::inheritance::Castable;
+ use crate::dom::characterdata::CharacterData;
+-use crate::dom::element::Element;
++use crate::dom::element::{CustomElementCreationMode, Element, ElementCreator};
+ use crate::dom::htmlinputelement::HTMLInputElement;
+ use crate::dom::node::{Node, NodeTraits};
+ use crate::dom::text::Text;
+@@ -60,8 +64,49 @@ struct TextValueShadowTree {
+ 
+ impl TextValueShadowTree {
+     fn new(cx: &mut JSContext, shadow_root: &Node) -> Self {
+-        let value = Text::new(cx, Default::default(), &shadow_root.owner_document());
+-        Node::replace_all(cx, Some(value.upcast()), shadow_root);
++        let document = shadow_root.owner_document();
++        // Mirror the text-control shadow structure (see text_input_widget.rs): an inner container
++        // (UA CSS: display:flex; height:stretch) holding an inner editor (margin-block:auto;
++        // block-size:fit-content) that wraps the value. This vertically centers the label exactly
++        // like text inputs — height:stretch fills the control and margin:auto centers the editor,
++        // internal to the shadow. A bare text node (or plain wrapper) is NOT centered, because the
++        // host's `inline-flex; align-items:center` does not center UA-shadow content (LYK-1299).
++        let inner_container = Element::create(
++            cx,
++            QualName::new(None, ns!(html), local_name!("div")),
++            None,
++            &document,
++            ElementCreator::ScriptCreated,
++            CustomElementCreationMode::Asynchronous,
++            None,
++        );
++        Node::replace_all(cx, Some(inner_container.upcast()), shadow_root);
++        inner_container
++            .upcast::<Node>()
++            .set_implemented_pseudo_element(PseudoElement::ServoTextControlInnerContainer);
++
++        let inner_editor = Element::create(
++            cx,
++            QualName::new(None, ns!(html), local_name!("div")),
++            None,
++            &document,
++            ElementCreator::ScriptCreated,
++            CustomElementCreationMode::Asynchronous,
++            None,
++        );
++        inner_container
++            .upcast::<Node>()
++            .AppendChild(cx, inner_editor.upcast())
++            .unwrap();
++        inner_editor
++            .upcast::<Node>()
++            .set_implemented_pseudo_element(PseudoElement::ServoTextControlInnerEditor);
++
++        let value = Text::new(cx, Default::default(), &document);
++        inner_editor
++            .upcast::<Node>()
++            .AppendChild(cx, value.upcast())
++            .unwrap();
+         Self {
+             value: value.as_traced(),
+         }

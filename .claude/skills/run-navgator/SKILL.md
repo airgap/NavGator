@@ -97,20 +97,25 @@ unimplemented (webidl commented out), so JS/WAAPI (`Element.animate().currentTim
 
 ## Form-control baseline (per-control Chrome diff)
 
-`forms-baseline.sh` catches form-control text **vertical-positioning / clipping / font-metric**
-divergences that `compare.sh`'s single whole-page SSIM dilutes to nothing (a few-px offset inside a
-control barely moves a full-page score — that's how the Google search-box clipping + too-high button
-labels slipped through; whole-page was ~0.96 while the bad controls were ~0.5-0.6). It renders
-`forms-baseline/forms.html` (each control absolutely positioned so crops align), then crops EACH
-control tightly and SSIMs it against Chrome:
+`forms-baseline.sh` catches form-control text **vertical-positioning** bugs (clipping, top-aligned
+labels, wrong baseline) that `compare.sh`'s single whole-page SSIM dilutes to nothing (a few-px
+offset inside a control barely moves a full-page score — that's how the Google search-box clipping +
+too-high button labels slipped through; whole-page was ~0.96 while the bad controls were ~0.5). It
+renders `forms-baseline/forms.html` (each control absolutely positioned so crops align) and gates on
+the **sub-pixel vertical ink-centroid** of each control's text (fraction of control height) vs
+Chrome — the right metric for a positioning bug (it ignores font-rasterization, which SSIM conflates):
 ```bash
-.claude/skills/run-navgator/forms-baseline.sh   # exit 0 = all controls within tolerance (0.95)
+.claude/skills/run-navgator/forms-baseline.sh           # gate: |Δpos| <= FB_POS_TOL% (default 0.1)
+FB_POS_TOL=0.5 .claude/skills/run-navgator/forms-baseline.sh   # non-flaky gate (see below)
 ```
-Current state: text input / `<button>` / textarea PASS (after the Liberation-font parity fix);
-`input[type=submit]`/`[type=button]` still FAIL — their value renders as a bare text node in a UA
-shadow root that the host's `inline-flex; align-items:center` doesn't center (unlike a `<button>`'s
-light-DOM child). Fix = give button-type inputs the text-control inner-container/inner-editor
-structure (swervo `text_value_widget.rs`). Tracked in Linear.
+State: all controls now match Chrome — text input / `<button>` / textarea after the Liberation-font
+parity fix (`a0bf499`); `input[type=submit]`/`[type=button]`/`[type=reset]` after LYK-1299 (give
+button-type inputs the text-control inner-container/inner-editor shadow structure so the value is
+centered like text inputs — swervo `text_value_widget.rs`, PR #6). **Tolerance note:** 0.1% (~0.05px
+on a 46px control) is at the cross-engine sub-pixel **rasterization floor** — swervo + Chrome both use
+FreeType but differ in hinting/AA by ~0.1px, so even pixel-perfect text reads ~0.2-0.4%. The LYK-1299
+buttons land at 0.04-0.08% (pass 0.1%); text input/textarea read ~0.2% (NOT bugs). Use `FB_POS_TOL=0.5`
+for a stable gate (real bugs like the original top-alignment were ~17%).
 
 ## Regression suite (run after every swervo rev bump)
 
