@@ -166,7 +166,13 @@ pipeline {
                                         sh '''
                                             set -e
                                             [ -f .ci-env ] && set -a && . ./.ci-env && set +a
+                                            # Ensure dav1d is (re)built static-from-source: setting
+                                            # SYSTEM_DEPS_DAV1D_BUILD_INTERNAL does NOT invalidate a dav1d-sys
+                                            # build cached dynamically before the var existed, so bust it once
+                                            # per workspace (marker persists). AVIF; LYK-1297/1298.
+                                            [ -f .dav1d-static-done ] || cargo clean -p dav1d-sys 2>/dev/null || true
                                             cargo build --release --locked --workspace
+                                            touch .dav1d-static-done
                                         '''
                                     } else {
                                         bat 'cargo build --release --locked --workspace'
