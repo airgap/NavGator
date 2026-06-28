@@ -124,11 +124,13 @@ pipeline {
                                         if command -v brew >/dev/null; then
                                             brew list llvm >/dev/null 2>&1 || brew install llvm cmake pkg-config || true
                                             brew list gstreamer >/dev/null 2>&1 || brew install gstreamer || true
-                                            brew list dav1d >/dev/null 2>&1 || brew install dav1d || true   # AVIF decode (image avif-native); LYK-1297 (bundling: LYK-1298)
+                                            # Build tools to compile + STATIC-link dav1d from source (AVIF; no runtime dylib to
+                                            # bundle/sign — LYK-1297/1298). See SYSTEM_DEPS_DAV1D_BUILD_INTERNAL in .ci-env.
+                                            for t in meson ninja nasm; do brew list "$t" >/dev/null 2>&1 || brew install "$t" || true; done
                                             P="$(brew --prefix llvm 2>/dev/null)"
                                             [ -n "$P" ] && { export PATH="$P/bin:$PATH"; LIBCLANG="$P/lib"; }
                                         elif command -v apt-get >/dev/null; then
-                                            sudo -n apt-get update -q && sudo -n apt-get install -y llvm clang libclang-dev cmake pkg-config python3 xvfb libunwind-dev libdav1d-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav || true
+                                            sudo -n apt-get update -q && sudo -n apt-get install -y llvm clang libclang-dev cmake pkg-config python3 xvfb libunwind-dev meson ninja-build nasm libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav || true
                                             LIBCLANG="$(llvm-config --libdir 2>/dev/null || echo /usr/lib/llvm-18/lib)"
                                         fi
                                         # Best-effort appimagetool for the Package stage's AppImage build (Linux only).
@@ -143,7 +145,9 @@ pipeline {
                                             export PATH="$HOME/.local/bin:$PATH"
                                         fi
                                         # Persist PATH (+ LIBCLANG_PATH) for the Build/Test/smoke stages (same workspace).
-                                        { echo "PATH=$PATH"; [ -n "$LIBCLANG" ] && echo "LIBCLANG_PATH=$LIBCLANG"; command -v sccache >/dev/null && echo "RUSTC_WRAPPER=sccache"; } > .ci-env
+                                        # SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always → build dav1d from source and static-link it
+                                        # (no runtime libdav1d to bundle/sign; AVIF decode, LYK-1297/1298). Needs meson/ninja/nasm.
+                                        { echo "PATH=$PATH"; [ -n "$LIBCLANG" ] && echo "LIBCLANG_PATH=$LIBCLANG"; echo "SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always"; command -v sccache >/dev/null && echo "RUSTC_WRAPPER=sccache"; } > .ci-env
                                         rustc --version && cargo --version
                                     '''
                                 } else {
