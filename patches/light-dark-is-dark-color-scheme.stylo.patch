@@ -1,0 +1,35 @@
+diff --git a/style/device/servo.rs b/style/device/servo.rs
+index 7bc1e2c55..7cee494ed 100644
+--- a/style/device/servo.rs
++++ b/style/device/servo.rs
+@@ -303,8 +303,20 @@ impl Device {
+         self.extra.all_pointer_capabilities
+     }
+ 
+-    pub(crate) fn is_dark_color_scheme(&self, _: ColorSchemeFlags) -> bool {
+-        false
++    pub(crate) fn is_dark_color_scheme(&self, color_scheme: ColorSchemeFlags) -> bool {
++        // Resolve the used color scheme (CSS Color Adjust). When the element's `color-scheme`
++        // supports exactly one of light/dark, that one is used; when it supports both (or is
++        // `normal`), fall back to the user/UA preference (`prefers-color-scheme`). Previously this
++        // was a `false` stub, so `light-dark()` and dark system colors always resolved light.
++        let supports_light = color_scheme.contains(ColorSchemeFlags::LIGHT);
++        let supports_dark = color_scheme.contains(ColorSchemeFlags::DARK);
++        if supports_dark && !supports_light {
++            true
++        } else if supports_light && !supports_dark {
++            false
++        } else {
++            self.extra.prefers_color_scheme == PrefersColorScheme::Dark
++        }
+     }
+ 
+     pub(crate) fn system_color(
+@@ -319,7 +331,6 @@ impl Device {
+         // Refer to spec
+         // <https://www.w3.org/TR/css-color-4/#css-system-colors>
+         if self.is_dark_color_scheme(color_scheme_flags) {
+-            // Note: is_dark_color_scheme always returns true, so this code is dead code.
+             match system_color {
+                 SystemColor::Accentcolor => srgb(10, 132, 255),
+                 SystemColor::Accentcolortext => srgb(255, 255, 255),

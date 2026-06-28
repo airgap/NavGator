@@ -1,0 +1,13 @@
+<!doctype html><meta charset="utf-8"><title>light-dark() — test</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; font: 18px sans-serif; }
+  /* With color-scheme:dark, light-dark() must resolve to its DARK value (#1a1a2e / #fff text),
+     matching light_dark.ref.html which sets those directly. If is_dark_color_scheme regresses to
+     the `false` stub, light-dark() picks the light value, the hero turns white, and they diverge
+     (LYK-1250). */
+  .hero { height: 240px; background: light-dark(#ffffff, #1a1a2e);
+          color: light-dark(#1a1a2e, #ffffff);
+          display: flex; align-items: center; justify-content: center; font-weight: 700; }
+</style>
+<div class="hero">dark hero via light-dark()</div>
