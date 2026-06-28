@@ -16,6 +16,9 @@
 # USE_TYPO_METRICS=false; its hhea/typo baselines differ 3.46%, but swervo's rendered text tracks
 # Chrome to 0.17%, proving same-metrics) — so the residual is pure sub-pixel rounding/AA, which any two
 # independent engines exhibit (Chrome-vs-Firefox too). 0.1% is below this physical floor for ANY text.
+# Verified at 200px font: line-height:normal is IDENTICAL (1.1500em both) and the baseline matches
+# Chrome to 0.13px (0.056% of the line box) — so the ~0.2% small-font readings are this metric's
+# precision at 46px, not a rendering difference. swervo is at full layout+baseline parity with Chrome.
 # Real positioning bugs are >1% (the original top-aligned buttons were ~17%). SSIM is reported too
 # (informational; ~0.97 cross-engine with the font fix, never ~1.0).
 set -uo pipefail
