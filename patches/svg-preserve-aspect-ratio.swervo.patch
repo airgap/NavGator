@@ -1,0 +1,43 @@
+diff --git a/components/layout/replaced.rs b/components/layout/replaced.rs
+index 563bd788cff..7d7af8f62ce 100644
+--- a/components/layout/replaced.rs
++++ b/components/layout/replaced.rs
+@@ -596,6 +596,38 @@ impl ReplacedContents {
+                         )
+                         .into(),
+                     );
++                } else {
++                    // The outermost SVG viewport applies `preserveAspectRatio` (default
++                    // `xMidYMid meet`) when mapping its viewBox into the box: the natural aspect
++                    // ratio is scaled uniformly to fit, then centered — it is NOT stretched to
++                    // fill. Without this, an inline `<svg>` whose box was given a different aspect
++                    // ratio than its viewBox by layout (a flex/grid item, `height: 100%`, etc.)
++                    // rendered distorted — e.g. the vertically-stretched clear "X" in Google's
++                    // search box. We honor `meet` by fitting+centering the rasterized content rect.
++                    // FIXME: honor a non-default `preserveAspectRatio` (`none`, `slice`, alignment).
++                    let box_rect = base.rect();
++                    let natural_width = vector_image.metadata.width as f32;
++                    let natural_height = vector_image.metadata.height as f32;
++                    if natural_width > 0.0 && natural_height > 0.0 {
++                        let box_width = box_rect.size.width.to_f32_px();
++                        let box_height = box_rect.size.height.to_f32_px();
++                        let fit_scale =
++                            (box_width / natural_width).min(box_height / natural_height);
++                        let fitted_width = natural_width * fit_scale;
++                        let fitted_height = natural_height * fit_scale;
++                        base.set_rect(PhysicalRect::new(
++                            PhysicalPoint::new(
++                                box_rect.origin.x +
++                                    Au::from_f32_px((box_width - fitted_width) / 2.0),
++                                box_rect.origin.y +
++                                    Au::from_f32_px((box_height - fitted_height) / 2.0),
++                            ),
++                            PhysicalSize::new(
++                                Au::from_f32_px(fitted_width),
++                                Au::from_f32_px(fitted_height),
++                            ),
++                        ));
++                    }
+                 }
+ 
+                 let scale = layout_context.style_context.device_pixel_ratio();

@@ -15,16 +15,18 @@ description = "The only navgator crate that touches the Servo fork — quarantin
 # content sandbox (gaol -> Landlock + seccomp; sandbox_backend.rs, applied in create_sandbox) +
 # CSS mask-image + form-control accent colour + `background-clip: text` (LYK-1296; needs the
 # matching airgap/stylo rev wired via the workspace `[patch]`) + AVIF decode (LYK-1297; the
-# image `avif-native` feature in swervo's own Cargo.toml pulls in dav1d — build needs libdav1d).
+# image `avif-native` feature in swervo's own Cargo.toml pulls in dav1d — build needs libdav1d) +
+# inline-<svg> preserveAspectRatio `meet` (LYK-1300; fixes the vertically-stretched clear "X" in
+# Google's search box — inline SVGs were rasterized stretched-to-fill instead of fit+centered).
 # DEFAULT features stay on
 # (baked-in-resources, clipboard, js_jit); `media-gstreamer` is added so <video>/<audio>
 # decode via GStreamer (requires libgstreamer1.0-dev + plugins; engine-gap.md Tier-0 #1).
 # The stylo and webrender forks are wired via the workspace-root `[patch]` tables.
-servo = { git = "https://github.com/airgap/swervo", rev = "5a4aa9ca1ff7c30d2b83667b423eea012b80b2eb", features = ["media-gstreamer"] }
+servo = { git = "https://github.com/airgap/swervo", rev = "dcf34ff42ca0ea5411ad312277a24049ed9e4bd2", features = ["media-gstreamer"] }
 
 # servo-embedder-traits (lib name `embedder_traits`): EventLoopWaker lives here and
 # isn't re-exported by `servo`. Same rev as `servo`.
-embedder_traits = { git = "https://github.com/airgap/swervo", rev = "5a4aa9ca1ff7c30d2b83667b423eea012b80b2eb", package = "servo-embedder-traits" }
+embedder_traits = { git = "https://github.com/airgap/swervo", rev = "dcf34ff42ca0ea5411ad312277a24049ed9e4bd2", package = "servo-embedder-traits" }
 
 # `http` (HeaderMap/StatusCode/HeaderValue) — needed to build WebResourceResponse for the
 # gator:// internal-page interception. Unifies with the engine's own http (servo uses 1.x).

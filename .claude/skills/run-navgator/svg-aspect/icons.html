@@ -1,0 +1,34 @@
+<!doctype html><meta charset="utf-8"><title>svg aspect-ratio baseline</title>
+<!--
+  Regression fixture for inline-<svg> preserveAspectRatio (default xMidYMid meet) — LYK-1300.
+  Each icon has a SQUARE viewBox (0 0 24 24) and a pinned 24px MAIN axis, but layout stretches the
+  CROSS axis (flex align-items:stretch / height:100%) so the box becomes non-square. Per `meet`,
+  the glyph must render square + centered; the bug rasterized the viewBox to FILL the box, so it
+  distorted (this is exactly what vertically stretched Google's search-box clear "X").
+  forms-baseline.sh never caught it — it only renders form controls, never an inline <svg>.
+  The gate (svg-aspect.sh) asserts each rendered glyph's ink bbox stays ~square.
+  Positions/sizes are shared with the measurement script — do not reflow.
+-->
+<style>
+ html,body{margin:0;background:#fff}
+ .c{position:absolute}
+ .stretch{display:flex;align-items:stretch;height:60px;width:24px} /* tall box, cross=height stretches */
+ svg{fill:#222}
+</style>
+<!-- close "X" (the exact Material glyph from Google's clear button) -->
+<!-- A: width:24px pinned, height stretched by align-items:stretch -->
+<div class="c" style="left:20px;top:20px"><div class="stretch">
+  <svg style="width:24px" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+</div></div>
+<!-- B: width:24px + explicit height:100% of the 60px box -->
+<div class="c" style="left:80px;top:20px"><div class="stretch">
+  <svg style="width:24px;height:100%" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+</div></div>
+<!-- C: a filled disc — distortion shows as an ellipse; width pinned, height stretched -->
+<div class="c" style="left:140px;top:20px"><div class="stretch">
+  <svg style="width:24px" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></svg>
+</div></div>
+<!-- D: control — square box, square icon, must be unchanged/square -->
+<div class="c" style="left:220px;top:20px"><div style="display:flex;align-items:center;justify-content:center;width:60px;height:60px">
+  <svg style="width:40px" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20"/></svg>
+</div></div>
