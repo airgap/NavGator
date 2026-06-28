@@ -95,6 +95,23 @@ specific animation. Covers `@keyframes` easing/transform/colour/opacity/fill-mod
 unimplemented (webidl commented out), so JS/WAAPI (`Element.animate().currentTime=…`) and literal
 `transition` runs can't be statically seeked — those need wall-clock sampling or a swervo WAAPI fix.
 
+## Form-control baseline (per-control Chrome diff)
+
+`forms-baseline.sh` catches form-control text **vertical-positioning / clipping / font-metric**
+divergences that `compare.sh`'s single whole-page SSIM dilutes to nothing (a few-px offset inside a
+control barely moves a full-page score — that's how the Google search-box clipping + too-high button
+labels slipped through; whole-page was ~0.96 while the bad controls were ~0.5-0.6). It renders
+`forms-baseline/forms.html` (each control absolutely positioned so crops align), then crops EACH
+control tightly and SSIMs it against Chrome:
+```bash
+.claude/skills/run-navgator/forms-baseline.sh   # exit 0 = all controls within tolerance (0.95)
+```
+Current state: text input / `<button>` / textarea PASS (after the Liberation-font parity fix);
+`input[type=submit]`/`[type=button]` still FAIL — their value renders as a bare text node in a UA
+shadow root that the host's `inline-flex; align-items:center` doesn't center (unlike a `<button>`'s
+light-DOM child). Fix = give button-type inputs the text-control inner-container/inner-editor
+structure (swervo `text_value_widget.rs`). Tracked in Linear.
+
 ## Regression suite (run after every swervo rev bump)
 
 `regression.sh` is a **self-reftest** rendering suite: it renders a `test` page and a `ref` page
