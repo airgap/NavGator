@@ -1,0 +1,82 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 847ac79a4be..ff4bc525791 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -131,7 +131,7 @@ hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "ht
+ icu_locid = "1.5.0"
+ icu_properties = "1.5.0"
+ icu_segmenter = "1.5.0"
+-image = { version = "0.25", default-features = false, features = ["avif", "bmp", "gif", "ico", "jpeg", "png", "rayon", "webp"] }
++image = { version = "0.25", default-features = false, features = ["avif", "avif-native", "bmp", "gif", "ico", "jpeg", "png", "rayon", "webp"] }
+ imsz = "0.4"
+ indexmap = { version = "2.14.0", features = ["std"] }
+ inventory = "0.3.24"
+diff --git a/components/pixels/lib.rs b/components/pixels/lib.rs
+index 9d78052bba2..ea9912792d0 100644
+--- a/components/pixels/lib.rs
++++ b/components/pixels/lib.rs
+@@ -13,7 +13,7 @@ use std::time::Duration;
+ use std::{cmp, fmt, vec};
+ 
+ use euclid::default::{Point2D, Rect, Size2D};
+-use image::codecs::{bmp, gif, ico, jpeg, png, webp};
++use image::codecs::{avif, bmp, gif, ico, jpeg, png, webp};
+ use image::error::ImageFormatHint;
+ use image::imageops::{self, FilterType};
+ use image::metadata::LoopCount;
+@@ -577,6 +577,9 @@ pub fn load_from_memory(buffer: &[u8], cors_status: CorsStatus) -> Option<Raster
+                 GenericImageDecoder::Ico(image_decoder) => {
+                     decode_static_image(cors_status, *image_decoder)
+                 },
++                GenericImageDecoder::Avif(image_decoder) => {
++                    decode_static_image(cors_status, *image_decoder)
++                },
+             }
+         },
+     }
+@@ -592,6 +595,8 @@ pub fn detect_image_format(buffer: &[u8]) -> Result<ImageFormat, &str> {
+         Ok(ImageFormat::Png)
+     } else if is_webp(buffer) {
+         Ok(ImageFormat::WebP)
++    } else if is_avif(buffer) {
++        Ok(ImageFormat::Avif)
+     } else if is_bmp(buffer) {
+         Ok(ImageFormat::Bmp)
+     } else if is_ico(buffer) {
+@@ -733,6 +738,20 @@ fn is_webp(buffer: &[u8]) -> bool {
+     buffer[8..].len() >= len && &buffer[8..12] == b"WEBP"
+ }
+ 
++fn is_avif(buffer: &[u8]) -> bool {
++    // AVIF is ISOBMFF: [4-byte big-endian box size][b"ftyp"][major brand][minor version]
++    // [compatible brands…]. Files carry the "avif" (still) or "avis" (sequence) brand as the
++    // major or a compatible brand; scan the `ftyp` box's brand list for either.
++    if buffer.len() < 12 || &buffer[4..8] != b"ftyp" {
++        return false;
++    }
++    let box_size = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
++    let end = box_size.clamp(12, buffer.len());
++    buffer[8..end]
++        .windows(4)
++        .any(|brand| brand == b"avif" || brand == b"avis")
++}
++
+ enum GenericImageDecoder<R: std::io::BufRead + std::io::Seek> {
+     Png(Box<png::PngDecoder<R>>),
+     Gif(Box<gif::GifDecoder<R>>),
+@@ -740,6 +759,7 @@ enum GenericImageDecoder<R: std::io::BufRead + std::io::Seek> {
+     Jpeg(Box<jpeg::JpegDecoder<R>>),
+     Bmp(Box<bmp::BmpDecoder<R>>),
+     Ico(Box<ico::IcoDecoder<R>>),
++    Avif(Box<avif::AvifDecoder<R>>),
+ }
+ 
+ fn make_decoder(
+@@ -757,6 +777,7 @@ fn make_decoder(
+         ImageFormat::Jpeg => GenericImageDecoder::Jpeg(Box::new(jpeg::JpegDecoder::new(reader)?)),
+         ImageFormat::Bmp => GenericImageDecoder::Bmp(Box::new(bmp::BmpDecoder::new(reader)?)),
+         ImageFormat::Ico => GenericImageDecoder::Ico(Box::new(ico::IcoDecoder::new(reader)?)),
++        ImageFormat::Avif => GenericImageDecoder::Avif(Box::new(avif::AvifDecoder::new(reader)?)),
+         _ => {
+             return Err(ImageError::Unsupported(
+                 ImageFormatHint::Exact(format).into(),

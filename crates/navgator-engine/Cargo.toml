@@ -9,21 +9,22 @@ description = "The only navgator crate that touches the Servo fork — quarantin
 [dependencies]
 # ── Servo embedding (our maintained fork; see docs/FORK.md, ROADMAP §R2) ──────
 # This is the ONLY crate that depends on the engine, so engine churn is isolated
-# here. `servo` is the high-level embedding crate. rev c71716a3a (branch sandbox-landlock on
+# here. `servo` is the high-level embedding crate. rev 2c71c0e7d (branch sandbox-landlock on
 # airgap/swervo) carries our fork patches: the UA rebrand + Content-Disposition attachment
 # downloads (ParserContext streams to ~/Downloads + Download EmbedderMsg/delegate) + the
 # content sandbox (gaol -> Landlock + seccomp; sandbox_backend.rs, applied in create_sandbox) +
 # CSS mask-image + form-control accent colour + `background-clip: text` (LYK-1296; needs the
-# matching airgap/stylo rev wired via the workspace `[patch]`).
+# matching airgap/stylo rev wired via the workspace `[patch]`) + AVIF decode (LYK-1297; the
+# image `avif-native` feature in swervo's own Cargo.toml pulls in dav1d — build needs libdav1d).
 # DEFAULT features stay on
 # (baked-in-resources, clipboard, js_jit); `media-gstreamer` is added so <video>/<audio>
 # decode via GStreamer (requires libgstreamer1.0-dev + plugins; engine-gap.md Tier-0 #1).
 # The stylo and webrender forks are wired via the workspace-root `[patch]` tables.
-servo = { git = "https://github.com/airgap/swervo", rev = "c71716a3a60272e4a2b6302f1efbc06470674e2a", features = ["media-gstreamer"] }
+servo = { git = "https://github.com/airgap/swervo", rev = "2c71c0e7d5fcfd19876e0dfb35fa0ddf14943763", features = ["media-gstreamer"] }
 
 # servo-embedder-traits (lib name `embedder_traits`): EventLoopWaker lives here and
 # isn't re-exported by `servo`. Same rev as `servo`.
-embedder_traits = { git = "https://github.com/airgap/swervo", rev = "c71716a3a60272e4a2b6302f1efbc06470674e2a", package = "servo-embedder-traits" }
+embedder_traits = { git = "https://github.com/airgap/swervo", rev = "2c71c0e7d5fcfd19876e0dfb35fa0ddf14943763", package = "servo-embedder-traits" }
 
 # `http` (HeaderMap/StatusCode/HeaderValue) — needed to build WebResourceResponse for the
 # gator:// internal-page interception. Unifies with the engine's own http (servo uses 1.x).

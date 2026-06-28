@@ -25,6 +25,13 @@ and the **gitignored `.cargo/config.toml` libclang pin**. If `cargo build` fails
 pin is missing — see the `navgator-build-env` memory. A from-scratch Servo build is huge; here it's
 incremental.
 
+Build-time native libs (the engine links them): GStreamer (`libgstreamer1.0-dev` + plugins, for
+`<video>`/`<audio>`) and **`libdav1d-dev`** (for AVIF image decode — the image crate's `avif-native`
+feature; if `cargo build` fails in `dav1d-sys`/pkg-config, install it). On a clean box:
+```bash
+apt-get install -y libdav1d-dev libgstreamer1.0-dev gstreamer1.0-plugins-{base,good,bad,ugly}
+```
+
 ## Run (agent path) — use the driver
 
 ```bash
