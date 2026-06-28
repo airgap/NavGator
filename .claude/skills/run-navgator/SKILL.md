@@ -76,6 +76,25 @@ score to `/tmp/navgator-compare/<name>_sidebyside.png` (chrome LEFT, swervo RIGH
 ```
 Read the side-by-side (scale it under 2000px wide first — `ffmpeg -i …_sidebyside.png -vf scale=1600:-1 view.png`) and look for divergences = swervo rendering bugs. Known divergences found this way: CSS Grid collapses to a 1-column stack; button/flex text sits too high (vertical-centering offset); `<select>`/range/checkbox styling differs. Note chrome headless defaults to **dark** mode (prefers-color-scheme) while swervo is light — compare *layout*, not colours.
 
+## Baseline animations against Chrome (phase sampling)
+
+`animbase.sh [page] [duration_ms]` baselines a **CSS animation** against Chrome at phase samples
+`-5 -1 0 1 5 25 50 75 95 99 100 101 105 %` of the duration, **deterministically** — no wall-clock
+race. The trick: `animbase/seek.html?t=<ms>&d=<ms>` freezes the animation at time `t` via a *paused*
+animation with `animation-delay: -t` (a paused animation with negative delay renders the static
+frame at that offset). Negative % → positive delay → before-phase; >100% → after-phase — both
+exercise `animation-fill-mode`. Each frozen frame is captured in chrome (`--screenshot`) and swervo
+(driver `nav`+`shot`), SSIM'd, and stacked into a contact sheet (chrome LEFT, swervo RIGHT per row):
+```bash
+.claude/skills/run-navgator/animbase.sh seek.html 1000
+# per-phase SSIM table + /tmp/anim-base/contact.png (13 rows: before-phase -> eased transit -> after-phase)
+```
+Point it at your own page (under `animbase/`, reading `?t`&`?d` like `seek.html`) to baseline a
+specific animation. Covers `@keyframes` easing/transform/colour/opacity/fill-mode interpolation.
+**Limitation:** swervo's `Animation` WAAPI interface (currentTime/pause) and `getAnimations()` are
+unimplemented (webidl commented out), so JS/WAAPI (`Element.animate().currentTime=…`) and literal
+`transition` runs can't be statically seeked — those need wall-clock sampling or a swervo WAAPI fix.
+
 ## Regression suite (run after every swervo rev bump)
 
 `regression.sh` is a **self-reftest** rendering suite: it renders a `test` page and a `ref` page

@@ -1,0 +1,34 @@
+<!doctype html><meta charset="utf-8"><title>anim seek</title>
+<!--
+  Deterministic animation-frame sampler. `?t=<ms>&d=<ms>` freezes a CSS animation at time `t` of a
+  duration-`d` run by PAUSING it with a negative `animation-delay` (= -t): a paused animation with a
+  negative delay renders the static frame at that offset, with no wall-clock timing. t<0 (positive
+  delay) shows the before-phase; t>d shows the after-phase — both governed by animation-fill-mode.
+  The box interpolates transform (translate+scale+rotate), background-color and opacity under a
+  cubic-bezier easing, so mid samples expose easing-curve / interpolation divergence vs Chrome.
+-->
+<style>
+  html, body { margin: 0; background: #fff; }
+  #stage { position: relative; height: 300px; }
+  #box {
+    position: absolute; top: 90px; left: 40px; width: 120px; height: 120px; border-radius: 14px;
+    background: #1565c0; opacity: .25;
+    animation-name: move; animation-duration: 1000ms;
+    animation-timing-function: cubic-bezier(.22, 1, .36, 1);
+    animation-fill-mode: both; animation-iteration-count: 1; animation-play-state: paused;
+  }
+  @keyframes move {
+    from { transform: translateX(0)     scale(1)   rotate(0deg);   background: #1565c0; opacity: .25; }
+    to   { transform: translateX(1000px) scale(1.6) rotate(180deg); background: #e53935; opacity: 1;  }
+  }
+</style>
+<div id="stage"><div id="box"></div></div>
+<script>
+  const q = new URLSearchParams(location.search);
+  const t = parseFloat(q.get('t') || '0');
+  const d = parseFloat(q.get('d') || '1000');
+  const b = document.getElementById('box');
+  b.style.animationDuration = d + 'ms';
+  b.style.animationDelay = (-t) + 'ms';   // negative delay seeks INTO the active interval
+  b.style.animationPlayState = 'paused';  // ...and pause so the frame is static
+</script>
