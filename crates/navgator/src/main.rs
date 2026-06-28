@@ -36,7 +36,7 @@ use euclid::default::{Point2D, Rect, Size2D};
 // Everything from the engine comes through navgator-engine, the only crate that touches
 // the Servo fork (ROADMAP §R2; docs/FORK.md). IPC wire types come from navgator-protocol.
 use navgator_engine::{
-    AuthenticationRequest, ColorPicker, ConsoleLogLevel, CreateNewWebViewRequest, DeviceIntRect,
+    AuthenticationRequest, ColorPicker, ConsoleLogLevel, CreateNewWebViewRequest, Cursor, DeviceIntRect,
     DeviceIntSize, DevicePoint, EmbedderControl,
     EmbedderControlId, EventLoopWaker, FilePicker, FilterPattern, Image, InputEvent, JSValue, Key,
     KeyState, KeyboardEvent, LoadStatus, MediaSessionEvent, MediaSessionPlaybackState,
@@ -1657,6 +1657,48 @@ fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
     }
 }
 
+/// Map a swervo CSS `cursor` keyword to the winit window cursor. The variant names match
+/// `cursor-icon` one-to-one (both follow the CSS `cursor` set); `None` (`cursor: none`) has no
+/// winit icon, so it falls back to the default arrow rather than hiding the pointer.
+fn map_cursor(c: Cursor) -> CursorIcon {
+    match c {
+        Cursor::None | Cursor::Default => CursorIcon::Default,
+        Cursor::Pointer => CursorIcon::Pointer,
+        Cursor::ContextMenu => CursorIcon::ContextMenu,
+        Cursor::Help => CursorIcon::Help,
+        Cursor::Progress => CursorIcon::Progress,
+        Cursor::Wait => CursorIcon::Wait,
+        Cursor::Cell => CursorIcon::Cell,
+        Cursor::Crosshair => CursorIcon::Crosshair,
+        Cursor::Text => CursorIcon::Text,
+        Cursor::VerticalText => CursorIcon::VerticalText,
+        Cursor::Alias => CursorIcon::Alias,
+        Cursor::Copy => CursorIcon::Copy,
+        Cursor::Move => CursorIcon::Move,
+        Cursor::NoDrop => CursorIcon::NoDrop,
+        Cursor::NotAllowed => CursorIcon::NotAllowed,
+        Cursor::Grab => CursorIcon::Grab,
+        Cursor::Grabbing => CursorIcon::Grabbing,
+        Cursor::EResize => CursorIcon::EResize,
+        Cursor::NResize => CursorIcon::NResize,
+        Cursor::NeResize => CursorIcon::NeResize,
+        Cursor::NwResize => CursorIcon::NwResize,
+        Cursor::SResize => CursorIcon::SResize,
+        Cursor::SeResize => CursorIcon::SeResize,
+        Cursor::SwResize => CursorIcon::SwResize,
+        Cursor::WResize => CursorIcon::WResize,
+        Cursor::EwResize => CursorIcon::EwResize,
+        Cursor::NsResize => CursorIcon::NsResize,
+        Cursor::NeswResize => CursorIcon::NeswResize,
+        Cursor::NwseResize => CursorIcon::NwseResize,
+        Cursor::ColResize => CursorIcon::ColResize,
+        Cursor::RowResize => CursorIcon::RowResize,
+        Cursor::AllScroll => CursorIcon::AllScroll,
+        Cursor::ZoomIn => CursorIcon::ZoomIn,
+        Cursor::ZoomOut => CursorIcon::ZoomOut,
+    }
+}
+
 /// Escape a string into a JS double-quoted string literal.
 /// Autofill JS: fill a login form's username + password. Called as `(AUTOFILL_JS)(u, p)`.
 const AUTOFILL_JS: &str = r#"function(u,p){
@@ -2135,6 +2177,10 @@ struct AppState {
     fullscreen: Cell<bool>,
     scale: Cell<f64>,
     cursor: Cell<(f64, f64)>,
+    /// The CSS cursor the page wants under the pointer (from `notify_cursor_changed`); applied to
+    /// the window while the pointer is over a page area (not the chrome). LYK-style: link→Pointer,
+    /// text→Text, etc.
+    page_cursor: Cell<CursorIcon>,
     ctrl: Cell<bool>,
     shift: Cell<bool>,
     weak_self: RefCell<Weak<AppState>>,
@@ -6473,11 +6519,34 @@ impl AppState {
     fn content_right_dev(&self) -> f64 {
         self.content_right.get() as f64 * self.scale.get()
     }
+
+    /// Whether the pointer (last known position) is over a page area — below the toolbar, right of
+    /// the vertical-tabs panel, left of the Studio panel. Used to decide whether the page's CSS
+    /// cursor (vs the egui chrome's own) should be shown.
+    fn over_page_area(&self) -> bool {
+        let (cx, cy) = self.cursor.get();
+        let win_w = self.window.inner_size().width as f64;
+        cy >= self.toolbar_dev()
+            && cx >= self.content_left_dev()
+            && cx <= win_w - self.content_right_dev()
+    }
 }
 
 impl WebViewDelegate for AppState {
     fn notify_new_frame_ready(&self, _webview: WebView) {
         self.window.request_redraw();
+    }
+
+    /// The page changed the CSS cursor under the pointer (e.g. a link → pointer, text → I-beam).
+    /// Store it for the move handler to keep applying, and — since swervo only emits this while the
+    /// pointer is over a page — apply it now too (handles a cursor change under a stationary
+    /// pointer, e.g. a hover state or JS that swaps the element).
+    fn notify_cursor_changed(&self, _webview: WebView, cursor: Cursor) {
+        let icon = map_cursor(cursor);
+        self.page_cursor.set(icon);
+        if self.over_page_area() {
+            self.window.set_cursor(icon);
+        }
     }
 
     /// Surface page `console.*` output and uncaught JS exceptions to the terminal — Servo routes
@@ -7249,6 +7318,7 @@ fn open_window(
         fullscreen: Cell::new(false),
         scale: Cell::new(scale),
         cursor: Cell::new((0.0, 0.0)),
+        page_cursor: Cell::new(CursorIcon::Default),
         ctrl: Cell::new(false),
         shift: Cell::new(false),
         weak_self: RefCell::new(Weak::new()),
@@ -7487,6 +7557,10 @@ impl ApplicationHandler<WakeUp> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 match state.resize_direction_at(position.x, position.y) {
                     Some(dir) => state.window.set_cursor(resize_cursor(dir)),
+                    // Over a page, keep showing the page's CSS cursor (swervo only re-emits it when
+                    // the hovered element's cursor changes, so moving within one element must not
+                    // reset it to the default arrow). Over the chrome, egui owns the cursor.
+                    None if !over_chrome => state.window.set_cursor(state.page_cursor.get()),
                     None => state.window.set_cursor(CursorIcon::Default),
                 }
                 let foc = state.focused.get();
