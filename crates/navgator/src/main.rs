@@ -1480,6 +1480,20 @@ fn navgator_preferences() -> Preferences {
     // and the container falls back to `block` (items collapse to a full-width 1-column stack).
     // The grid layout path itself is fully implemented; this just opts the parser in.
     p.layout_grid_enabled = true; // CSS Grid (marketing-site hero/card layouts, etc.)
+    // Font parity (LYK): on Linux, Chrome maps Arial/Times/Courier to the metric-compatible
+    // Liberation fonts via fontconfig aliasing. swervo's family matching doesn't alias, so an
+    // unresolved "Arial" (or a bare generic) falls back to its default — DejaVu Sans, which is
+    // wider/taller than Arial. In fixed-height form controls (e.g. Google's search box + buttons)
+    // those larger glyphs clip at the bottom and the labels sit too high. Pin the generic families
+    // to the Liberation set so swervo matches Chrome. macOS/Windows ship real Arial/Times/Courier,
+    // so this is Linux-only.
+    #[cfg(target_os = "linux")]
+    {
+        p.fonts_default = "Liberation Sans".into();
+        p.fonts_sans_serif = "Liberation Sans".into();
+        p.fonts_serif = "Liberation Serif".into();
+        p.fonts_monospace = "Liberation Mono".into();
+    }
     p
 }
 
