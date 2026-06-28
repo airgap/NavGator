@@ -105,17 +105,19 @@ renders `forms-baseline/forms.html` (each control absolutely positioned so crops
 the **sub-pixel vertical ink-centroid** of each control's text (fraction of control height) vs
 Chrome — the right metric for a positioning bug (it ignores font-rasterization, which SSIM conflates):
 ```bash
-.claude/skills/run-navgator/forms-baseline.sh           # gate: |Δpos| <= FB_POS_TOL% (default 0.1)
-FB_POS_TOL=0.5 .claude/skills/run-navgator/forms-baseline.sh   # non-flaky gate (see below)
+.claude/skills/run-navgator/forms-baseline.sh   # gate: |Δpos| <= FB_POS_TOL% (default 0.3 = the floor)
 ```
-State: all controls now match Chrome — text input / `<button>` / textarea after the Liberation-font
-parity fix (`a0bf499`); `input[type=submit]`/`[type=button]`/`[type=reset]` after LYK-1299 (give
-button-type inputs the text-control inner-container/inner-editor shadow structure so the value is
-centered like text inputs — swervo `text_value_widget.rs`, PR #6). **Tolerance note:** 0.1% (~0.05px
-on a 46px control) is at the cross-engine sub-pixel **rasterization floor** — swervo + Chrome both use
-FreeType but differ in hinting/AA by ~0.1px, so even pixel-perfect text reads ~0.2-0.4%. The LYK-1299
-buttons land at 0.04-0.08% (pass 0.1%); text input/textarea read ~0.2% (NOT bugs). Use `FB_POS_TOL=0.5`
-for a stable gate (real bugs like the original top-alignment were ~17%).
+State: all controls match Chrome — text input / `<button>` / textarea after the Liberation-font parity
+fix (`a0bf499`); `input[type=submit]`/`[type=button]`/`[type=reset]` after LYK-1299 (give button-type
+inputs the text-control inner-container/inner-editor shadow structure so the value centers like text
+inputs — swervo `text_value_widget.rs`, PR #6). Measured Δpos: buttons 0.04-0.08%, text input/textarea
+~0.2%. **The 0.3% default is the measured cross-engine sub-pixel FLOOR, not slack:** a plain
+flex-centered `<div>` (no form control) also reads ~0.17% vs Chrome, and it was *verified* that swervo
+uses the SAME font metrics as Chrome — Liberation Sans has `USE_TYPO_METRICS=false` and its hhea-vs-OS/2
+baselines differ 3.46%, yet swervo tracks Chrome to 0.17%, proving swervo did NOT fall into the
+hhea/typo line-height trap. So the residual is pure sub-pixel rounding/AA (any two independent engines
+have it). 0.1% is below this physical floor for ANY text. Real positioning bugs are >1% (the original
+top-aligned buttons were ~17%).
 
 ## Regression suite (run after every swervo rev bump)
 
