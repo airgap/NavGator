@@ -1,0 +1,97 @@
+diff --git a/components/fonts/platform/freetype/font_list.rs b/components/fonts/platform/freetype/font_list.rs
+index e2b2dc04830..173ca40143a 100644
+--- a/components/fonts/platform/freetype/font_list.rs
++++ b/components/fonts/platform/freetype/font_list.rs
+@@ -276,6 +276,45 @@ pub(crate) fn default_system_generic_font_family(
+     .into()
+ }
+ 
++/// Resolve a requested font family *name* through fontconfig's configuration substitution + match —
++/// i.e. its aliases (Arial → Liberation Sans, Verdana → Noto Sans, Helvetica → Nimbus Sans, Times New
++/// Roman → Liberation Serif, …). This is what Chrome does on Linux for families that are not installed
++/// under their requested name; swervo otherwise only ran fontconfig for *generic* families and dropped
++/// named misses to the generic fallback, so e.g. Arial and Verdana both collapsed to the same font.
++/// Returns the matched family name (always an installed font), or None on failure.
++pub(crate) fn font_family_substitute(name: &str) -> Option<String> {
++    let cname = std::ffi::CString::new(name).ok()?;
++    unsafe {
++        let pattern = FcNameParse(cname.as_ptr() as *mut FcChar8);
++        if pattern.is_null() {
++            return None;
++        }
++        FcConfigSubstitute(ptr::null_mut(), pattern, FcMatchPattern);
++        FcDefaultSubstitute(pattern);
++
++        let mut result = 0;
++        let family_match = FcFontMatch(ptr::null_mut(), pattern, &mut result);
++        let mut matched = None;
++        if !family_match.is_null() {
++            let mut match_string: *mut FcChar8 = ptr::null_mut();
++            FcPatternGetString(
++                family_match,
++                FC_FAMILY.as_ptr() as *mut c_char,
++                0,
++                &mut match_string,
++            );
++            if !match_string.is_null() {
++                if let Ok(s) = CStr::from_ptr(match_string as *const c_char).to_str() {
++                    matched = Some(s.to_owned());
++                }
++            }
++            FcPatternDestroy(family_match);
++        }
++        FcPatternDestroy(pattern);
++        matched
++    }
++}
++
+ fn font_style_from_fontconfig_pattern(pattern: *mut FcPattern) -> Option<FontStyle> {
+     let mut slant: c_int = 0;
+     unsafe {
+diff --git a/components/fonts/system_font_service.rs b/components/fonts/system_font_service.rs
+index d86ef8a62e3..d6f1a71de4e 100644
+--- a/components/fonts/system_font_service.rs
++++ b/components/fonts/system_font_service.rs
+@@ -31,6 +31,19 @@ use crate::platform::font_list::{
+     default_system_generic_font_family, for_each_available_family, for_each_variation,
+ };
+ 
++/// Resolve a *named* font family that isn't installed under that name, via the platform's font
++/// configuration. On Linux/freetype this is fontconfig's alias substitution (Arial -> Liberation
++/// Sans, Verdana -> Noto Sans, …, matching Chrome); on macOS/Windows the requested families are
++/// installed and native matching already handles them, so this is a no-op.
++#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
++fn platform_family_substitute(name: &str) -> Option<String> {
++    crate::platform::font_list::font_family_substitute(name)
++}
++#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
++fn platform_family_substitute(_name: &str) -> Option<String> {
++    None
++}
++
+ #[derive(Default, MallocSizeOf)]
+ struct ResolvedGenericFontFamilies {
+     default: OnceCell<LowercaseFontFamilyName>,
+@@ -239,7 +252,21 @@ impl SystemFontService {
+     ) -> Vec<FontTemplateRef> {
+         // TODO(Issue #188): look up localized font family names if canonical name not found
+         // look up canonical name
+-        let family_name = self.family_name_for_single_font_family(family);
++        let mut family_name = self.family_name_for_single_font_family(family);
++        // If a *named* family is not installed under that name, resolve it through the platform's
++        // font configuration (fontconfig on Linux: Arial -> Liberation Sans, Verdana -> Noto Sans,
++        // Helvetica -> Nimbus Sans, …) instead of dropping to the generic fallback — matching what
++        // Chrome does. Generics are already resolved by `family_name_for_single_font_family`.
++        if matches!(family, SingleFontFamily::FamilyName(_)) &&
++            !self.local_families.families.contains_key(&family_name)
++        {
++            if let Some(substitute) = platform_family_substitute(&family_name)
++                .map(|name: String| LowercaseFontFamilyName::from(name))
++                .filter(|name| self.local_families.families.contains_key(name))
++            {
++                family_name = substitute;
++            }
++        }
+         self.local_families
+             .families
+             .get_mut(&family_name)

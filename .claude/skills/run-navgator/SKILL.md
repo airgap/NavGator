@@ -107,8 +107,9 @@ Chrome — the right metric for a positioning bug (it ignores font-rasterization
 ```bash
 .claude/skills/run-navgator/forms-baseline.sh   # gate: |Δpos| <= FB_POS_TOL% (default 0.3 = the floor)
 ```
-State: all controls match Chrome — text input / `<button>` / textarea after the Liberation-font parity
-fix (`a0bf499`); `input[type=submit]`/`[type=button]`/`[type=reset]` after LYK-1299 (give button-type
+State: all controls match Chrome — text input / `<button>` / textarea after the font-resolution fix
+(swervo PR #7: resolve uninstalled named families via fontconfig like Chrome — Arial→Liberation,
+Verdana→Noto, …); `input[type=submit]`/`[type=button]`/`[type=reset]` after LYK-1299 (give button-type
 inputs the text-control inner-container/inner-editor shadow structure so the value centers like text
 inputs — swervo `text_value_widget.rs`, PR #6). Measured Δpos: buttons 0.04-0.08%, text input/textarea
 ~0.2%. **The 0.3% default is the measured cross-engine sub-pixel FLOOR, not slack:** a plain
