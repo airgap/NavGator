@@ -4732,6 +4732,7 @@ name = "navgator"
 version = "0.1.0"
 dependencies = [
  "adblock",
+ "android-activity",
  "argon2",
  "chacha20poly1305",
  "egui",

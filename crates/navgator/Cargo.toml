@@ -7,6 +7,27 @@ license = "MPL-2.0"
 description = "A web browser with native (egui) chrome and Servo as the page renderer"
 repository = "https://github.com/airgap/NavGator"
 
+# ── Android packaging (cargo-apk) ──────────────────────────────────────────────
+[package.metadata.android]
+package = "org.airgap.navgator"
+build_targets = ["aarch64-linux-android"]
+
+[package.metadata.android.sdk]
+min_sdk_version = 30
+target_sdk_version = 34
+
+[package.metadata.android.application]
+label = "NavGator"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[lib]
+name = "navgator"
+# rlib for the desktop binary to link; cdylib for the Android NativeActivity (.so).
+crate-type = ["lib", "cdylib"]
+path = "src/lib.rs"
+
 [[bin]]
 name = "navgator"
 path = "src/main.rs"
@@ -61,3 +82,7 @@ png = "0.18"
 # runtime — all calls degrade to manual unlock if no secret-service is available.
 # Pure-rust crypto (no system OpenSSL dep); zbus is already in the cache transitively.
 keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+
+# Android entry point: winit drives the NativeActivity via android-activity (Android only).
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }

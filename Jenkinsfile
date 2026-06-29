@@ -248,6 +248,30 @@ pipeline {
             }
         }
 
+        // Android: cross-compile + package a signed APK (arm64) on the linux agent, then
+        // stash it for the Publish stage. Requires the Android SDK/NDK on the runner;
+        // scripts/android-apk.sh no-ops gracefully when it's absent, so this never gates the
+        // desktop build. See docs/ANDROID.md.
+        stage('Android APK') {
+            agent { label 'linux' }
+            steps {
+                checkout scm
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    sh '''
+                        export PATH="$HOME/.cargo/bin:/usr/lib/llvm-18/bin:$PATH"
+                        export LIBCLANG_PATH="${LIBCLANG_PATH:-/usr/lib/llvm-18/lib}"
+                        export ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}"
+                        command -v rustup >/dev/null || \
+                          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none
+                        export PATH="$HOME/.cargo/bin:$PATH"
+                        rustup show >/dev/null 2>&1 || true
+                        bash scripts/android-apk.sh
+                    '''
+                }
+                stash name: 'dist-android', includes: 'dist/**', allowEmpty: true
+            }
+        }
+
         // Collect each platform's stashed artifacts on the linux agent (which has the
         // Doppler token) and publish them all to R2 + lyku.org/apps. macOS can't publish
         // from its own agent (no token there), so we mirror lyku's desktop job: the mac
@@ -257,7 +281,7 @@ pipeline {
             steps {
                 checkout scm
                 script {
-                    ['dist-linux', 'dist-macos'].each { s ->
+                    ['dist-linux', 'dist-macos', 'dist-android'].each { s ->
                         try { unstash s } catch (err) { echo "no stash ${s} (platform may have failed)" }
                     }
                 }
