@@ -137,6 +137,15 @@ Covers (each = a landed swervo fix): `mask_circle` / `mask_chevron` (CSS `mask-i
 by dropping `regression/<name>.test.html` + `<name>.ref.html` and adding `<name>` to the SSIM loop,
 or a colour/pixel assertion for a non-shape case (see `forms_accent`).
 
+**Standalone per-feature gates** (run individually; each catches a class `regression.sh`/
+`forms-baseline.sh` can't — a square viewBox or a flex-stretched control):
+- `svg-aspect.sh` — inline-`<svg>` aspect-ratio distortion (LYK-1300): each square-viewBox glyph must
+  stay ~square (catches the stretched clear-`X`).
+- `textarea-clip.sh` — flex-stretched `<textarea>` descender clip (LYK-1301): renders the exact
+  Google `gLFyf` trigger next to a non-clipping reference `<textarea>` and asserts the flex one keeps
+  its descenders (TEST/REF ink-height ratio). forms-baseline only renders a *block* textarea, so it
+  never exercised the `display:flex`-host collapse; fixed by UA `textarea { min-block-size: 1lh }`.
+
 ## Record/replay real pages (deterministic fixtures)
 
 `regression.sh` uses synthetic local HTML. To regression-test **real** pages without content drift

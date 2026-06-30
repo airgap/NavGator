@@ -1,0 +1,20 @@
+diff --git a/components/layout/stylesheets/servo.css b/components/layout/stylesheets/servo.css
+index 4932dd8e977..fbb5fb8c8e5 100644
+--- a/components/layout/stylesheets/servo.css
++++ b/components/layout/stylesheets/servo.css
+@@ -16,6 +16,15 @@ input[type="radio"] {
+ 
+ textarea {
+     padding: 2px;
++    /* A textarea is a text-entry widget: its content box must be at least one line
++       tall. Authors sometimes set `display: flex` on the <textarea> host (e.g. Google's
++       search box). swervo lays out the UA shadow tree (inner-container/inner-editor) but
++       does not size the flex container from it, collapsing the content box below one line
++       (~font-size), so the single text line overflows and `overflow: hidden`/scroll shears
++       the descenders. Flooring the block size to `1lh` restores the min-content minimum that
++       browsers apply and keeps the line inside the scrollport. No-op for normal multi-line
++       textareas (already taller than one line). LYK-1301. */
++    min-block-size: 1lh;
+ }
+ 
+ input {

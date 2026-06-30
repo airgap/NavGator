@@ -1,0 +1,19 @@
+<!doctype html><meta charset="utf-8"><title>textarea descender clip gate</title>
+<style>
+ html,body{margin:0;background:#fff}
+ body{font-family:Arial,sans-serif}
+ /* TEST: faithful Google gLFyf trigger, scaled up (font 40px) for a robust descender signal —
+    a rows=1 <textarea> with display:flex on the host, flex-stretched by an outer flex parent,
+    big top padding, overflow:hidden. Without the UA `min-block-size:1lh` floor the flex container
+    collapses below one line and shears the descenders (LYK-1301). */
+ .a4bIc{display:flex;height:120px;width:560px}
+ .gLFyf{display:flex;flex:1 1 100%;box-sizing:content-box;line-height:54px;font-size:40px;
+   padding:34px 0 0;border:0;overflow:hidden auto;resize:none;outline:0;background:#fff;color:#000}
+ /* REF: a plain block <textarea>, tall enough it can never clip — the descender baseline. */
+ .ref{display:block;width:560px;height:130px;box-sizing:content-box;line-height:54px;font-size:40px;
+   padding:0;border:0;overflow:hidden;resize:none;outline:0;background:#fff;color:#000;white-space:nowrap}
+</style>
+<div style="position:absolute;left:20px;top:20px"><div class="a4bIc">
+ <textarea class="gLFyf">bdfgjpqy</textarea></div></div>
+<div style="position:absolute;left:20px;top:200px">
+ <textarea class="ref">bdfgjpqy</textarea></div>
