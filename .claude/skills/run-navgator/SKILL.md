@@ -145,6 +145,11 @@ or a colour/pixel assertion for a non-shape case (see `forms_accent`).
   Google `gLFyf` trigger next to a non-clipping reference `<textarea>` and asserts the flex one keeps
   its descenders (TEST/REF ink-height ratio). forms-baseline only renders a *block* textarea, so it
   never exercised the `display:flex`-host collapse; fixed by UA `textarea { min-block-size: 1lh }`.
+- `kbd-shortcuts.sh` — page text-editing shortcuts (LYK-1309): an INTERACTION smoke (clicks a text
+  field, then type → `Ctrl+A` → `Ctrl+X` → `Ctrl+V`) asserting the field empties on cut and refills
+  on paste via field ink count. Catches the regression where NavGator forwarded page keys with no
+  modifiers so Ctrl+A/C/X/V typed literal letters. Needs `ctrl`/`shift` on the forwarded
+  `KeyboardEvent.modifiers`.
 
 ## Record/replay real pages (deterministic fixtures)
 

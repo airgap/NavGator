@@ -11,7 +11,7 @@
 
 pub use servo::{
     CreateNewWebViewRequest, DeviceIntRect, DeviceIntSize, DevicePoint, InputEvent, Key, KeyState,
-    KeyboardEvent, LoadStatus,
+    KeyboardEvent, LoadStatus, Modifiers,
     MouseButton, MouseButtonAction,
     MouseButtonEvent, MouseMoveEvent, NamedKey, NavigationRequest, OffscreenRenderingContext,
     Preferences, RenderingContext, Servo, ServoBuilder,

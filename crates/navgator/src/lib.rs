@@ -39,7 +39,7 @@ use navgator_engine::{
     AuthenticationRequest, ColorPicker, ConsoleLogLevel, CreateNewWebViewRequest, Cursor, DeviceIntRect,
     DeviceIntSize, DevicePoint, EmbedderControl,
     EmbedderControlId, EventLoopWaker, FilePicker, FilterPattern, Image, InputEvent, JSValue, Key,
-    KeyState, KeyboardEvent, LoadStatus, MediaSessionEvent, MediaSessionPlaybackState,
+    KeyState, KeyboardEvent, LoadStatus, MediaSessionEvent, MediaSessionPlaybackState, Modifiers,
     MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
     NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, Opts, PermissionRequest,
     PixelFormat, Preferences, RenderingContext, run_content_process,
@@ -7874,9 +7874,20 @@ impl ApplicationHandler<WakeUp> for App {
                             ElementState::Pressed => KeyState::Down,
                             ElementState::Released => KeyState::Up,
                         };
-                        state.forward_to_page(InputEvent::Keyboard(
-                            KeyboardEvent::from_state_and_key(key_state, key),
-                        ));
+                        // Carry the active modifiers so the page's text editing shortcuts fire.
+                        // Without this, swervo's textinput ShortcutMatcher never sees CONTROL and
+                        // Ctrl+A/C/X/V fall through to typing the literal letter (LYK-1309).
+                        let mut modifiers = Modifiers::empty();
+                        if state.ctrl.get() {
+                            modifiers |= Modifiers::CONTROL;
+                        }
+                        if state.shift.get() {
+                            modifiers |= Modifiers::SHIFT;
+                        }
+                        let mut keyboard_event =
+                            KeyboardEvent::from_state_and_key(key_state, key);
+                        keyboard_event.event.modifiers = modifiers;
+                        state.forward_to_page(InputEvent::Keyboard(keyboard_event));
                     }
                 }
             }
