@@ -1,30 +1,49 @@
 <!doctype html><meta charset="utf-8"><title>idb-index gate</title>
 <body style="margin:0;background:#888"><pre id="o" style="font:13px monospace;padding:8px"></pre></body>
 <script>
-// Exercises the full IndexedDB index surface (LYK-1310) and signals the result as the page
-// background colour so a screenshot pixel-sample can gate it: GREEN = all pass, RED = any fail.
-const o=document.getElementById('o'); const log=[];
-function fail(m){ log.push('FAIL '+m); o.textContent=log.join('\n'); document.body.style.background='#cc0000'; document.title='IDB IDX FAIL'; }
-function pass(){ o.textContent=log.join('\n')+'\nALL PASS'; document.body.style.background='#00aa00'; document.title='IDB IDX OK'; }
-const req=indexedDB.open('idbgate',1);
-req.onupgradeneeded=(e)=>{ const db=e.target.result; const s=db.createObjectStore('p',{keyPath:'id'});
-  s.createIndex('byName','name',{unique:false}); s.createIndex('byEmail','email',{unique:true}); };
+// Full IndexedDB index lifecycle (LYK-1310): create unique+non-unique indexes, put, then
+// get/getKey/getAll/getAllKeys/count/openCursor(+continue), then DELETE and CLEAR (which must clean
+// up index entries — the index_data->object_data FK blocks the delete otherwise). Page background
+// GREEN = all pass, RED = any fail (sampled by the gate, OCR-free).
+const o=document.getElementById('o'); const log=[]; let bad=0;
+function add(m){log.push(m);o.textContent=log.join('\n');}
+function chk(label,cond,extra){ if(cond){add('ok '+label);} else {bad++;add('BAD '+label+(extra!==undefined?' => '+JSON.stringify(extra):''));} }
+function fail(m){add('FAIL '+m);bad++;done();}
+function done(){ if(bad){o.textContent=log.join('\n')+'\nFAIL';document.body.style.background='#cc0000';document.title='IDB IDX FAIL';}
+  else {o.textContent=log.join('\n')+'\nALL PASS';document.body.style.background='#00aa00';document.title='IDB IDX OK';} }
+const req=indexedDB.open('idbgate2',1);
+req.onupgradeneeded=(e)=>{const db=e.target.result;const s=db.createObjectStore('p',{keyPath:'id'});
+  s.createIndex('byName','name',{unique:false});s.createIndex('byEmail','email',{unique:true});};
 req.onerror=()=>fail('open');
-req.onsuccess=(e)=>{ const db=e.target.result; const tx=db.transaction('p','readwrite'); const s=tx.objectStore('p');
-  s.put({id:1,name:'Alice',email:'a1@x'}); s.put({id:2,name:'Bob',email:'b@x'}); s.put({id:3,name:'Alice',email:'a2@x'});
-  tx.onerror=(ev)=>fail('write '+ev.target.error); tx.oncomplete=()=>reads(db); };
+req.onsuccess=(e)=>{const db=e.target.result;const tx=db.transaction('p','readwrite');const s=tx.objectStore('p');
+  s.put({id:1,name:'Alice',email:'a1@x'});s.put({id:2,name:'Bob',email:'b@x'});s.put({id:3,name:'Alice',email:'a2@x'});
+  tx.onerror=(ev)=>fail('write '+ev.target.error);tx.oncomplete=()=>reads(db);};
 function reads(db){
-  const tx=db.transaction('p','readonly'); const idx=tx.objectStore('p').index('byName');
-  let pend=6, bad=0; const done=()=>{ if(--pend===0){ bad?fail('('+bad+' checks failed)'):pass(); } };
-  function chk(label,r,ok){ r.onsuccess=()=>{ let g; try{g=ok(r.result);}catch(e){g=false;} if(g)log.push('ok '+label); else {bad++; log.push('BAD '+label+' => '+JSON.stringify(r.result));} done(); }; r.onerror=()=>{bad++; log.push('ERR '+label); done(); }; }
-  chk('get',      idx.get('Alice'),       v=>v&&v.id===1);
-  chk('getKey',   idx.getKey('Alice'),    v=>v===1);
-  chk('getAll',   idx.getAll('Alice'),    v=>v.length===2&&v[0].id===1&&v[1].id===3);
-  chk('getAllKeys',idx.getAllKeys('Alice'),v=>v.length===2&&v[0]===1&&v[1]===3);
-  chk('count',    idx.count('Alice'),     v=>v===2);
-  const seen=[]; const c=idx.openCursor();
-  c.onsuccess=()=>{ const r=c.result; if(r){ seen.push([r.key,r.primaryKey]); r.continue(); }
-    else { const g=seen.length===3&&seen[0][1]===1&&seen[1][1]===3&&seen[2][1]===2; if(g)log.push('ok cursor'); else{bad++;log.push('BAD cursor '+JSON.stringify(seen));} done(); } };
-  c.onerror=()=>{bad++; log.push('ERR cursor'); done(); };
+  const tx=db.transaction('p','readonly');const idx=tx.objectStore('p').index('byName');
+  let pend=6;const next=()=>{if(--pend===0)delPhase(db);};
+  function c(label,r,ok){r.onsuccess=()=>{let g;try{g=ok(r.result);}catch(e){g=false;}chk(label,g,r.result);next();};r.onerror=()=>{bad++;add('ERR '+label);next();};}
+  c('get',idx.get('Alice'),v=>v&&v.id===1);
+  c('getKey',idx.getKey('Alice'),v=>v===1);
+  c('getAll',idx.getAll('Alice'),v=>v.length===2&&v[0].id===1&&v[1].id===3);
+  c('getAllKeys',idx.getAllKeys('Alice'),v=>v.length===2&&v[0]===1&&v[1]===3);
+  c('count',idx.count('Alice'),v=>v===2);
+  const seen=[];const cur=idx.openCursor();
+  cur.onsuccess=()=>{const r=cur.result;if(r){seen.push([r.key,r.primaryKey]);r.continue();}
+    else{chk('cursor',seen.length===3&&seen[0][1]===1&&seen[1][1]===3&&seen[2][1]===2,seen);next();}};
+  cur.onerror=()=>{bad++;add('ERR cursor');next();};
+}
+function delPhase(db){ // delete id=1 then verify the index reflects it (FK cleanup path)
+  const tx=db.transaction('p','readwrite');tx.onerror=(ev)=>fail('delete '+ev.target.error);
+  tx.objectStore('p').delete(1);
+  tx.oncomplete=()=>{ const idx=db.transaction('p','readonly').objectStore('p').index('byName');
+    const r=idx.getAll('Alice'); r.onsuccess=()=>{chk('after-delete getAll==[3]',r.result.length===1&&r.result[0].id===3,r.result);clearPhase(db);};
+    r.onerror=()=>{bad++;add('ERR after-delete getAll');clearPhase(db);}; };
+}
+function clearPhase(db){ // clear then verify empty (FK cleanup path)
+  const tx=db.transaction('p','readwrite');tx.onerror=(ev)=>fail('clear '+ev.target.error);
+  tx.objectStore('p').clear();
+  tx.oncomplete=()=>{ const idx=db.transaction('p','readonly').objectStore('p').index('byName');
+    const r=idx.count(); r.onsuccess=()=>{chk('after-clear count==0',r.result===0,r.result);done();};
+    r.onerror=()=>{bad++;add('ERR after-clear count');done();}; };
 }
 </script>

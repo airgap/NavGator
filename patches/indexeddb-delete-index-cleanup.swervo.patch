@@ -1,0 +1,47 @@
+diff --git a/components/storage/indexeddb/engines/sqlite.rs b/components/storage/indexeddb/engines/sqlite.rs
+index 43f88b1591f..649957b50e4 100644
+--- a/components/storage/indexeddb/engines/sqlite.rs
++++ b/components/storage/indexeddb/engines/sqlite.rs
+@@ -639,16 +639,39 @@ impl SqliteEngine {
+         store: object_store_model::Model,
+         key_range: IndexedDBKeyRange,
+     ) -> Result<(), Error> {
++        // Resolve the primary keys in range, then drop each record's index entries before the
++        // record itself — the `index_data -> object_data` foreign key would otherwise block the
++        // delete ("FOREIGN KEY constraint failed"). (LYK-1310)
+         let query = range_to_query(key_range);
+-        let (sql, values) = sea_query::Query::delete()
+-            .from_table(object_data_model::Column::Table)
++        let (sql, values) = sea_query::Query::select()
++            .column(object_data_model::Column::Key)
++            .from(object_data_model::Column::Table)
+             .and_where(query.and(Expr::col(object_data_model::Column::ObjectStoreId).is(store.id)))
+             .build_rusqlite(SqliteQueryBuilder);
+-        connection.prepare(&sql)?.execute(&*values.as_params())?;
++        let keys: Vec<Vec<u8>> = connection
++            .prepare(&sql)?
++            .query_map(&*values.as_params(), |row| row.get::<_, Vec<u8>>(0))?
++            .collect::<Result<Vec<_>, _>>()?;
++        for key in &keys {
++            Self::delete_index_entries_for_key(connection, store.id, key)?;
++            connection.execute(
++                "DELETE FROM object_data WHERE object_store_id = ? AND key = ?",
++                params![store.id, key],
++            )?;
++        }
+         Ok(())
+     }
+ 
+     fn clear(connection: &Connection, store: object_store_model::Model) -> Result<(), Error> {
++        // Drop the store's index entries before its records (FK: index_data -> object_data). (LYK-1310)
++        connection.execute(
++            "DELETE FROM index_data WHERE object_store_id = ?",
++            params![store.id],
++        )?;
++        connection.execute(
++            "DELETE FROM unique_index_data WHERE object_store_id = ?",
++            params![store.id],
++        )?;
+         connection.execute(
+             "DELETE FROM object_data WHERE object_store_id = ?",
+             params![store.id],
