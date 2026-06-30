@@ -703,6 +703,25 @@ pub(crate) fn build_visuals(theme: &Theme, pal: &Palette) -> Visuals {
     v.faint_bg_color = pal.elev;
     v.window_stroke = Stroke::new(1.0, pal.border);
 
+    // egui's default window/popup shadow is a hard, low-blur, down-right offset
+    // (`offset:[10,20], blur:15`) that reads as a cheap rectangle rather than elevation —
+    // and the default light alpha (25) is nearly invisible. Override with a soft, centered
+    // drop shadow so floating chrome (Settings window, command palette, combo/context menus)
+    // sits clearly above the page. Darker in dark themes where the page is dark too.
+    let shadow_color = Color32::from_black_alpha(if theme.base.is_light() { 45 } else { 120 });
+    v.window_shadow = egui::Shadow {
+        offset: [0, 10],
+        blur: 30,
+        spread: 0,
+        color: shadow_color,
+    };
+    v.popup_shadow = egui::Shadow {
+        offset: [0, 6],
+        blur: 18,
+        spread: 0,
+        color: shadow_color,
+    };
+
     v.widgets.noninteractive.bg_fill = pal.bg2;
     v.widgets.noninteractive.weak_bg_fill = pal.bg2;
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, pal.border);

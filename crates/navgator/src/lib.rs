@@ -4631,11 +4631,18 @@ impl AppState {
         // keyring store/clear (which needs the password_store + settings borrows released) happens
         // after the Settings window closure below rather than inside it.
         let mut remember_toggled: Option<bool> = None;
+        // The Settings body is long (search → appearance → privacy → userscripts → setup →
+        // sync → passwords). Without a height cap it grew taller than the viewport and spilled
+        // off the top and bottom edges (title bar clipped, no way to scroll). Cap it to the
+        // viewport and let the body scroll internally.
+        let settings_max_h = (ctx.screen_rect().height() - 120.0).max(320.0);
         egui::Window::new("Settings")
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .max_height(settings_max_h)
+            .vscroll(true)
             .show(ctx, |ui| {
                 let mut s = self.browser.settings.borrow_mut();
                 let mut changed = false;
