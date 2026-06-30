@@ -58,9 +58,16 @@ fn section_presets(ui: &mut egui::Ui, theme: &mut Theme, pal: &Palette) -> bool 
     section_label(ui, "PRESETS", pal);
     let mut changed = false;
 
+    // egui::Grid sizes column 0 to its content's *minimum* width, which — for a card whose
+    // label can wrap — collapses to ~1 character (the title then renders one letter per line)
+    // while column 1 takes all remaining space. Pin both columns to an equal half of the
+    // available panel width so each card gets a real, symmetric width.
+    let col_w = ((ui.available_width() - 9.0) / 2.0 - 1.0).max(60.0);
     egui::Grid::new("studio_presets")
         .num_columns(2)
         .spacing([9.0, 9.0])
+        .min_col_width(col_w)
+        .max_col_width(col_w)
         .show(ui, |ui| {
             for (i, preset) in Preset::ALL.iter().copied().enumerate() {
                 let (c1, c2) = preset.swatch();
@@ -143,37 +150,53 @@ fn section_surface(ui: &mut egui::Ui, theme: &mut Theme, pal: &Palette) -> bool 
     section_label(ui, "SURFACE", pal);
     let mut changed = false;
 
-    ui.horizontal_wrapped(|ui| {
-        for base in Base::ALL.iter().copied() {
-            // Resolve this base's bg2 by building a temp theme.
-            let bg2 = Theme { base, ..*theme }.palette().bg2;
+    // `horizontal_wrapped` fails to wrap Frame-wrapped chips (the frame's size isn't known
+    // when the wrap decision is made), so all six bases laid out on one row and ran off the
+    // panel's right edge. Use a fixed 3-column grid of equal width instead. See section_presets.
+    let surf_cols = 3;
+    let surf_w = ((ui.available_width() - (surf_cols - 1) as f32 * 9.0) / surf_cols as f32
+        - 1.0)
+        .max(50.0);
+    egui::Grid::new("studio_surface")
+        .num_columns(surf_cols)
+        .spacing([9.0, 9.0])
+        .min_col_width(surf_w)
+        .max_col_width(surf_w)
+        .show(ui, |ui| {
+            for (i, base) in Base::ALL.iter().copied().enumerate() {
+                // Resolve this base's bg2 by building a temp theme.
+                let bg2 = Theme { base, ..*theme }.palette().bg2;
 
-            let inner = widgets::card_frame(pal.bg, pal.border, 9).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let (sq, _) =
-                        ui.allocate_exact_size(egui::vec2(13.0, 13.0), egui::Sense::hover());
-                    ui.painter()
-                        .rect_filled(sq, egui::CornerRadius::same(3), bg2);
-                    ui.add_space(6.0);
-                    ui.label(egui::RichText::new(base.label()).size(11.5));
+                let inner = widgets::card_frame(pal.bg, pal.border, 9).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let (sq, _) =
+                            ui.allocate_exact_size(egui::vec2(13.0, 13.0), egui::Sense::hover());
+                        ui.painter()
+                            .rect_filled(sq, egui::CornerRadius::same(3), bg2);
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new(base.label()).size(11.5));
+                    });
                 });
-            });
 
-            let resp = inner.response.interact(egui::Sense::click());
-            if base == theme.base {
-                ui.painter().rect_stroke(
-                    resp.rect,
-                    egui::CornerRadius::same(9),
-                    egui::Stroke::new(1.5, pal.accent),
-                    egui::StrokeKind::Inside,
-                );
+                let resp = inner.response.interact(egui::Sense::click());
+                if base == theme.base {
+                    ui.painter().rect_stroke(
+                        resp.rect,
+                        egui::CornerRadius::same(9),
+                        egui::Stroke::new(1.5, pal.accent),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                if resp.clicked() && base != theme.base {
+                    theme.set_base(base);
+                    changed = true;
+                }
+
+                if i % surf_cols == surf_cols - 1 {
+                    ui.end_row();
+                }
             }
-            if resp.clicked() && base != theme.base {
-                theme.set_base(base);
-                changed = true;
-            }
-        }
-    });
+        });
 
     ui.add_space(10.0);
 
@@ -203,35 +226,48 @@ fn section_typography(ui: &mut egui::Ui, theme: &mut Theme, pal: &Palette) -> bo
     section_label(ui, "TYPOGRAPHY", pal);
     let mut changed = false;
 
-    ui.horizontal(|ui| {
-        for f in FontChoice::ALL.iter().copied() {
-            let inner = widgets::card_frame(pal.bg, pal.border, 9).show(ui, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.label(
-                        egui::RichText::new("Aa")
-                            .family(family(f))
-                            .size(20.0),
-                    );
-                    ui.add_space(2.0);
-                    ui.label(egui::RichText::new(f.label()).size(11.0));
+    // A plain `ui.horizontal` let each card's `vertical_centered` body grab the full panel
+    // width, so the first font tile ballooned across (and past) the panel and pushed the rest
+    // off-screen. Pin the tiles to equal columns so each one is bounded.
+    let font_cols = FontChoice::ALL.len();
+    let font_w = ((ui.available_width() - (font_cols.saturating_sub(1)) as f32 * 9.0)
+        / font_cols as f32
+        - 1.0)
+        .max(50.0);
+    egui::Grid::new("studio_fonts")
+        .num_columns(font_cols)
+        .spacing([9.0, 9.0])
+        .min_col_width(font_w)
+        .max_col_width(font_w)
+        .show(ui, |ui| {
+            for f in FontChoice::ALL.iter().copied() {
+                let inner = widgets::card_frame(pal.bg, pal.border, 9).show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("Aa")
+                                .family(family(f))
+                                .size(20.0),
+                        );
+                        ui.add_space(2.0);
+                        ui.label(egui::RichText::new(f.label()).size(11.0));
+                    });
                 });
-            });
 
-            let resp = inner.response.interact(egui::Sense::click());
-            if f == theme.font {
-                ui.painter().rect_stroke(
-                    resp.rect,
-                    egui::CornerRadius::same(9),
-                    egui::Stroke::new(1.5, pal.accent),
-                    egui::StrokeKind::Inside,
-                );
+                let resp = inner.response.interact(egui::Sense::click());
+                if f == theme.font {
+                    ui.painter().rect_stroke(
+                        resp.rect,
+                        egui::CornerRadius::same(9),
+                        egui::Stroke::new(1.5, pal.accent),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                if resp.clicked() && f != theme.font {
+                    theme.font = f;
+                    changed = true;
+                }
             }
-            if resp.clicked() && f != theme.font {
-                theme.font = f;
-                changed = true;
-            }
-        }
-    });
+        });
 
     ui.add_space(10.0);
 
