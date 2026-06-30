@@ -150,6 +150,12 @@ or a colour/pixel assertion for a non-shape case (see `forms_accent`).
   on paste via field ink count. Catches the regression where NavGator forwarded page keys with no
   modifiers so Ctrl+A/C/X/V typed literal letters. Needs `ctrl`/`shift` on the forwarded
   `KeyboardEvent.modifiers`.
+- `idb-index.sh` — IndexedDB index support (LYK-1310): a JS-driven gate that creates a store with a
+  unique + non-unique index, then exercises `index.get/getKey/getAll/getAllKeys/count/openCursor`
+  (cursor `continue()`-ing every record) and paints the page GREEN/RED by result; the gate samples a
+  background pixel (OCR-free). Catches regressions in the swervo IndexedDB index feature (backend
+  index population + index reads, `IDBIndex` methods, `IDBCursor.continue()`). Before it, index
+  queries threw "not a function" (broke YouTube).
 
 ## Record/replay real pages (deterministic fixtures)
 

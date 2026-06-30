@@ -1,0 +1,1244 @@
+diff --git a/components/script/dom/indexeddb/idbcursor.rs b/components/script/dom/indexeddb/idbcursor.rs
+index b9aaa8e9f90..361d76d6464 100644
+--- a/components/script/dom/indexeddb/idbcursor.rs
++++ b/components/script/dom/indexeddb/idbcursor.rs
+@@ -3,22 +3,26 @@
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+ use std::cell::Cell;
++use std::ptr::NonNull;
+ 
+ use dom_struct::dom_struct;
+ use js::context::JSContext;
+ use js::jsapi::Heap;
+ use js::jsval::{JSVal, UndefinedValue};
+-use js::rust::MutableHandleValue;
++use js::rust::{HandleValue, MutableHandleValue};
+ use script_bindings::cell::DomRefCell;
+ use script_bindings::reflector::{Reflector, reflect_dom_object};
+ use script_bindings::script_runtime::CanGc;
+-use storage_traits::indexeddb::{IndexedDBKeyRange, IndexedDBKeyType, IndexedDBRecord};
++use storage_traits::indexeddb::{
++    AsyncOperation, AsyncReadOnlyOperation, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBRecord,
++};
+ 
+ use crate::dom::bindings::codegen::Bindings::IDBCursorBinding::{
+     IDBCursorDirection, IDBCursorMethods,
+ };
+ use crate::dom::bindings::codegen::UnionTypes::IDBObjectStoreOrIDBIndex;
+-use crate::dom::bindings::error::Error;
++use crate::dom::bindings::error::{Error, Fallible};
++use crate::dom::bindings::import::base::SafeJSContext;
+ use crate::dom::bindings::refcounted::Trusted;
+ use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
+ use crate::dom::bindings::structuredclone;
+@@ -27,7 +31,7 @@ use crate::dom::indexeddb::idbindex::IDBIndex;
+ use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
+ use crate::dom::indexeddb::idbrequest::IDBRequest;
+ use crate::dom::indexeddb::idbtransaction::IDBTransaction;
+-use crate::indexeddb::key_type_to_jsval;
++use crate::indexeddb::{convert_value_to_key, key_type_to_jsval};
+ 
+ #[derive(JSTraceable, MallocSizeOf)]
+ #[expect(unused)]
+@@ -171,6 +175,58 @@ impl IDBCursor {
+             ObjectStoreOrIndex::Index(_) => self.object_store_position.borrow().clone(),
+         }
+     }
++
++    /// Re-run the cursor's request to advance it (the shared core of `continue`/`advance`). Until
++    /// this existed no cursor could move past its first record. The backend re-fetches the records
++    /// and [`iterate_cursor`] advances from the cursor's current position, optionally skipping to
++    /// `key` and/or moving `count` steps. (LYK-1310)
++    fn iterate(
++        &self,
++        cx: &mut JSContext,
++        key: Option<IndexedDBKeyType>,
++        count: Option<u32>,
++    ) -> Fallible<()> {
++        // The transaction must still be active and the cursor must hold a value (i.e. not already
++        // be iterating) before it can be advanced again.
++        if !self.transaction.is_active() || !self.transaction.is_usable() {
++            return Err(Error::TransactionInactive(None));
++        }
++        if !self.got_value.get() {
++            return Err(Error::InvalidState(None));
++        }
++        self.got_value.set(false);
++        *self.cached_key.borrow_mut() = None;
++        *self.cached_primary_key.borrow_mut() = None;
++
++        let (object_store, index) = match &self.source {
++            ObjectStoreOrIndex::ObjectStore(os) => (DomRoot::from_ref(&**os), None),
++            ObjectStoreOrIndex::Index(idx) => (
++                DomRoot::from_ref(idx.object_store()),
++                Some(idx.name().to_string()),
++            ),
++        };
++        let iteration_param = IterationParam {
++            cursor: Trusted::new(self),
++            key,
++            primary_key: None,
++            count,
++        };
++        let range = self.range.clone();
++        IDBRequest::execute_async(
++            &object_store,
++            move |callback| {
++                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
++                    callback,
++                    key_range: range,
++                    index,
++                })
++            },
++            Some(self.Request()),
++            Some(iteration_param),
++            CanGc::from_cx(cx),
++        )?;
++        Ok(())
++    }
+ }
+ 
+ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+@@ -245,6 +301,23 @@ impl IDBCursorMethods<crate::DomTypeHolder> for IDBCursor {
+             .get()
+             .expect("IDBCursor.request should be set when cursor is opened")
+     }
++
++    /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbcursor-continue>
++    fn Continue(&self, cx: SafeJSContext, key: HandleValue) -> Fallible<()> {
++        // The generated binding hands us the raw `SafeJSContext`; the IndexedDB key helpers want
++        // `js::context::JSContext`. SAFETY: `cx` is the live context for this call.
++        let mut cx =
++            unsafe { js::context::JSContext::from_ptr(NonNull::new(cx.raw_cx()).unwrap()) };
++        // If a key is given, the cursor advances to the first record whose key is >= it; otherwise
++        // it advances to the next record. The ordering against the current position is enforced by
++        // `iterate_cursor`.
++        let key = if key.is_undefined() {
++            None
++        } else {
++            Some(convert_value_to_key(&mut cx, key, None)?.into_result()?)
++        };
++        self.iterate(&mut cx, key, None)
++    }
+ }
+ 
+ /// A struct containing parameters for
+@@ -301,7 +374,7 @@ pub(crate) fn iterate_cursor(
+     let mut position = cursor.position.borrow().clone();
+ 
+     // Step 7. Let object store position be cursor’s object store position.
+-    let object_store_position = cursor.object_store_position.borrow().clone();
++    let mut object_store_position = cursor.object_store_position.borrow().clone();
+ 
+     // Step 8. If count is not given, let count be 1.
+     let mut count = count.unwrap_or(1);
+@@ -508,9 +581,13 @@ pub(crate) fn iterate_cursor(
+                 // Step 9.3. Let position be found record’s key.
+                 position = Some(found_record.key.clone());
+ 
+-                // Step 9.4. If source is an index, let object store position be found record’s value.
++                // Step 9.4. If source is an index, let object store position be found record’s value
++                // (the referenced record's primary key). Update the *local* tracked value so that
++                // Step 11 persists it onto the cursor — writing the cursor directly here is then
++                // overwritten by Step 11 with the stale pre-loop value, which left an index cursor's
++                // primaryKey undefined and stalled continue(). (LYK-1310)
+                 if matches!(source, ObjectStoreOrIndex::Index(_)) {
+-                    cursor.set_object_store_position(Some(found_record.primary_key.clone()));
++                    object_store_position = Some(found_record.primary_key.clone());
+                 }
+ 
+                 // Step 9.5. Decrease count by 1.
+diff --git a/components/script/dom/indexeddb/idbindex.rs b/components/script/dom/indexeddb/idbindex.rs
+index 7367a0ab388..1e12f19d634 100644
+--- a/components/script/dom/indexeddb/idbindex.rs
++++ b/components/script/dom/indexeddb/idbindex.rs
+@@ -1,20 +1,41 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++use std::ptr::NonNull;
++
+ use dom_struct::dom_struct;
+ use js::gc::MutableHandleValue;
++use js::rust::HandleValue;
+ use script_bindings::codegen::GenericBindings::IDBIndexBinding::IDBIndexMethods;
+ use script_bindings::conversions::SafeToJSValConvertible;
+ use script_bindings::reflector::{Reflector, reflect_dom_object};
+ use script_bindings::str::DOMString;
++use storage_traits::indexeddb::{AsyncOperation, AsyncReadOnlyOperation};
+ 
++use crate::dom::bindings::codegen::Bindings::IDBCursorBinding::IDBCursorDirection;
++use crate::dom::bindings::error::Fallible;
+ use crate::dom::bindings::import::base::SafeJSContext;
+-use crate::dom::bindings::root::DomRoot;
++use crate::dom::bindings::refcounted::Trusted;
++use crate::dom::bindings::reflector::DomGlobal;
++use crate::dom::bindings::root::{Dom, DomRoot};
+ use crate::dom::globalscope::GlobalScope;
+ use crate::dom::idbobjectstore::KeyPath;
++use crate::dom::indexeddb::idbcursor::{IDBCursor, IterationParam, ObjectStoreOrIndex};
++use crate::dom::indexeddb::idbcursorwithvalue::IDBCursorWithValue;
+ use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
++use crate::dom::indexeddb::idbrequest::IDBRequest;
++use crate::indexeddb::convert_value_to_key_range;
+ use crate::script_runtime::CanGc;
+ 
++/// The generated `IDBIndex` bindings hand us a raw `SafeJSContext` wrapper, but the IndexedDB
++/// helpers (`convert_value_to_key_range`, `CanGc::from_cx`) take the realm-tracking
++/// `js::context::JSContext`. Re-wrap the live context pointer into that form, mirroring the
++/// conversion script_runtime.rs performs for SpiderMonkey callbacks.
++fn js_context(cx: SafeJSContext) -> js::context::JSContext {
++    // SAFETY: `cx` is the live JS context for the current call.
++    unsafe { js::context::JSContext::from_ptr(NonNull::new(cx.raw_cx()).unwrap()) }
++}
++
+ #[dom_struct]
+ pub(crate) struct IDBIndex {
+     reflector_: Reflector,
+@@ -64,6 +85,91 @@ impl IDBIndex {
+             can_gc,
+         )
+     }
++
++    /// The index's name (its identifier within its object store).
++    pub(crate) fn name(&self) -> &DOMString {
++        &self.name
++    }
++
++    /// The index's key path, used to extract the index key from a stored value.
++    pub(crate) fn key_path(&self) -> &KeyPath {
++        &self.key_path
++    }
++
++    /// Whether this is a `multiEntry` index (an array index key yields one entry per element).
++    pub(crate) fn is_multi_entry(&self) -> bool {
++        self.multi_entry
++    }
++
++    /// The object store this index belongs to. Used as the request source / for transaction
++    /// access when running index queries (the index reads route through the store's transaction).
++    pub(crate) fn object_store(&self) -> &IDBObjectStore {
++        &self.object_store
++    }
++
++    /// Shared open-cursor logic for [`OpenCursor`](Self::OpenCursor) /
++    /// [`OpenKeyCursor`](Self::OpenKeyCursor). Mirrors the object-store variant, but the cursor's
++    /// source is this index (so its key is the index key and its primary key is the record key),
++    /// and the iterate operation carries this index's name so the backend walks `index_data`. (LYK-1310)
++    fn open_cursor(
++        &self,
++        cx: &mut js::context::JSContext,
++        query: HandleValue,
++        direction: IDBCursorDirection,
++        key_only: bool,
++    ) -> Fallible<DomRoot<IDBRequest>> {
++        self.object_store().verify_not_deleted()?;
++        self.object_store().check_transaction_active()?;
++
++        let range = convert_value_to_key_range(cx, query, Some(false))?;
++        let transaction = self.object_store().transaction();
++
++        let cursor = if key_only {
++            IDBCursor::new(
++                &self.global(),
++                &transaction,
++                direction,
++                false,
++                ObjectStoreOrIndex::Index(Dom::from_ref(self)),
++                range.clone(),
++                key_only,
++                CanGc::from_cx(cx),
++            )
++        } else {
++            DomRoot::upcast(IDBCursorWithValue::new(
++                &self.global(),
++                &transaction,
++                direction,
++                false,
++                ObjectStoreOrIndex::Index(Dom::from_ref(self)),
++                range.clone(),
++                key_only,
++                CanGc::from_cx(cx),
++            ))
++        };
++
++        let iteration_param = IterationParam {
++            cursor: Trusted::new(&cursor),
++            key: None,
++            primary_key: None,
++            count: None,
++        };
++        let index_name = self.name.to_string();
++        IDBRequest::execute_async(
++            self.object_store(),
++            |callback| {
++                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
++                    callback,
++                    key_range: range,
++                    index: Some(index_name),
++                })
++            },
++            None,
++            Some(iteration_param),
++            CanGc::from_cx(cx),
++        )
++        .inspect(|request| cursor.set_request(request))
++    }
+ }
+ 
+ impl IDBIndexMethods<crate::DomTypeHolder> for IDBIndex {
+@@ -93,4 +199,148 @@ impl IDBIndexMethods<crate::DomTypeHolder> for IDBIndex {
+             },
+         }
+     }
++
++    /// <https://www.w3.org/TR/IndexedDB/#dom-idbindex-get>
++    fn Get(&self, cx: SafeJSContext, query: HandleValue) -> Fallible<DomRoot<IDBRequest>> {
++        self.object_store().verify_not_deleted()?;
++        self.object_store().check_transaction_active()?;
++        let mut cx = js_context(cx);
++        let index_name = self.name.to_string();
++        let range = convert_value_to_key_range(&mut cx, query, Some(true))?;
++        IDBRequest::execute_async(
++            self.object_store(),
++            |callback| {
++                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
++                    callback,
++                    key_range: range,
++                    index: Some(index_name),
++                })
++            },
++            None,
++            None,
++            CanGc::from_cx(&mut cx),
++        )
++    }
++
++    /// <https://www.w3.org/TR/IndexedDB/#dom-idbindex-getkey>
++    fn GetKey(&self, cx: SafeJSContext, query: HandleValue) -> Fallible<DomRoot<IDBRequest>> {
++        self.object_store().verify_not_deleted()?;
++        self.object_store().check_transaction_active()?;
++        let mut cx = js_context(cx);
++        let index_name = self.name.to_string();
++        let range = convert_value_to_key_range(&mut cx, query, Some(true))?;
++        IDBRequest::execute_async(
++            self.object_store(),
++            |callback| {
++                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetKey {
++                    callback,
++                    key_range: range,
++                    index: Some(index_name),
++                })
++            },
++            None,
++            None,
++            CanGc::from_cx(&mut cx),
++        )
++    }
++
++    /// <https://www.w3.org/TR/IndexedDB/#dom-idbindex-getall>
++    fn GetAll(
++        &self,
++        cx: SafeJSContext,
++        query: HandleValue,
++        count: Option<u32>,
++    ) -> Fallible<DomRoot<IDBRequest>> {
++        self.object_store().verify_not_deleted()?;
++        self.object_store().check_transaction_active()?;
++        let mut cx = js_context(cx);
++        let index_name = self.name.to_string();
++        let range = convert_value_to_key_range(&mut cx, query, None)?;
++        IDBRequest::execute_async(
++            self.object_store(),
++            |callback| {
++                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllItems {
++                    callback,
++                    key_range: range,
++                    count,
++                    index: Some(index_name),
++                })
++            },
++            None,
++            None,
++            CanGc::from_cx(&mut cx),
++        )
++    }
++
++    /// <https://www.w3.org/TR/IndexedDB/#dom-idbindex-getallkeys>
++    fn GetAllKeys(
++        &self,
++        cx: SafeJSContext,
++        query: HandleValue,
++        count: Option<u32>,
++    ) -> Fallible<DomRoot<IDBRequest>> {
++        self.object_store().verify_not_deleted()?;
++        self.object_store().check_transaction_active()?;
++        let mut cx = js_context(cx);
++        let index_name = self.name.to_string();
++        let range = convert_value_to_key_range(&mut cx, query, None)?;
++        IDBRequest::execute_async(
++            self.object_store(),
++            |callback| {
++                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllKeys {
++                    callback,
++                    key_range: range,
++                    count,
++                    index: Some(index_name),
++                })
++            },
++            None,
++            None,
++            CanGc::from_cx(&mut cx),
++        )
++    }
++
++    /// <https://www.w3.org/TR/IndexedDB/#dom-idbindex-count>
++    fn Count(&self, cx: SafeJSContext, query: HandleValue) -> Fallible<DomRoot<IDBRequest>> {
++        self.object_store().verify_not_deleted()?;
++        self.object_store().check_transaction_active()?;
++        let mut cx = js_context(cx);
++        let index_name = self.name.to_string();
++        let range = convert_value_to_key_range(&mut cx, query, None)?;
++        IDBRequest::execute_async(
++            self.object_store(),
++            |callback| {
++                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count {
++                    callback,
++                    key_range: range,
++                    index: Some(index_name),
++                })
++            },
++            None,
++            None,
++            CanGc::from_cx(&mut cx),
++        )
++    }
++
++    /// <https://www.w3.org/TR/IndexedDB/#dom-idbindex-opencursor>
++    fn OpenCursor(
++        &self,
++        cx: SafeJSContext,
++        query: HandleValue,
++        direction: IDBCursorDirection,
++    ) -> Fallible<DomRoot<IDBRequest>> {
++        let mut cx = js_context(cx);
++        self.open_cursor(&mut cx, query, direction, false)
++    }
++
++    /// <https://www.w3.org/TR/IndexedDB/#dom-idbindex-openkeycursor>
++    fn OpenKeyCursor(
++        &self,
++        cx: SafeJSContext,
++        query: HandleValue,
++        direction: IDBCursorDirection,
++    ) -> Fallible<DomRoot<IDBRequest>> {
++        let mut cx = js_context(cx);
++        self.open_cursor(&mut cx, query, direction, true)
++    }
+ }
+diff --git a/components/script/dom/indexeddb/idbobjectstore.rs b/components/script/dom/indexeddb/idbobjectstore.rs
+index b5b03840bda..0600ef12db3 100644
+--- a/components/script/dom/indexeddb/idbobjectstore.rs
++++ b/components/script/dom/indexeddb/idbobjectstore.rs
+@@ -323,7 +323,7 @@ impl IDBObjectStore {
+         self.key_path.is_some()
+     }
+ 
+-    fn verify_not_deleted(&self) -> ErrorResult {
++    pub(crate) fn verify_not_deleted(&self) -> ErrorResult {
+         let db = self.transaction.Db();
+         if !db.object_store_exists(&self.name.borrow()) {
+             return Err(Error::InvalidState(None));
+@@ -332,7 +332,7 @@ impl IDBObjectStore {
+     }
+ 
+     /// Checks if the transaction is active, throwing a "TransactionInactiveError" DOMException if not.
+-    fn check_transaction_active(&self) -> Fallible<()> {
++    pub(crate) fn check_transaction_active(&self) -> Fallible<()> {
+         // Let transaction be this object store handle's transaction.
+         let transaction = &self.transaction;
+ 
+@@ -467,6 +467,33 @@ impl IDBObjectStore {
+         let Ok(serialized_value) = postcard::to_stdvec(&cloned_value) else {
+             return Err(Error::InvalidState(None));
+         };
++
++        // Extract this value's key for each of the store's indexes. Key-path evaluation needs
++        // SpiderMonkey, so it happens here in the script process; the resulting `(index name, key)`
++        // pairs travel with the put so the storage backend can write the `index_data` entries.
++        // Indexes whose key path does not yield a valid key for this value contribute no entry.
++        // (LYK-1310)
++        let index_descriptors: Vec<(String, KeyPath, bool)> = self
++            .index_set
++            .borrow()
++            .values()
++            .map(|index| {
++                (
++                    index.name().to_string(),
++                    index.key_path().clone(),
++                    index.is_multi_entry(),
++                )
++            })
++            .collect();
++        let mut index_keys: Vec<(String, IndexedDBKeyType)> = Vec::new();
++        for (name, key_path, multi_entry) in &index_descriptors {
++            if let ExtractionResult::Key(index_key) =
++                extract_key(cx, cloned_js_value.handle(), key_path, Some(*multi_entry))?
++            {
++                index_keys.push((name.clone(), index_key));
++            }
++        }
++
+         // Step 12. Let operation be an algorithm to run store a record into an object store with
+         // store, clone, key, and no-overwrite flag.
+         let request = IDBRequest::execute_async(
+@@ -478,6 +505,7 @@ impl IDBObjectStore {
+                     value: serialized_value,
+                     should_overwrite: !no_overwrite,
+                     key_generator_current_number: key_generator_current_number_for_put,
++                    index_keys,
+                 })
+             },
+             None,
+@@ -566,6 +594,7 @@ impl IDBObjectStore {
+                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
+                     callback,
+                     key_range: range,
++                    index: None,
+                 })
+             },
+             None,
+@@ -698,6 +727,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+                     AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
+                         callback,
+                         key_range: q,
++                        index: None,
+                     })
+                 },
+                 None,
+@@ -730,6 +760,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+                     AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetKey {
+                         callback,
+                         key_range: q,
++                        index: None,
+                     })
+                 },
+                 None,
+@@ -768,6 +799,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+                         callback,
+                         key_range: q,
+                         count,
++                        index: None,
+                     })
+                 },
+                 None,
+@@ -806,6 +838,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+                         callback,
+                         key_range: q,
+                         count,
++                        index: None,
+                     })
+                 },
+                 None,
+@@ -837,6 +870,7 @@ impl IDBObjectStoreMethods<crate::DomTypeHolder> for IDBObjectStore {
+                     AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count {
+                         callback,
+                         key_range: q,
++                        index: None,
+                     })
+                 },
+                 None,
+diff --git a/components/script_bindings/webidls/IDBCursor.webidl b/components/script_bindings/webidls/IDBCursor.webidl
+index 93ec491e785..6b60bcbf042 100644
+--- a/components/script_bindings/webidls/IDBCursor.webidl
++++ b/components/script_bindings/webidls/IDBCursor.webidl
+@@ -17,7 +17,7 @@ interface IDBCursor {
+   [SameObject] readonly attribute IDBRequest request;
+ 
+   // undefined advance([EnforceRange] unsigned long count);
+-  // undefined continue(optional any key);
++  [Throws] undefined continue(optional any key);
+   // undefined continuePrimaryKey(any key, any primaryKey);
+ 
+   // [NewObject] IDBRequest update(any value);
+diff --git a/components/script_bindings/webidls/IDBIndex.webidl b/components/script_bindings/webidls/IDBIndex.webidl
+index 834bd0a7ecc..d0cdacf8ada 100644
+--- a/components/script_bindings/webidls/IDBIndex.webidl
++++ b/components/script_bindings/webidls/IDBIndex.webidl
+@@ -15,17 +15,17 @@ interface IDBIndex {
+   readonly attribute boolean multiEntry;
+   readonly attribute boolean unique;
+ 
+-  // [NewObject] IDBRequest get(any query);
+-  // [NewObject] IDBRequest getKey(any query);
+-  // [NewObject] IDBRequest getAll(optional any queryOrOptions,
+-  //                               optional [EnforceRange] unsigned long count);
+-  // [NewObject] IDBRequest getAllKeys(optional any queryOrOptions,
+-  //                                   optional [EnforceRange] unsigned long count);
++  [NewObject, Throws] IDBRequest get(any query);
++  [NewObject, Throws] IDBRequest getKey(any query);
++  [NewObject, Throws] IDBRequest getAll(optional any query,
++                                optional [EnforceRange] unsigned long count);
++  [NewObject, Throws] IDBRequest getAllKeys(optional any query,
++                                    optional [EnforceRange] unsigned long count);
+   // [NewObject] IDBRequest getAllRecords(optional IDBGetAllOptions options = {});
+-  // [NewObject] IDBRequest count(optional any query);
++  [NewObject, Throws] IDBRequest count(optional any query);
+ 
+-  // [NewObject] IDBRequest openCursor(optional any query,
+-  //                                   optional IDBCursorDirection direction = "next");
+-  // [NewObject] IDBRequest openKeyCursor(optional any query,
+-  //                                      optional IDBCursorDirection direction = "next");
++  [NewObject, Throws] IDBRequest openCursor(optional any query,
++                                    optional IDBCursorDirection direction = "next");
++  [NewObject, Throws] IDBRequest openKeyCursor(optional any query,
++                                       optional IDBCursorDirection direction = "next");
+ };
+diff --git a/components/shared/storage/indexeddb.rs b/components/shared/storage/indexeddb.rs
+index 857d7736758..941dff979bb 100644
+--- a/components/shared/storage/indexeddb.rs
++++ b/components/shared/storage/indexeddb.rs
+@@ -284,34 +284,45 @@ pub enum PutItemResult {
+ 
+ #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+ pub enum AsyncReadOnlyOperation {
++    // `index` selects the source for a read: `None` reads the object store by primary key (the
++    // `key_range` applies to the primary key); `Some(index name)` reads via that index (the
++    // `key_range` applies to the index key, and the backend resolves matching index entries to
++    // the records they reference). The returned values/keys are always the record's value and the
++    // record's primary key, regardless of source. (LYK-1310)
+     /// Gets the value associated with the given key in the associated idb data
+     GetKey {
+         callback: GenericCallback<BackendResult<Option<IndexedDBKeyType>>>,
+         key_range: IndexedDBKeyRange,
++        index: Option<String>,
+     },
+     GetItem {
+         callback: GenericCallback<BackendResult<Option<Vec<u8>>>>,
+         key_range: IndexedDBKeyRange,
++        index: Option<String>,
+     },
+ 
+     GetAllKeys {
+         callback: GenericCallback<BackendResult<Vec<IndexedDBKeyType>>>,
+         key_range: IndexedDBKeyRange,
+         count: Option<u32>,
++        index: Option<String>,
+     },
+     GetAllItems {
+         callback: GenericCallback<BackendResult<Vec<Vec<u8>>>>,
+         key_range: IndexedDBKeyRange,
+         count: Option<u32>,
++        index: Option<String>,
+     },
+ 
+     Count {
+         callback: GenericCallback<BackendResult<u64>>,
+         key_range: IndexedDBKeyRange,
++        index: Option<String>,
+     },
+     Iterate {
+         callback: GenericCallback<BackendResult<Vec<IndexedDBRecord>>>,
+         key_range: IndexedDBKeyRange,
++        index: Option<String>,
+     },
+ }
+ 
+@@ -338,6 +349,13 @@ pub enum AsyncReadWriteOperation {
+         should_overwrite: bool,
+         /// New object store key generator current number to persist if the put succeeds.
+         key_generator_current_number: Option<i64>,
++        /// Index keys extracted (script-side, via each index's key path) from the value being
++        /// stored, as `(index name, index key)`. The key-path evaluation needs SpiderMonkey, so it
++        /// happens in the script process and the results are shipped here for the backend to write
++        /// into `index_data`/`unique_index_data`. For a multiEntry index the key may be an
++        /// `Array`, which the backend expands to one index entry per element. Indexes whose key
++        /// path did not yield a valid key for this value are omitted (no index entry). (LYK-1310)
++        index_keys: Vec<(String, IndexedDBKeyType)>,
+     },
+ 
+     /// Removes the key/value pair for the given key in the associated idb data
+diff --git a/components/storage/indexeddb/engines/sqlite.rs b/components/storage/indexeddb/engines/sqlite.rs
+index 6baa8aa9364..43f88b1591f 100644
+--- a/components/storage/indexeddb/engines/sqlite.rs
++++ b/components/storage/indexeddb/engines/sqlite.rs
+@@ -241,6 +241,7 @@ impl SqliteEngine {
+         value: Vec<u8>,
+         should_overwrite: bool,
+         key_generator_current_number: Option<i64>,
++        index_keys: Vec<(String, IndexedDBKeyType)>,
+     ) -> Result<PutItemResult, Error> {
+         let no_overwrite = !should_overwrite;
+         let serialized_key: Vec<u8> = encoding::serialize(&key);
+@@ -257,7 +258,9 @@ impl SqliteEngine {
+                 return Ok(PutItemResult::CannotOverwrite);
+             }
+             // Preserve `put()` semantics by replacing the stored value when the primary
+-            // key already exists.
++            // key already exists. Drop the record's stale index entries first so they can be
++            // rebuilt from the new value below. (LYK-1310)
++            Self::delete_index_entries_for_key(connection, store.id, &serialized_key)?;
+             connection.execute(
+                 "UPDATE object_data SET data = ? WHERE object_store_id = ? AND key = ?",
+                 params![value, store.id, serialized_key],
+@@ -268,6 +271,8 @@ impl SqliteEngine {
+                 params![store.id, serialized_key, value],
+             )?;
+         }
++        // Record this value in each of its object store's indexes. (LYK-1310)
++        Self::write_index_entries(connection, store.id, &serialized_key, index_keys)?;
+         if let Some(next_key_generator_current_number) = key_generator_current_number {
+             connection.execute(
+                 "UPDATE object_store SET auto_increment = ? WHERE id = ?",
+@@ -277,6 +282,358 @@ impl SqliteEngine {
+         Ok(PutItemResult::Key(key))
+     }
+ 
++    /// Write `index_data`/`unique_index_data` rows for a record's extracted index keys, mapping
++    /// each index key to the record's primary key. A `multiEntry` index whose key is an `Array`
++    /// produces one entry per element. A unique index relies on the `unique_index_data` primary
++    /// key `(index_id, value)` to reject a duplicate (surfaced as an error). (LYK-1310)
++    fn write_index_entries(
++        connection: &Connection,
++        object_store_id: i32,
++        serialized_primary_key: &[u8],
++        index_keys: Vec<(String, IndexedDBKeyType)>,
++    ) -> Result<(), Error> {
++        for (index_name, index_key) in index_keys {
++            let lookup = connection
++                .prepare(
++                    "SELECT id, unique_index, multi_entry_index FROM object_store_index \
++                     WHERE name = ? AND object_store_id = ?",
++                )
++                .and_then(|mut stmt| {
++                    stmt.query_row(params![index_name, object_store_id], |row| {
++                        Ok((
++                            row.get::<_, i64>(0)?,
++                            row.get::<_, bool>(1)?,
++                            row.get::<_, bool>(2)?,
++                        ))
++                    })
++                    .optional()
++                })?;
++            let Some((index_id, unique, multi_entry)) = lookup else {
++                // Index was removed since the script process snapshotted it; nothing to write.
++                continue;
++            };
++            // multiEntry expands an array key into one entry per element; everything else is a
++            // single entry.
++            let entry_keys: Vec<IndexedDBKeyType> = match (multi_entry, index_key) {
++                (true, IndexedDBKeyType::Array(elements)) => elements,
++                (_, other) => vec![other],
++            };
++            for entry_key in &entry_keys {
++                let serialized_index_value = encoding::serialize(entry_key);
++                if unique {
++                    connection.execute(
++                        "INSERT INTO unique_index_data \
++                         (index_id, value, object_store_id, object_data_key) VALUES (?, ?, ?, ?)",
++                        params![
++                            index_id,
++                            serialized_index_value,
++                            object_store_id,
++                            serialized_primary_key
++                        ],
++                    )?;
++                } else {
++                    connection.execute(
++                        "INSERT INTO index_data \
++                         (index_id, value, object_data_key, object_store_id) VALUES (?, ?, ?, ?)",
++                        params![
++                            index_id,
++                            serialized_index_value,
++                            serialized_primary_key,
++                            object_store_id
++                        ],
++                    )?;
++                }
++            }
++        }
++        Ok(())
++    }
++
++    /// Remove all index entries (both tables) that point at a given record's primary key — used
++    /// when a record is overwritten or deleted so indexes don't keep stale rows. (LYK-1310)
++    fn delete_index_entries_for_key(
++        connection: &Connection,
++        object_store_id: i32,
++        serialized_primary_key: &[u8],
++    ) -> Result<(), Error> {
++        connection.execute(
++            "DELETE FROM index_data WHERE object_store_id = ? AND object_data_key = ?",
++            params![object_store_id, serialized_primary_key],
++        )?;
++        connection.execute(
++            "DELETE FROM unique_index_data WHERE object_store_id = ? AND object_data_key = ?",
++            params![object_store_id, serialized_primary_key],
++        )?;
++        Ok(())
++    }
++
++    // ----- Index reads (LYK-1310) -------------------------------------------------------------
++    // A read with `index = Some(name)` resolves matching index entries (by index-key range) to
++    // the primary keys they reference, then to the stored records. Index values and object-store
++    // keys share the same order-preserving `encoding::serialize` form, so the index-key range
++    // becomes a plain byte comparison on the `value` column.
++
++    /// Resolve an index name to its `(id, unique)` within an object store, or `None` if absent.
++    fn lookup_index(
++        connection: &Connection,
++        object_store_id: i32,
++        index_name: &str,
++    ) -> Result<Option<(i64, bool)>, Error> {
++        connection
++            .prepare(
++                "SELECT id, unique_index FROM object_store_index \
++                 WHERE name = ? AND object_store_id = ?",
++            )
++            .and_then(|mut stmt| {
++                stmt.query_row(params![index_name, object_store_id], |row| {
++                    Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
++                })
++                .optional()
++            })
++    }
++
++    /// Build the `value`-column predicates + their bound blobs for an index-key range.
++    fn index_value_conditions(range: &IndexedDBKeyRange) -> (Vec<String>, Vec<Vec<u8>>) {
++        let mut parts = Vec::new();
++        let mut binds = Vec::new();
++        if let Some(singleton) = range.as_singleton() {
++            parts.push("value = ?".to_string());
++            binds.push(encoding::serialize(singleton));
++        } else {
++            if let Some(lower) = range.lower.as_ref() {
++                parts.push(format!("value {} ?", if range.lower_open { ">" } else { ">=" }));
++                binds.push(encoding::serialize(lower));
++            }
++            if let Some(upper) = range.upper.as_ref() {
++                parts.push(format!("value {} ?", if range.upper_open { "<" } else { "<=" }));
++                binds.push(encoding::serialize(upper));
++            }
++        }
++        (parts, binds)
++    }
++
++    /// `(serialized index value, serialized primary key)` for index entries in `range`, ordered by
++    /// index value then primary key (the cursor/getAll iteration order), optionally capped.
++    fn index_entries(
++        connection: &Connection,
++        index_id: i64,
++        unique: bool,
++        range: IndexedDBKeyRange,
++        count: Option<u32>,
++    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
++        let table = if unique { "unique_index_data" } else { "index_data" };
++        let (mut conds, binds) = Self::index_value_conditions(&range);
++        conds.insert(0, "index_id = ?".to_string());
++        let limit = match count {
++            Some(c) => format!(" LIMIT {}", c),
++            None => String::new(),
++        };
++        let sql = format!(
++            "SELECT value, object_data_key FROM {} WHERE {} ORDER BY value, object_data_key{}",
++            table,
++            conds.join(" AND "),
++            limit,
++        );
++        let mut stmt = connection.prepare(&sql)?;
++        let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&index_id];
++        for b in &binds {
++            bound.push(b);
++        }
++        let rows = stmt
++            .query_map(&bound[..], |row| {
++                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
++            })?
++            .collect::<Result<Vec<_>, _>>()?;
++        Ok(rows)
++    }
++
++    /// Number of index entries in `range`.
++    fn index_count(
++        connection: &Connection,
++        index_id: i64,
++        unique: bool,
++        range: IndexedDBKeyRange,
++    ) -> Result<u64, Error> {
++        let table = if unique { "unique_index_data" } else { "index_data" };
++        let (mut conds, binds) = Self::index_value_conditions(&range);
++        conds.insert(0, "index_id = ?".to_string());
++        let sql = format!("SELECT COUNT(*) FROM {} WHERE {}", table, conds.join(" AND "));
++        let mut stmt = connection.prepare(&sql)?;
++        let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&index_id];
++        for b in &binds {
++            bound.push(b);
++        }
++        let n: i64 = stmt.query_row(&bound[..], |row| row.get(0))?;
++        Ok(n as u64)
++    }
++
++    /// The stored value (data blob) for a primary key, or `None` if the record is gone.
++    fn object_data_value(
++        connection: &Connection,
++        object_store_id: i32,
++        serialized_key: &[u8],
++    ) -> Result<Option<Vec<u8>>, Error> {
++        connection
++            .prepare("SELECT data FROM object_data WHERE object_store_id = ? AND key = ?")
++            .and_then(|mut stmt| {
++                stmt.query_row(params![object_store_id, serialized_key], |row| {
++                    row.get::<_, Vec<u8>>(0)
++                })
++                .optional()
++            })
++    }
++
++    // ----- Read dispatch helpers: branch on object-store vs index source ----------------------
++
++    fn op_get_item(
++        connection: &Connection,
++        store: object_store_model::Model,
++        key_range: IndexedDBKeyRange,
++        index: Option<String>,
++    ) -> Result<Option<Vec<u8>>, Error> {
++        let Some(index_name) = index else {
++            return Self::get_item(connection, store, key_range);
++        };
++        let store_id = store.id;
++        let Some((index_id, unique)) = Self::lookup_index(connection, store_id, &index_name)? else {
++            return Ok(None);
++        };
++        match Self::index_entries(connection, index_id, unique, key_range, Some(1))?
++            .into_iter()
++            .next()
++        {
++            Some((_, primary_key)) => Self::object_data_value(connection, store_id, &primary_key),
++            None => Ok(None),
++        }
++    }
++
++    fn op_get_key(
++        connection: &Connection,
++        store: object_store_model::Model,
++        key_range: IndexedDBKeyRange,
++        index: Option<String>,
++    ) -> Result<Option<IndexedDBKeyType>, Error> {
++        let Some(index_name) = index else {
++            return Self::get_key(connection, store, key_range)
++                .map(|opt| opt.and_then(|k| encoding::deserialize(&k)));
++        };
++        let Some((index_id, unique)) = Self::lookup_index(connection, store.id, &index_name)? else {
++            return Ok(None);
++        };
++        Ok(Self::index_entries(connection, index_id, unique, key_range, Some(1))?
++            .into_iter()
++            .next()
++            .and_then(|(_, primary_key)| encoding::deserialize(&primary_key)))
++    }
++
++    fn op_get_all_keys(
++        connection: &Connection,
++        store: object_store_model::Model,
++        key_range: IndexedDBKeyRange,
++        count: Option<u32>,
++        index: Option<String>,
++    ) -> Result<Vec<IndexedDBKeyType>, Error> {
++        let Some(index_name) = index else {
++            return Self::get_all_keys(connection, store, key_range, count).map(|keys| {
++                keys.into_iter()
++                    .filter_map(|k| encoding::deserialize(&k))
++                    .collect()
++            });
++        };
++        let Some((index_id, unique)) = Self::lookup_index(connection, store.id, &index_name)? else {
++            return Ok(Vec::new());
++        };
++        Ok(Self::index_entries(connection, index_id, unique, key_range, count)?
++            .into_iter()
++            .filter_map(|(_, primary_key)| encoding::deserialize(&primary_key))
++            .collect())
++    }
++
++    fn op_get_all_items(
++        connection: &Connection,
++        store: object_store_model::Model,
++        key_range: IndexedDBKeyRange,
++        count: Option<u32>,
++        index: Option<String>,
++    ) -> Result<Vec<Vec<u8>>, Error> {
++        let Some(index_name) = index else {
++            return Self::get_all_items(connection, store, key_range, count);
++        };
++        let store_id = store.id;
++        let Some((index_id, unique)) = Self::lookup_index(connection, store_id, &index_name)? else {
++            return Ok(Vec::new());
++        };
++        let mut values = Vec::new();
++        for (_, primary_key) in Self::index_entries(connection, index_id, unique, key_range, count)? {
++            if let Some(value) = Self::object_data_value(connection, store_id, &primary_key)? {
++                values.push(value);
++            }
++        }
++        Ok(values)
++    }
++
++    fn op_count(
++        connection: &Connection,
++        store: object_store_model::Model,
++        key_range: IndexedDBKeyRange,
++        index: Option<String>,
++    ) -> Result<u64, Error> {
++        let Some(index_name) = index else {
++            return Self::count(connection, store, key_range).map(|r| r as u64);
++        };
++        let Some((index_id, unique)) = Self::lookup_index(connection, store.id, &index_name)? else {
++            return Ok(0);
++        };
++        Self::index_count(connection, index_id, unique, key_range)
++    }
++
++    fn op_iterate(
++        connection: &Connection,
++        store: object_store_model::Model,
++        key_range: IndexedDBKeyRange,
++        index: Option<String>,
++    ) -> Result<Vec<IndexedDBRecord>, Error> {
++        let Some(index_name) = index else {
++            return Self::get_all_records(connection, store, key_range).map(|records| {
++                records
++                    .into_iter()
++                    .filter_map(|(key, data)| {
++                        let key = encoding::deserialize(&key)?;
++                        Some(IndexedDBRecord {
++                            key: key.clone(),
++                            primary_key: key,
++                            value: data,
++                        })
++                    })
++                    .collect()
++            });
++        };
++        let store_id = store.id;
++        let Some((index_id, unique)) = Self::lookup_index(connection, store_id, &index_name)? else {
++            return Ok(Vec::new());
++        };
++        // For an index cursor the cursor key is the index value and the primary key is the
++        // referenced record's key; the value is that record's stored data.
++        let mut records = Vec::new();
++        for (index_value, primary_key) in
++            Self::index_entries(connection, index_id, unique, key_range, None)?
++        {
++            let (Some(key), Some(primary)) = (
++                encoding::deserialize(&index_value),
++                encoding::deserialize(&primary_key),
++            ) else {
++                continue;
++            };
++            let value = Self::object_data_value(connection, store_id, &primary_key)?
++                .unwrap_or_default();
++            records.push(IndexedDBRecord {
++                key,
++                primary_key: primary,
++                value,
++            });
++        }
++        Ok(records)
++    }
++
+     fn delete_item(
+         connection: &Connection,
+         store: object_store_model::Model,
+@@ -438,6 +795,7 @@ impl KvsEngine for SqliteEngine {
+                         value,
+                         should_overwrite,
+                         key_generator_current_number,
++                        index_keys,
+                     }) => {
+                         let (key, key_generator_current_number) = match key {
+                             Some(key) => (key, key_generator_current_number),
+@@ -476,6 +834,7 @@ impl KvsEngine for SqliteEngine {
+                                 value,
+                                 should_overwrite,
+                                 key_generator_current_number,
++                                index_keys,
+                             )
+                             .map_err(|e| BackendError::DbErr(format!("{:?}", e))),
+                         );
+@@ -483,9 +842,10 @@ impl KvsEngine for SqliteEngine {
+                     AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
+                         callback,
+                         key_range,
++                        index,
+                     }) => {
+                         let _ = callback.send(
+-                            Self::get_item(&connection, object_store, key_range)
++                            Self::op_get_item(&connection, object_store, key_range, index)
+                                 .map_err(|e| BackendError::DbErr(format!("{:?}", e))),
+                         );
+                     },
+@@ -493,14 +853,10 @@ impl KvsEngine for SqliteEngine {
+                         callback,
+                         key_range,
+                         count,
++                        index,
+                     }) => {
+                         let _ = callback.send(
+-                            Self::get_all_keys(&connection, object_store, key_range, count)
+-                                .map(|keys| {
+-                                    keys.into_iter()
+-                                        .map(|k| encoding::deserialize(&k).unwrap())
+-                                        .collect()
+-                                })
++                            Self::op_get_all_keys(&connection, object_store, key_range, count, index)
+                                 .map_err(|e| BackendError::DbErr(format!("{:?}", e))),
+                         );
+                     },
+@@ -508,9 +864,10 @@ impl KvsEngine for SqliteEngine {
+                         callback,
+                         key_range,
+                         count,
++                        index,
+                     }) => {
+                         let _ = callback.send(
+-                            Self::get_all_items(&connection, object_store, key_range, count)
++                            Self::op_get_all_items(&connection, object_store, key_range, count, index)
+                                 .map_err(|e| BackendError::DbErr(format!("{:?}", e))),
+                         );
+                     },
+@@ -526,29 +883,20 @@ impl KvsEngine for SqliteEngine {
+                     AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count {
+                         callback,
+                         key_range,
++                        index,
+                     }) => {
+                         let _ = callback.send(
+-                            Self::count(&connection, object_store, key_range)
+-                                .map(|r| r as u64)
++                            Self::op_count(&connection, object_store, key_range, index)
+                                 .map_err(|e| BackendError::DbErr(format!("{:?}", e))),
+                         );
+                     },
+                     AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
+                         callback,
+                         key_range,
++                        index,
+                     }) => {
+                         let _ = callback.send(
+-                            Self::get_all_records(&connection, object_store, key_range)
+-                                .map(|records| {
+-                                    records
+-                                        .into_iter()
+-                                        .map(|(key, data)| IndexedDBRecord {
+-                                            key: encoding::deserialize(&key).unwrap(),
+-                                            primary_key: encoding::deserialize(&key).unwrap(),
+-                                            value: data,
+-                                        })
+-                                        .collect()
+-                                })
++                            Self::op_iterate(&connection, object_store, key_range, index)
+                                 .map_err(|e| BackendError::DbErr(format!("{:?}", e))),
+                         );
+                     },
+@@ -561,10 +909,10 @@ impl KvsEngine for SqliteEngine {
+                     AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetKey {
+                         callback,
+                         key_range,
++                        index,
+                     }) => {
+                         let _ = callback.send(
+-                            Self::get_key(&connection, object_store, key_range)
+-                                .map(|key| key.map(|k| encoding::deserialize(&k).unwrap()))
++                            Self::op_get_key(&connection, object_store, key_range, index)
+                                 .map_err(|e| BackendError::DbErr(format!("{:?}", e))),
+                         );
+                     },
+@@ -1031,6 +1379,7 @@ mod tests {
+             vec![1, 2, 3],
+             true,
+             None,
++            vec![],
+         )
+         .expect("Failed to insert item");
+ 
+@@ -1116,6 +1465,7 @@ mod tests {
+                             value: vec![1, 2, 3],
+                             should_overwrite: false,
+                             key_generator_current_number: None,
++                            index_keys: vec![],
+                         }),
+                     },
+                     KvsOperation {
+@@ -1126,6 +1476,7 @@ mod tests {
+                             value: vec![4, 5, 6],
+                             should_overwrite: false,
+                             key_generator_current_number: None,
++                            index_keys: vec![],
+                         }),
+                     },
+                     KvsOperation {
+@@ -1139,6 +1490,7 @@ mod tests {
+                             value: vec![7, 8, 9],
+                             should_overwrite: false,
+                             key_generator_current_number: None,
++                            index_keys: vec![],
+                         }),
+                     },
+                     // Try to put a duplicate key without overwrite
+@@ -1150,6 +1502,7 @@ mod tests {
+                             value: vec![10, 11, 12],
+                             should_overwrite: false,
+                             key_generator_current_number: None,
++                            index_keys: vec![],
+                         }),
+                     },
+                     KvsOperation {
+@@ -1160,6 +1513,7 @@ mod tests {
+                             value: vec![13, 14, 15],
+                             should_overwrite: true,
+                             key_generator_current_number: None,
++                            index_keys: vec![],
+                         }),
+                     },
+                     KvsOperation {
+@@ -1167,6 +1521,7 @@ mod tests {
+                         operation: AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
+                             callback: get_callback(get_item_some.0),
+                             key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(1.0)),
++                            index: None,
+                         }),
+                     },
+                     KvsOperation {
+@@ -1174,6 +1529,7 @@ mod tests {
+                         operation: AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
+                             callback: get_callback(get_item_none.0),
+                             key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(5.0)),
++                            index: None,
+                         }),
+                     },
+                     KvsOperation {
+@@ -1185,6 +1541,7 @@ mod tests {
+                                 false,
+                             ),
+                             count: None,
++                            index: None,
+                         }),
+                     },
+                     KvsOperation {
+@@ -1192,6 +1549,7 @@ mod tests {
+                         operation: AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count {
+                             callback: get_callback(count.0),
+                             key_range: IndexedDBKeyRange::only(IndexedDBKeyType::Number(1.0)),
++                            index: None,
+                         }),
+                     },
+                     KvsOperation {
+@@ -1276,6 +1634,7 @@ mod tests {
+                     vec![key as u8],
+                     false,
+                     None,
++                    vec![],
+                 )
+                 .expect("Failed to seed object store");
+             }

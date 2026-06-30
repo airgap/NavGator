@@ -1,0 +1,30 @@
+<!doctype html><meta charset="utf-8"><title>idb-index gate</title>
+<body style="margin:0;background:#888"><pre id="o" style="font:13px monospace;padding:8px"></pre></body>
+<script>
+// Exercises the full IndexedDB index surface (LYK-1310) and signals the result as the page
+// background colour so a screenshot pixel-sample can gate it: GREEN = all pass, RED = any fail.
+const o=document.getElementById('o'); const log=[];
+function fail(m){ log.push('FAIL '+m); o.textContent=log.join('\n'); document.body.style.background='#cc0000'; document.title='IDB IDX FAIL'; }
+function pass(){ o.textContent=log.join('\n')+'\nALL PASS'; document.body.style.background='#00aa00'; document.title='IDB IDX OK'; }
+const req=indexedDB.open('idbgate',1);
+req.onupgradeneeded=(e)=>{ const db=e.target.result; const s=db.createObjectStore('p',{keyPath:'id'});
+  s.createIndex('byName','name',{unique:false}); s.createIndex('byEmail','email',{unique:true}); };
+req.onerror=()=>fail('open');
+req.onsuccess=(e)=>{ const db=e.target.result; const tx=db.transaction('p','readwrite'); const s=tx.objectStore('p');
+  s.put({id:1,name:'Alice',email:'a1@x'}); s.put({id:2,name:'Bob',email:'b@x'}); s.put({id:3,name:'Alice',email:'a2@x'});
+  tx.onerror=(ev)=>fail('write '+ev.target.error); tx.oncomplete=()=>reads(db); };
+function reads(db){
+  const tx=db.transaction('p','readonly'); const idx=tx.objectStore('p').index('byName');
+  let pend=6, bad=0; const done=()=>{ if(--pend===0){ bad?fail('('+bad+' checks failed)'):pass(); } };
+  function chk(label,r,ok){ r.onsuccess=()=>{ let g; try{g=ok(r.result);}catch(e){g=false;} if(g)log.push('ok '+label); else {bad++; log.push('BAD '+label+' => '+JSON.stringify(r.result));} done(); }; r.onerror=()=>{bad++; log.push('ERR '+label); done(); }; }
+  chk('get',      idx.get('Alice'),       v=>v&&v.id===1);
+  chk('getKey',   idx.getKey('Alice'),    v=>v===1);
+  chk('getAll',   idx.getAll('Alice'),    v=>v.length===2&&v[0].id===1&&v[1].id===3);
+  chk('getAllKeys',idx.getAllKeys('Alice'),v=>v.length===2&&v[0]===1&&v[1]===3);
+  chk('count',    idx.count('Alice'),     v=>v===2);
+  const seen=[]; const c=idx.openCursor();
+  c.onsuccess=()=>{ const r=c.result; if(r){ seen.push([r.key,r.primaryKey]); r.continue(); }
+    else { const g=seen.length===3&&seen[0][1]===1&&seen[1][1]===3&&seen[2][1]===2; if(g)log.push('ok cursor'); else{bad++;log.push('BAD cursor '+JSON.stringify(seen));} done(); } };
+  c.onerror=()=>{bad++; log.push('ERR cursor'); done(); };
+}
+</script>
