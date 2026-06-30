@@ -1,0 +1,44 @@
+diff --git a/components/net/subresource_integrity.rs b/components/net/subresource_integrity.rs
+index 75e5978af54..76ce475536c 100644
+--- a/components/net/subresource_integrity.rs
++++ b/components/net/subresource_integrity.rs
+@@ -134,13 +134,27 @@ pub fn get_strongest_metadata(integrity_metadata_list: Vec<SriEntry>) -> Vec<Sri
+ }
+ 
+ /// <https://w3c.github.io/webappsec-subresource-integrity/#apply-algorithm-to-response>
+-fn apply_algorithm_to_response<D: Digest>(body: MutexGuard<ResponseBody>, mut hasher: D) -> String {
++///
++/// Returns `None` when there is no fully-received body to digest. The body can be
++/// [`ResponseBody::Empty`] (a null-body-status response — 204/304/HEAD — or a
++/// de-duplicated network-error response) or still [`ResponseBody::Receiving`] (a race in
++/// the HTTP cache's in-flight request de-duplication, where an awaiting consumer is woken
++/// with `Data::Done` before the shared body has been finalized). In all of those cases we
++/// have nothing valid to hash, so we report "no digest" and let the caller treat the
++/// response as failing integrity — per Fetch "main fetch" step 19, a null body fails
++/// integrity. This used to `unreachable!()`-panic, which tore down the resource thread,
++/// closed the script IPC pipe (broken-pipe content-process crashes) and left every
++/// SRI-using page (Astro/Next/CDN bundles with `integrity="sha…"`) blank.
++fn apply_algorithm_to_response<D: Digest>(
++    body: MutexGuard<ResponseBody>,
++    mut hasher: D,
++) -> Option<String> {
+     if let ResponseBody::Done(ref vec) = *body {
+         hasher.update(vec);
+         let response_digest = hasher.finalize(); // Now hash
+-        base64::engine::general_purpose::STANDARD.encode(&response_digest)
++        Some(base64::engine::general_purpose::STANDARD.encode(&response_digest))
+     } else {
+-        unreachable!("Tried to calculate digest of incomplete response body")
++        None
+     }
+ }
+ 
+@@ -180,7 +194,7 @@ pub fn is_response_integrity_valid(integrity_metadata: &str, response: &Response
+             _ => continue,
+         };
+ 
+-        if hashed == digest {
++        if hashed.as_deref() == Some(digest.as_str()) {
+             return true;
+         }
+     }
