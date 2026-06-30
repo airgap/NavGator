@@ -622,6 +622,24 @@ mod icon {
         p.line_segment([pos2(end_x, r.center().y - dy), pos2(tip_x, r.center().y)], st);
         p.line_segment([pos2(tip_x, r.center().y), pos2(end_x, r.center().y + dy)], st);
     }
+    /// Up / down chevrons (find prev / next match).
+    pub fn up(p: &Painter, r: Rect, c: Color32) {
+        vchevron(p, r, c, true);
+    }
+    pub fn down(p: &Painter, r: Rect, c: Color32) {
+        vchevron(p, r, c, false);
+    }
+    fn vchevron(p: &Painter, r: Rect, c: Color32, up: bool) {
+        let st = Stroke::new(1.8, c);
+        let (tip_y, end_y) = if up {
+            (r.top() + r.height() * 0.34, r.top() + r.height() * 0.62)
+        } else {
+            (r.top() + r.height() * 0.66, r.top() + r.height() * 0.38)
+        };
+        let dx = r.width() * 0.26;
+        p.line_segment([pos2(r.center().x - dx, end_y), pos2(r.center().x, tip_y)], st);
+        p.line_segment([pos2(r.center().x, tip_y), pos2(r.center().x + dx, end_y)], st);
+    }
     /// Circular reload arrow (a ~300° arc with an arrowhead at the top gap).
     pub fn reload(p: &Painter, r: Rect, c: Color32) {
         let st = Stroke::new(1.6, c);
@@ -3103,6 +3121,7 @@ impl AppState {
 
             // Find-in-page bar (Ctrl+F), floating top-right under the chrome.
             if self.find_open.get() {
+                let pal = self.browser.settings.borrow().theme.palette();
                 egui::Area::new(egui::Id::new("findbar"))
                     .order(egui::Order::Foreground)
                     .anchor(
@@ -3133,13 +3152,15 @@ impl AppState {
                                     self.find_active.get(),
                                     self.find_matches.get()
                                 ));
-                                if ui.button("▲").clicked() {
+                                // Flat vector icons — the UI font has no glyph for ▲/▼/✕, so
+                                // `ui.button("▲")` painted a .notdef box (see no-emoji rule).
+                                if icon_button(ui, true, "Previous match", &pal, icon::up).clicked() {
                                     self.find_step(-1);
                                 }
-                                if ui.button("▼").clicked() {
+                                if icon_button(ui, true, "Next match", &pal, icon::down).clicked() {
                                     self.find_step(1);
                                 }
-                                if ui.button("✕").clicked() {
+                                if icon_button(ui, true, "Close", &pal, icon::close).clicked() {
                                     self.find_close();
                                 }
                             });
@@ -3345,13 +3366,8 @@ impl AppState {
             .order(egui::Order::Foreground)
             .fixed_pos(egui::pos2(right_rect.right() - 30.0, right_rect.top() + 6.0))
             .show(ctx, |ui| {
-                if ui
-                    .add(egui::Button::new(
-                        egui::RichText::new("✕").size(14.0).color(pal.muted),
-                    ))
-                    .on_hover_text("Close split")
-                    .clicked()
-                {
+                // Flat vector × — the UI font renders a "✕" glyph as a .notdef box.
+                if icon_button(ui, true, "Close split", &pal, icon::close).clicked() {
                     self.exit_split();
                 }
             });
@@ -3562,10 +3578,8 @@ impl AppState {
                             .color(pal.text),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(egui::Button::new(egui::RichText::new("✕").size(15.0)).frame(false))
-                            .clicked()
-                        {
+                        // Flat vector × (the UI font has no "✕" glyph → .notdef box).
+                        if icon_button(ui, true, "Close", &pal, icon::close).clicked() {
                             close = true;
                         }
                     });
@@ -4672,7 +4686,8 @@ impl AppState {
                         .weak(),
                 );
                 ui.add_space(4.0);
-                if ui.button("🎨  Open the Studio").clicked() {
+                // No emoji — the UI font renders 🎨 as a .notdef box (see no-emoji rule).
+                if ui.button("Open the Studio").clicked() {
                     self.show_studio.set(true);
                 }
                 ui.add_space(6.0);
