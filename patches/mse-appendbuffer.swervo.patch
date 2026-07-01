@@ -1,0 +1,150 @@
+diff --git a/components/script/dom/html/htmlmediaelement.rs b/components/script/dom/html/htmlmediaelement.rs
+index d94dae9c7e5..300607d8b38 100644
+--- a/components/script/dom/html/htmlmediaelement.rs
++++ b/components/script/dom/html/htmlmediaelement.rs
+@@ -1520,6 +1520,12 @@ impl HTMLMediaElement {
+     }
+ 
+     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
++    /// The GStreamer player backing this element, if one has been created. Used by MSE
++    /// `SourceBuffer.appendBuffer` to feed appended bytes via `push_data`.
++    pub(crate) fn get_player(&self) -> Option<Arc<Mutex<dyn Player>>> {
++        self.player.borrow().clone()
++    }
++
+     /// Attach this media element to a `MediaSource` (MSE): link them, put the element into the
+     /// loading network state, and queue the `sourceopen` transition on the MediaSource. The
+     /// GStreamer player was already created by `create_media_player`; `SourceBuffer.appendBuffer`
+diff --git a/components/script/dom/media/mediasource.rs b/components/script/dom/media/mediasource.rs
+index 67034008973..ccb6fa62811 100644
+--- a/components/script/dom/media/mediasource.rs
++++ b/components/script/dom/media/mediasource.rs
+@@ -83,6 +83,16 @@ impl MediaSource {
+         self.media_element.set(Some(element));
+     }
+ 
++    /// The `HTMLMediaElement` this MediaSource is attached to, if any.
++    pub(crate) fn media_element(&self) -> Option<DomRoot<HTMLMediaElement>> {
++        self.media_element.get()
++    }
++
++    /// Whether `readyState` is `"open"`.
++    pub(crate) fn is_open(&self) -> bool {
++        self.ready_state.get() == ReadyState::Open
++    }
++
+     /// Transition to `"open"` and fire `sourceopen`, per the MSE attach steps. Called from a
+     /// media-element task once the element has resolved this MediaSource's blob URL.
+     pub(crate) fn open_and_fire_sourceopen(&self, cx: &mut js::context::JSContext) {
+@@ -144,8 +154,20 @@ impl MediaSourceMethods<crate::DomTypeHolder> for MediaSource {
+     fn RemoveSourceBuffer(&self, _buffer: &SourceBuffer) -> ErrorResult {
+         Err(Error::NotSupported(None))
+     }
++    /// <https://w3c.github.io/media-source/#dom-mediasource-endofstream>
+     fn EndOfStream(&self, _error: Option<EndOfStreamError>) -> ErrorResult {
+-        Err(Error::NotSupported(None))
++        // Step 1. If readyState is not "open", throw an InvalidStateError.
++        if !self.is_open() {
++            return Err(Error::InvalidState(None));
++        }
++        // Steps 2-4. Transition to "ended" and signal end-of-stream to the player.
++        self.ready_state.set(ReadyState::Ended);
++        if let Some(element) = self.media_element.get() &&
++            let Some(player) = element.get_player()
++        {
++            let _ = player.lock().unwrap().end_of_stream();
++        }
++        Ok(())
+     }
+ 
+     /// <https://w3c.github.io/media-source/#dom-mediasource-istypesupported>
+diff --git a/components/script/dom/media/sourcebuffer.rs b/components/script/dom/media/sourcebuffer.rs
+index 31f5033a768..05eb1cc98c5 100644
+--- a/components/script/dom/media/sourcebuffer.rs
++++ b/components/script/dom/media/sourcebuffer.rs
+@@ -8,11 +8,15 @@
+ use std::cell::Cell;
+ 
+ use dom_struct::dom_struct;
+-
+ use script_bindings::reflector::reflect_dom_object;
++use stylo_atoms::Atom;
+ 
+ use crate::dom::bindings::codegen::Bindings::SourceBufferBinding::{AppendMode, SourceBufferMethods};
+-use crate::dom::bindings::error::{ErrorResult, Fallible};
++use crate::dom::bindings::codegen::UnionTypes::ArrayBufferViewOrArrayBuffer;
++use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
++use crate::dom::bindings::inheritance::Castable;
++use crate::dom::bindings::refcounted::Trusted;
++use crate::dom::bindings::reflector::DomGlobal;
+ use crate::dom::bindings::root::{Dom, DomRoot};
+ use crate::dom::eventtarget::EventTarget;
+ use crate::dom::globalscope::GlobalScope;
+@@ -59,9 +63,53 @@ impl SourceBuffer {
+             can_gc,
+         )
+     }
++
++    /// The async segment of `appendBuffer`: push the bytes into the attached element's player,
++    /// then clear `updating` and fire `update` + `updateend`.
++    fn finish_append(&self, cx: &mut js::context::JSContext, bytes: Vec<u8>) {
++        self.upcast::<EventTarget>()
++            .fire_event(cx, Atom::from("updatestart"));
++
++        if let Some(element) = self.media_source.media_element() &&
++            let Some(player) = element.get_player()
++        {
++            if let Err(error) = player.lock().unwrap().push_data(bytes) {
++                warn!("MSE appendBuffer push_data failed: {error:?}");
++            }
++        }
++
++        self.updating.set(false);
++        self.upcast::<EventTarget>()
++            .fire_event(cx, Atom::from("update"));
++        self.upcast::<EventTarget>()
++            .fire_event(cx, Atom::from("updateend"));
++    }
+ }
+ 
+ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
++    /// <https://w3c.github.io/media-source/#dom-sourcebuffer-appendbuffer>
++    fn AppendBuffer(&self, data: ArrayBufferViewOrArrayBuffer) -> ErrorResult {
++        // Steps 1-2. Throw InvalidStateError if updating, or the parent MediaSource is not "open".
++        if self.updating.get() || !self.media_source.is_open() {
++            return Err(Error::InvalidState(None));
++        }
++        // Copy out the bytes to append.
++        let bytes = match data {
++            ArrayBufferViewOrArrayBuffer::ArrayBufferView(view) => view.to_vec(),
++            ArrayBufferViewOrArrayBuffer::ArrayBuffer(buffer) => buffer.to_vec(),
++        };
++        // Step 5. Set updating to true and run the append asynchronously.
++        self.updating.set(true);
++        let this = Trusted::new(self);
++        self.global()
++            .task_manager()
++            .media_element_task_source()
++            .queue(task!(mse_append_buffer: move |cx| {
++                this.root().finish_append(cx, bytes);
++            }));
++        Ok(())
++    }
++
+     fn GetMode(&self) -> Fallible<AppendMode> {
+         Ok(self.mode.get())
+     }
+diff --git a/components/script_bindings/webidls/SourceBuffer.webidl b/components/script_bindings/webidls/SourceBuffer.webidl
+index 3350c1b58c4..68d7aa7a592 100644
+--- a/components/script_bindings/webidls/SourceBuffer.webidl
++++ b/components/script_bindings/webidls/SourceBuffer.webidl
+@@ -22,8 +22,7 @@ interface SourceBuffer : EventTarget {
+   //   attribute EventHandler onupdateend;
+   //   attribute EventHandler onerror;
+   //   attribute EventHandler onabort;
+-  // Phase 2 (append pipeline):
+-  // [Throws] undefined appendBuffer(BufferSource data);
++  [Throws] undefined appendBuffer(BufferSource data);
+   // [Throws] undefined abort();
+   // [Throws] undefined remove(double start, unrestricted double end);
+ };
