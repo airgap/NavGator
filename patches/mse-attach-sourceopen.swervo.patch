@@ -1,0 +1,109 @@
+diff --git a/components/script/dom/html/htmlmediaelement.rs b/components/script/dom/html/htmlmediaelement.rs
+index 4f1ab598ae6..d94dae9c7e5 100644
+--- a/components/script/dom/html/htmlmediaelement.rs
++++ b/components/script/dom/html/htmlmediaelement.rs
+@@ -72,6 +72,7 @@ use crate::dom::bindings::num::Finite;
+ use crate::dom::bindings::refcounted::Trusted;
+ use crate::dom::bindings::reflector::DomGlobal;
+ use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom, UnrootedDom};
++use crate::dom::media::mediasource::MediaSource;
+ use crate::dom::bindings::str::{DOMString, USVString};
+ use crate::dom::blob::Blob;
+ use crate::dom::csp::{GlobalCspReporting, Violation};
+@@ -1519,6 +1520,22 @@ impl HTMLMediaElement {
+     }
+ 
+     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
++    /// Attach this media element to a `MediaSource` (MSE): link them, put the element into the
++    /// loading network state, and queue the `sourceopen` transition on the MediaSource. The
++    /// GStreamer player was already created by `create_media_player`; `SourceBuffer.appendBuffer`
++    /// will feed it via `push_data`.
++    fn attach_media_source(&self, media_source: &MediaSource) {
++        media_source.set_media_element(self);
++        self.network_state.set(NetworkState::Loading);
++        let media_source = Trusted::new(media_source);
++        self.owner_global()
++            .task_manager()
++            .media_element_task_source()
++            .queue(task!(mse_source_open: move |cx| {
++                media_source.root().open_and_fire_sourceopen(cx);
++            }));
++    }
++
+     fn resource_fetch_algorithm(&self, resource: Resource) {
+         if let Err(e) = self.create_media_player(&resource) {
+             error!("Create media player error {:?}", e);
+@@ -1536,6 +1553,13 @@ impl HTMLMediaElement {
+         // Step 5. Run the appropriate steps from the following list:
+         match resource {
+             Resource::Url(url) => {
++                // MSE: if this URL was minted by `URL.createObjectURL(mediaSource)`, attach to the
++                // MediaSource instead of fetching a remote resource.
++                if let Some(media_source) = self.global().get_media_source(url.as_str()) {
++                    self.attach_media_source(&media_source);
++                    return;
++                }
++
+                 // Step 5.remote.1. Optionally, run the following substeps. This is the expected
+                 // behavior if the user agent intends to not attempt to fetch the resource until the
+                 // user requests it explicitly (e.g. as a way to implement the preload attribute's
+diff --git a/components/script/dom/media/mediasource.rs b/components/script/dom/media/mediasource.rs
+index 2f0e9a61063..a3bfd74062b 100644
+--- a/components/script/dom/media/mediasource.rs
++++ b/components/script/dom/media/mediasource.rs
+@@ -17,13 +17,16 @@ use crate::dom::bindings::codegen::Bindings::MediaSourceBinding::{
+ };
+ use script_bindings::reflector::reflect_dom_object_with_proto;
+ use servo_media::{ServoMedia, SupportsMediaType};
++use stylo_atoms::Atom;
+ 
+ use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
++use crate::dom::bindings::inheritance::Castable;
+ use crate::dom::bindings::reflector::DomGlobal;
+-use crate::dom::bindings::root::{Dom, DomRoot};
++use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
+ use crate::dom::bindings::str::DOMString;
+ use crate::dom::eventtarget::EventTarget;
+ use crate::dom::globalscope::GlobalScope;
++use crate::dom::html::htmlmediaelement::HTMLMediaElement;
+ use crate::dom::media::sourcebuffer::SourceBuffer;
+ use crate::dom::media::sourcebufferlist::SourceBufferList;
+ use crate::dom::window::Window;
+@@ -36,6 +39,9 @@ pub(crate) struct MediaSource {
+     active_source_buffers: Dom<SourceBufferList>,
+     ready_state: Cell<ReadyState>,
+     duration: Cell<f64>,
++    /// The `HTMLMediaElement` this MediaSource is attached to, once `URL.createObjectURL`'d and
++    /// loaded. `None` while `readyState` is `"closed"`.
++    media_element: MutNullableDom<HTMLMediaElement>,
+ }
+ 
+ impl MediaSource {
+@@ -49,6 +55,7 @@ impl MediaSource {
+             active_source_buffers: Dom::from_ref(active_source_buffers),
+             ready_state: Cell::new(ReadyState::Closed),
+             duration: Cell::new(f64::NAN),
++            media_element: Default::default(),
+         }
+     }
+ 
+@@ -69,6 +76,19 @@ impl MediaSource {
+             can_gc,
+         )
+     }
++
++    /// Record the `HTMLMediaElement` this MediaSource has been attached to.
++    pub(crate) fn set_media_element(&self, element: &HTMLMediaElement) {
++        self.media_element.set(Some(element));
++    }
++
++    /// Transition to `"open"` and fire `sourceopen`, per the MSE attach steps. Called from a
++    /// media-element task once the element has resolved this MediaSource's blob URL.
++    pub(crate) fn open_and_fire_sourceopen(&self, cx: &mut js::context::JSContext) {
++        self.ready_state.set(ReadyState::Open);
++        self.upcast::<EventTarget>()
++            .fire_event(cx, Atom::from("sourceopen"));
++    }
+ }
+ 
+ impl MediaSourceMethods<crate::DomTypeHolder> for MediaSource {
