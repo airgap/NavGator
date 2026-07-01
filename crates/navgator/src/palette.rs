@@ -24,6 +24,7 @@ pub(crate) enum PaletteAction {
     OpenWhy,
     OpenExport,
     ToggleForceDark,
+    ReaderMode,
 }
 
 /// The full command catalog: (label, right-aligned mono hint, action). `studio_open`
@@ -45,6 +46,11 @@ pub(crate) fn palette_catalog(studio_open: bool) -> Vec<(String, &'static str, P
             "Toggle force-dark mode".to_string(),
             "Appearance",
             PaletteAction::ToggleForceDark,
+        ),
+        (
+            "Reader mode".to_string(),
+            "Reading",
+            PaletteAction::ReaderMode,
         ),
         (
             "Toggle vertical tabs".to_string(),

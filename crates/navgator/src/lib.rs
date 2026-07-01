@@ -1890,6 +1890,21 @@ const FORCE_DARK_JS: &str = r#"(function(){var id='__ng_forcedark';if(document.g
 /// Remove the force-dark style injected by `FORCE_DARK_JS`.
 const FORCE_DARK_OFF_JS: &str = r#"(function(){var e=document.getElementById('__ng_forcedark');if(e)e.remove();})()"#;
 
+/// Reader mode: a Readability-lite that extracts the main article in-place and restyles the page
+/// into a clean, centered, dark reading column. Injected fire-and-forget; reload to exit.
+const READER_JS: &str = r#"(function(){try{
+var pick=document.querySelector('article')||document.querySelector('[role=main]')||document.querySelector('main');
+if(!pick){var best=null,score=0;document.querySelectorAll('div,section').forEach(function(el){var ps=el.querySelectorAll('p');if(ps.length<3)return;var len=(el.innerText||'').length;if(len>score){score=len;best=el;}});pick=best||document.body;}
+var title=((document.querySelector('h1')||{}).innerText||document.title||'').trim();
+var clone=pick.cloneNode(true);
+clone.querySelectorAll('script,style,nav,aside,header,footer,form,iframe,button,h1,.ad,[data-ad],.advertisement,.comments,.social,.share,.newsletter').forEach(function(n){n.remove();});
+document.head.querySelectorAll('style,link[rel="stylesheet"]').forEach(function(n){n.remove();});
+document.body.innerHTML='<div id="ngreader"><h1>'+title.replace(/</g,'&lt;')+'</h1>'+clone.innerHTML+'</div>';
+var s=document.createElement('style');
+s.textContent='html,body{margin:0;background:#111418;color:#e6e8eb}#ngreader{max-width:44rem;margin:48px auto 96px;padding:0 24px;font:19px/1.75 Georgia,serif}#ngreader h1{font:600 34px/1.2 system-ui,sans-serif;margin:0 0 24px;color:#fff}#ngreader img{max-width:100%;height:auto;border-radius:6px}#ngreader a{color:#7aa2ff}#ngreader p{margin:0 0 20px}#ngreader pre{overflow:auto;background:#0b0d10;padding:12px;border-radius:6px}';
+document.head.appendChild(s);
+}catch(e){console.log('reader error '+e);}})()"#;
+
 /// DOM-render diagnostic, injected only when `NAVGATOR_DOMPROBE` is set. Snapshots DOM size +
 /// laid-out box count at load, +3s and +6s, logging to the console (captured with
 /// `NAVGATOR_CONSOLE`). Distinguishes a silent CSR hydration failure's two modes: DOM populated
@@ -3825,6 +3840,10 @@ impl AppState {
                 self.toggle_force_dark();
                 return;
             }
+            A::ReaderMode => {
+                self.activate_reader_mode();
+                return;
+            }
             _ => {}
         }
         {
@@ -3848,7 +3867,12 @@ impl AppState {
                 A::ApplyPreset(p) => p.merge_into(&mut s.theme),
                 A::ToggleNotes => s.modules.notes = !s.modules.notes,
                 A::ToggleFeed => s.modules.feed = !s.modules.feed,
-                A::NewTab | A::ToggleStudio | A::OpenWhy | A::OpenExport | A::ToggleForceDark => {}
+                A::NewTab
+                | A::ToggleStudio
+                | A::OpenWhy
+                | A::OpenExport
+                | A::ToggleForceDark
+                | A::ReaderMode => {}
             }
             sync_legacy_theme(&mut s);
             save_settings(&s);
@@ -6630,6 +6654,13 @@ impl AppState {
     }
 
     /// Toggle force-dark and apply it to every open tab immediately (and future loads pick it up).
+    /// Reader mode: inject the Readability-lite script into the active page (in place; reload exits).
+    fn activate_reader_mode(&self) {
+        if let Some(tab) = self.active_tab() {
+            tab.evaluate_javascript(READER_JS.to_string(), |_| {});
+        }
+    }
+
     fn toggle_force_dark(&self) {
         {
             let mut s = self.browser.settings.borrow_mut();
