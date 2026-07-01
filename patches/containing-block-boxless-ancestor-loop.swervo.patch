@@ -1,0 +1,17 @@
+diff --git a/components/layout/query.rs b/components/layout/query.rs
+index 66e51468642..daf64b22980 100644
+--- a/components/layout/query.rs
++++ b/components/layout/query.rs
+@@ -809,6 +809,12 @@ fn containing_block_for_node<'a>(node: ServoLayoutNode<'a>) -> Option<ServoLayou
+     #[expect(unsafe_code)]
+     while let Some(ancestor) = unsafe { current_ancestor.dangerous_flat_tree_parent() } {
+         let Some((ancestor_style, ancestor_flags)) = style_and_flags_for_node(&ancestor) else {
++            // This ancestor has no layout box (e.g. `display: none` / `display: contents`, or it
++            // is not laid out yet). Skip PAST it — advance to it before continuing — otherwise
++            // `dangerous_flat_tree_parent()` re-yields the same node every iteration and the walk
++            // spins forever at 100% CPU, wedging the script thread (hit on real sites, e.g.
++            // airbnb, whose containing-block chain runs through a box-less wrapper).
++            current_ancestor = ancestor;
+             continue;
+         };
+ 
