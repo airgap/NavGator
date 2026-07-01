@@ -1619,6 +1619,13 @@ fn navgator_preferences() -> Preferences {
     // and the container falls back to `block` (items collapse to a full-width 1-column stack).
     // The grid layout path itself is fully implemented; this just opts the parser in.
     p.layout_grid_enabled = true; // CSS Grid (marketing-site hero/card layouts, etc.)
+    // More stylo parse-gates that default OFF but are implemented in swervo — additive standards
+    // features (sites that don't use them are unaffected; sites that do now render correctly
+    // instead of dropping the property). Gap analysis LYK-1362.
+    p.layout_container_queries_enabled = true; // `@container` (ubiquitous on modern responsive sites)
+    p.layout_columns_enabled = true; // CSS multi-column (`column-count`/`column-width`)
+    p.layout_variable_fonts_enabled = true; // variable fonts (weight/width axes)
+    p.layout_writing_mode_enabled = true; // `writing-mode: vertical-*` (CJK + vertical layouts)
     // (Font parity handled in the engine: swervo resolves uninstalled named families via
     // fontconfig like Chrome — Arial->Liberation, Verdana->Noto, sans-serif->DejaVu — so no pref
     // override is needed. See airgap/swervo font_list font_family_substitute.)
