@@ -1786,6 +1786,12 @@ const FORCE_DARK_JS: &str = r#"(function(){var id='__ng_forcedark';if(document.g
 /// Remove the force-dark style injected by `FORCE_DARK_JS`.
 const FORCE_DARK_OFF_JS: &str = r#"(function(){var e=document.getElementById('__ng_forcedark');if(e)e.remove();})()"#;
 
+/// DOM-render diagnostic, injected only when `NAVGATOR_DOMPROBE` is set. Snapshots DOM size +
+/// laid-out box count at load, +3s and +6s, logging to the console (captured with
+/// `NAVGATOR_CONSOLE`). Distinguishes a silent CSR hydration failure's two modes: DOM populated
+/// but no visible boxes (layout/paint gap) vs DOM never grows (JS never mounted).
+const DOM_PROBE_JS: &str = r#"(function(){function snap(t){try{var b=document.body;var all=document.querySelectorAll('body *');var vis=0;for(var i=0;i<all.length;i++){var r=all[i].getBoundingClientRect();if(r.width>1&&r.height>1)vis++;}console.log('NGPROBE t='+t+' nodes='+document.querySelectorAll('*').length+' bodyTextLen='+(b?b.innerText.length:-1)+' visibleBoxes='+vis+' bodyChildren='+(b?b.children.length:-1)+' bodyClientH='+(b?b.clientHeight:-1)+' ready='+document.readyState);}catch(e){console.log('NGPROBE err '+e);}}snap(0);setTimeout(function(){snap(3000);},3000);setTimeout(function(){snap(6000);},6000);})()"#;
+
 /// Credential Firewall (#19): on a password/card field focus, ping the native side with this
 /// page's origin/host so it can warn if the site is a look-alike of one with a saved login.
 /// Advisory only (runs in the page's world); the bridge fetch is intercepted by load_web_resource.
@@ -3110,8 +3116,23 @@ impl AppState {
                     .show(ctx, |ui| {
                         egui::Frame::popup(ui.style()).show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(format!("🔑  {pmsg}")));
-                                if ui.small_button("×").clicked() {
+                                // Flat vector key icon + text — the UI font renders 🔑 as a
+                                // .notdef box (see no-emoji rule).
+                                let pal = self.browser.settings.borrow().theme.palette();
+                                let (kr, _) = ui.allocate_exact_size(
+                                    egui::vec2(15.0, 15.0),
+                                    egui::Sense::hover(),
+                                );
+                                icon::key(
+                                    ui.painter(),
+                                    egui::Rect::from_center_size(
+                                        kr.center(),
+                                        egui::vec2(13.0, 13.0),
+                                    ),
+                                    pal.muted,
+                                );
+                                ui.label(egui::RichText::new(pmsg.as_str()));
+                                if icon_button(ui, true, "Dismiss", &pal, icon::close).clicked() {
                                     *self.browser.password_msg.borrow_mut() = None;
                                 }
                             });
@@ -5692,10 +5713,17 @@ impl AppState {
     /// add-ons whose `@match` accepts each navigated URL (the engine captures the UCM at build
     /// time and has no post-build setter, so we keep this Rc per tab and grow it on navigation).
     fn make_tab_ucm(&self) -> Option<Rc<UserContentManager>> {
-        if self.browser.addons.borrow().addons.is_empty() {
+        let probe = std::env::var_os("NAVGATOR_DOMPROBE").is_some();
+        if self.browser.addons.borrow().addons.is_empty() && !probe {
             return None;
         }
-        Some(Rc::new(UserContentManager::new(&self.browser.servo)))
+        let ucm = Rc::new(UserContentManager::new(&self.browser.servo));
+        if probe {
+            // Diagnostic: run the DOM probe at document-start so its +3s/+6s snapshots fire
+            // even when the page never reaches LoadStatus::Complete.
+            ucm.add_script(Rc::new(UserScript::new(DOM_PROBE_JS.to_string(), None)));
+        }
+        Some(ucm)
     }
 
     fn new_tab(&self, url: Url) {
@@ -7001,6 +7029,12 @@ impl WebViewDelegate for AppState {
                     if t.url.starts_with("http://") || t.url.starts_with("https://") {
                         // Credential-firewall sensor (#19).
                         t.webview.evaluate_javascript(FIREWALL_JS.to_string(), |_| {});
+                        // DOM-render diagnostic (set NAVGATOR_DOMPROBE=1): reports DOM/layout
+                        // stats to the console at load, +3s, +6s so a silent CSR hydration
+                        // failure (populated-but-not-painted vs never-mounted) is observable.
+                        if std::env::var_os("NAVGATOR_DOMPROBE").is_some() {
+                            t.webview.evaluate_javascript(DOM_PROBE_JS.to_string(), |_| {});
+                        }
                     }
                     if force_dark {
                         self.apply_force_dark(&t.webview, &t.url);
