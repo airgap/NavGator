@@ -499,6 +499,9 @@ struct Settings {
     theme: theme::Theme,
     /// New-tab dashboard widget toggles (Studio "New-tab modules" section).
     modules: theme::Modules,
+    /// True once the user has explicitly chosen a theme base (Studio surface chip). Until then
+    /// the base follows the OS colour-scheme (dark OS → dark chrome) on each launch.
+    theme_base_explicit: bool,
 }
 
 impl Default for Settings {
@@ -517,8 +520,20 @@ impl Default for Settings {
             wallpaper: String::new(),
             theme: theme::Theme::default(),
             modules: theme::Modules::default(),
+            theme_base_explicit: false,
         }
     }
+}
+
+/// Whether the OS is in dark mode. `NAVGATOR_COLOR_SCHEME=dark|light` forces it (useful when the
+/// desktop exposes no theme, and for testing); otherwise winit's per-window OS theme is used.
+fn os_prefers_dark(window: &Window) -> bool {
+    match std::env::var("NAVGATOR_COLOR_SCHEME").ok().as_deref() {
+        Some("dark") => return true,
+        Some("light") => return false,
+        _ => {},
+    }
+    matches!(window.theme(), Some(winit::window::Theme::Dark))
 }
 
 /// Format an egui color as a `#rrggbb` string (for the gator:// page palette).
@@ -553,6 +568,86 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// Flat vector chrome icons drawn via the egui painter — native, crisp, theme-coloured, and immune
 /// to missing font glyphs (emoji/symbols like the puzzle, close-✕ and maximize-▢ otherwise render
 /// as `.notdef` squares without an emoji font). Each fn paints into the icon's square bounding box.
+/// A cached GL program (fullscreen SDF pass) that erases the four window corners to transparent,
+/// giving the undecorated window rounded corners. Drawn after egui paints, before present, onto
+/// the same (transparent) surface — a real compositor shows the corners through; the
+/// compositor-less test display shows them black.
+struct CornerMaskGl {
+    program: glow::Program,
+    vao: glow::VertexArray,
+    u_res: glow::UniformLocation,
+    u_radius: glow::UniformLocation,
+}
+
+impl CornerMaskGl {
+    /// Compile the program + a fullscreen-triangle VAO. Returns `None` if any GL step fails (the
+    /// caller then just leaves the corners square — no crash, no per-frame retry).
+    fn build(gl: &glow::Context) -> Option<CornerMaskGl> {
+        use glow::HasContext as _;
+        unsafe {
+            let sl = gl.get_parameter_string(glow::SHADING_LANGUAGE_VERSION);
+            let header = if sl.contains("ES") {
+                "#version 300 es\nprecision highp float;\n"
+            } else {
+                "#version 330 core\n"
+            };
+            let vs_src =
+                format!("{header}layout(location=0) in vec2 a_pos;\nvoid main(){{ gl_Position = vec4(a_pos, 0.0, 1.0); }}\n");
+            let fs_src = format!(
+                "{header}out vec4 fragColor;\nuniform vec2 u_res;\nuniform float u_radius;\nvoid main() {{\n  vec2 p = gl_FragCoord.xy;\n  vec2 hs = u_res * 0.5;\n  vec2 q = abs(p - hs) - (hs - vec2(u_radius));\n  float d = length(max(q, vec2(0.0))) - u_radius;\n  float outside = clamp(d + 0.5, 0.0, 1.0);\n  fragColor = vec4(0.0, 0.0, 0.0, outside);\n}}\n"
+            );
+
+            let program = gl.create_program().ok()?;
+            let mut ok = true;
+            let mut shaders = Vec::new();
+            for (ty, src) in [
+                (glow::VERTEX_SHADER, &vs_src),
+                (glow::FRAGMENT_SHADER, &fs_src),
+            ] {
+                match gl.create_shader(ty) {
+                    Ok(sh) => {
+                        gl.shader_source(sh, src);
+                        gl.compile_shader(sh);
+                        if !gl.get_shader_compile_status(sh) {
+                            ok = false;
+                        }
+                        gl.attach_shader(program, sh);
+                        shaders.push(sh);
+                    },
+                    Err(_) => ok = false,
+                }
+            }
+            if ok {
+                gl.link_program(program);
+                ok = gl.get_program_link_status(program);
+            }
+            for sh in shaders {
+                gl.detach_shader(program, sh);
+                gl.delete_shader(sh);
+            }
+            if !ok {
+                gl.delete_program(program);
+                return None;
+            }
+
+            let vao = gl.create_vertex_array().ok()?;
+            let vbo = gl.create_buffer().ok()?;
+            gl.bind_vertex_array(Some(vao));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+            let verts: [f32; 6] = [-1.0, -1.0, 3.0, -1.0, -1.0, 3.0];
+            let bytes = std::slice::from_raw_parts(verts.as_ptr() as *const u8, std::mem::size_of_val(&verts));
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+            gl.enable_vertex_attrib_array(0);
+            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
+            gl.bind_vertex_array(None);
+
+            let u_res = gl.get_uniform_location(program, "u_res")?;
+            let u_radius = gl.get_uniform_location(program, "u_radius")?;
+            Some(CornerMaskGl { program, vao, u_res, u_radius })
+        }
+    }
+}
+
 mod icon {
     use egui::{pos2, vec2, Color32, CornerRadius, Painter, Rect, Stroke, StrokeKind};
     fn s(c: Color32) -> Stroke {
@@ -791,6 +886,7 @@ fn load_settings() -> Settings {
                             s.theme.base = b;
                         }
                     }
+                    "th_base_explicit" => s.theme_base_explicit = v.trim() == "true",
                     "th_accent" => {
                         if let Some(a) = theme::Accent::from_key(v.trim()) {
                             s.theme.accent = a;
@@ -858,7 +954,7 @@ fn save_settings(s: &Settings) {
         let _ = std::fs::write(
             &path,
             format!(
-                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nremember_passphrase={}\nblock_ads={}\nforce_dark={}\nwallpaper={}\nth_base={}\nth_accent={}\nth_density={}\nth_font={}\nth_tabpos={}\nth_wallpaper={}\nth_tabfit={}\nth_radius={}\nth_glass={}\nth_tabmaxw={}\nmod_clock={}\nmod_search={}\nmod_sites={}\nmod_notes={}\nmod_feed={}\n",
+                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nremember_passphrase={}\nblock_ads={}\nforce_dark={}\nwallpaper={}\nth_base={}\nth_accent={}\nth_density={}\nth_font={}\nth_tabpos={}\nth_wallpaper={}\nth_tabfit={}\nth_radius={}\nth_glass={}\nth_tabmaxw={}\nth_base_explicit={}\nmod_clock={}\nmod_search={}\nmod_sites={}\nmod_notes={}\nmod_feed={}\n",
                 s.search,
                 s.accent,
                 s.dark,
@@ -880,6 +976,7 @@ fn save_settings(s: &Settings) {
                 s.theme.radius,
                 s.theme.glass,
                 s.theme.tab_max_w,
+                s.theme_base_explicit,
                 s.modules.clock,
                 s.modules.search,
                 s.modules.sites,
@@ -2133,6 +2230,8 @@ struct BrowserState {
     userscripts_count: usize,
     ipc_clients: Arc<Mutex<Vec<UnixStream>>>,
     settings: RefCell<Settings>,
+    /// Guards the one-time "follow the OS colour-scheme" step so only the first window applies it.
+    os_theme_applied: Cell<bool>,
     /// Persisted history + bookmarks.
     profile: RefCell<Profile>,
     /// Lyku sync (early access): per-collection pull cursors, a status line, an in-flight guard.
@@ -2174,6 +2273,9 @@ struct AppState {
     window_context: Rc<WindowRenderingContext>,
     content_context: Rc<OffscreenRenderingContext>,
     egui: RefCell<EguiGlow>,
+    /// Lazily-built GL program that erases the four window corners to transparent (rounded window).
+    /// `Some(None)` after a failed build so we don't retry every frame.
+    corner_mask: RefCell<Option<Option<CornerMaskGl>>>,
     /// Height (logical px) of the egui chrome panels; the page begins below this.
     toolbar_height: Cell<f32>,
     /// Logical-px width of the left vertical-tabs SidePanel (0 when horizontal); the page
@@ -3534,7 +3636,48 @@ impl AppState {
         let _ = self.content_context.make_current();
         self.window_context.prepare_for_rendering();
         self.egui.borrow_mut().paint(&self.window);
+        self.round_corners_gl();
         self.window_context.present();
+    }
+
+    /// Erase the four window corners to transparent so the undecorated window reads as rounded.
+    /// Runs after egui paints and before present, on the current (content) context's surface.
+    /// Lazily builds the GL program once; if the build fails, the corners just stay square.
+    fn round_corners_gl(&self) {
+        use glow::HasContext as _;
+        let gl = self.content_context.glow_gl_api();
+        if self.corner_mask.borrow().is_none() {
+            let built = CornerMaskGl::build(&gl);
+            *self.corner_mask.borrow_mut() = Some(built);
+        }
+        let guard = self.corner_mask.borrow();
+        let Some(Some(mask)) = guard.as_ref() else {
+            return;
+        };
+        let size = self.window.inner_size();
+        let (w, h) = (size.width.max(1) as i32, size.height.max(1) as i32);
+        let radius = (12.0 * self.window.scale_factor() as f32).max(1.0);
+        unsafe {
+            gl.disable(glow::DEPTH_TEST);
+            gl.disable(glow::SCISSOR_TEST);
+            gl.disable(glow::CULL_FACE);
+            gl.enable(glow::BLEND);
+            gl.blend_equation(glow::FUNC_ADD);
+            gl.blend_func_separate(
+                glow::ZERO,
+                glow::ONE_MINUS_SRC_ALPHA,
+                glow::ZERO,
+                glow::ONE_MINUS_SRC_ALPHA,
+            );
+            gl.viewport(0, 0, w, h);
+            gl.use_program(Some(mask.program));
+            gl.uniform_2_f32(Some(&mask.u_res), w as f32, h as f32);
+            gl.uniform_1_f32(Some(&mask.u_radius), radius);
+            gl.bind_vertex_array(Some(mask.vao));
+            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            gl.bind_vertex_array(None);
+            gl.use_program(None);
+        }
     }
 
     /// Apply the live customization theme to the egui chrome each frame: OKLCH
@@ -3568,6 +3711,7 @@ impl AppState {
             (s.theme, s.modules)
         };
         let pal = theme.palette();
+        let orig_base = theme.base;
         let mut changed = false;
         let mut close = false;
 
@@ -3617,6 +3761,9 @@ impl AppState {
             let mut s = self.browser.settings.borrow_mut();
             s.theme = theme;
             s.modules = modules;
+            if theme.base != orig_base {
+                s.theme_base_explicit = true; // user picked a base → stop following the OS scheme
+            }
             sync_legacy_theme(&mut s);
             save_settings(&s);
             drop(s);
@@ -3704,6 +3851,7 @@ impl AppState {
     fn draw_chrome(&self, ctx: &egui::Context) {
         let frame = egui::Frame::default()
             .fill(ctx.global_style().visuals.window_fill)
+            .corner_radius(egui::CornerRadius { nw: 12, ne: 12, sw: 0, se: 0 })
             .inner_margin(6.0);
         let toolbar = egui::TopBottomPanel::top("toolbar").frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -7340,10 +7488,26 @@ fn open_window(
             Window::default_attributes()
                 .with_title("NavGator")
                 .with_decorations(false)
+                .with_transparent(true)
                 .with_visible(false)
                 .with_inner_size(LogicalSize::new(1280.0, 800.0)),
         )
         .expect("failed to create window");
+
+    // First window only: if the user hasn't explicitly chosen a theme base, follow the OS
+    // colour-scheme — dark OS → dark chrome. Not persisted, so it re-tracks the OS each launch
+    // until the user picks a base in the Studio (which sets `theme_base_explicit`).
+    if !browser.os_theme_applied.replace(true) {
+        let follow_os = !browser.settings.borrow().theme_base_explicit;
+        if follow_os && os_prefers_dark(&window) {
+            let mut s = browser.settings.borrow_mut();
+            if s.theme.base.is_light() {
+                s.theme.base = theme::Base::Obsidian;
+                sync_legacy_theme(&mut s);
+            }
+        }
+    }
+
     let window_id = window.id();
     let window_handle = window.window_handle().expect("no window handle");
     let inner = window.inner_size();
@@ -7372,6 +7536,7 @@ fn open_window(
         window_context,
         content_context: content_context.clone(),
         egui: RefCell::new(egui),
+        corner_mask: RefCell::new(None),
         toolbar_height: Cell::new(0.0),
         content_left: Cell::new(0.0),
         content_right: Cell::new(0.0),
@@ -7475,6 +7640,7 @@ impl ApplicationHandler<WakeUp> for App {
             userscripts_count,
             ipc_clients,
             settings: RefCell::new(load_settings()),
+            os_theme_applied: Cell::new(false),
             profile: RefCell::new(load_profile()),
             sync_cursor_bookmarks: Cell::new(sync_cb),
             sync_cursor_history: Cell::new(sync_ch),
