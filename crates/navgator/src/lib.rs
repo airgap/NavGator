@@ -2274,6 +2274,13 @@ struct BrowserState {
 /// Per-window state: its OS window, render contexts, egui, panes/tabs, and all chrome/overlay
 /// state. Holds an `Rc<BrowserState>` for the shared engine + services. One per OS window;
 /// `AppState` IS the `WebViewDelegate` for the webviews it builds.
+/// One captured page `console.*` message, for the in-app DevTools console panel.
+#[derive(Clone)]
+struct ConsoleMessage {
+    level: ConsoleLogLevel,
+    text: String,
+}
+
 struct AppState {
     /// The shared browser-global engine + services.
     browser: Rc<BrowserState>,
@@ -2317,6 +2324,12 @@ struct AppState {
     show_settings: Cell<bool>,
     /// Whether the Studio (live interface customization) side panel is open.
     show_studio: Cell<bool>,
+    /// DevTools console (Ctrl+Shift+J): recent page `console.*` messages (capped), the open
+    /// flag, and the filter box. Global (most-recent across tabs) for now — per-tab is a follow-up.
+    console_log: RefCell<std::collections::VecDeque<ConsoleMessage>>,
+    show_console: Cell<bool>,
+    console_filter: RefCell<String>,
+    console_filter_focus: Cell<bool>,
     /// Whether the 🧩 add-ons popover panel is open.
     show_addons: Cell<bool>,
     /// Logical-px rect of the 🧩 toolbar badge, so the add-ons popover anchors under it.
@@ -3297,6 +3310,9 @@ impl AppState {
                         });
                     });
             }
+
+            // DevTools console overlay (Ctrl+Shift+J) — Foreground, over the page.
+            self.render_console_panel(ctx);
 
             // The page occupies everything below the chrome panels. (At the Context
             // level egui's available_rect doesn't reflect panel reservations, so derive
@@ -6789,6 +6805,17 @@ impl WebViewDelegate for AppState {
         if std::env::var_os("NAVGATOR_CONSOLE").is_some() {
             eprintln!("[page console {level:?}] {message}");
         }
+        // Buffer for the in-app DevTools console (Ctrl+Shift+J), capped so a chatty page can't
+        // grow it unbounded.
+        let mut buf = self.console_log.borrow_mut();
+        buf.push_back(ConsoleMessage { level, text: message });
+        while buf.len() > 500 {
+            buf.pop_front();
+        }
+        drop(buf);
+        if self.show_console.get() {
+            self.window.request_redraw();
+        }
     }
 
     /// Serve NavGator's internal `gator://` pages (e.g. `gator://welcome`). Servo asks the
@@ -7560,6 +7587,10 @@ fn open_window(
         focus_omnibox: Cell::new(false),
         show_settings: Cell::new(false),
         show_studio: Cell::new(false),
+        console_log: RefCell::new(std::collections::VecDeque::new()),
+        show_console: Cell::new(false),
+        console_filter: RefCell::new(String::new()),
+        console_filter_focus: Cell::new(false),
         show_addons: Cell::new(false),
         addon_badge_rect: Cell::new(egui::Rect::NOTHING),
         dialogs: RefCell::new(Vec::new()),
@@ -8021,7 +8052,12 @@ impl ApplicationHandler<WakeUp> for App {
                             return;
                         }
                         WinitKey::Character(c) if c.eq_ignore_ascii_case("j") => {
-                            if let (Ok(url), Some(tab)) =
+                            if state.shift.get() {
+                                // Ctrl+Shift+J: toggle the DevTools console panel.
+                                state.show_console.set(!state.show_console.get());
+                                state.console_filter_focus.set(state.show_console.get());
+                                state.window.request_redraw();
+                            } else if let (Ok(url), Some(tab)) =
                                 (Url::parse("gator://downloads"), state.active_tab())
                             {
                                 state.location_dirty.set(false);
@@ -8360,3 +8396,82 @@ mod chrome_helper_tests {
         assert_eq!(color_hex(egui::Color32::from_rgb(255, 255, 255)), "#ffffff");
     }
 }
+
+impl AppState {
+    fn render_console_panel(&self, ctx: &egui::Context) {
+        if !self.show_console.get() {
+            return;
+        }
+        let pal = self.browser.settings.borrow().theme.palette();
+        let screen = ctx.content_rect();
+        let height = (screen.height() * 0.32).clamp(140.0, 320.0);
+        let frame = egui::Frame::NONE
+            .fill(pal.bg2)
+            .stroke(egui::Stroke::new(1.0, pal.border))
+            .inner_margin(egui::Margin::same(6));
+        egui::Area::new(egui::Id::new("devtools_console"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_width(screen.width());
+                frame.show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Console").strong().color(pal.text));
+                        let count = self.console_log.borrow().len();
+                        ui.label(egui::RichText::new(format!("{count}")).small().weak());
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("filter").small().weak());
+                        let mut filter = self.console_filter.borrow_mut();
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut *filter)
+                                .desired_width(180.0)
+                                .hint_text("level or text"),
+                        );
+                        if self.console_filter_focus.take() {
+                            resp.request_focus();
+                        }
+                        drop(filter);
+                        if ui.button("Clear").clicked() {
+                            self.console_log.borrow_mut().clear();
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if icon_button(ui, true, "Close", &pal, icon::close).clicked() {
+                                self.show_console.set(false);
+                            }
+                        });
+                    });
+                    ui.separator();
+                    let filter = self.console_filter.borrow().to_lowercase();
+                    egui::ScrollArea::vertical()
+                        .max_height(height)
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            ui.set_width(screen.width() - 16.0);
+                            for msg in self.console_log.borrow().iter() {
+                                let level = format!("{:?}", msg.level).to_lowercase();
+                                if !filter.is_empty()
+                                    && !level.contains(&filter)
+                                    && !msg.text.to_lowercase().contains(&filter)
+                                {
+                                    continue;
+                                }
+                                let color = match msg.level {
+                                    ConsoleLogLevel::Error => egui::Color32::from_rgb(0xf0, 0x6b, 0x6b),
+                                    ConsoleLogLevel::Warn => egui::Color32::from_rgb(0xe6, 0xb4, 0x50),
+                                    ConsoleLogLevel::Info => pal.accent,
+                                    _ => pal.text,
+                                };
+                                ui.label(
+                                    egui::RichText::new(&msg.text)
+                                        .monospace()
+                                        .size(11.5)
+                                        .color(color),
+                                );
+                            }
+                        });
+                });
+            });
+    }
+}
+
