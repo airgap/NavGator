@@ -1,0 +1,412 @@
+diff --git a/components/config/prefs.rs b/components/config/prefs.rs
+index d0f70233830..411bf2989fe 100644
+--- a/components/config/prefs.rs
++++ b/components/config/prefs.rs
+@@ -220,6 +220,8 @@ pub struct Preferences {
+     /// Enable WebGL2 APIs.
+     // feature: WebGL2 | #41394 | Web/API/WebGL2RenderingContext
+     pub dom_webgl2_enabled: bool,
++    // feature: Media Source Extensions | Web/API/Media_Source_Extensions_API
++    pub dom_mediasource_enabled: bool,
+     // feature: WebRTC | #41396 | Web/API/WebRTC_API
+     pub dom_webrtc_enabled: bool,
+     // feature: WebRTC Transceiver | #41396 | Web/API/RTCRtpTransceiver
+@@ -444,6 +446,7 @@ impl Preferences {
+             dom_webgl2_enabled: false,
+             dom_webgpu_enabled: false,
+             dom_webgpu_wgpu_backend: String::new(),
++            dom_mediasource_enabled: false,
+             dom_webrtc_enabled: false,
+             dom_webrtc_transceiver_enabled: false,
+             dom_webvtt_enabled: false,
+diff --git a/components/script/dom/media/mediasource.rs b/components/script/dom/media/mediasource.rs
+new file mode 100644
+index 00000000000..4005c44b9f1
+--- /dev/null
++++ b/components/script/dom/media/mediasource.rs
+@@ -0,0 +1,117 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! Media Source Extensions `MediaSource` — Phase 1 scaffold, gated behind
++//! `dom_mediasource_enabled`. The media operations (`addSourceBuffer`/`endOfStream`) throw
++//! `NotSupported` until Phase 2 wires the GStreamer append pipeline, so the interface exists and
++//! feature-detection stays honest.
++
++use std::cell::Cell;
++
++use dom_struct::dom_struct;
++use js::rust::HandleObject;
++
++use crate::dom::bindings::codegen::Bindings::MediaSourceBinding::{
++    EndOfStreamError, MediaSourceMethods, ReadyState,
++};
++use script_bindings::reflector::reflect_dom_object_with_proto;
++
++use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
++use crate::dom::bindings::reflector::DomGlobal;
++use crate::dom::bindings::root::{Dom, DomRoot};
++use crate::dom::bindings::str::DOMString;
++use crate::dom::eventtarget::EventTarget;
++use crate::dom::globalscope::GlobalScope;
++use crate::dom::media::sourcebuffer::SourceBuffer;
++use crate::dom::media::sourcebufferlist::SourceBufferList;
++use crate::dom::window::Window;
++use crate::script_runtime::CanGc;
++
++#[dom_struct]
++pub(crate) struct MediaSource {
++    eventtarget: EventTarget,
++    source_buffers: Dom<SourceBufferList>,
++    active_source_buffers: Dom<SourceBufferList>,
++    ready_state: Cell<ReadyState>,
++    duration: Cell<f64>,
++}
++
++impl MediaSource {
++    fn new_inherited(
++        source_buffers: &SourceBufferList,
++        active_source_buffers: &SourceBufferList,
++    ) -> MediaSource {
++        MediaSource {
++            eventtarget: EventTarget::new_inherited(),
++            source_buffers: Dom::from_ref(source_buffers),
++            active_source_buffers: Dom::from_ref(active_source_buffers),
++            ready_state: Cell::new(ReadyState::Closed),
++            duration: Cell::new(f64::NAN),
++        }
++    }
++
++    fn new_with_proto(
++        global: &GlobalScope,
++        proto: Option<HandleObject>,
++        can_gc: CanGc,
++    ) -> DomRoot<MediaSource> {
++        let source_buffers = SourceBufferList::new(global, can_gc);
++        let active_source_buffers = SourceBufferList::new(global, can_gc);
++        reflect_dom_object_with_proto(
++            Box::new(MediaSource::new_inherited(
++                &source_buffers,
++                &active_source_buffers,
++            )),
++            global,
++            proto,
++            can_gc,
++        )
++    }
++}
++
++impl MediaSourceMethods<crate::DomTypeHolder> for MediaSource {
++    /// <https://w3c.github.io/media-source/#dom-mediasource-mediasource>
++    fn Constructor(
++        window: &Window,
++        proto: Option<HandleObject>,
++        can_gc: CanGc,
++    ) -> Fallible<DomRoot<MediaSource>> {
++        Ok(MediaSource::new_with_proto(&window.global(), proto, can_gc))
++    }
++
++    fn SourceBuffers(&self) -> DomRoot<SourceBufferList> {
++        DomRoot::from_ref(&self.source_buffers)
++    }
++    fn ActiveSourceBuffers(&self) -> DomRoot<SourceBufferList> {
++        DomRoot::from_ref(&self.active_source_buffers)
++    }
++    fn ReadyState(&self) -> ReadyState {
++        self.ready_state.get()
++    }
++    fn GetDuration(&self) -> Fallible<f64> {
++        Ok(self.duration.get())
++    }
++    fn SetDuration(&self, value: f64) -> ErrorResult {
++        self.duration.set(value);
++        Ok(())
++    }
++
++    /// Phase 2 wires codec validation + the SourceBuffer append pipeline.
++    fn AddSourceBuffer(&self, _type_: DOMString) -> Fallible<DomRoot<SourceBuffer>> {
++        Err(Error::NotSupported(None))
++    }
++    fn RemoveSourceBuffer(&self, _buffer: &SourceBuffer) -> ErrorResult {
++        Err(Error::NotSupported(None))
++    }
++    fn EndOfStream(&self, _error: Option<EndOfStreamError>) -> ErrorResult {
++        Err(Error::NotSupported(None))
++    }
++
++    /// <https://w3c.github.io/media-source/#dom-mediasource-istypesupported>
++    /// Phase 1 heuristic; Phase 2 will consult the GStreamer registry scanner.
++    fn IsTypeSupported(_window: &Window, type_: DOMString) -> bool {
++        let t = type_.to_ascii_lowercase();
++        !t.is_empty() && (t.starts_with("video/") || t.starts_with("audio/"))
++    }
++}
+diff --git a/components/script/dom/media/mod.rs b/components/script/dom/media/mod.rs
+index 2fde3a6df7b..8281a712e47 100644
+--- a/components/script/dom/media/mod.rs
++++ b/components/script/dom/media/mod.rs
+@@ -11,7 +11,10 @@ pub(crate) mod mediametadata;
+ pub(crate) mod mediaquerylist;
+ pub(crate) mod mediaquerylistevent;
+ pub(crate) mod mediasession;
++pub(crate) mod mediasource;
+ pub(crate) mod mediastream;
+ pub(crate) mod mediastreamtrack;
++pub(crate) mod sourcebuffer;
++pub(crate) mod sourcebufferlist;
+ pub(crate) mod videotrack;
+ pub(crate) mod videotracklist;
+diff --git a/components/script/dom/media/sourcebuffer.rs b/components/script/dom/media/sourcebuffer.rs
+new file mode 100644
+index 00000000000..201953f1dda
+--- /dev/null
++++ b/components/script/dom/media/sourcebuffer.rs
+@@ -0,0 +1,100 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! Media Source Extensions `SourceBuffer` — Phase 1 scaffold (state only). `appendBuffer` /
++//! `remove` and the GStreamer append pipeline land in Phase 2.
++
++use std::cell::Cell;
++
++use dom_struct::dom_struct;
++
++use script_bindings::reflector::reflect_dom_object;
++
++use crate::dom::bindings::codegen::Bindings::SourceBufferBinding::{AppendMode, SourceBufferMethods};
++use crate::dom::bindings::error::{ErrorResult, Fallible};
++use crate::dom::bindings::root::{Dom, DomRoot};
++use crate::dom::eventtarget::EventTarget;
++use crate::dom::globalscope::GlobalScope;
++use crate::dom::media::mediasource::MediaSource;
++use crate::dom::timeranges::{TimeRanges, TimeRangesContainer};
++use crate::script_runtime::CanGc;
++
++#[dom_struct]
++pub(crate) struct SourceBuffer {
++    eventtarget: EventTarget,
++    mode: Cell<AppendMode>,
++    updating: Cell<bool>,
++    buffered: Dom<TimeRanges>,
++    timestamp_offset: Cell<f64>,
++    append_window_start: Cell<f64>,
++    append_window_end: Cell<f64>,
++    media_source: Dom<MediaSource>,
++}
++
++impl SourceBuffer {
++    fn new_inherited(media_source: &MediaSource, buffered: &TimeRanges) -> SourceBuffer {
++        SourceBuffer {
++            eventtarget: EventTarget::new_inherited(),
++            mode: Cell::new(AppendMode::Segments),
++            updating: Cell::new(false),
++            buffered: Dom::from_ref(buffered),
++            timestamp_offset: Cell::new(0.0),
++            append_window_start: Cell::new(0.0),
++            append_window_end: Cell::new(f64::INFINITY),
++            media_source: Dom::from_ref(media_source),
++        }
++    }
++
++    #[allow(dead_code)]
++    pub(crate) fn new(
++        global: &GlobalScope,
++        media_source: &MediaSource,
++        can_gc: CanGc,
++    ) -> DomRoot<SourceBuffer> {
++        let buffered =
++            TimeRanges::new(global.as_window(), TimeRangesContainer::default(), can_gc);
++        reflect_dom_object(
++            Box::new(SourceBuffer::new_inherited(media_source, &buffered)),
++            global,
++            can_gc,
++        )
++    }
++}
++
++impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
++    fn GetMode(&self) -> Fallible<AppendMode> {
++        Ok(self.mode.get())
++    }
++    fn SetMode(&self, value: AppendMode) -> ErrorResult {
++        self.mode.set(value);
++        Ok(())
++    }
++    fn Updating(&self) -> bool {
++        self.updating.get()
++    }
++    fn GetBuffered(&self) -> Fallible<DomRoot<TimeRanges>> {
++        Ok(DomRoot::from_ref(&self.buffered))
++    }
++    fn GetTimestampOffset(&self) -> Fallible<f64> {
++        Ok(self.timestamp_offset.get())
++    }
++    fn SetTimestampOffset(&self, value: f64) -> ErrorResult {
++        self.timestamp_offset.set(value);
++        Ok(())
++    }
++    fn GetAppendWindowStart(&self) -> Fallible<f64> {
++        Ok(self.append_window_start.get())
++    }
++    fn SetAppendWindowStart(&self, value: f64) -> ErrorResult {
++        self.append_window_start.set(value);
++        Ok(())
++    }
++    fn GetAppendWindowEnd(&self) -> Fallible<f64> {
++        Ok(self.append_window_end.get())
++    }
++    fn SetAppendWindowEnd(&self, value: f64) -> ErrorResult {
++        self.append_window_end.set(value);
++        Ok(())
++    }
++}
+diff --git a/components/script/dom/media/sourcebufferlist.rs b/components/script/dom/media/sourcebufferlist.rs
+new file mode 100644
+index 00000000000..d6c2cc7e638
+--- /dev/null
++++ b/components/script/dom/media/sourcebufferlist.rs
+@@ -0,0 +1,49 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! Media Source Extensions `SourceBufferList` — Phase 1 scaffold.
++
++use dom_struct::dom_struct;
++use script_bindings::cell::DomRefCell;
++
++use script_bindings::reflector::reflect_dom_object;
++
++use crate::dom::bindings::codegen::Bindings::SourceBufferListBinding::SourceBufferListMethods;
++use crate::dom::bindings::root::{Dom, DomRoot};
++use crate::dom::eventtarget::EventTarget;
++use crate::dom::globalscope::GlobalScope;
++use crate::dom::media::sourcebuffer::SourceBuffer;
++use crate::script_runtime::CanGc;
++
++#[dom_struct]
++pub(crate) struct SourceBufferList {
++    eventtarget: EventTarget,
++    buffers: DomRefCell<Vec<Dom<SourceBuffer>>>,
++}
++
++impl SourceBufferList {
++    fn new_inherited() -> SourceBufferList {
++        SourceBufferList {
++            eventtarget: EventTarget::new_inherited(),
++            buffers: DomRefCell::new(vec![]),
++        }
++    }
++
++    pub(crate) fn new(global: &GlobalScope, can_gc: CanGc) -> DomRoot<SourceBufferList> {
++        reflect_dom_object(Box::new(SourceBufferList::new_inherited()), global, can_gc)
++    }
++}
++
++impl SourceBufferListMethods<crate::DomTypeHolder> for SourceBufferList {
++    fn Length(&self) -> u32 {
++        self.buffers.borrow().len() as u32
++    }
++
++    fn IndexedGetter(&self, index: u32) -> Option<DomRoot<SourceBuffer>> {
++        self.buffers
++            .borrow()
++            .get(index as usize)
++            .map(|b| DomRoot::from_ref(&**b))
++    }
++}
+diff --git a/components/script_bindings/webidls/MediaSource.webidl b/components/script_bindings/webidls/MediaSource.webidl
+new file mode 100644
+index 00000000000..9b897ec9e6b
+--- /dev/null
++++ b/components/script_bindings/webidls/MediaSource.webidl
+@@ -0,0 +1,32 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++// https://w3c.github.io/media-source/#mediasource
++
++enum ReadyState {
++  "closed",
++  "open",
++  "ended"
++};
++
++enum EndOfStreamError {
++  "network",
++  "decode"
++};
++
++[Pref="dom_mediasource_enabled", Exposed=Window]
++interface MediaSource : EventTarget {
++  [Throws] constructor();
++  readonly attribute SourceBufferList sourceBuffers;
++  readonly attribute SourceBufferList activeSourceBuffers;
++  readonly attribute ReadyState readyState;
++  [Throws] attribute unrestricted double duration;
++  //   attribute EventHandler onsourceopen;
++  //   attribute EventHandler onsourceended;
++  //   attribute EventHandler onsourceclose;
++  [Throws, NewObject] SourceBuffer addSourceBuffer(DOMString type);
++  [Throws] undefined removeSourceBuffer(SourceBuffer sourceBuffer);
++  [Throws] undefined endOfStream(optional EndOfStreamError error);
++  static boolean isTypeSupported(DOMString type);
++};
+diff --git a/components/script_bindings/webidls/SourceBuffer.webidl b/components/script_bindings/webidls/SourceBuffer.webidl
+new file mode 100644
+index 00000000000..3350c1b58c4
+--- /dev/null
++++ b/components/script_bindings/webidls/SourceBuffer.webidl
+@@ -0,0 +1,29 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++// https://w3c.github.io/media-source/#sourcebuffer
++
++enum AppendMode {
++  "segments",
++  "sequence"
++};
++
++[Pref="dom_mediasource_enabled", Exposed=Window]
++interface SourceBuffer : EventTarget {
++  [Throws] attribute AppendMode mode;
++  readonly attribute boolean updating;
++  [Throws] readonly attribute TimeRanges buffered;
++  [Throws] attribute unrestricted double timestampOffset;
++  [Throws] attribute unrestricted double appendWindowStart;
++  [Throws] attribute unrestricted double appendWindowEnd;
++  //   attribute EventHandler onupdatestart;
++  //   attribute EventHandler onupdate;
++  //   attribute EventHandler onupdateend;
++  //   attribute EventHandler onerror;
++  //   attribute EventHandler onabort;
++  // Phase 2 (append pipeline):
++  // [Throws] undefined appendBuffer(BufferSource data);
++  // [Throws] undefined abort();
++  // [Throws] undefined remove(double start, unrestricted double end);
++};
+diff --git a/components/script_bindings/webidls/SourceBufferList.webidl b/components/script_bindings/webidls/SourceBufferList.webidl
+new file mode 100644
+index 00000000000..a4615b27852
+--- /dev/null
++++ b/components/script_bindings/webidls/SourceBufferList.webidl
+@@ -0,0 +1,13 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++// https://w3c.github.io/media-source/#sourcebufferlist
++
++[Pref="dom_mediasource_enabled", Exposed=Window]
++interface SourceBufferList : EventTarget {
++  readonly attribute unsigned long length;
++  //   attribute EventHandler onaddsourcebuffer;
++  //   attribute EventHandler onremovesourcebuffer;
++  getter SourceBuffer (unsigned long index);
++};
