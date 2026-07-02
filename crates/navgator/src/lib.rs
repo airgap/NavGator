@@ -1607,6 +1607,9 @@ fn navgator_preferences() -> Preferences {
     p.dom_webgl2_enabled = true; // 3D / maps / games
     // MSE: adaptive-streaming DOM API — single + multi-segment VP8/WebM play (LYK-1361).
     p.dom_mediasource_enabled = true;
+    // EME Clear Key: CENC decrypt element + `encrypted` event — encrypted H.264 plays end to
+    // end (LYK-1429). Clear Key only; Widevine/PlayReady are rejected (NotSupported).
+    p.dom_eme_enabled = true;
     // Second wave — features with real implementations in the fork (additive, low-risk).
     p.dom_offscreen_canvas_enabled = true; // OffscreenCanvas (2d/bitmap/webgl)
     p.dom_sanitizer_enabled = true; // HTML Sanitizer API (security pitch)

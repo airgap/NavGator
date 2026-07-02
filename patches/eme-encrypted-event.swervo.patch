@@ -1,0 +1,342 @@
+diff --git a/components/media/backends/gstreamer/cenc_decryptor.rs b/components/media/backends/gstreamer/cenc_decryptor.rs
+index af1150cc535..b025a262c89 100644
+--- a/components/media/backends/gstreamer/cenc_decryptor.rs
++++ b/components/media/backends/gstreamer/cenc_decryptor.rs
+@@ -195,9 +195,24 @@ mod imp {
+                 gstreamer::warning!(CAT, "protected buffer without kid/iv");
+                 return Err(gstreamer::FlowError::NotSupported);
+             };
+-            let Some(key) = clearkey::get_key(&key_id) else {
+-                gstreamer::warning!(CAT, "no Clear Key for kid {key_id:02x?}");
+-                return Err(gstreamer::FlowError::NotSupported);
++            // The key may still be in flight: an EME player sets it up asynchronously in response
++            // to the `encrypted` event we fired. Wait for it (bounded), rather than erroring —
++            // this is the "waiting for key" state the spec describes.
++            let key = {
++                let mut key = clearkey::get_key(&key_id);
++                let mut waited_ms = 0u32;
++                while key.is_none() && waited_ms < 5000 {
++                    std::thread::sleep(std::time::Duration::from_millis(20));
++                    waited_ms += 20;
++                    key = clearkey::get_key(&key_id);
++                }
++                match key {
++                    Some(key) => key,
++                    None => {
++                        gstreamer::warning!(CAT, "no Clear Key for kid {key_id:02x?} after wait");
++                        return Err(gstreamer::FlowError::NotSupported);
++                    },
++                }
+             };
+             let mut key16 = [0u8; 16];
+             key16[..key.len().min(16)].copy_from_slice(&key[..key.len().min(16)]);
+diff --git a/components/media/backends/gstreamer/player.rs b/components/media/backends/gstreamer/player.rs
+index 2e0d5d191d8..926efcd9fcc 100644
+--- a/components/media/backends/gstreamer/player.rs
++++ b/components/media/backends/gstreamer/player.rs
+@@ -518,6 +518,47 @@ impl GStreamerPlayer {
+             pipeline.set_context(&context);
+         }
+ 
++        // EME: when our CENC decryptor is autoplugged, probe its sink pad for the demuxer's
++        // GST_EVENT_PROTECTION so we can surface the init data (pssh) to the DOM as an
++        // `encrypted` event (fired once per stream). Scoped per-player via `observer`.
++        if let Some(bin) = pipeline.dynamic_cast_ref::<gstreamer::Bin>() {
++            let observer = self.observer.clone();
++            let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
++            bin.connect_deep_element_added(move |_bin, _sub_bin, element| {
++                let is_decryptor = element
++                    .factory()
++                    .map(|f| f.name() == "servocencdecrypt")
++                    .unwrap_or(false);
++                if !is_decryptor {
++                    return;
++                }
++                let Some(sink_pad) = element.static_pad("sink") else {
++                    return;
++                };
++                let observer = observer.clone();
++                let fired = fired.clone();
++                sink_pad.add_probe(gstreamer::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
++                    if let Some(gstreamer::PadProbeData::Event(ref event)) = info.data &&
++                        let gstreamer::EventView::Protection(protection) = event.view()
++                    {
++                        let (_system_id, data, _origin) = protection.get();
++                        if !fired.swap(true, std::sync::atomic::Ordering::Relaxed) &&
++                            let Ok(map) = data.map_readable()
++                        {
++                            let _ = notify!(
++                                observer,
++                                PlayerEvent::NeedKey {
++                                    init_data_type: "cenc".to_string(),
++                                    init_data: map.to_vec(),
++                                }
++                            );
++                        }
++                    }
++                    gstreamer::PadProbeReturn::Ok
++                });
++            });
++        }
++
+         // FIXME(#282): The progressive downloading breaks playback on Windows and Android.
+         if !cfg!(any(target_os = "windows", target_os = "android")) {
+             // Set player to perform progressive downloading. This will make the
+diff --git a/components/media/player/lib.rs b/components/media/player/lib.rs
+index 660129a7894..2e68e019005 100644
+--- a/components/media/player/lib.rs
++++ b/components/media/player/lib.rs
+@@ -76,6 +76,12 @@ pub enum PlayerEvent {
+     /// The internal player queue is running out of data. The client should start
+     /// pushing more data.
+     NeedData,
++    /// The stream is protected (encrypted). Carries the protection-system init data (e.g. a
++    /// `pssh` box) so the client can fire the `encrypted` DOM event and set up decryption keys.
++    NeedKey {
++        init_data_type: String,
++        init_data: Vec<u8>,
++    },
+     PositionChanged(f64),
+     /// The player needs the data to perform a seek to the given offset in bytes.
+     /// The next push_data should get the buffers from the new offset.
+diff --git a/components/script/dom/html/htmlmediaelement.rs b/components/script/dom/html/htmlmediaelement.rs
+index 954a398d9b4..5ea1585a970 100644
+--- a/components/script/dom/html/htmlmediaelement.rs
++++ b/components/script/dom/html/htmlmediaelement.rs
+@@ -72,6 +72,7 @@ use crate::dom::bindings::num::Finite;
+ use crate::dom::bindings::refcounted::Trusted;
+ use crate::dom::bindings::reflector::DomGlobal;
+ use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom, UnrootedDom};
++use crate::dom::media::mediaencryptedevent::MediaEncryptedEvent;
+ use crate::dom::media::mediakeys::MediaKeys;
+ use crate::dom::media::mediasource::MediaSource;
+ use crate::dom::bindings::str::{DOMString, USVString};
+@@ -2724,6 +2725,23 @@ impl HTMLMediaElement {
+         }
+     }
+ 
++    /// The stream is protected: fire the `encrypted` event so scripts can set up decryption keys.
++    fn playback_need_key(&self, init_data_type: &str, init_data: &[u8], cx: &mut JSContext) {
++        let can_gc = CanGc::from_cx(cx);
++        let global = self.global();
++        let event = MediaEncryptedEvent::new(
++            cx,
++            &global,
++            Atom::from("encrypted"),
++            DOMString::from(init_data_type),
++            init_data,
++            can_gc,
++        );
++        event
++            .upcast::<Event>()
++            .fire(cx, self.upcast::<EventTarget>());
++    }
++
+     fn playback_need_data(&self) {
+         // The media engine signals that the source needs more data. If we already have a valid
+         // fetch request, we do nothing. Otherwise, if we have no request and the previous request
+@@ -4130,6 +4148,10 @@ impl HTMLMediaElementEventHandler {
+                 element.playback_metadata_updated(cx, metadata)
+             },
+             PlayerEvent::NeedData => element.playback_need_data(),
++            PlayerEvent::NeedKey {
++                ref init_data_type,
++                ref init_data,
++            } => element.playback_need_key(init_data_type, init_data, cx),
+             PlayerEvent::PositionChanged(position) => element.playback_position_changed(position),
+             PlayerEvent::SeekData(offset, seek_lock) => {
+                 element.fetch_request(Some(offset), Some(seek_lock))
+diff --git a/components/script/dom/media/mediaencryptedevent.rs b/components/script/dom/media/mediaencryptedevent.rs
+new file mode 100644
+index 00000000000..32d2e9ae475
+--- /dev/null
++++ b/components/script/dom/media/mediaencryptedevent.rs
+@@ -0,0 +1,86 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++use std::ptr;
++
++use dom_struct::dom_struct;
++use js::context::JSContext;
++use js::jsapi::{Heap, JSObject};
++use js::typedarray::{ArrayBufferU8, HeapArrayBuffer};
++use script_bindings::cell::DomRefCell;
++use script_bindings::reflector::reflect_dom_object_with_proto;
++use script_bindings::trace::RootedTraceableBox;
++use stylo_atoms::Atom;
++
++use crate::dom::bindings::buffer_source::{BufferSource, HeapBufferSource, create_buffer_source};
++use crate::dom::bindings::codegen::Bindings::EventBinding::EventMethods;
++use crate::dom::bindings::codegen::Bindings::MediaEncryptedEventBinding::MediaEncryptedEventMethods;
++use crate::dom::bindings::inheritance::Castable;
++use crate::dom::bindings::root::DomRoot;
++use crate::dom::bindings::str::DOMString;
++use crate::dom::event::Event;
++use crate::dom::globalscope::GlobalScope;
++use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
++
++/// <https://w3c.github.io/encrypted-media/#mediaencryptedevent>
++#[dom_struct]
++pub(crate) struct MediaEncryptedEvent {
++    event: Event,
++    init_data_type: DOMString,
++    #[ignore_malloc_size_of = "mozjs"]
++    init_data: DomRefCell<HeapBufferSource<ArrayBufferU8>>,
++}
++
++impl MediaEncryptedEvent {
++    /// Build a `MediaEncryptedEvent`, copying `init_data` into a fresh `ArrayBuffer`.
++    pub(crate) fn new(
++        cx: &mut JSContext,
++        global: &GlobalScope,
++        type_: Atom,
++        init_data_type: DOMString,
++        init_data: &[u8],
++        can_gc: CanGc,
++    ) -> DomRoot<MediaEncryptedEvent> {
++        rooted!(&in(cx) let mut array = ptr::null_mut::<JSObject>());
++        let buffer_source = if init_data.is_empty() {
++            HeapBufferSource::<ArrayBufferU8>::default()
++        } else {
++            create_buffer_source::<ArrayBufferU8>(cx.into(), init_data, array.handle_mut(), can_gc)
++                .expect("Creating an ArrayBuffer from init data should never fail");
++            HeapBufferSource::<ArrayBufferU8>::new(BufferSource::ArrayBuffer(Heap::boxed(
++                *array.handle(),
++            )))
++        };
++
++        let ev = reflect_dom_object_with_proto(
++            Box::new(MediaEncryptedEvent {
++                event: Event::new_inherited(),
++                init_data_type,
++                init_data: DomRefCell::new(buffer_source),
++            }),
++            global,
++            None,
++            can_gc,
++        );
++        ev.upcast::<Event>().init_event(type_, false, false);
++        ev
++    }
++}
++
++impl MediaEncryptedEventMethods<crate::DomTypeHolder> for MediaEncryptedEvent {
++    /// <https://w3c.github.io/encrypted-media/#dom-mediaencryptedevent-initdatatype>
++    fn InitDataType(&self) -> DOMString {
++        self.init_data_type.clone()
++    }
++
++    /// <https://w3c.github.io/encrypted-media/#dom-mediaencryptedevent-initdata>
++    fn GetInitData(&self, _cx: SafeJSContext) -> Option<RootedTraceableBox<HeapArrayBuffer>> {
++        self.init_data.borrow().typed_array_to_option()
++    }
++
++    /// <https://dom.spec.whatwg.org/#dom-event-istrusted>
++    fn IsTrusted(&self) -> bool {
++        self.upcast::<Event>().IsTrusted()
++    }
++}
+diff --git a/components/script/dom/media/mediakeysession.rs b/components/script/dom/media/mediakeysession.rs
+index a18d44dc44e..e3c6a03774d 100644
+--- a/components/script/dom/media/mediakeysession.rs
++++ b/components/script/dom/media/mediakeysession.rs
+@@ -102,7 +102,8 @@ impl MediaKeySessionMethods<crate::DomTypeHolder> for MediaKeySession {
+                 .unwrap_or_default(),
+             // "webm": init data is a single raw key id.
+             "webm" => vec![data],
+-            // "cenc" (pssh) and others: follow-up.
++            // "cenc": init data is one or more `pssh` boxes; extract the key ids.
++            "cenc" => parse_pssh_key_ids(&data),
+             _ => Vec::new(),
+         };
+         *self.key_ids.borrow_mut() = key_ids;
+@@ -172,3 +173,59 @@ impl MediaKeySessionMethods<crate::DomTypeHolder> for MediaKeySession {
+         promise
+     }
+ }
++
++/// Extract the key ids from one or more concatenated `pssh` boxes (ISO/IEC 23001-7). Handles a
++/// version-1 pssh (explicit KID list) and a version-0 Clear Key pssh (data = concatenated key ids).
++fn parse_pssh_key_ids(data: &[u8]) -> Vec<Vec<u8>> {
++    let mut key_ids = Vec::new();
++    let mut pos = 0usize;
++    while pos + 32 <= data.len() {
++        let box_size = u32::from_be_bytes([
++            data[pos],
++            data[pos + 1],
++            data[pos + 2],
++            data[pos + 3],
++        ]) as usize;
++        if &data[pos + 4..pos + 8] != b"pssh" || box_size < 32 {
++            break;
++        }
++        let box_end = (pos + box_size).min(data.len());
++        let version = data[pos + 8];
++        // 4 size + 4 'pssh' + 4 version/flags + 16 system id.
++        let mut off = pos + 28;
++        if version >= 1 {
++            if off + 4 <= box_end {
++                let kid_count = u32::from_be_bytes([
++                    data[off],
++                    data[off + 1],
++                    data[off + 2],
++                    data[off + 3],
++                ]) as usize;
++                off += 4;
++                for _ in 0..kid_count {
++                    if off + 16 > box_end {
++                        break;
++                    }
++                    key_ids.push(data[off..off + 16].to_vec());
++                    off += 16;
++                }
++            }
++        } else if off + 4 <= box_end {
++            // Version 0: [u32 data_size][data]; Clear Key data is concatenated 16-byte key ids.
++            let data_size = u32::from_be_bytes([
++                data[off],
++                data[off + 1],
++                data[off + 2],
++                data[off + 3],
++            ]) as usize;
++            off += 4;
++            let data_end = (off + data_size).min(box_end);
++            while off + 16 <= data_end {
++                key_ids.push(data[off..off + 16].to_vec());
++                off += 16;
++            }
++        }
++        pos = box_end;
++    }
++    key_ids
++}
+diff --git a/components/script/dom/media/mod.rs b/components/script/dom/media/mod.rs
+index 9ace1ecba5c..bc532400ea2 100644
+--- a/components/script/dom/media/mod.rs
++++ b/components/script/dom/media/mod.rs
+@@ -4,6 +4,7 @@
+ 
+ pub(crate) mod mediadeviceinfo;
+ pub(crate) mod mediadevices;
++pub(crate) mod mediaencryptedevent;
+ pub(crate) mod mediaerror;
+ pub(crate) mod mediafragmentparser;
+ pub(crate) mod mediakeys;
+diff --git a/components/script_bindings/webidls/MediaEncryptedEvent.webidl b/components/script_bindings/webidls/MediaEncryptedEvent.webidl
+new file mode 100644
+index 00000000000..d7a5973d16e
+--- /dev/null
++++ b/components/script_bindings/webidls/MediaEncryptedEvent.webidl
+@@ -0,0 +1,10 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++// https://w3c.github.io/encrypted-media/#mediaencryptedevent
++[Exposed=Window, Pref="dom_eme_enabled"]
++interface MediaEncryptedEvent : Event {
++  readonly attribute DOMString initDataType;
++  readonly attribute ArrayBuffer? initData;
++};
