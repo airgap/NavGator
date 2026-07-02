@@ -1,0 +1,265 @@
+diff --git a/components/script/dom/media/keysystem.rs b/components/script/dom/media/keysystem.rs
+new file mode 100644
+index 00000000000..5e9360a11cc
+--- /dev/null
++++ b/components/script/dom/media/keysystem.rs
+@@ -0,0 +1,42 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! Pluggable EME key-system dispatch.
++//!
++//! `Navigator.requestMediaKeySystemAccess` consults [`evaluate`] instead of hard-coding a single
++//! key system. Clear Key is fully implemented in-process (no external CDM). Proprietary systems
++//! (Widevine, PlayReady, FairPlay) are *recognized* here so the plumbing is ready, but report
++//! [`KeySystemSupport::NeedsCdm`] until a Content Decryption Module is hosted — that CDM host
++//! (loading e.g. `libwidevinecdm.so` and speaking the CDM protocol) is the remaining, legally
++//! gated work tracked in LYK-1364.
++
++/// The Clear Key key system, fully supported in-process.
++pub(crate) const CLEAR_KEY: &str = "org.w3.clearkey";
++
++/// Recognized proprietary key systems, each needing an external CDM host that is not yet bundled.
++pub(crate) const WIDEVINE: &str = "com.widevine.alpha";
++pub(crate) const PLAYREADY: &str = "com.microsoft.playready";
++pub(crate) const PLAYREADY_RECOMMENDATION: &str = "com.microsoft.playready.recommendation";
++pub(crate) const FAIRPLAY: &str = "com.apple.fps";
++
++/// How well this build can service a given key system.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum KeySystemSupport {
++    /// Fully implemented in-process (Clear Key).
++    Available,
++    /// A recognized DRM whose CDM host is not present in this build. The pluggable seam for a real
++    /// CDM lives here — until then, access is rejected (per spec, as if unsupported).
++    NeedsCdm,
++    /// Unknown / unsupported key system.
++    Unsupported,
++}
++
++/// Classify a key-system string. This is the single place to extend when a CDM host lands.
++pub(crate) fn evaluate(key_system: &str) -> KeySystemSupport {
++    match key_system {
++        CLEAR_KEY => KeySystemSupport::Available,
++        WIDEVINE | PLAYREADY | PLAYREADY_RECOMMENDATION | FAIRPLAY => KeySystemSupport::NeedsCdm,
++        _ => KeySystemSupport::Unsupported,
++    }
++}
+diff --git a/components/script/dom/media/mediakeymessageevent.rs b/components/script/dom/media/mediakeymessageevent.rs
+new file mode 100644
+index 00000000000..5377d3f10b5
+--- /dev/null
++++ b/components/script/dom/media/mediakeymessageevent.rs
+@@ -0,0 +1,86 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++use std::ptr;
++
++use dom_struct::dom_struct;
++use js::context::JSContext;
++use js::jsapi::{Heap, JSObject};
++use js::typedarray::{ArrayBufferU8, HeapArrayBuffer};
++use script_bindings::cell::DomRefCell;
++use script_bindings::reflector::reflect_dom_object_with_proto;
++use script_bindings::trace::RootedTraceableBox;
++use stylo_atoms::Atom;
++
++use crate::dom::bindings::buffer_source::{BufferSource, HeapBufferSource, create_buffer_source};
++use crate::dom::bindings::codegen::Bindings::EventBinding::EventMethods;
++use crate::dom::bindings::codegen::Bindings::MediaKeyMessageEventBinding::MediaKeyMessageEventMethods;
++use crate::dom::bindings::codegen::Bindings::MediaKeySystemAccessBinding::MediaKeyMessageType;
++use crate::dom::bindings::inheritance::Castable;
++use crate::dom::bindings::root::DomRoot;
++use crate::dom::event::Event;
++use crate::dom::globalscope::GlobalScope;
++use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
++
++/// <https://w3c.github.io/encrypted-media/#mediakeymessageevent>
++#[dom_struct]
++pub(crate) struct MediaKeyMessageEvent {
++    event: Event,
++    message_type: MediaKeyMessageType,
++    #[ignore_malloc_size_of = "mozjs"]
++    message: DomRefCell<HeapBufferSource<ArrayBufferU8>>,
++}
++
++impl MediaKeyMessageEvent {
++    /// Build a `MediaKeyMessageEvent`, copying `message` into a fresh `ArrayBuffer`.
++    pub(crate) fn new(
++        cx: &mut JSContext,
++        global: &GlobalScope,
++        type_: Atom,
++        message_type: MediaKeyMessageType,
++        message: &[u8],
++        can_gc: CanGc,
++    ) -> DomRoot<MediaKeyMessageEvent> {
++        rooted!(&in(cx) let mut array = ptr::null_mut::<JSObject>());
++        let buffer_source = if message.is_empty() {
++            HeapBufferSource::<ArrayBufferU8>::default()
++        } else {
++            create_buffer_source::<ArrayBufferU8>(cx.into(), message, array.handle_mut(), can_gc)
++                .expect("Creating an ArrayBuffer from the license message should never fail");
++            HeapBufferSource::<ArrayBufferU8>::new(BufferSource::ArrayBuffer(Heap::boxed(
++                *array.handle(),
++            )))
++        };
++
++        let ev = reflect_dom_object_with_proto(
++            Box::new(MediaKeyMessageEvent {
++                event: Event::new_inherited(),
++                message_type,
++                message: DomRefCell::new(buffer_source),
++            }),
++            global,
++            None,
++            can_gc,
++        );
++        ev.upcast::<Event>().init_event(type_, false, false);
++        ev
++    }
++}
++
++impl MediaKeyMessageEventMethods<crate::DomTypeHolder> for MediaKeyMessageEvent {
++    /// <https://w3c.github.io/encrypted-media/#dom-mediakeymessageevent-messagetype>
++    fn MessageType(&self) -> MediaKeyMessageType {
++        self.message_type
++    }
++
++    /// <https://w3c.github.io/encrypted-media/#dom-mediakeymessageevent-message>
++    fn GetMessage(&self, _cx: SafeJSContext) -> Option<RootedTraceableBox<HeapArrayBuffer>> {
++        self.message.borrow().typed_array_to_option()
++    }
++
++    /// <https://dom.spec.whatwg.org/#dom-event-istrusted>
++    fn IsTrusted(&self) -> bool {
++        self.upcast::<Event>().IsTrusted()
++    }
++}
+diff --git a/components/script/dom/media/mediakeysession.rs b/components/script/dom/media/mediakeysession.rs
+index e3c6a03774d..88c0b4bfd59 100644
+--- a/components/script/dom/media/mediakeysession.rs
++++ b/components/script/dom/media/mediakeysession.rs
+@@ -23,14 +23,19 @@ use script_bindings::cell::DomRefCell;
+ use script_bindings::reflector::reflect_dom_object;
+ use stylo_atoms::Atom;
+ 
++use crate::dom::bindings::codegen::Bindings::EventBinding::EventMethods;
+ use crate::dom::bindings::codegen::Bindings::MediaKeySessionBinding::MediaKeySessionMethods;
++use crate::dom::bindings::codegen::Bindings::MediaKeySystemAccessBinding::MediaKeyMessageType;
+ use crate::dom::bindings::codegen::UnionTypes::ArrayBufferViewOrArrayBuffer;
+ use crate::dom::bindings::error::Error;
+ use crate::dom::bindings::inheritance::Castable;
+ use crate::dom::bindings::root::DomRoot;
+ use crate::dom::bindings::str::DOMString;
++use crate::dom::bindings::reflector::DomGlobal;
++use crate::dom::event::Event;
+ use crate::dom::eventtarget::EventTarget;
+ use crate::dom::globalscope::GlobalScope;
++use crate::dom::media::mediakeymessageevent::MediaKeyMessageEvent;
+ use crate::dom::promise::Promise;
+ use crate::script_runtime::CanGc;
+ 
+@@ -106,10 +111,26 @@ impl MediaKeySessionMethods<crate::DomTypeHolder> for MediaKeySession {
+             "cenc" => parse_pssh_key_ids(&data),
+             _ => Vec::new(),
+         };
+-        *self.key_ids.borrow_mut() = key_ids;
++        *self.key_ids.borrow_mut() = key_ids.clone();
++
++        // Fire a `message` event carrying the Clear Key license request so unmodified players can
++        // fetch a license (or answer from a local config) and hand it back via `update`.
++        if !key_ids.is_empty() {
++            let kids: Vec<String> = key_ids.iter().map(|k| URL_SAFE_NO_PAD.encode(k)).collect();
++            let request = serde_json::json!({ "kids": kids, "type": "temporary" }).to_string();
++            let can_gc = CanGc::from_cx(cx);
++            let global = self.global();
++            let event = MediaKeyMessageEvent::new(
++                cx,
++                &global,
++                Atom::from("message"),
++                MediaKeyMessageType::License_request,
++                request.as_bytes(),
++                can_gc,
++            );
++            event.upcast::<Event>().fire(cx, self.upcast::<EventTarget>());
++        }
+ 
+-        // TODO(brick 2b): fire a `message` MediaKeyMessageEvent carrying the Clear Key license
+-        // request `{"kids":[...],"type":"temporary"}` so unmodified Clear Key players work.
+         promise.resolve_native_with_cx(cx, &());
+         promise
+     }
+diff --git a/components/script/dom/media/mod.rs b/components/script/dom/media/mod.rs
+index bc532400ea2..b0902c61570 100644
+--- a/components/script/dom/media/mod.rs
++++ b/components/script/dom/media/mod.rs
+@@ -4,9 +4,11 @@
+ 
+ pub(crate) mod mediadeviceinfo;
+ pub(crate) mod mediadevices;
++pub(crate) mod keysystem;
+ pub(crate) mod mediaencryptedevent;
+ pub(crate) mod mediaerror;
+ pub(crate) mod mediafragmentparser;
++pub(crate) mod mediakeymessageevent;
+ pub(crate) mod mediakeys;
+ pub(crate) mod mediakeysession;
+ pub(crate) mod mediakeysystemaccess;
+diff --git a/components/script/dom/navigator.rs b/components/script/dom/navigator.rs
+index 0ba848a7f0d..869359285f6 100644
+--- a/components/script/dom/navigator.rs
++++ b/components/script/dom/navigator.rs
+@@ -41,6 +41,7 @@ use crate::dom::bindings::error::{Error, Fallible};
+ use crate::dom::bindings::refcounted::Trusted;
+ use crate::dom::bindings::codegen::Bindings::MediaKeySystemAccessBinding::MediaKeySystemConfiguration;
+ use crate::dom::bindings::reflector::DomGlobal;
++use crate::dom::media::keysystem;
+ use crate::dom::media::mediakeysystemaccess::MediaKeySystemAccess;
+ use crate::dom::promise::Promise;
+ use crate::dom::bindings::root::{DomRoot, MutNullableDom};
+@@ -313,12 +314,20 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
+     ) -> Rc<Promise> {
+         let mut realm = CurrentRealm::assert(cx);
+         let promise = Promise::new_in_realm(&mut realm);
+-        if key_system.to_string() == "org.w3.clearkey" {
+-            let access =
+-                MediaKeySystemAccess::new(&self.global(), key_system, CanGc::deprecated_note());
+-            promise.resolve_native_with_cx(cx, &access);
+-        } else {
+-            promise.reject_error(cx, Error::NotSupported(None));
++        match keysystem::evaluate(&key_system.to_string()) {
++            keysystem::KeySystemSupport::Available => {
++                let access = MediaKeySystemAccess::new(
++                    &self.global(),
++                    key_system,
++                    CanGc::deprecated_note(),
++                );
++                promise.resolve_native_with_cx(cx, &access);
++            },
++            // A recognized DRM whose CDM host is not bundled (LYK-1364), or an unknown key system:
++            // no usable access — reject as unsupported, per the EME algorithm.
++            keysystem::KeySystemSupport::NeedsCdm | keysystem::KeySystemSupport::Unsupported => {
++                promise.reject_error(cx, Error::NotSupported(None));
++            },
+         }
+         promise
+     }
+diff --git a/components/script_bindings/webidls/MediaKeyMessageEvent.webidl b/components/script_bindings/webidls/MediaKeyMessageEvent.webidl
+new file mode 100644
+index 00000000000..82c1e71007d
+--- /dev/null
++++ b/components/script_bindings/webidls/MediaKeyMessageEvent.webidl
+@@ -0,0 +1,10 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++// https://w3c.github.io/encrypted-media/#mediakeymessageevent
++[Exposed=Window, Pref="dom_eme_enabled"]
++interface MediaKeyMessageEvent : Event {
++  readonly attribute MediaKeyMessageType messageType;
++  readonly attribute ArrayBuffer? message;
++};
