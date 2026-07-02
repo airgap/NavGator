@@ -1,0 +1,82 @@
+diff --git a/components/script/dom/media/sourcebuffer.rs b/components/script/dom/media/sourcebuffer.rs
+index 05eb1cc98c5..a24cb0df4d4 100644
+--- a/components/script/dom/media/sourcebuffer.rs
++++ b/components/script/dom/media/sourcebuffer.rs
+@@ -29,7 +29,9 @@ pub(crate) struct SourceBuffer {
+     eventtarget: EventTarget,
+     mode: Cell<AppendMode>,
+     updating: Cell<bool>,
+-    buffered: Dom<TimeRanges>,
++    /// Running total of bytes appended, used to keep the player's input size in sync so its
++    /// (percent-based) buffering query and playback progress work.
++    total_bytes: Cell<u64>,
+     timestamp_offset: Cell<f64>,
+     append_window_start: Cell<f64>,
+     append_window_end: Cell<f64>,
+@@ -37,12 +39,12 @@ pub(crate) struct SourceBuffer {
+ }
+ 
+ impl SourceBuffer {
+-    fn new_inherited(media_source: &MediaSource, buffered: &TimeRanges) -> SourceBuffer {
++    fn new_inherited(media_source: &MediaSource) -> SourceBuffer {
+         SourceBuffer {
+             eventtarget: EventTarget::new_inherited(),
+             mode: Cell::new(AppendMode::Segments),
+             updating: Cell::new(false),
+-            buffered: Dom::from_ref(buffered),
++            total_bytes: Cell::new(0),
+             timestamp_offset: Cell::new(0.0),
+             append_window_start: Cell::new(0.0),
+             append_window_end: Cell::new(f64::INFINITY),
+@@ -55,10 +57,8 @@ impl SourceBuffer {
+         media_source: &MediaSource,
+         can_gc: CanGc,
+     ) -> DomRoot<SourceBuffer> {
+-        let buffered =
+-            TimeRanges::new(global.as_window(), TimeRangesContainer::default(), can_gc);
+         reflect_dom_object(
+-            Box::new(SourceBuffer::new_inherited(media_source, &buffered)),
++            Box::new(SourceBuffer::new_inherited(media_source)),
+             global,
+             can_gc,
+         )
+@@ -70,10 +70,14 @@ impl SourceBuffer {
+         self.upcast::<EventTarget>()
+             .fire_event(cx, Atom::from("updatestart"));
+ 
++        let total = self.total_bytes.get().saturating_add(bytes.len() as u64);
++        self.total_bytes.set(total);
+         if let Some(element) = self.media_source.media_element() &&
+             let Some(player) = element.get_player()
+         {
+-            if let Err(error) = player.lock().unwrap().push_data(bytes) {
++            let player = player.lock().unwrap();
++            let _ = player.set_input_size(total);
++            if let Err(error) = player.push_data(bytes) {
+                 warn!("MSE appendBuffer push_data failed: {error:?}");
+             }
+         }
+@@ -120,8 +124,22 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
+     fn Updating(&self) -> bool {
+         self.updating.get()
+     }
++    /// <https://w3c.github.io/media-source/#dom-sourcebuffer-buffered>
++    /// Reports the ranges the attached element's player has actually buffered.
+     fn GetBuffered(&self) -> Fallible<DomRoot<TimeRanges>> {
+-        Ok(DomRoot::from_ref(&self.buffered))
++        let mut buffered = TimeRangesContainer::default();
++        if let Some(element) = self.media_source.media_element() &&
++            let Some(player) = element.get_player()
++        {
++            for range in player.lock().unwrap().buffered() {
++                let _ = buffered.add(range.start, range.end);
++            }
++        }
++        Ok(TimeRanges::new(
++            self.global().as_window(),
++            buffered,
++            CanGc::deprecated_note(),
++        ))
+     }
+     fn GetTimestampOffset(&self) -> Fallible<f64> {
+         Ok(self.timestamp_offset.get())
