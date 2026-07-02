@@ -1,0 +1,96 @@
+diff --git a/components/script/dom/media/mediasource.rs b/components/script/dom/media/mediasource.rs
+index ccb6fa62811..570d76c7add 100644
+--- a/components/script/dom/media/mediasource.rs
++++ b/components/script/dom/media/mediasource.rs
+@@ -22,6 +22,7 @@ use stylo_atoms::Atom;
+ 
+ use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
+ use crate::dom::bindings::inheritance::Castable;
++use crate::dom::bindings::refcounted::Trusted;
+ use crate::dom::bindings::reflector::DomGlobal;
+ use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
+ use crate::dom::bindings::str::DOMString;
+@@ -100,6 +101,19 @@ impl MediaSource {
+         self.upcast::<EventTarget>()
+             .fire_event(cx, Atom::from("sourceopen"));
+     }
++
++    /// Queue a task that fires a named event at this MediaSource.
++    fn queue_event(&self, name: &'static str) {
++        let this = Trusted::new(self);
++        self.global()
++            .task_manager()
++            .media_element_task_source()
++            .queue(task!(mse_event: move |cx| {
++                this.root()
++                    .upcast::<EventTarget>()
++                    .fire_event(cx, Atom::from(name));
++            }));
++    }
+ }
+ 
+ impl MediaSourceMethods<crate::DomTypeHolder> for MediaSource {
+@@ -145,8 +159,8 @@ impl MediaSourceMethods<crate::DomTypeHolder> for MediaSource {
+         if self.ready_state.get() != ReadyState::Open {
+             return Err(Error::InvalidState(None));
+         }
+-        // Steps 5-7. Create the SourceBuffer, add it to sourceBuffers.
+-        // TODO(Phase 2b): fire `addsourcebuffer` at sourceBuffers (needs a JSContext).
++        // Steps 5-7. Create the SourceBuffer, add it to sourceBuffers (which queues the
++        // `addsourcebuffer` event at the list).
+         let source_buffer = SourceBuffer::new(&self.global(), self, CanGc::deprecated_note());
+         self.source_buffers.add(&source_buffer);
+         Ok(source_buffer)
+@@ -167,6 +181,7 @@ impl MediaSourceMethods<crate::DomTypeHolder> for MediaSource {
+         {
+             let _ = player.lock().unwrap().end_of_stream();
+         }
++        self.queue_event("sourceended");
+         Ok(())
+     }
+ 
+diff --git a/components/script/dom/media/sourcebufferlist.rs b/components/script/dom/media/sourcebufferlist.rs
+index c794d939bb7..bbcb909b6cb 100644
+--- a/components/script/dom/media/sourcebufferlist.rs
++++ b/components/script/dom/media/sourcebufferlist.rs
+@@ -6,10 +6,13 @@
+ 
+ use dom_struct::dom_struct;
+ use script_bindings::cell::DomRefCell;
+-
+ use script_bindings::reflector::reflect_dom_object;
++use stylo_atoms::Atom;
+ 
+ use crate::dom::bindings::codegen::Bindings::SourceBufferListBinding::SourceBufferListMethods;
++use crate::dom::bindings::inheritance::Castable;
++use crate::dom::bindings::refcounted::Trusted;
++use crate::dom::bindings::reflector::DomGlobal;
+ use crate::dom::bindings::root::{Dom, DomRoot};
+ use crate::dom::eventtarget::EventTarget;
+ use crate::dom::globalscope::GlobalScope;
+@@ -34,9 +37,24 @@ impl SourceBufferList {
+         reflect_dom_object(Box::new(SourceBufferList::new_inherited()), global, can_gc)
+     }
+ 
+-    /// Append a SourceBuffer to the list (used by `MediaSource.addSourceBuffer`).
++    /// Append a SourceBuffer to the list (used by `MediaSource.addSourceBuffer`) and queue the
++    /// `addsourcebuffer` event at the list.
+     pub(crate) fn add(&self, source_buffer: &SourceBuffer) {
+         self.buffers.borrow_mut().push(Dom::from_ref(source_buffer));
++        self.queue_event("addsourcebuffer");
++    }
++
++    /// Queue a task that fires a named event at this SourceBufferList.
++    fn queue_event(&self, name: &'static str) {
++        let this = Trusted::new(self);
++        self.global()
++            .task_manager()
++            .media_element_task_source()
++            .queue(task!(sbl_event: move |cx| {
++                this.root()
++                    .upcast::<EventTarget>()
++                    .fire_event(cx, Atom::from(name));
++            }));
+     }
+ }
+ 
