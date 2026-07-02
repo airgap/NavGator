@@ -1,0 +1,502 @@
+diff --git a/components/config/prefs.rs b/components/config/prefs.rs
+index 411bf2989fe..3888a43edfb 100644
+--- a/components/config/prefs.rs
++++ b/components/config/prefs.rs
+@@ -222,6 +222,8 @@ pub struct Preferences {
+     pub dom_webgl2_enabled: bool,
+     // feature: Media Source Extensions | Web/API/Media_Source_Extensions_API
+     pub dom_mediasource_enabled: bool,
++    // feature: Encrypted Media Extensions (EME) | Web/API/Encrypted_Media_Extensions_API
++    pub dom_eme_enabled: bool,
+     // feature: WebRTC | #41396 | Web/API/WebRTC_API
+     pub dom_webrtc_enabled: bool,
+     // feature: WebRTC Transceiver | #41396 | Web/API/RTCRtpTransceiver
+@@ -447,6 +449,7 @@ impl Preferences {
+             dom_webgpu_enabled: false,
+             dom_webgpu_wgpu_backend: String::new(),
+             dom_mediasource_enabled: false,
++            dom_eme_enabled: false,
+             dom_webrtc_enabled: false,
+             dom_webrtc_transceiver_enabled: false,
+             dom_webvtt_enabled: false,
+diff --git a/components/script/dom/html/htmlmediaelement.rs b/components/script/dom/html/htmlmediaelement.rs
+index 14f336ea1ca..5dc3ff09946 100644
+--- a/components/script/dom/html/htmlmediaelement.rs
++++ b/components/script/dom/html/htmlmediaelement.rs
+@@ -72,6 +72,7 @@ use crate::dom::bindings::num::Finite;
+ use crate::dom::bindings::refcounted::Trusted;
+ use crate::dom::bindings::reflector::DomGlobal;
+ use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom, UnrootedDom};
++use crate::dom::media::mediakeys::MediaKeys;
+ use crate::dom::media::mediasource::MediaSource;
+ use crate::dom::bindings::str::{DOMString, USVString};
+ use crate::dom::blob::Blob;
+@@ -536,6 +537,8 @@ pub(crate) struct HTMLMediaElement {
+     fired_loadeddata_event: Cell<bool>,
+     /// <https://html.spec.whatwg.org/multipage/#dom-media-error>
+     error: MutNullableDom<MediaError>,
++    /// <https://w3c.github.io/encrypted-media/#dom-htmlmediaelement-mediakeys> (EME)
++    media_keys: MutNullableDom<MediaKeys>,
+     /// <https://html.spec.whatwg.org/multipage/#dom-media-paused>
+     paused: Cell<bool>,
+     /// <https://html.spec.whatwg.org/multipage/#dom-media-defaultplaybackrate>
+@@ -660,6 +663,7 @@ impl HTMLMediaElement {
+             generation_id: Cell::new(0),
+             fired_loadeddata_event: Cell::new(false),
+             error: Default::default(),
++            media_keys: Default::default(),
+             paused: Cell::new(true),
+             default_playback_rate: Cell::new(1.0),
+             playback_rate: Cell::new(1.0),
+@@ -3017,6 +3021,22 @@ impl HTMLMediaElement {
+ }
+ 
+ impl HTMLMediaElementMethods<crate::DomTypeHolder> for HTMLMediaElement {
++    /// <https://w3c.github.io/encrypted-media/#dom-htmlmediaelement-mediakeys> (EME)
++    fn GetMediaKeys(&self) -> Option<DomRoot<MediaKeys>> {
++        self.media_keys.get()
++    }
++
++    /// <https://w3c.github.io/encrypted-media/#dom-htmlmediaelement-setmediakeys> (EME)
++    /// Brick 1: associate the MediaKeys with this element and resolve; the encrypted-media
++    /// attachment (feeding keys into the decrypt pipeline) lands with brick 3.
++    fn SetMediaKeys(&self, cx: &mut JSContext, media_keys: Option<&MediaKeys>) -> Rc<Promise> {
++        let mut realm = CurrentRealm::assert(cx);
++        let promise = Promise::new_in_realm(&mut realm);
++        self.media_keys.set(media_keys);
++        promise.resolve_native_with_cx(cx, &());
++        promise
++    }
++
+     /// <https://html.spec.whatwg.org/multipage/#dom-media-networkstate>
+     fn NetworkState(&self) -> u16 {
+         self.network_state.get() as u16
+diff --git a/components/script/dom/media/mediakeys.rs b/components/script/dom/media/mediakeys.rs
+new file mode 100644
+index 00000000000..c71febbe1e7
+--- /dev/null
++++ b/components/script/dom/media/mediakeys.rs
+@@ -0,0 +1,45 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! Encrypted Media Extensions `MediaKeys` — brick 1 (framework skeleton).
++
++use dom_struct::dom_struct;
++use script_bindings::reflector::{Reflector, reflect_dom_object};
++
++use crate::dom::bindings::codegen::Bindings::MediaKeySystemAccessBinding::MediaKeySessionType;
++use crate::dom::bindings::codegen::Bindings::MediaKeysBinding::MediaKeysMethods;
++use crate::dom::bindings::error::Fallible;
++use crate::dom::bindings::reflector::DomGlobal;
++use crate::dom::bindings::root::DomRoot;
++use crate::dom::globalscope::GlobalScope;
++use crate::dom::media::mediakeysession::MediaKeySession;
++use crate::script_runtime::CanGc;
++
++#[dom_struct]
++pub(crate) struct MediaKeys {
++    reflector_: Reflector,
++}
++
++impl MediaKeys {
++    fn new_inherited() -> MediaKeys {
++        MediaKeys {
++            reflector_: Reflector::new(),
++        }
++    }
++
++    pub(crate) fn new(global: &GlobalScope, can_gc: CanGc) -> DomRoot<MediaKeys> {
++        reflect_dom_object(Box::new(MediaKeys::new_inherited()), global, can_gc)
++    }
++}
++
++impl MediaKeysMethods<crate::DomTypeHolder> for MediaKeys {
++    /// <https://w3c.github.io/encrypted-media/#dom-mediakeys-createsession>
++    fn CreateSession(
++        &self,
++        _session_type: MediaKeySessionType,
++    ) -> Fallible<DomRoot<MediaKeySession>> {
++        // brick 2 records the session type + tracks the session on the MediaKeys.
++        Ok(MediaKeySession::new(&self.global(), CanGc::deprecated_note()))
++    }
++}
+diff --git a/components/script/dom/media/mediakeysession.rs b/components/script/dom/media/mediakeysession.rs
+new file mode 100644
+index 00000000000..e714307810b
+--- /dev/null
++++ b/components/script/dom/media/mediakeysession.rs
+@@ -0,0 +1,80 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! Encrypted Media Extensions `MediaKeySession` — brick 1 (framework skeleton). The Clear Key
++//! session logic (generateRequest→message, update→keys, keyStatuses) lands in brick 2; for now
++//! the operations return resolved promises so the API surface is exercisable.
++
++use std::rc::Rc;
++
++use dom_struct::dom_struct;
++use js::context::JSContext;
++use js::realm::CurrentRealm;
++use script_bindings::cell::DomRefCell;
++use script_bindings::reflector::reflect_dom_object;
++
++use crate::dom::bindings::codegen::Bindings::MediaKeySessionBinding::MediaKeySessionMethods;
++use crate::dom::bindings::codegen::UnionTypes::ArrayBufferViewOrArrayBuffer;
++use crate::dom::bindings::root::DomRoot;
++use crate::dom::bindings::str::DOMString;
++use crate::dom::eventtarget::EventTarget;
++use crate::dom::globalscope::GlobalScope;
++use crate::dom::promise::Promise;
++use crate::script_runtime::CanGc;
++
++#[dom_struct]
++pub(crate) struct MediaKeySession {
++    eventtarget: EventTarget,
++    session_id: DomRefCell<DOMString>,
++}
++
++impl MediaKeySession {
++    fn new_inherited() -> MediaKeySession {
++        MediaKeySession {
++            eventtarget: EventTarget::new_inherited(),
++            session_id: DomRefCell::new(DOMString::new()),
++        }
++    }
++
++    pub(crate) fn new(global: &GlobalScope, can_gc: CanGc) -> DomRoot<MediaKeySession> {
++        reflect_dom_object(Box::new(MediaKeySession::new_inherited()), global, can_gc)
++    }
++}
++
++impl MediaKeySessionMethods<crate::DomTypeHolder> for MediaKeySession {
++    fn SessionId(&self) -> DOMString {
++        self.session_id.borrow().clone()
++    }
++
++    /// <https://w3c.github.io/encrypted-media/#dom-mediakeysession-generaterequest>
++    fn GenerateRequest(
++        &self,
++        cx: &mut JSContext,
++        _init_data_type: DOMString,
++        _init_data: ArrayBufferViewOrArrayBuffer,
++    ) -> Rc<Promise> {
++        // brick 2: parse init data, fire a `message` event carrying the Clear Key request.
++        let mut realm = CurrentRealm::assert(cx);
++        let promise = Promise::new_in_realm(&mut realm);
++        promise.resolve_native_with_cx(cx, &());
++        promise
++    }
++
++    /// <https://w3c.github.io/encrypted-media/#dom-mediakeysession-update>
++    fn Update(&self, cx: &mut JSContext, _response: ArrayBufferViewOrArrayBuffer) -> Rc<Promise> {
++        // brick 2: parse the JWK key set, store keys, fire `keystatuseschange`.
++        let mut realm = CurrentRealm::assert(cx);
++        let promise = Promise::new_in_realm(&mut realm);
++        promise.resolve_native_with_cx(cx, &());
++        promise
++    }
++
++    /// <https://w3c.github.io/encrypted-media/#dom-mediakeysession-close>
++    fn Close(&self, cx: &mut JSContext) -> Rc<Promise> {
++        let mut realm = CurrentRealm::assert(cx);
++        let promise = Promise::new_in_realm(&mut realm);
++        promise.resolve_native_with_cx(cx, &());
++        promise
++    }
++}
+diff --git a/components/script/dom/media/mediakeysystemaccess.rs b/components/script/dom/media/mediakeysystemaccess.rs
+new file mode 100644
+index 00000000000..7228af51ab9
+--- /dev/null
++++ b/components/script/dom/media/mediakeysystemaccess.rs
+@@ -0,0 +1,64 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! Encrypted Media Extensions `MediaKeySystemAccess` — brick 1 (framework skeleton), gated behind
++//! `dom_eme_enabled`. Clear Key only for now.
++
++use std::rc::Rc;
++
++use dom_struct::dom_struct;
++use js::context::JSContext;
++use js::realm::CurrentRealm;
++use script_bindings::reflector::{Reflector, reflect_dom_object};
++
++use crate::dom::bindings::codegen::Bindings::MediaKeySystemAccessBinding::MediaKeySystemAccessMethods;
++use crate::dom::bindings::reflector::DomGlobal;
++use crate::dom::bindings::root::DomRoot;
++use crate::dom::bindings::str::DOMString;
++use crate::dom::globalscope::GlobalScope;
++use crate::dom::media::mediakeys::MediaKeys;
++use crate::dom::promise::Promise;
++use crate::script_runtime::CanGc;
++
++#[dom_struct]
++pub(crate) struct MediaKeySystemAccess {
++    reflector_: Reflector,
++    key_system: DOMString,
++}
++
++impl MediaKeySystemAccess {
++    fn new_inherited(key_system: DOMString) -> MediaKeySystemAccess {
++        MediaKeySystemAccess {
++            reflector_: Reflector::new(),
++            key_system,
++        }
++    }
++
++    pub(crate) fn new(
++        global: &GlobalScope,
++        key_system: DOMString,
++        can_gc: CanGc,
++    ) -> DomRoot<MediaKeySystemAccess> {
++        reflect_dom_object(
++            Box::new(MediaKeySystemAccess::new_inherited(key_system)),
++            global,
++            can_gc,
++        )
++    }
++}
++
++impl MediaKeySystemAccessMethods<crate::DomTypeHolder> for MediaKeySystemAccess {
++    fn KeySystem(&self) -> DOMString {
++        self.key_system.clone()
++    }
++
++    /// <https://w3c.github.io/encrypted-media/#dom-mediakeysystemaccess-createmediakeys>
++    fn CreateMediaKeys(&self, cx: &mut JSContext) -> Rc<Promise> {
++        let mut realm = CurrentRealm::assert(cx);
++        let promise = Promise::new_in_realm(&mut realm);
++        let media_keys = MediaKeys::new(&self.global(), CanGc::deprecated_note());
++        promise.resolve_native_with_cx(cx, &media_keys);
++        promise
++    }
++}
+diff --git a/components/script/dom/media/mod.rs b/components/script/dom/media/mod.rs
+index 8281a712e47..9ace1ecba5c 100644
+--- a/components/script/dom/media/mod.rs
++++ b/components/script/dom/media/mod.rs
+@@ -6,6 +6,9 @@ pub(crate) mod mediadeviceinfo;
+ pub(crate) mod mediadevices;
+ pub(crate) mod mediaerror;
+ pub(crate) mod mediafragmentparser;
++pub(crate) mod mediakeys;
++pub(crate) mod mediakeysession;
++pub(crate) mod mediakeysystemaccess;
+ pub(crate) mod medialist;
+ pub(crate) mod mediametadata;
+ pub(crate) mod mediaquerylist;
+diff --git a/components/script/dom/navigator.rs b/components/script/dom/navigator.rs
+index e8af6ff4ca9..0ba848a7f0d 100644
+--- a/components/script/dom/navigator.rs
++++ b/components/script/dom/navigator.rs
+@@ -12,8 +12,10 @@ use dom_struct::dom_struct;
+ use embedder_traits::{EmbedderMsg, ProtocolHandlerUpdateRegistration, RegisterOrUnregister};
+ use headers::HeaderMap;
+ use http::header::{self, HeaderValue};
+-#[cfg(feature = "webgpu")]
++use std::rc::Rc;
++
+ use js::context::JSContext;
++use js::realm::CurrentRealm;
+ use js::rust::MutableHandleValue;
+ use net_traits::blob_url_store::UrlWithBlobClaim;
+ use net_traits::request::{
+@@ -37,7 +39,10 @@ use crate::dom::bindings::codegen::Bindings::WindowBinding::Window_Binding::Wind
+ use crate::dom::bindings::codegen::Bindings::XMLHttpRequestBinding::BodyInit;
+ use crate::dom::bindings::error::{Error, Fallible};
+ use crate::dom::bindings::refcounted::Trusted;
++use crate::dom::bindings::codegen::Bindings::MediaKeySystemAccessBinding::MediaKeySystemConfiguration;
+ use crate::dom::bindings::reflector::DomGlobal;
++use crate::dom::media::mediakeysystemaccess::MediaKeySystemAccess;
++use crate::dom::promise::Promise;
+ use crate::dom::bindings::root::{DomRoot, MutNullableDom};
+ use crate::dom::bindings::str::{DOMString, USVString};
+ use crate::dom::bindings::utils::to_frozen_array;
+@@ -298,6 +303,26 @@ impl Navigator {
+ }
+ 
+ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
++    /// <https://w3c.github.io/encrypted-media/#dom-navigator-requestmediakeysystemaccess>
++    /// Brick 1: Clear Key only — resolves for `org.w3.clearkey`, rejects otherwise.
++    fn RequestMediaKeySystemAccess(
++        &self,
++        cx: &mut JSContext,
++        key_system: DOMString,
++        _supported_configurations: Vec<MediaKeySystemConfiguration>,
++    ) -> Rc<Promise> {
++        let mut realm = CurrentRealm::assert(cx);
++        let promise = Promise::new_in_realm(&mut realm);
++        if key_system.to_string() == "org.w3.clearkey" {
++            let access =
++                MediaKeySystemAccess::new(&self.global(), key_system, CanGc::deprecated_note());
++            promise.resolve_native_with_cx(cx, &access);
++        } else {
++            promise.reject_error(cx, Error::NotSupported(None));
++        }
++        promise
++    }
++
+     /// <https://html.spec.whatwg.org/multipage/#dom-navigator-product>
+     fn Product(&self) -> DOMString {
+         navigatorinfo::Product()
+diff --git a/components/script_bindings/codegen/Bindings.conf b/components/script_bindings/codegen/Bindings.conf
+index 39afa39b453..08757ba4108 100644
+--- a/components/script_bindings/codegen/Bindings.conf
++++ b/components/script_bindings/codegen/Bindings.conf
+@@ -767,7 +767,7 @@ DOMInterfaces = {
+ 'HTMLMediaElement': {
+     'realm': ['Play'],
+     'weakReferenceable': True,
+-    'cx': [ 'AddTextTrack', 'AudioTracks', 'Buffered', 'Played', 'Seekable', 'SetCrossOrigin', 'SetSrcObject', 'TextTracks', 'Load', 'Pause', 'VideoTracks'],
++    'cx': [ 'AddTextTrack', 'AudioTracks', 'Buffered', 'Played', 'Seekable', 'SetCrossOrigin', 'SetMediaKeys', 'SetSrcObject', 'TextTracks', 'Load', 'Pause', 'VideoTracks'],
+ },
+ 
+ 'HTMLMeterElement': {
+@@ -934,6 +934,14 @@ DOMInterfaces = {
+     'inRealms': ['GetUserMedia', 'GetClientRects', 'GetBoundingClientRect'],
+ },
+ 
++'MediaKeySystemAccess': {
++    'cx': ['CreateMediaKeys'],
++},
++
++'MediaKeySession': {
++    'cx': ['GenerateRequest', 'Update', 'Close'],
++},
++
+ 'MediaElementAudioSourceNode': {
+     'cx': ['Constructor'],
+ },
+@@ -1010,7 +1018,7 @@ DOMInterfaces = {
+ 
+ 'Navigator': {
+     'inRealms': ['GetVRDisplays'],
+-    'cx': ['Bluetooth', 'Clipboard', 'Gpu', 'Languages', 'SendBeacon', 'ServiceWorker', 'Storage', 'UserActivation', 'WakeLock', 'Xr'],
++    'cx': ['Bluetooth', 'Clipboard', 'Gpu', 'Languages', 'RequestMediaKeySystemAccess', 'SendBeacon', 'ServiceWorker', 'Storage', 'UserActivation', 'WakeLock', 'Xr'],
+ },
+ 
+ 'CredentialsContainer': {
+diff --git a/components/script_bindings/webidls/MediaKeySession.webidl b/components/script_bindings/webidls/MediaKeySession.webidl
+new file mode 100644
+index 00000000000..0aed76be67f
+--- /dev/null
++++ b/components/script_bindings/webidls/MediaKeySession.webidl
+@@ -0,0 +1,20 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++// https://w3c.github.io/encrypted-media/#mediakeysession-interface
++
++[Pref="dom_eme_enabled", Exposed=Window]
++interface MediaKeySession : EventTarget {
++  readonly attribute DOMString sessionId;
++  // readonly attribute unrestricted double expiration;         // brick 2
++  // readonly attribute Promise<undefined> closed;              // brick 2
++  // readonly attribute MediaKeyStatusMap keyStatuses;          // brick 2 (maplike)
++  // attribute EventHandler onkeystatuseschange;                // brick 2
++  // attribute EventHandler onmessage;                          // brick 2
++  Promise<undefined> generateRequest(DOMString initDataType, BufferSource initData);
++  Promise<undefined> update(BufferSource response);
++  Promise<undefined> close();
++  // Promise<undefined> load(DOMString sessionId);              // persistent sessions (later)
++  // Promise<undefined> remove();                               // persistent sessions (later)
++};
+diff --git a/components/script_bindings/webidls/MediaKeySystemAccess.webidl b/components/script_bindings/webidls/MediaKeySystemAccess.webidl
+new file mode 100644
+index 00000000000..bc8e3ad002e
+--- /dev/null
++++ b/components/script_bindings/webidls/MediaKeySystemAccess.webidl
+@@ -0,0 +1,68 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++// https://w3c.github.io/encrypted-media/
++
++enum MediaKeysRequirement {
++  "required",
++  "optional",
++  "not-allowed"
++};
++
++enum MediaKeySessionType {
++  "temporary",
++  "persistent-license"
++};
++
++enum MediaKeyStatus {
++  "usable",
++  "expired",
++  "released",
++  "output-restricted",
++  "output-downscaled",
++  "status-pending",
++  "internal-error"
++};
++
++enum MediaKeyMessageType {
++  "license-request",
++  "license-renewal",
++  "license-release",
++  "individualization-request"
++};
++
++dictionary MediaKeySystemMediaCapability {
++  DOMString contentType = "";
++  DOMString? encryptionScheme = null;
++  DOMString robustness = "";
++};
++
++dictionary MediaKeySystemConfiguration {
++  DOMString label = "";
++  sequence<DOMString> initDataTypes = [];
++  sequence<MediaKeySystemMediaCapability> audioCapabilities = [];
++  sequence<MediaKeySystemMediaCapability> videoCapabilities = [];
++  MediaKeysRequirement distinctiveIdentifier = "optional";
++  MediaKeysRequirement persistentState = "optional";
++  sequence<MediaKeySessionType> sessionTypes = [];
++};
++
++[Pref="dom_eme_enabled", Exposed=Window]
++interface MediaKeySystemAccess {
++  readonly attribute DOMString keySystem;
++  // MediaKeySystemConfiguration getConfiguration();  // brick 1b (dictionary return)
++  Promise<MediaKeys> createMediaKeys();
++};
++
++partial interface Navigator {
++  [Pref="dom_eme_enabled"]
++  Promise<MediaKeySystemAccess> requestMediaKeySystemAccess(
++      DOMString keySystem,
++      sequence<MediaKeySystemConfiguration> supportedConfigurations);
++};
++
++partial interface HTMLMediaElement {
++  [Pref="dom_eme_enabled"] readonly attribute MediaKeys? mediaKeys;
++  [Pref="dom_eme_enabled"] Promise<undefined> setMediaKeys(MediaKeys? mediaKeys);
++};
+diff --git a/components/script_bindings/webidls/MediaKeys.webidl b/components/script_bindings/webidls/MediaKeys.webidl
+new file mode 100644
+index 00000000000..529d6f348c1
+--- /dev/null
++++ b/components/script_bindings/webidls/MediaKeys.webidl
+@@ -0,0 +1,11 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++// https://w3c.github.io/encrypted-media/#mediakeys-interface
++
++[Pref="dom_eme_enabled", Exposed=Window]
++interface MediaKeys {
++  [Throws] MediaKeySession createSession(optional MediaKeySessionType sessionType = "temporary");
++  // Promise<boolean> setServerCertificate(BufferSource serverCertificate);  // brick 2
++};
