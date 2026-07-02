@@ -1,0 +1,103 @@
+diff --git a/components/script/dom/media/sourcebuffer.rs b/components/script/dom/media/sourcebuffer.rs
+index a24cb0df4d4..44b751948c2 100644
+--- a/components/script/dom/media/sourcebuffer.rs
++++ b/components/script/dom/media/sourcebuffer.rs
+@@ -6,6 +6,7 @@
+ //! `remove` and the GStreamer append pipeline land in Phase 2.
+ 
+ use std::cell::Cell;
++use std::ffi::CString;
+ 
+ use dom_struct::dom_struct;
+ use script_bindings::reflector::reflect_dom_object;
+@@ -64,6 +65,19 @@ impl SourceBuffer {
+         )
+     }
+ 
++    /// Queue a task that fires a named event at this SourceBuffer.
++    fn queue_event(&self, name: &'static str) {
++        let this = Trusted::new(self);
++        self.global()
++            .task_manager()
++            .media_element_task_source()
++            .queue(task!(mse_sb_event: move |cx| {
++                this.root()
++                    .upcast::<EventTarget>()
++                    .fire_event(cx, Atom::from(name));
++            }));
++    }
++
+     /// The async segment of `appendBuffer`: push the bytes into the attached element's player,
+     /// then clear `updating` and fire `update` + `updateend`.
+     fn finish_append(&self, cx: &mut js::context::JSContext, bytes: Vec<u8>) {
+@@ -114,6 +128,57 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
+         Ok(())
+     }
+ 
++    /// <https://w3c.github.io/media-source/#dom-sourcebuffer-abort>
++    fn Abort(&self) -> ErrorResult {
++        // If the parent MediaSource is not "open", throw InvalidStateError.
++        if !self.media_source.is_open() {
++            return Err(Error::InvalidState(None));
++        }
++        // Abort any in-progress append: reset updating and fire abort + updateend.
++        if self.updating.get() {
++            self.updating.set(false);
++            self.queue_event("abort");
++            self.queue_event("updateend");
++        }
++        // Reset the append window to its defaults.
++        self.append_window_start.set(0.0);
++        self.append_window_end.set(f64::INFINITY);
++        Ok(())
++    }
++
++    /// <https://w3c.github.io/media-source/#dom-sourcebuffer-remove>
++    fn Remove(&self, start: f64, end: f64) -> ErrorResult {
++        // If not "open" or currently updating, throw InvalidStateError.
++        if !self.media_source.is_open() || self.updating.get() {
++            return Err(Error::InvalidState(None));
++        }
++        // The range must be valid: 0 <= start < end.
++        if !(start >= 0.0) || !(start < end) {
++            return Err(Error::Type(
++                CString::new("Invalid remove range").unwrap(),
++            ));
++        }
++        // Run the removal asynchronously. NB: the GStreamer appsrc cannot drop already-pushed
++        // data, so `buffered` does not shrink (best-effort); the update events still fire so
++        // players that call remove() for buffer management proceed normally.
++        self.updating.set(true);
++        let this = Trusted::new(self);
++        self.global()
++            .task_manager()
++            .media_element_task_source()
++            .queue(task!(mse_remove: move |cx| {
++                let sb = this.root();
++                sb.upcast::<EventTarget>()
++                    .fire_event(cx, Atom::from("updatestart"));
++                sb.updating.set(false);
++                sb.upcast::<EventTarget>()
++                    .fire_event(cx, Atom::from("update"));
++                sb.upcast::<EventTarget>()
++                    .fire_event(cx, Atom::from("updateend"));
++            }));
++        Ok(())
++    }
++
+     fn GetMode(&self) -> Fallible<AppendMode> {
+         Ok(self.mode.get())
+     }
+diff --git a/components/script_bindings/webidls/SourceBuffer.webidl b/components/script_bindings/webidls/SourceBuffer.webidl
+index 68d7aa7a592..d9d835261f5 100644
+--- a/components/script_bindings/webidls/SourceBuffer.webidl
++++ b/components/script_bindings/webidls/SourceBuffer.webidl
+@@ -23,6 +23,6 @@ interface SourceBuffer : EventTarget {
+   //   attribute EventHandler onerror;
+   //   attribute EventHandler onabort;
+   [Throws] undefined appendBuffer(BufferSource data);
+-  // [Throws] undefined abort();
+-  // [Throws] undefined remove(double start, unrestricted double end);
++  [Throws] undefined abort();
++  [Throws] undefined remove(unrestricted double start, unrestricted double end);
+ };
