@@ -1,0 +1,174 @@
+diff --git a/components/script/dom/media/mediakeysession.rs b/components/script/dom/media/mediakeysession.rs
+index e714307810b..ca7a642a9c2 100644
+--- a/components/script/dom/media/mediakeysession.rs
++++ b/components/script/dom/media/mediakeysession.rs
+@@ -2,20 +2,31 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+-//! Encrypted Media Extensions `MediaKeySession` — brick 1 (framework skeleton). The Clear Key
+-//! session logic (generateRequest→message, update→keys, keyStatuses) lands in brick 2; for now
+-//! the operations return resolved promises so the API surface is exercisable.
++//! Encrypted Media Extensions `MediaKeySession` — brick 2: Clear Key session logic.
++//!
++//! `generateRequest` records the requested key ids (a `message` event carrying the license
++//! request is a follow-up — the `MediaKeyMessageEvent`/ArrayBuffer plumbing); `update` parses a
++//! Clear Key JWK license, decodes the keys, stores them, and fires `keystatuseschange`. The stored
++//! keys are what the CENC decrypt element (brick 3) will consume. `keyStatuses` (maplike) is a
++//! follow-up; the key store is exposed internally via `key_for`.
+ 
++use std::collections::HashMap;
++use std::ffi::CString;
+ use std::rc::Rc;
+ 
++use base64::Engine;
++use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+ use dom_struct::dom_struct;
+ use js::context::JSContext;
+ use js::realm::CurrentRealm;
+ use script_bindings::cell::DomRefCell;
+ use script_bindings::reflector::reflect_dom_object;
++use stylo_atoms::Atom;
+ 
+ use crate::dom::bindings::codegen::Bindings::MediaKeySessionBinding::MediaKeySessionMethods;
+ use crate::dom::bindings::codegen::UnionTypes::ArrayBufferViewOrArrayBuffer;
++use crate::dom::bindings::error::Error;
++use crate::dom::bindings::inheritance::Castable;
+ use crate::dom::bindings::root::DomRoot;
+ use crate::dom::bindings::str::DOMString;
+ use crate::dom::eventtarget::EventTarget;
+@@ -27,6 +38,10 @@ use crate::script_runtime::CanGc;
+ pub(crate) struct MediaKeySession {
+     eventtarget: EventTarget,
+     session_id: DomRefCell<DOMString>,
++    /// Key ids requested via `generateRequest` (Clear Key request contents).
++    key_ids: DomRefCell<Vec<Vec<u8>>>,
++    /// keyId → key material, populated by `update` from the Clear Key JWK license.
++    keys: DomRefCell<HashMap<Vec<u8>, Vec<u8>>>,
+ }
+ 
+ impl MediaKeySession {
+@@ -34,12 +49,21 @@ impl MediaKeySession {
+         MediaKeySession {
+             eventtarget: EventTarget::new_inherited(),
+             session_id: DomRefCell::new(DOMString::new()),
++            key_ids: DomRefCell::new(Vec::new()),
++            keys: DomRefCell::new(HashMap::new()),
+         }
+     }
+ 
+     pub(crate) fn new(global: &GlobalScope, can_gc: CanGc) -> DomRoot<MediaKeySession> {
+         reflect_dom_object(Box::new(MediaKeySession::new_inherited()), global, can_gc)
+     }
++
++    /// The key material for a given key id, if this session holds it (used by the CENC decrypt
++    /// element in brick 3).
++    #[allow(dead_code)]
++    pub(crate) fn key_for(&self, key_id: &[u8]) -> Option<Vec<u8>> {
++        self.keys.borrow().get(key_id).cloned()
++    }
+ }
+ 
+ impl MediaKeySessionMethods<crate::DomTypeHolder> for MediaKeySession {
+@@ -48,24 +72,88 @@ impl MediaKeySessionMethods<crate::DomTypeHolder> for MediaKeySession {
+     }
+ 
+     /// <https://w3c.github.io/encrypted-media/#dom-mediakeysession-generaterequest>
++    /// Extracts the requested key ids from the init data. Firing the `message` event with the
++    /// Clear Key license request is a follow-up (needs MediaKeyMessageEvent).
+     fn GenerateRequest(
+         &self,
+         cx: &mut JSContext,
+-        _init_data_type: DOMString,
+-        _init_data: ArrayBufferViewOrArrayBuffer,
++        init_data_type: DOMString,
++        init_data: ArrayBufferViewOrArrayBuffer,
+     ) -> Rc<Promise> {
+-        // brick 2: parse init data, fire a `message` event carrying the Clear Key request.
+         let mut realm = CurrentRealm::assert(cx);
+         let promise = Promise::new_in_realm(&mut realm);
++
++        let data = match init_data {
++            ArrayBufferViewOrArrayBuffer::ArrayBufferView(v) => v.to_vec(),
++            ArrayBufferViewOrArrayBuffer::ArrayBuffer(b) => b.to_vec(),
++        };
++        let key_ids: Vec<Vec<u8>> = match init_data_type.to_string().as_str() {
++            // "keyids": init data is JSON `{"kids":["base64url", ...]}`.
++            "keyids" => serde_json::from_slice::<serde_json::Value>(&data)
++                .ok()
++                .and_then(|json| {
++                    json.get("kids").and_then(|k| k.as_array()).map(|arr| {
++                        arr.iter()
++                            .filter_map(|v| v.as_str())
++                            .filter_map(|s| URL_SAFE_NO_PAD.decode(s).ok())
++                            .collect()
++                    })
++                })
++                .unwrap_or_default(),
++            // "webm": init data is a single raw key id.
++            "webm" => vec![data],
++            // "cenc" (pssh) and others: follow-up.
++            _ => Vec::new(),
++        };
++        *self.key_ids.borrow_mut() = key_ids;
++
++        // TODO(brick 2b): fire a `message` MediaKeyMessageEvent carrying the Clear Key license
++        // request `{"kids":[...],"type":"temporary"}` so unmodified Clear Key players work.
+         promise.resolve_native_with_cx(cx, &());
+         promise
+     }
+ 
+     /// <https://w3c.github.io/encrypted-media/#dom-mediakeysession-update>
+-    fn Update(&self, cx: &mut JSContext, _response: ArrayBufferViewOrArrayBuffer) -> Rc<Promise> {
+-        // brick 2: parse the JWK key set, store keys, fire `keystatuseschange`.
++    /// Parses a Clear Key JWK license (`{"keys":[{"kty":"oct","kid":..,"k":..}]}`), stores the
++    /// keys, and fires `keystatuseschange`.
++    fn Update(&self, cx: &mut JSContext, response: ArrayBufferViewOrArrayBuffer) -> Rc<Promise> {
+         let mut realm = CurrentRealm::assert(cx);
+         let promise = Promise::new_in_realm(&mut realm);
++
++        let data = match response {
++            ArrayBufferViewOrArrayBuffer::ArrayBufferView(v) => v.to_vec(),
++            ArrayBufferViewOrArrayBuffer::ArrayBuffer(b) => b.to_vec(),
++        };
++        let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) else {
++            promise
++                .reject_error(cx, Error::Type(CString::new("invalid Clear Key license").unwrap()));
++            return promise;
++        };
++        let mut stored = 0usize;
++        if let Some(keys) = json.get("keys").and_then(|k| k.as_array()) {
++            let mut store = self.keys.borrow_mut();
++            for key in keys {
++                let kid = key.get("kid").and_then(|v| v.as_str());
++                let k = key.get("k").and_then(|v| v.as_str());
++                if let (Some(kid), Some(k)) = (kid, k) &&
++                    let (Ok(kid_bytes), Ok(k_bytes)) =
++                        (URL_SAFE_NO_PAD.decode(kid), URL_SAFE_NO_PAD.decode(k))
++                {
++                    store.insert(kid_bytes, k_bytes);
++                    stored += 1;
++                }
++            }
++        }
++        if stored == 0 {
++            promise.reject_error(
++                cx,
++                Error::Type(CString::new("no usable keys in license").unwrap()),
++            );
++            return promise;
++        }
++
++        self.upcast::<EventTarget>()
++            .fire_event(cx, Atom::from("keystatuseschange"));
+         promise.resolve_native_with_cx(cx, &());
+         promise
+     }
+@@ -74,6 +162,7 @@ impl MediaKeySessionMethods<crate::DomTypeHolder> for MediaKeySession {
+     fn Close(&self, cx: &mut JSContext) -> Rc<Promise> {
+         let mut realm = CurrentRealm::assert(cx);
+         let promise = Promise::new_in_realm(&mut realm);
++        self.keys.borrow_mut().clear();
+         promise.resolve_native_with_cx(cx, &());
+         promise
+     }
