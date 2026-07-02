@@ -1605,6 +1605,8 @@ fn navgator_preferences() -> Preferences {
     // Tier-1 — real backends, high payoff (validate hardening before relying on them).
     p.dom_indexeddb_enabled = true; // rusqlite backend → web apps / PWAs
     p.dom_webgl2_enabled = true; // 3D / maps / games
+    // MSE: adaptive-streaming DOM API — single + multi-segment VP8/WebM play (LYK-1361).
+    p.dom_mediasource_enabled = true;
     // Second wave — features with real implementations in the fork (additive, low-risk).
     p.dom_offscreen_canvas_enabled = true; // OffscreenCanvas (2d/bitmap/webgl)
     p.dom_sanitizer_enabled = true; // HTML Sanitizer API (security pitch)
