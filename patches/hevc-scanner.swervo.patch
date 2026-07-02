@@ -1,0 +1,27 @@
+diff --git a/components/media/backends/gstreamer/registry_scanner.rs b/components/media/backends/gstreamer/registry_scanner.rs
+index 345740862a9..6d3db50e8cf 100644
+--- a/components/media/backends/gstreamer/registry_scanner.rs
++++ b/components/media/backends/gstreamer/registry_scanner.rs
+@@ -136,6 +136,22 @@ impl GStreamerRegistryScanner {
+             self.supported_codecs.insert("mp4v*");
+         }
+ 
++        // HEVC / H.265: only reported when the HOST provides a decoder (system GStreamer plugins
++        // — e.g. libav's avdec_h265, or hardware decoders like vah265dec/vtdec). We never bundle
++        // a software HEVC decoder ourselves (patent pools); on hosts without one this stays off.
++        let is_h265_decoder_available =
++            has_element_for_media_type(&video_decoder_factories, "video/x-h265");
++        if is_h265_decoder_available &&
++            has_element_for_media_type(&video_parser_factories, "video/x-h265")
++        {
++            self.supported_mime_types.insert("video/mp4");
++            self.supported_codecs.insert("x-h265");
++            // CODECS= strings per ISO BMFF: hvc1.* / hev1.* (and bare hevc some sites use).
++            self.supported_codecs.insert("hvc1*");
++            self.supported_codecs.insert("hev1*");
++            self.supported_codecs.insert("hevc");
++        }
++
+         if has_element_for_media_type(&audio_decoder_factories, "audio/midi") {
+             self.supported_mime_types.insert("audio/midi");
+             self.supported_mime_types.insert("audio/riff-midi");
