@@ -1,0 +1,36 @@
+diff --git a/components/media/backends/gstreamer/registry_scanner.rs b/components/media/backends/gstreamer/registry_scanner.rs
+index 08a57f4fc91..345740862a9 100644
+--- a/components/media/backends/gstreamer/registry_scanner.rs
++++ b/components/media/backends/gstreamer/registry_scanner.rs
+@@ -32,7 +32,15 @@ impl GStreamerRegistryScanner {
+     }
+ 
+     fn is_codec_supported(&self, codec: &str) -> bool {
+-        self.supported_codecs.contains(codec)
++        // Entries ending in '*' are prefixes (e.g. "avc*" matches "avc1.42E01E", "mp4a*" matches
++        // "mp4a.40.2"); everything else matches exactly. The plain `contains` check made the
++        // wildcard entries unreachable, so h264/aac/av1 codec strings never matched.
++        self.supported_codecs
++            .iter()
++            .any(|supported| match supported.strip_suffix('*') {
++                Some(prefix) => codec.starts_with(prefix),
++                None => *supported == codec,
++            })
+     }
+ 
+     pub fn are_all_codecs_supported(&self, codecs: &Vec<&str>) -> bool {
+@@ -254,7 +262,13 @@ fn has_element_for_media_type(
+     match gstreamer::caps::Caps::from_str(media_type) {
+         Ok(caps) => {
+             for factory in factories {
+-                if factory.can_sink_all_caps(&caps) {
++                // `can_sink_any_caps` (non-empty intersection) rather than `can_sink_all_caps`
++                // (subset): decoders whose sink templates constrain extra fields — e.g. libav's
++                // `alignment`/`stream-format` on video/x-h264, or opusdec's
++                // `channel-mapping-family` — must still count as support for the media type.
++                // With the subset check, h264/aac/opus reported unsupported even when their
++                // decoders were installed (only bare-template decoders like vp8/vp9 passed).
++                if factory.can_sink_any_caps(&caps) {
+                     return true;
+                 }
+             }
