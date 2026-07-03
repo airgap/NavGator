@@ -4029,13 +4029,15 @@ impl AppState {
         let frame = egui::Frame::default()
             .fill(ctx.global_style().visuals.window_fill)
             .corner_radius(egui::CornerRadius { nw: 12, ne: 12, sw: 0, se: 0 })
-            // Small bottom margin: a 6px bottom left a dark `bg2` gap between the omnibar and the
-            // tab strip that read as a "dark band" over the tabs. Keep 6 up top (window rounding).
+            // Zero bottom margin: any bottom margin here is toolbar `bg2` sitting *below* the omnibar
+            // and *above* the tab panel — a dark strip that, against the tint of the tab pills, reads
+            // as a "dark region on the buttons" (invisible over the bare strip, bg2-on-bg2). With 0
+            // the pills butt straight against the omnibar. Keep 6 up top (window rounding).
             .inner_margin(egui::Margin {
                 left: 6,
                 right: 6,
                 top: 6,
-                bottom: 2,
+                bottom: 0,
             });
         let toolbar = egui::TopBottomPanel::top("toolbar")
             .frame(frame)
@@ -4606,8 +4608,18 @@ impl AppState {
             content_w.clamp(ICON + 2.0 * PAD, tab_max_w)
         };
 
+        // Horizontal pills fill the FULL strip height so the tint reaches the strip's top/bottom
+        // edges. Allocating a fixed `tab_h` while the strip content is a few px taller let
+        // `Align::Center` drop the pill down, leaving a dark `bg2` cap above the tint — invisible on
+        // the bare strip (bg2-on-bg2) but visible on the tabs (bg2-on-tint), i.e. "dark only on the
+        // buttons". Vertical tabs keep the fixed row height.
+        let row_h = if vertical {
+            tab_h
+        } else {
+            ui.available_height().max(tab_h)
+        };
         let (rect, resp) =
-            ui.allocate_exact_size(egui::vec2(width, tab_h), egui::Sense::click_and_drag());
+            ui.allocate_exact_size(egui::vec2(width, row_h), egui::Sense::click_and_drag());
         let painter = ui.painter().clone();
 
         // Tab background: active = accent-soft pill; hover = elevated; else transparent.
