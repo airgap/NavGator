@@ -753,6 +753,12 @@ pub(crate) fn build_visuals(theme: &Theme, pal: &Palette) -> Visuals {
     v.widgets.open.corner_radius = r;
     v.window_corner_radius = CornerRadius::same(theme.radius.min(14));
 
+    // Buttons/segmented toggles must not grow on hover: egui's default hover/active `expansion`
+    // enlarges the widget a couple px, which shifts the surrounding layout (the Studio's
+    // Compact/Cozy and Top bar/Sidebar toggles visibly jumped on hover).
+    v.widgets.hovered.expansion = 0.0;
+    v.widgets.active.expansion = 0.0;
+
     v
 }
 
@@ -764,6 +770,9 @@ pub(crate) fn apply_style(ctx: &egui::Context, theme: &Theme) {
     ctx.global_style_mut(|s| {
         s.spacing.item_spacing = egui::vec2(tk.gap, tk.gap);
         s.spacing.button_padding = egui::vec2(tk.pad * 0.6, tk.pad * 0.4);
+        // Chrome labels are not text-selectable: a selectable label shows a text I-beam over
+        // button text (the Studio font/surface tiles read as editable text otherwise).
+        s.interaction.selectable_labels = false;
 
         s.text_styles.insert(TextStyle::Body, FontId::new(tk.fs, fam.clone()));
         s.text_styles.insert(TextStyle::Button, FontId::new(tk.fs, fam.clone()));

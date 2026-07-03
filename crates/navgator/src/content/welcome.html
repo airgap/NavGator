@@ -41,17 +41,18 @@
   .time { font: 300 78px/1 var(--display); letter-spacing:-2px; color: var(--fg); }
   .greet { font-size:26px; color: var(--muted); }
 
-  /* Search box — focuses the native omnibar (gator://omnibar is intercepted by the chrome) */
-  a.search {
-    display:flex; align-items:center; gap:13px; text-decoration:none;
+  /* Search box — a real input; Enter submits the query to the chrome (gator://omnibar?q=…). */
+  .search {
+    display:flex; align-items:center; gap:13px;
     background: var(--panel); border:1.5px solid var(--line); border-radius:16px;
     padding:17px 18px; color: var(--muted); font-size:16px; cursor:text;
     transition: border-color .15s, box-shadow .15s;
   }
-  a.search:hover { border-color: rgba(var(--accent-rgb), .55); box-shadow:0 0 0 4px rgba(var(--accent-rgb), .08); }
-  a.search .dot { flex:none; width:9px; height:9px; border-radius:50%; background: var(--accent); }
-  a.search .ph { flex:1; }
-  a.search .kbd { flex:none; font: 600 12px var(--mono); color: var(--muted);
+  .search:hover, .search:focus-within { border-color: rgba(var(--accent-rgb), .55); box-shadow:0 0 0 4px rgba(var(--accent-rgb), .08); }
+  .search .dot { flex:none; width:9px; height:9px; border-radius:50%; background: var(--accent); }
+  .search .ph { flex:1; border:none; background:transparent; outline:none; color: var(--text); font:inherit; }
+  .search .ph::placeholder { color: var(--muted); }
+  .search .kbd { flex:none; font: 600 12px var(--mono); color: var(--muted);
     border:1px solid var(--line); border-radius:7px; padding:3px 8px; background: var(--bg); }
 
   /* Section label */
@@ -110,11 +111,12 @@
       </div>
     </section>
 
-    <a class="search __SEARCH_HIDE__" href="gator://omnibar">
+    <form class="search __SEARCH_HIDE__" id="searchForm">
       <span class="dot"></span>
-      <span class="ph">Search the web, your tabs, or type a command&hellip;</span>
-      <span class="kbd">&#8984;K</span>
-    </a>
+      <input class="ph" id="searchInput" type="text" autocomplete="off" spellcheck="false"
+             placeholder="Search the web, your tabs, or type a command&hellip;">
+      <span class="kbd">__KBD__</span>
+    </form>
 
     <section class="__SITES_HIDE__">
       <div class="label">Top sites</div>
@@ -202,6 +204,12 @@
     var row = e.target.closest('.read'); if (!row) return;
     READING.splice(+row.dataset.i, 1);
     save('nav_reading', READING); renderReading();
+  });
+  var searchForm = document.getElementById('searchForm');
+  if (searchForm) searchForm.addEventListener('submit', function(e){
+    e.preventDefault();
+    var q = document.getElementById('searchInput').value;
+    if (q.trim()) location.href = 'gator://omnibar?q=' + encodeURIComponent(q.trim());
   });
   var noteAdd = document.getElementById('note-add');
   if (noteAdd) noteAdd.addEventListener('keydown', function(e){

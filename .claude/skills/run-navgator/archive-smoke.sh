@@ -3,7 +3,7 @@
 # replays are pixel-identical (deterministic) and that replay #2 needed no network (misses logged).
 set -uo pipefail
 W=1280; H=800; VH=722; TOP=78; DISP=:99
-BIN=/raid/NavGator/target/debug/navgator
+BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/target/debug/navgator"
 SITE="${1:-https://news.ycombinator.com/}"
 DIR=/tmp/arc/store; rm -rf "$DIR"
 OUT=/tmp/arc; mkdir -p "$OUT"

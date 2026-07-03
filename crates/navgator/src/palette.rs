@@ -192,6 +192,15 @@ pub(crate) fn draw_palette_dropdown(
                         return;
                     }
 
+                    // Cap the height so the dropdown fits BELOW the omnibar. Without this the full
+                    // catalog is ~760px tall — too tall to fit under the bar, so egui shoves the
+                    // whole area UP to keep it on-screen, covering the omnibar. Scroll for the rest.
+                    let max_h = (ui.ctx().screen_rect().bottom() - anchor.bottom() - 40.0)
+                        .clamp(180.0, 460.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(max_h)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
                     for (i, (label, hint, action)) in items.iter().enumerate() {
                         let (rect, resp) = ui.allocate_exact_size(
                             egui::vec2(ui.available_width(), 32.0),
@@ -250,6 +259,7 @@ pub(crate) fn draw_palette_dropdown(
                             clicked = Some(*action);
                         }
                     }
+                        });
                 });
         });
 

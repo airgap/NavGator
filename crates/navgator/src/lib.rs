@@ -735,23 +735,32 @@ mod icon {
         p.line_segment([pos2(r.center().x - dx, end_y), pos2(r.center().x, tip_y)], st);
         p.line_segment([pos2(r.center().x, tip_y), pos2(r.center().x + dx, end_y)], st);
     }
-    /// Circular reload arrow (a ~300° arc with an arrowhead at the top gap).
+    /// Circular reload arrow: a ~290° arc with a filled triangular arrowhead at the top gap,
+    /// pointing clockwise (the direction of rotation).
     pub fn reload(p: &Painter, r: Rect, c: Color32) {
-        let st = Stroke::new(1.6, c);
+        use egui::vec2;
+        let st = Stroke::new(1.7, c);
         let center = r.center();
-        let rad = r.width() * 0.36;
-        let (start, end, steps) = (0.9_f32, 6.0_f32, 20);
+        let rad = r.width() * 0.30;
+        // Arc sweeps clockwise, leaving a gap at the top for the arrowhead.
+        let start = -0.62_f32; // just right of straight up
+        let sweep = 5.05_f32; // ~289°
+        let steps = 30;
         let pts: Vec<_> = (0..=steps)
             .map(|i| {
-                let a = start + (end - start) * (i as f32 / steps as f32);
+                let a = start + sweep * (i as f32 / steps as f32);
                 pos2(center.x + rad * a.cos(), center.y + rad * a.sin())
             })
             .collect();
         p.add(egui::Shape::line(pts, st));
-        // Arrowhead at the arc start (upper-right), pointing clockwise.
+        // Filled arrowhead at the arc start (top), apex along the clockwise tangent.
         let tip = pos2(center.x + rad * start.cos(), center.y + rad * start.sin());
-        p.line_segment([tip, pos2(tip.x - 4.5, tip.y - 1.5)], st);
-        p.line_segment([tip, pos2(tip.x - 1.0, tip.y + 4.5)], st);
+        let tangent = vec2(-start.sin(), start.cos()); // clockwise (increasing angle)
+        let radial = vec2(start.cos(), start.sin()); // outward
+        let apex = tip + tangent * 4.6;
+        let b1 = tip + radial * 3.4;
+        let b2 = tip - radial * 3.4;
+        p.add(egui::Shape::convex_polygon(vec![apex, b1, b2], c, Stroke::NONE));
     }
     /// Key: a ring on the left, a stem to the right, two teeth.
     pub fn key(p: &Painter, r: Rect, c: Color32) {
@@ -787,6 +796,12 @@ fn icon_button(
     };
     let icon_box = egui::Rect::from_center_size(rect.center(), egui::vec2(13.0, 13.0));
     draw(ui.painter(), icon_box, col);
+    // Clickable chrome shows a pointer on hover (web-style), not the default arrow.
+    let resp = if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    };
     if tip.is_empty() {
         resp
     } else {
@@ -2545,6 +2560,7 @@ impl AppState {
             .replace("__TOPSITES__", &topsites)
             .replace("__CLOCK_HIDE__", hide(modules.clock))
             .replace("__SEARCH_HIDE__", hide(modules.search))
+            .replace("__KBD__", if cfg!(target_os = "macos") { "\u{2318}K" } else { "Ctrl K" })
             .replace("__SITES_HIDE__", hide(modules.sites))
             .replace("__NOTES_HIDE__", hide(modules.notes))
             .replace("__FEED_HIDE__", hide(modules.feed));
@@ -3906,7 +3922,12 @@ impl AppState {
             .corner_radius(egui::CornerRadius { nw: 12, ne: 12, sw: 0, se: 0 })
             .inner_margin(6.0);
         let toolbar = egui::TopBottomPanel::top("toolbar").frame(frame).show(ctx, |ui| {
+            // Pin the row to the omnibar height (the tallest control) up front, so every item —
+            // which egui lays out left-to-right and would otherwise top-align before the omnibar
+            // grows the row — is vertically centered against it instead of floating too high.
+            let omni_h = theme::density_tokens(self.browser.settings.borrow().theme.density).omni_h;
             ui.horizontal(|ui| {
+                ui.set_min_height(omni_h);
                 let navpal = self.browser.settings.borrow().theme.palette();
                 let (cb, cf) = self.active_nav();
                 if icon_button(ui, cb, "Back", &navpal, icon::back).clicked() {
@@ -4007,6 +4028,14 @@ impl AppState {
                         (s.theme.palette(), tk.omni_h, tk.omni_px)
                     };
                     let rad = (omni_h * 0.5) as u8;
+                    // Ctrl/Cmd+K opens the command palette regardless of focus. Handled here on the
+                    // egui side because the winit shortcut handler is bypassed while a text field
+                    // (the omnibar) has focus, so Ctrl+K did nothing once the omnibar was focused.
+                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
+                        *loc = ">".to_string();
+                        self.location_dirty.set(true);
+                        self.focus_omnibox.set(true);
+                    }
                     let is_cmd = loc.trim_start().starts_with('>');
                     let focused = ui.memory(|m| m.has_focus(id));
 
@@ -4048,10 +4077,14 @@ impl AppState {
                                         .inner_margin(egui::Margin::symmetric(5, 1))
                                         .show(ui, |ui| {
                                             ui.label(
-                                                egui::RichText::new("⌘K")
-                                                    .monospace()
-                                                    .size(10.5)
-                                                    .color(pal.muted),
+                                                egui::RichText::new(if cfg!(target_os = "macos") {
+                                                    "⌘K"
+                                                } else {
+                                                    "Ctrl K"
+                                                })
+                                                .monospace()
+                                                .size(10.5)
+                                                .color(pal.muted),
                                             );
                                         });
                                     ui.add_space(4.0);
@@ -4245,12 +4278,18 @@ impl AppState {
                         if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             run_action = items.first().map(|(_, _, a)| *a);
                         }
-                        if field.has_focus() {
-                            if let Some(a) =
-                                palette::draw_palette_dropdown(ui, pill_rect, &items, &pal)
-                            {
-                                run_action = Some(a);
-                            }
+                        // Draw whenever in command mode — NOT gated on field focus — so a click on
+                        // a row (which steals focus from the omnibar) is still drawn on the release
+                        // frame and dispatches, instead of vanishing before the click lands.
+                        if let Some(a) =
+                            palette::draw_palette_dropdown(ui, pill_rect, &items, &pal)
+                        {
+                            run_action = Some(a);
+                        }
+                        // Escape leaves command mode (closes the palette).
+                        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            loc.clear();
+                            self.location_dirty.set(true);
                         }
                     } else {
                         if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -4710,40 +4749,65 @@ impl AppState {
             } else {
                 None
             };
+            let pal = self.browser.settings.borrow().theme.palette();
             ui.horizontal(|ui| {
-                // Trailing fixed `+` (always reachable, outside the scrolled region).
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::Button::new("+").frame(false)).clicked() {
-                        pending = Some(TabAction::NewTab);
-                    }
-                    // The scrolled strip fills the remaining width to the left of `+`. The
-                    // scrollbar is hidden — a tab strip shouldn't show one (and VisibleWhenNeeded
-                    // mis-fires on sub-pixel content with a single tab); overflow still wheels.
-                    egui::ScrollArea::horizontal()
-                        .scroll_bar_visibility(
-                            egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
-                        )
-                        .show(ui, |ui| {
-                            ui.with_layout(
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    for &i in &order {
-                                        let (act, resp) = self.tab_row(ui, i, active, false, fw);
-                                        rects.push(resp.rect);
-                                        if resp.hovered() && i != active {
-                                            self.draw_tab_preview(ui, i, resp.rect, false);
-                                        }
-                                        if i == active && scroll_active {
-                                            resp.scroll_to_me(None);
-                                        }
-                                        if !matches!(act, TabAction::None) && pending.is_none() {
-                                            pending = Some(act);
-                                        }
+                // The scrolled strip: the tabs, then the new-tab `+` right after the last tab
+                // (scrollbar hidden — a tab strip shouldn't show one; overflow still wheels).
+                egui::ScrollArea::horizontal()
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .show(ui, |ui| {
+                        ui.with_layout(
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                let mut last_bottom = ui.max_rect().bottom();
+                                for &i in &order {
+                                    let (act, resp) = self.tab_row(ui, i, active, false, fw);
+                                    last_bottom = resp.rect.bottom();
+                                    rects.push(resp.rect);
+                                    if resp.hovered() && i != active {
+                                        self.draw_tab_preview(ui, i, resp.rect, false);
                                     }
-                                },
-                            );
-                        });
-                });
+                                    if i == active && scroll_active {
+                                        resp.scroll_to_me(None);
+                                    }
+                                    if !matches!(act, TabAction::None) && pending.is_none() {
+                                        pending = Some(act);
+                                    }
+                                }
+                                // New-tab button, just right of the last tab: a square cell sized
+                                // to the tab height so the `+` sits equidistant from top, bottom
+                                // and (via the equal left gap) the tab.
+                                let h = (last_bottom - ui.max_rect().top()).clamp(28.0, 44.0);
+                                ui.add_space((h * 0.28).round());
+                                let (rect, resp) =
+                                    ui.allocate_exact_size(egui::vec2(h, h), egui::Sense::click());
+                                let resp = resp.on_hover_text("New tab (Ctrl+T)");
+                                let c = if resp.hovered() { pal.text } else { pal.muted };
+                                let p = ui.painter();
+                                if resp.hovered() {
+                                    p.rect_filled(
+                                        rect.shrink(4.0),
+                                        egui::CornerRadius::same(7),
+                                        pal.elev,
+                                    );
+                                }
+                                let cc = rect.center();
+                                let s = (h * 0.22).round();
+                                let st = egui::Stroke::new(1.9, c);
+                                p.line_segment(
+                                    [egui::pos2(cc.x - s, cc.y), egui::pos2(cc.x + s, cc.y)],
+                                    st,
+                                );
+                                p.line_segment(
+                                    [egui::pos2(cc.x, cc.y - s), egui::pos2(cc.x, cc.y + s)],
+                                    st,
+                                );
+                                if resp.clicked() {
+                                    pending = Some(TabAction::NewTab);
+                                }
+                            },
+                        );
+                    });
             });
         });
 
@@ -4895,7 +4959,9 @@ impl AppState {
                                 .selectable_value(&mut s.search, template.to_string(), *name)
                                 .changed();
                         }
-                    });
+                    })
+                    .response
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
                 ui.add_space(4.0);
                 ui.label("Custom search URL (use %s for the query)");
                 changed |= ui.text_edit_singleline(&mut s.search).changed();
@@ -4910,6 +4976,8 @@ impl AppState {
                 // No emoji — the UI font renders 🎨 as a .notdef box (see no-emoji rule).
                 if ui.button("Open the Studio").clicked() {
                     self.show_studio.set(true);
+                    // Close this modal so the Studio isn't opened hidden underneath it.
+                    self.show_settings.set(false);
                 }
                 ui.add_space(6.0);
 
@@ -7512,9 +7580,28 @@ impl WebViewDelegate for AppState {
         if navigation_request.url.scheme() == "gator"
             && navigation_request.url.host_str() == Some("omnibar")
         {
-            self.focus_omnibox.set(true);
-            self.window.request_redraw();
+            // A submitted query (`?q=…`) from the new-tab search box: resolve it (search or URL)
+            // and load it, so the user can type + Enter right in the box. A bare click (no query)
+            // just focuses the native omnibar. (Read the query before `deny()` consumes the request.)
+            let query = navigation_request
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "q")
+                .map(|(_, v)| v.into_owned());
             navigation_request.deny();
+            match query {
+                Some(q) if !q.trim().is_empty() => {
+                    let target = {
+                        let s = self.browser.settings.borrow();
+                        omnibox_target(q.trim(), &s.search)
+                    };
+                    self.navigate_from_omnibox(&target);
+                },
+                _ => {
+                    self.focus_omnibox.set(true);
+                    self.window.request_redraw();
+                },
+            }
             return;
         }
         // Block web pages from *navigating* to gator:// internal pages. Several of them mutate
@@ -7671,6 +7758,27 @@ enum App {
     },
 }
 
+/// Free a window's webviews (the heavy per-window Servo resources). Each webview also holds a
+/// strong `Rc<AppState>` as its delegate (AppState *is* the `WebViewDelegate`), so clearing the
+/// tabs additionally breaks that reference cycle.
+fn drop_window_webviews(state: &AppState) {
+    state.pane0.tabs.borrow_mut().clear();
+    state.pane1.tabs.borrow_mut().clear();
+}
+
+/// Retire a closed window. We free its webviews and hide the OS window, but deliberately **leak**
+/// the `AppState` shell (`mem::forget`) rather than dropping it. Dropping a window's
+/// `WindowRenderingContext` tears down the **EGL display shared across every window and Servo**,
+/// which makes the other windows' painter fail with `MakeCurrentFailed(BadDisplay)` and panic — so
+/// closing one window would otherwise take down all of them. Leaking keeps that shared display
+/// alive; only the light GL/egui shell leaks (webviews are freed). Proper fix belongs in swervo's
+/// `WindowRenderingContext` (it should not destroy the shared display on drop).
+fn retire_window(state: Rc<AppState>) {
+    drop_window_webviews(&state);
+    state.window.set_visible(false);
+    std::mem::forget(state);
+}
+
 impl ApplicationHandler<WakeUp> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let (waker, ipc_clients) = match self {
@@ -7802,9 +7910,15 @@ impl ApplicationHandler<WakeUp> for App {
         // Closing a window drops just that window's state (its Drop frees its GL contexts); the
         // last window closing quits the app.
         if matches!(event, WindowEvent::CloseRequested) {
-            windows.remove(&id);
+            if let Some(state) = windows.remove(&id) {
+                retire_window(state);
+            }
             if windows.is_empty() {
                 event_loop.exit();
+            } else {
+                for w in windows.values() {
+                    w.window.request_redraw();
+                }
             }
             return;
         }
@@ -7818,9 +7932,19 @@ impl ApplicationHandler<WakeUp> for App {
                 // Close this window if requested (✕ button or its last tab closed); quit only if
                 // it was the last window.
                 if state.wants_close.get() {
-                    windows.remove(&id);
+                    // Retire this window (frees its webviews + hides it, leaking the shared GL
+                    // shell so the other windows' EGL display survives — see retire_window). Quit
+                    // only when the last *visible* window is gone.
+                    if let Some(st) = windows.remove(&id) {
+                        retire_window(st);
+                    }
                     if windows.is_empty() {
                         event_loop.exit();
+                    } else {
+                        // Repaint the survivors so they don't sit stale after a sibling closed.
+                        for w in windows.values() {
+                            w.window.request_redraw();
+                        }
                     }
                     return;
                 }
@@ -7884,7 +8008,10 @@ impl ApplicationHandler<WakeUp> for App {
                     // the hovered element's cursor changes, so moving within one element must not
                     // reset it to the default arrow). Over the chrome, egui owns the cursor.
                     None if !over_chrome => state.window.set_cursor(state.page_cursor.get()),
-                    None => state.window.set_cursor(CursorIcon::Default),
+                    // Over the chrome, let egui own the cursor: it sets the correct per-widget icon
+                    // each frame (a text I-beam over the omnibar, a pointer over buttons/dropdowns).
+                    // Forcing Default here raced egui and produced the wrong cursor.
+                    None => {}
                 }
                 let foc = state.focused.get();
                 let off = if state.split.get() && foc == 1 { mid_dev } else { left_dev };
