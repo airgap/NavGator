@@ -4608,18 +4608,8 @@ impl AppState {
             content_w.clamp(ICON + 2.0 * PAD, tab_max_w)
         };
 
-        // Horizontal pills fill the FULL strip height so the tint reaches the strip's top/bottom
-        // edges. Allocating a fixed `tab_h` while the strip content is a few px taller let
-        // `Align::Center` drop the pill down, leaving a dark `bg2` cap above the tint — invisible on
-        // the bare strip (bg2-on-bg2) but visible on the tabs (bg2-on-tint), i.e. "dark only on the
-        // buttons". Vertical tabs keep the fixed row height.
-        let row_h = if vertical {
-            tab_h
-        } else {
-            ui.available_height().max(tab_h)
-        };
         let (rect, resp) =
-            ui.allocate_exact_size(egui::vec2(width, row_h), egui::Sense::click_and_drag());
+            ui.allocate_exact_size(egui::vec2(width, tab_h), egui::Sense::click_and_drag());
         let painter = ui.painter().clone();
 
         // Tab background: active = accent-soft pill; hover = elevated; else transparent.
@@ -4903,6 +4893,11 @@ impl AppState {
             };
             let pal = self.browser.settings.borrow().theme.palette();
             ui.horizontal(|ui| {
+                // Disable egui's ScrollArea edge-fade. The strip's scrollbar gutter makes the
+                // viewport a hair shorter than the pills, so egui fades their content toward the
+                // panel bg over its default 20px — invisible on the bare `bg2` strip but a clear
+                // dark ramp down the top ~2/3 of every active/tinted tab ("top half darkened").
+                ui.spacing_mut().scroll.fade.strength = 0.0;
                 // The scrolled strip: the tabs, then the new-tab `+` right after the last tab
                 // (scrollbar hidden — a tab strip shouldn't show one; overflow still wheels).
                 egui::ScrollArea::horizontal()
