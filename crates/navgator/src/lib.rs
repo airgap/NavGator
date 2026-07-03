@@ -2261,6 +2261,12 @@ enum TabAction {
 /// One instance for the whole process; each window's `AppState` holds a clone of the `Rc`.
 struct BrowserState {
     servo: Servo,
+    /// The first window's `WindowRenderingContext`, held for the whole app lifetime so its surfman
+    /// `Connection` — and thus the EGL display shared by every window — outlives any individual
+    /// window. Windows after the first are built with `WindowRenderingContext::new_shared` off this
+    /// seed so they all share one `Connection`; closing any window then never terminates the shared
+    /// display. Set when the first window opens (see `open_window`).
+    render_seed: RefCell<Option<Rc<WindowRenderingContext>>>,
     /// The metadata-aware, permission-gated add-on registry (userscripts today; forward-compat
     /// for WebExtensions). Replaces the old single shared UserContentManager: per-tab injection
     /// now selects the matching enabled add-ons per navigation (see `inject_userscripts`). The
@@ -7494,10 +7500,22 @@ fn open_window(
     let inner = window.inner_size();
     let scale = window.scale_factor();
 
+    // Every window after the first shares the first window's surfman `Connection` (via
+    // `new_shared`) so they all render against ONE EGL display — closing a window then can't
+    // terminate the display the others use. The first window's context becomes the render seed,
+    // held for the app's lifetime so that shared display outlives every window.
     let window_context = Rc::new(
-        WindowRenderingContext::new(display_handle, window_handle, inner)
-            .expect("failed to create WindowRenderingContext"),
+        match browser.render_seed.borrow().as_ref() {
+            Some(seed) => seed
+                .new_shared(window_handle, inner)
+                .expect("failed to create shared WindowRenderingContext"),
+            None => WindowRenderingContext::new(display_handle, window_handle, inner)
+                .expect("failed to create WindowRenderingContext"),
+        },
     );
+    if browser.render_seed.borrow().is_none() {
+        *browser.render_seed.borrow_mut() = Some(window_context.clone());
+    }
     let _ = window_context.make_current();
     let content_context = Rc::new(window_context.offscreen_context(inner));
     // Second offscreen FBO for the right split pane (its own webview + history).
@@ -7588,17 +7606,20 @@ fn drop_window_webviews(state: &AppState) {
     state.pane1.tabs.borrow_mut().clear();
 }
 
-/// Retire a closed window. We free its webviews and hide the OS window, but deliberately **leak**
-/// the `AppState` shell (`mem::forget`) rather than dropping it. Dropping a window's
-/// `WindowRenderingContext` tears down the **EGL display shared across every window and Servo**,
-/// which makes the other windows' painter fail with `MakeCurrentFailed(BadDisplay)` and panic — so
-/// closing one window would otherwise take down all of them. Leaking keeps that shared display
-/// alive; only the light GL/egui shell leaks (webviews are freed). Proper fix belongs in swervo's
-/// `WindowRenderingContext` (it should not destroy the shared display on drop).
+/// Retire a closed window: free its webviews, hide the OS window, and drop its `AppState` (which
+/// tears down just this window's `WindowRenderingContext` — its surfman context + surface).
+///
+/// This used to `mem::forget` the shell to avoid a crash: every window built its own surfman
+/// `Connection`, and since surfman hands back the *same* `EGLDisplay` for the same X11 display
+/// while each `Connection` independently owns it, the first window to drop `eglTerminate`d the
+/// display the others were still rendering with (`MakeCurrentFailed(BadDisplay)` panic). Now every
+/// window after the first is built with `WindowRenderingContext::new_shared`, so they all share one
+/// `Connection`; the display outlives them all (kept alive by the render seed in `BrowserState`),
+/// and a normal drop is safe.
 fn retire_window(state: Rc<AppState>) {
     drop_window_webviews(&state);
     state.window.set_visible(false);
-    std::mem::forget(state);
+    drop(state);
 }
 
 impl ApplicationHandler<WakeUp> for App {
@@ -7639,6 +7660,7 @@ impl ApplicationHandler<WakeUp> for App {
         let (sync_cb, sync_ch, sync_cp) = load_sync_cursors();
         let browser = Rc::new(BrowserState {
             servo,
+            render_seed: RefCell::new(None),
             addons: RefCell::new(addons),
             gm_salt: password::random_salt(),
             userscripts_count,
