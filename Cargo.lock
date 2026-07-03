@@ -123,9 +123,9 @@ dependencies = [
 
 [[package]]
 name = "aes-gcm"
-version = "0.11.0-rc.4"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da8c919c118108f144adecad74b425b804ad075580d605d9b33c2d6d1c62a2f8"
+checksum = "fdf011db2e21ce0d575593d749db5554b47fed37aff429e4dc50bc91ac93a028"
 dependencies = [
  "aead",
  "aes 0.9.1",
@@ -143,7 +143,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41ac571010bd60765c56085a4f1d412012a9be2663b1a2f2b19b49318653fd0d"
 dependencies = [
  "aes 0.9.1",
- "const-oid 0.10.2",
+ "const-oid",
  "zeroize",
 ]
 
@@ -649,12 +649,6 @@ dependencies = [
 
 [[package]]
 name = "base16ct"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c7f02d4ea65f2c1853089ffd8d2787bdbc63de2f0d29dedbcf8ccdfa0ccd4cf"
-
-[[package]]
-name = "base16ct"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd307490d624467aa6f74b0eabb77633d1f758a7b25f12bceb0b22e08d9726f6"
@@ -1054,9 +1048,9 @@ dependencies = [
 
 [[package]]
 name = "chacha20poly1305"
-version = "0.11.0-rc.3"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c9ed179664f12fd6f155f6dd632edf5f3806d48c228c67ff78366f2a0eb6b5e"
+checksum = "9b89e1c441e926b9c82a8d023f6e1b7ae0adcfaa7d621814e4d60789bac751cb"
 dependencies = [
  "aead",
  "chacha20",
@@ -1215,12 +1209,6 @@ checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
 dependencies = [
  "crossbeam-utils",
 ]
-
-[[package]]
-name = "const-oid"
-version = "0.9.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "const-oid"
@@ -1410,27 +1398,18 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crypto-bigint"
-version = "0.5.5"
+version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0dc92fb57ca44df6db8059111ab3af99a63d5d0f8375d9972e319a379c6bab76"
-dependencies = [
- "generic-array",
- "rand_core 0.6.4",
- "subtle",
- "zeroize",
-]
-
-[[package]]
-name = "crypto-bigint"
-version = "0.7.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97bb4a855e3b10f84c4e7e895a7de01db7f9a7b7eb7f73ed9773fd52ac686451"
+checksum = "1a52aa3fcda4e6302a9f48734f234d35d4721b96f8fe07d073f07ce9df4f0271"
 dependencies = [
  "cpubits",
  "ctutils",
+ "getrandom 0.4.3",
+ "hybrid-array",
  "num-traits",
  "rand_core 0.10.1",
  "serdect",
+ "subtle",
  "zeroize",
 ]
 
@@ -1461,7 +1440,7 @@ version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3633a51a39c69ebbaa4feaa694bd83d241e4093901c84a0963b19d9bb3f0cf8f"
 dependencies = [
- "crypto-bigint 0.7.4",
+ "crypto-bigint",
  "rand_core 0.10.1",
 ]
 
@@ -1516,6 +1495,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
 dependencies = [
  "cmov",
+ "subtle",
 ]
 
 [[package]]
@@ -1526,13 +1506,14 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "curve25519-dalek"
-version = "4.1.3"
+version = "5.0.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97fb8b7c4503de7d6ae7b42ab72a5a59857b4c937ec27a3d4539dba95b5ab2be"
+checksum = "c906a87e53a36ff795d72e06e8162a83c5436e3ea89e942a9cb9fc083f0a384f"
 dependencies = [
  "cfg-if",
- "cpufeatures 0.2.17",
+ "cpufeatures 0.3.0",
  "curve25519-dalek-derive",
+ "digest 0.11.3",
  "fiat-crypto",
  "rustc_version",
  "subtle",
@@ -1658,23 +1639,12 @@ dependencies = [
 
 [[package]]
 name = "der"
-version = "0.7.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
-dependencies = [
- "const-oid 0.9.6",
- "pem-rfc7468 0.7.0",
- "zeroize",
-]
-
-[[package]]
-name = "der"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71fd89660b2dc699704064e59e9dba0147b903e85319429e131620d022be411b"
 dependencies = [
- "const-oid 0.10.2",
- "pem-rfc7468 1.0.0",
+ "const-oid",
+ "pem-rfc7468",
  "zeroize",
 ]
 
@@ -1715,7 +1685,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer 0.10.4",
- "const-oid 0.9.6",
  "crypto-common 0.1.6",
  "subtle",
 ]
@@ -1727,7 +1696,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer 0.12.1",
- "const-oid 0.10.2",
+ "const-oid",
  "crypto-common 0.2.2",
  "ctutils",
 ]
@@ -1871,16 +1840,17 @@ dependencies = [
 
 [[package]]
 name = "ecdsa"
-version = "0.16.9"
+version = "0.17.0-rc.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee27f32b5c5292967d2d4a9d7f1e0b0aed2c15daded5a60300e4abb9d8020bca"
+checksum = "b7c72d1455753a703ad4b90ed2a759f2bc4562024a303176439cf6e593b5ade4"
 dependencies = [
- "der 0.7.10",
- "digest 0.10.7",
+ "der",
+ "digest 0.11.3",
  "elliptic-curve",
  "rfc6979",
- "signature 2.2.0",
- "spki 0.7.3",
+ "signature",
+ "spki",
+ "zeroize",
 ]
 
 [[package]]
@@ -1891,6 +1861,58 @@ checksum = "a05fbfa222ffb51989d5ccf33e5f7aebfcf96c5023413856b0c3618a7f79896e"
 dependencies = [
  "bytemuck",
  "emath",
+]
+
+[[package]]
+name = "ed25519"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29fcf32e6c73d1079f83ab4d782de2d81620346a5f38c6237a86a22f8368980a"
+dependencies = [
+ "pkcs8",
+ "signature",
+]
+
+[[package]]
+name = "ed25519-dalek"
+version = "3.0.0-rc.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1685663e23882cd8517dcbcb1c23a6ebff4433c22dfb681d760219b62cd1b849"
+dependencies = [
+ "curve25519-dalek",
+ "ed25519",
+ "rand_core 0.10.1",
+ "serde",
+ "sha2 0.11.0",
+ "signature",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "ed448"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae112a25f86ae3598d4e8533ed1e65149cec6eb21918e7a6f4c06dddec370263"
+dependencies = [
+ "pkcs8",
+ "signature",
+]
+
+[[package]]
+name = "ed448-goldilocks"
+version = "0.14.0-pre.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b805154de2e68f59874ec217ca36790dcffe500cd872c60fe509d28d0814a74d"
+dependencies = [
+ "ed448",
+ "elliptic-curve",
+ "hash2curve",
+ "rand_core 0.10.1",
+ "serdect",
+ "shake",
+ "signature",
+ "subtle",
 ]
 
 [[package]]
@@ -1970,20 +1992,21 @@ checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "elliptic-curve"
-version = "0.13.8"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5e6043086bf7973472e0c7dff2142ea0b680d30e18d9cc40f267efbf222bd47"
+checksum = "9d65aa39b3a5c1c9c1b745c9a019234bb7a21b77abcb4f4d266d706e2d577d65"
 dependencies = [
- "base16ct 0.2.0",
- "crypto-bigint 0.5.5",
- "digest 0.10.7",
+ "base16ct",
+ "crypto-bigint",
+ "crypto-common 0.2.2",
+ "digest 0.11.3",
  "ff",
- "generic-array",
  "group",
- "hkdf 0.12.4",
- "pem-rfc7468 0.7.0",
- "pkcs8 0.10.2",
- "rand_core 0.6.4",
+ "hkdf 0.13.0",
+ "hybrid-array",
+ "pem-rfc7468",
+ "pkcs8",
+ "rand_core 0.10.1",
  "sec1",
  "subtle",
  "zeroize",
@@ -2285,19 +2308,19 @@ checksum = "b97b65636e5b9ef369943878ac74335ba1c55c1cb6adbf1e2c293c624248d693"
 
 [[package]]
 name = "ff"
-version = "0.13.1"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0b50bfb653653f9ca9095b427bed08ab8d75a137839d9ad64eb11810d5b6393"
+checksum = "a1f686ab92a9fb0eaf188f6c6c87b89490baa6fdb0db4544ba4dc47f7942489f"
 dependencies = [
- "rand_core 0.6.4",
+ "rand_core 0.10.1",
  "subtle",
 ]
 
 [[package]]
 name = "fiat-crypto"
-version = "0.2.9"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
+checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 
 [[package]]
 name = "filetime"
@@ -2615,7 +2638,6 @@ checksum = "4bb6743198531e02858aeaea5398fcc883e71851fcbcb5a2f773e2fb6cb1edf2"
 dependencies = [
  "typenum",
  "version_check",
- "zeroize",
 ]
 
 [[package]]
@@ -2827,12 +2849,12 @@ checksum = "b40ca9252762c466af32d0b1002e91e4e1bc5398f77455e55474deb466355ff5"
 
 [[package]]
 name = "group"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0f9ef7462f7c099f518d754361858f86d8a07af53ba9af0fe635bbccb151a63"
+checksum = "7fd1a1c7a5206c5b7a3f5a0d7ccd3ff85d0c8f5133d62a02680255b0004af5f4"
 dependencies = [
  "ff",
- "rand_core 0.6.4",
+ "rand_core 0.10.1",
  "subtle",
 ]
 
@@ -3173,6 +3195,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hash2curve"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1eaf40612d7d854743e7189228a6d528f0f6e8502cf6a0cb831d28a218b7f3f6"
+dependencies = [
+ "digest 0.11.3",
+ "elliptic-curve",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3369,11 +3401,12 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "hybrid-array"
-version = "0.4.12"
+version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9155a582abd142abc056962c29e3ce5ff2ad5469f4246b537ed42c5deba857da"
+checksum = "818356c5132c1fede50f837ca96afbe78ff42413047f4abb886217845e1b6c8c"
 dependencies = [
  "ctutils",
+ "subtle",
  "typenum",
  "zeroize",
 ]
@@ -4149,6 +4182,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "itertools"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
+dependencies = [
+ "either",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4614,14 +4656,14 @@ version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "add6b9d92e496f16f4526d68ff29da1483aba4b119baeab8bed3b9e3544a6f3d"
 dependencies = [
- "const-oid 0.10.2",
+ "const-oid",
  "crypto-common 0.2.2",
  "ctutils",
  "hybrid-array",
  "module-lattice",
- "pkcs8 0.11.0",
+ "pkcs8",
  "shake",
- "signature 3.0.0",
+ "signature",
  "zeroize",
 ]
 
@@ -4631,11 +4673,11 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e15f3e5b957493873e396a66914e83e616b6afe335cdef7efe5c6e1216aba66"
 dependencies = [
- "const-oid 0.10.2",
+ "const-oid",
  "hybrid-array",
  "kem",
  "module-lattice",
- "pkcs8 0.11.0",
+ "pkcs8",
  "rand_core 0.10.1",
  "sha3 0.11.0",
  "zeroize",
@@ -4676,9 +4718,9 @@ dependencies = [
 
 [[package]]
 name = "mozjs"
-version = "0.16.4"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8d7e5cba578bc71ec962623e1bfffa5aaaa7665c54fa236d6f930c492807f7d"
+checksum = "7e22429d9fe0dc27169cb3ce0631d20f64f7d1c8fa5a90e039437e9fa9a7f30f"
 dependencies = [
  "bindgen",
  "cc",
@@ -4691,9 +4733,9 @@ dependencies = [
 
 [[package]]
 name = "mozjs_sys"
-version = "140.12.0-0"
+version = "140.12.0-1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f78cdbe11d0dba944f54f21f0f2b8c3ffb24b94170c0c075fadc24cc3e947dc4"
+checksum = "8d2c9df3f8007cf4b37f411602870d73f05f6cb70906766fe8639fcad1133a48"
 dependencies = [
  "bindgen",
  "cc",
@@ -5484,40 +5526,43 @@ dependencies = [
 
 [[package]]
 name = "p256"
-version = "0.13.2"
+version = "0.14.0-rc.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b"
+checksum = "c855a8d2ffd346aa03122626f22e96e3aa75e3bfe64e6bf6cb82f71821ed6ae7"
 dependencies = [
  "ecdsa",
  "elliptic-curve",
+ "primefield",
  "primeorder",
- "sha2 0.10.9",
+ "sha2 0.11.0",
 ]
 
 [[package]]
 name = "p384"
-version = "0.13.1"
+version = "0.14.0-rc.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe42f1670a52a47d448f14b6a5c61dd78fce51856e68edaa38f7ae3a46b8d6b6"
+checksum = "62941b68907ddf996ac20f0debf700c236ccc3d874637731a93c631129ca042f"
 dependencies = [
  "ecdsa",
  "elliptic-curve",
+ "fiat-crypto",
+ "primefield",
  "primeorder",
- "sha2 0.10.9",
+ "sha2 0.11.0",
 ]
 
 [[package]]
 name = "p521"
-version = "0.13.3"
+version = "0.14.0-rc.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fc9e2161f1f215afdfce23677034ae137bbd45016a880c2eb3ba8eb95f085b2"
+checksum = "0dd6f2fe6e76c8d5e8828e92aafa463777d1e72e70b78acc724214757e92479a"
 dependencies = [
- "base16ct 0.2.0",
+ "base16ct",
  "ecdsa",
  "elliptic-curve",
+ "primefield",
  "primeorder",
- "rand_core 0.6.4",
- "sha2 0.10.9",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -5595,15 +5640,6 @@ dependencies = [
  "quote",
  "syn",
  "synstructure",
-]
-
-[[package]]
-name = "pem-rfc7468"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88b39c9bfcfc231068454382784bb460aae594343fb030d46e9f50a645418412"
-dependencies = [
- "base64ct",
 ]
 
 [[package]]
@@ -5759,18 +5795,8 @@ version = "0.8.0-rc.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "986d2e952779af96ea048f160fd9194e1751b4faea78bcf3ceb456efe008088e"
 dependencies = [
- "der 0.8.0",
- "spki 0.8.0",
-]
-
-[[package]]
-name = "pkcs8"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f950b2377845cebe5cf8b5165cb3cc1a5e0fa5cfa3e1f7f55707d8fd82e0a7b7"
-dependencies = [
- "der 0.7.10",
- "spki 0.7.3",
+ "der",
+ "spki",
 ]
 
 [[package]]
@@ -5779,8 +5805,8 @@ version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "451913da69c775a56034ea8d9003d27ee8948e12443eae7c038ba100a4f21cb7"
 dependencies = [
- "der 0.8.0",
- "spki 0.8.0",
+ "der",
+ "spki",
 ]
 
 [[package]]
@@ -5931,12 +5957,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "primeorder"
-version = "0.13.6"
+name = "primefield"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "353e1ca18966c16d9deb1c69278edbc5f194139612772bd9537af60ac231e1e6"
+checksum = "c555a6e4eb7d4e158fcb028c835c3b8642206ddc279b5c6b202ef9a8bdb592f4"
+dependencies = [
+ "crypto-bigint",
+ "crypto-common 0.2.2",
+ "ff",
+ "rand_core 0.10.1",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "primeorder"
+version = "0.14.0-rc.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e56e6d67fdf5744e9e245ae571450fe584b91f5af261d0e40163b618e53a1f6"
 dependencies = [
  "elliptic-curve",
+ "once_cell",
+ "primefield",
+ "serdect",
 ]
 
 [[package]]
@@ -6311,12 +6354,12 @@ dependencies = [
 
 [[package]]
 name = "rfc6979"
-version = "0.4.0"
+version = "0.6.0-pre.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8dd2a808d456c4a54e300a23e9f5a67e122c3024119acbfd73e3bf664491cb2"
+checksum = "9935425142ac6e252364413291d96c8bc9898d0876a801824c7af4eae397b689"
 dependencies = [
- "hmac 0.12.1",
- "subtle",
+ "ctutils",
+ "hmac 0.13.0",
 ]
 
 [[package]]
@@ -6377,15 +6420,15 @@ version = "0.10.0-rc.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "30b2aa4ba0d89f73d1e332df05be0eeab8840351c36ca5654341dfdb57bb3caf"
 dependencies = [
- "const-oid 0.10.2",
- "crypto-bigint 0.7.4",
+ "const-oid",
+ "crypto-bigint",
  "crypto-primes",
  "digest 0.11.3",
  "pkcs1",
- "pkcs8 0.11.0",
+ "pkcs8",
  "rand_core 0.10.1",
- "signature 3.0.0",
- "spki 0.8.0",
+ "signature",
+ "spki",
  "zeroize",
 ]
 
@@ -6641,14 +6684,14 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "sec1"
-version = "0.7.3"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3e97a565f76233a6003f9f5c54be1d9c5bdfa3eccfb189469f11ec4901c47dc"
+checksum = "d56d437c2f19203ce5f7122e507831de96f3d2d4d3be5af44a0b0a09d8a80e4d"
 dependencies = [
- "base16ct 0.2.0",
- "der 0.7.10",
- "generic-array",
- "pkcs8 0.10.2",
+ "base16ct",
+ "ctutils",
+ "der",
+ "hybrid-array",
  "subtle",
  "zeroize",
 ]
@@ -6706,8 +6749,8 @@ dependencies = [
 
 [[package]]
 name = "selectors"
-version = "0.38.0"
-source = "git+https://github.com/airgap/stylo?rev=9aebcb91d050ce0928f9e7c4fac704174080a217#9aebcb91d050ce0928f9e7c4fac704174080a217"
+version = "0.39.0"
+source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
 dependencies = [
  "bitflags 2.13.0",
  "cssparser",
@@ -6822,14 +6865,14 @@ version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66cf8fedced2fcf12406bcb34223dffb92eaf34908ede12fed414c82b7f00b3e"
 dependencies = [
- "base16ct 1.0.0",
+ "base16ct",
  "serde",
 ]
 
 [[package]]
 name = "servo"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "accesskit",
  "arboard",
@@ -6894,8 +6937,8 @@ dependencies = [
 
 [[package]]
 name = "servo-allocator"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "libc",
  "tikv-jemalloc-sys",
@@ -6905,8 +6948,8 @@ dependencies = [
 
 [[package]]
 name = "servo-background-hang-monitor"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "backtrace",
  "crossbeam-channel",
@@ -6920,8 +6963,8 @@ dependencies = [
 
 [[package]]
 name = "servo-background-hang-monitor-api"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "serde",
  "servo-base",
@@ -6929,8 +6972,8 @@ dependencies = [
 
 [[package]]
 name = "servo-base"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "accesskit",
  "crossbeam-channel",
@@ -6954,8 +6997,8 @@ dependencies = [
 
 [[package]]
 name = "servo-canvas"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "bytemuck",
  "crossbeam-channel",
@@ -6979,13 +7022,14 @@ dependencies = [
 
 [[package]]
 name = "servo-canvas-traits"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "crossbeam-channel",
  "euclid",
  "glow",
  "kurbo",
+ "log",
  "malloc_size_of_derive",
  "serde",
  "servo-base",
@@ -7000,8 +7044,8 @@ dependencies = [
 
 [[package]]
 name = "servo-config"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "num_enum",
  "serde",
@@ -7013,8 +7057,8 @@ dependencies = [
 
 [[package]]
 name = "servo-config-macro"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7024,8 +7068,8 @@ dependencies = [
 
 [[package]]
 name = "servo-constellation"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "accesskit",
  "backtrace",
@@ -7071,8 +7115,8 @@ dependencies = [
 
 [[package]]
 name = "servo-constellation-traits"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "base64",
  "content-security-policy",
@@ -7106,16 +7150,16 @@ dependencies = [
 
 [[package]]
 name = "servo-default-resources"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "servo-embedder-traits",
 ]
 
 [[package]]
 name = "servo-deny-public-fields"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "proc-macro2",
  "syn",
@@ -7124,8 +7168,8 @@ dependencies = [
 
 [[package]]
 name = "servo-devtools"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "atomic_refcell",
  "base64",
@@ -7154,8 +7198,8 @@ dependencies = [
 
 [[package]]
 name = "servo-devtools-traits"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "http 1.4.2",
  "malloc_size_of_derive",
@@ -7171,8 +7215,8 @@ dependencies = [
 
 [[package]]
 name = "servo-dom-struct"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "prettyplease",
  "proc-macro2",
@@ -7182,8 +7226,8 @@ dependencies = [
 
 [[package]]
 name = "servo-embedder-traits"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "accesskit",
  "bitflags 2.13.0",
@@ -7216,8 +7260,8 @@ dependencies = [
 
 [[package]]
 name = "servo-fonts"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "app_units",
  "bitflags 2.13.0",
@@ -7230,7 +7274,7 @@ dependencies = [
  "harfbuzz-sys",
  "icu_locid",
  "icu_properties 1.5.1",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "libc",
  "log",
  "malloc_size_of_derive",
@@ -7273,8 +7317,8 @@ dependencies = [
 
 [[package]]
 name = "servo-fonts-traits"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "atomic_refcell",
  "dwrote",
@@ -7297,8 +7341,8 @@ dependencies = [
 
 [[package]]
 name = "servo-geometry"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "app_units",
  "euclid",
@@ -7310,8 +7354,8 @@ dependencies = [
 
 [[package]]
 name = "servo-hyper-serde"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "cookie 0.18.1",
  "headers",
@@ -7324,8 +7368,8 @@ dependencies = [
 
 [[package]]
 name = "servo-jstraceable-derive"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "proc-macro2",
  "syn",
@@ -7334,8 +7378,8 @@ dependencies = [
 
 [[package]]
 name = "servo-layout"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "accesskit",
  "app_units",
@@ -7346,7 +7390,7 @@ dependencies = [
  "icu_locid",
  "icu_properties 1.5.1",
  "icu_segmenter",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "kurbo",
  "log",
  "malloc_size_of_derive",
@@ -7391,8 +7435,8 @@ dependencies = [
 
 [[package]]
 name = "servo-layout-api"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "app_units",
  "atomic_refcell",
@@ -7424,8 +7468,8 @@ dependencies = [
 
 [[package]]
 name = "servo-malloc-size-of"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "app_units",
  "atomic_refcell",
@@ -7467,9 +7511,10 @@ dependencies = [
 
 [[package]]
 name = "servo-media"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
+ "servo-base",
  "servo-media-audio",
  "servo-media-player",
  "servo-media-streams",
@@ -7479,8 +7524,8 @@ dependencies = [
 
 [[package]]
 name = "servo-media-audio"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "byte-slice-cast",
  "euclid",
@@ -7490,6 +7535,7 @@ dependencies = [
  "num-traits",
  "petgraph",
  "serde",
+ "servo-base",
  "servo-malloc-size-of",
  "servo-media-derive",
  "servo-media-player",
@@ -7501,8 +7547,8 @@ dependencies = [
 
 [[package]]
 name = "servo-media-derive"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7511,10 +7557,10 @@ dependencies = [
 
 [[package]]
 name = "servo-media-dummy"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
- "ipc-channel",
+ "servo-base",
  "servo-media",
  "servo-media-audio",
  "servo-media-player",
@@ -7525,8 +7571,8 @@ dependencies = [
 
 [[package]]
 name = "servo-media-gstreamer"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "byte-slice-cast",
  "glib",
@@ -7540,9 +7586,9 @@ dependencies = [
  "gstreamer-sys",
  "gstreamer-video",
  "gstreamer-webrtc",
- "ipc-channel",
  "log",
  "mime",
+ "servo-base",
  "servo-media",
  "servo-media-audio",
  "servo-media-gstreamer-render",
@@ -7557,8 +7603,8 @@ dependencies = [
 
 [[package]]
 name = "servo-media-gstreamer-render"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "gstreamer",
  "servo-media-player",
@@ -7566,8 +7612,8 @@ dependencies = [
 
 [[package]]
 name = "servo-media-gstreamer-render-android"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "glib",
  "gstreamer",
@@ -7580,8 +7626,8 @@ dependencies = [
 
 [[package]]
 name = "servo-media-gstreamer-render-unix"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "glib",
  "gstreamer",
@@ -7594,11 +7640,10 @@ dependencies = [
 
 [[package]]
 name = "servo-media-ohos"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "crossbeam-channel",
- "ipc-channel",
  "libc",
  "log",
  "mime",
@@ -7606,6 +7651,7 @@ dependencies = [
  "ohos-sys-opaque-types",
  "ohos-window-sys",
  "serde_json",
+ "servo-base",
  "servo-media",
  "servo-media-audio",
  "servo-media-player",
@@ -7617,12 +7663,12 @@ dependencies = [
 
 [[package]]
 name = "servo-media-player"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
- "ipc-channel",
  "malloc_size_of_derive",
  "serde",
+ "servo-base",
  "servo-malloc-size-of",
  "servo-media-streams",
  "servo-media-traits",
@@ -7630,8 +7676,8 @@ dependencies = [
 
 [[package]]
 name = "servo-media-streams"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "malloc_size_of_derive",
  "servo-malloc-size-of",
@@ -7640,8 +7686,8 @@ dependencies = [
 
 [[package]]
 name = "servo-media-thread"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "euclid",
  "ipc-channel",
@@ -7649,6 +7695,7 @@ dependencies = [
  "malloc_size_of_derive",
  "rustc-hash 2.1.2",
  "serde",
+ "servo-base",
  "servo-config",
  "servo-malloc-size-of",
  "servo-media",
@@ -7658,8 +7705,8 @@ dependencies = [
 
 [[package]]
 name = "servo-media-traits"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "aes 0.9.1",
  "ctr",
@@ -7669,8 +7716,8 @@ dependencies = [
 
 [[package]]
 name = "servo-media-webrtc"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "log",
  "servo-media-streams",
@@ -7679,8 +7726,8 @@ dependencies = [
 
 [[package]]
 name = "servo-metrics"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "malloc_size_of_derive",
  "servo-base",
@@ -7694,8 +7741,8 @@ dependencies = [
 
 [[package]]
 name = "servo-net"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "async-compression",
  "async-recursion",
@@ -7719,7 +7766,7 @@ dependencies = [
  "hyper-util",
  "imsz",
  "ipc-channel",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "log",
  "malloc_size_of_derive",
  "mime",
@@ -7764,8 +7811,8 @@ dependencies = [
 
 [[package]]
 name = "servo-net-traits"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "content-security-policy",
  "cookie 0.18.1",
@@ -7804,8 +7851,8 @@ dependencies = [
 
 [[package]]
 name = "servo-paint"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "bitflags 2.13.0",
  "crossbeam-channel",
@@ -7841,8 +7888,8 @@ dependencies = [
 
 [[package]]
 name = "servo-paint-api"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "bitflags 2.13.0",
  "crossbeam-channel",
@@ -7876,8 +7923,8 @@ dependencies = [
 
 [[package]]
 name = "servo-pixels"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "euclid",
  "image",
@@ -7891,8 +7938,8 @@ dependencies = [
 
 [[package]]
 name = "servo-profile"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "libc",
  "log",
@@ -7904,14 +7951,13 @@ dependencies = [
  "servo-base",
  "servo-config",
  "servo-profile-traits",
- "tikv-jemalloc-sys",
  "time",
 ]
 
 [[package]]
 name = "servo-profile-traits"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "crossbeam-channel",
  "ipc-channel",
@@ -7926,8 +7972,8 @@ dependencies = [
 
 [[package]]
 name = "servo-script"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "aes 0.9.1",
  "aes-gcm",
@@ -7950,13 +7996,14 @@ dependencies = [
  "content-security-policy",
  "cookie 0.18.1",
  "crossbeam-channel",
- "crypto-bigint 0.7.4",
+ "crypto-bigint",
  "cshake",
  "cssparser",
  "ctr",
  "data-url",
- "digest 0.11.3",
  "ecdsa",
+ "ed25519-dalek",
+ "ed448-goldilocks",
  "elliptic-curve",
  "encoding_rs",
  "euclid",
@@ -7970,7 +8017,7 @@ dependencies = [
  "icu_locid",
  "indexmap",
  "ipc-channel",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "k12",
  "keyboard-types",
  "libc",
@@ -7993,13 +8040,12 @@ dependencies = [
  "parking_lot",
  "percent-encoding",
  "phf",
- "pkcs8 0.11.0",
+ "pkcs8",
  "postcard",
  "rand 0.10.1",
  "regex",
  "rsa",
  "rustc-hash 2.1.2",
- "sec1",
  "selectors",
  "seq-macro",
  "serde",
@@ -8065,8 +8111,8 @@ dependencies = [
 
 [[package]]
 name = "servo-script-bindings"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "bitflags 2.13.0",
  "crossbeam-channel",
@@ -8104,8 +8150,8 @@ dependencies = [
 
 [[package]]
 name = "servo-script-traits"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "accesskit",
  "crossbeam-channel",
@@ -8138,8 +8184,8 @@ dependencies = [
 
 [[package]]
 name = "servo-storage"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "libc",
  "log",
@@ -8163,8 +8209,8 @@ dependencies = [
 
 [[package]]
 name = "servo-storage-traits"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "malloc_size_of_derive",
  "serde",
@@ -8177,8 +8223,8 @@ dependencies = [
 
 [[package]]
 name = "servo-timers"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "crossbeam-channel",
  "malloc_size_of_derive",
@@ -8187,8 +8233,8 @@ dependencies = [
 
 [[package]]
 name = "servo-tracing"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8197,8 +8243,8 @@ dependencies = [
 
 [[package]]
 name = "servo-url"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "encoding_rs",
  "malloc_size_of_derive",
@@ -8211,8 +8257,8 @@ dependencies = [
 
 [[package]]
 name = "servo-wakelock"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "serde",
  "servo-embedder-traits",
@@ -8220,8 +8266,8 @@ dependencies = [
 
 [[package]]
 name = "servo-webgl"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "bitflags 2.13.0",
  "byteorder",
@@ -8229,7 +8275,7 @@ dependencies = [
  "euclid",
  "glow",
  "half",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "log",
  "num-traits",
  "parking_lot",
@@ -8244,8 +8290,8 @@ dependencies = [
 
 [[package]]
 name = "servo-webxr-api"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "euclid",
  "ipc-channel",
@@ -8260,8 +8306,8 @@ dependencies = [
 
 [[package]]
 name = "servo-xpath"
-version = "0.3.0"
-source = "git+https://github.com/airgap/swervo?rev=a059522f00e5cbf045741534c66ac39150f90eb5#a059522f00e5cbf045741534c66ac39150f90eb5"
+version = "0.4.0"
+source = "git+https://github.com/airgap/swervo?rev=c6428a14073bf0bdf8ad75ca969889b475566d94#c6428a14073bf0bdf8ad75ca969889b475566d94"
 dependencies = [
  "log",
  "malloc_size_of_derive",
@@ -8272,7 +8318,7 @@ dependencies = [
 [[package]]
 name = "servo_arc"
 version = "0.4.3"
-source = "git+https://github.com/airgap/stylo?rev=9aebcb91d050ce0928f9e7c4fac704174080a217#9aebcb91d050ce0928f9e7c4fac704174080a217"
+source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
 dependencies = [
  "serde",
  "stable_deref_trait",
@@ -8380,16 +8426,6 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
-]
-
-[[package]]
-name = "signature"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
-dependencies = [
- "digest 0.10.7",
- "rand_core 0.6.4",
 ]
 
 [[package]]
@@ -8588,22 +8624,12 @@ checksum = "b72d540d5c565dbe1f891d7e21ceb21d2649508306782f1066989fccb0b363d3"
 
 [[package]]
 name = "spki"
-version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
-dependencies = [
- "base64ct",
- "der 0.7.10",
-]
-
-[[package]]
-name = "spki"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d9efca8738c78ee9484207732f728b1ef517bbb1833d6fc0879ca898a522f6f"
 dependencies = [
  "base64ct",
- "der 0.8.0",
+ "der",
 ]
 
 [[package]]
@@ -8697,8 +8723,8 @@ dependencies = [
 
 [[package]]
 name = "stylo"
-version = "0.18.0"
-source = "git+https://github.com/airgap/stylo?rev=9aebcb91d050ce0928f9e7c4fac704174080a217#9aebcb91d050ce0928f9e7c4fac704174080a217"
+version = "0.19.0"
+source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
 dependencies = [
  "app_units",
  "arrayvec",
@@ -8753,8 +8779,8 @@ dependencies = [
 
 [[package]]
 name = "stylo_atoms"
-version = "0.18.0"
-source = "git+https://github.com/airgap/stylo?rev=9aebcb91d050ce0928f9e7c4fac704174080a217#9aebcb91d050ce0928f9e7c4fac704174080a217"
+version = "0.19.0"
+source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
 dependencies = [
  "string_cache",
  "string_cache_codegen",
@@ -8762,8 +8788,8 @@ dependencies = [
 
 [[package]]
 name = "stylo_derive"
-version = "0.18.0"
-source = "git+https://github.com/airgap/stylo?rev=9aebcb91d050ce0928f9e7c4fac704174080a217#9aebcb91d050ce0928f9e7c4fac704174080a217"
+version = "0.19.0"
+source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -8774,8 +8800,8 @@ dependencies = [
 
 [[package]]
 name = "stylo_dom"
-version = "0.18.0"
-source = "git+https://github.com/airgap/stylo?rev=9aebcb91d050ce0928f9e7c4fac704174080a217#9aebcb91d050ce0928f9e7c4fac704174080a217"
+version = "0.19.0"
+source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
 dependencies = [
  "bitflags 2.13.0",
  "stylo_malloc_size_of",
@@ -8783,8 +8809,8 @@ dependencies = [
 
 [[package]]
 name = "stylo_malloc_size_of"
-version = "0.18.0"
-source = "git+https://github.com/airgap/stylo?rev=9aebcb91d050ce0928f9e7c4fac704174080a217#9aebcb91d050ce0928f9e7c4fac704174080a217"
+version = "0.19.0"
+source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
 dependencies = [
  "app_units",
  "cssparser",
@@ -8800,16 +8826,16 @@ dependencies = [
 
 [[package]]
 name = "stylo_static_prefs"
-version = "0.18.0"
-source = "git+https://github.com/airgap/stylo?rev=9aebcb91d050ce0928f9e7c4fac704174080a217#9aebcb91d050ce0928f9e7c4fac704174080a217"
+version = "0.19.0"
+source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
 dependencies = [
  "toml",
 ]
 
 [[package]]
 name = "stylo_traits"
-version = "0.18.0"
-source = "git+https://github.com/airgap/stylo?rev=9aebcb91d050ce0928f9e7c4fac704174080a217#9aebcb91d050ce0928f9e7c4fac704174080a217"
+version = "0.19.0"
+source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
 dependencies = [
  "app_units",
  "bitflags 2.13.0",
@@ -8983,7 +9009,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -9200,8 +9226,8 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "to_shmem"
-version = "0.4.0"
-source = "git+https://github.com/airgap/stylo?rev=9aebcb91d050ce0928f9e7c4fac704174080a217#9aebcb91d050ce0928f9e7c4fac704174080a217"
+version = "0.5.0"
+source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
 dependencies = [
  "cssparser",
  "servo_arc",
@@ -9214,7 +9240,7 @@ dependencies = [
 [[package]]
 name = "to_shmem_derive"
 version = "0.1.0"
-source = "git+https://github.com/airgap/stylo?rev=9aebcb91d050ce0928f9e7c4fac704174080a217#9aebcb91d050ce0928f9e7c4fac704174080a217"
+source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -10655,13 +10681,13 @@ checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
 
 [[package]]
 name = "x25519-dalek"
-version = "2.0.1"
+version = "3.0.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
+checksum = "eee64e8620caa64914d669b1f68f858aaff54e2d0f9ad3b30a613b58a1baa83e"
 dependencies = [
  "curve25519-dalek",
- "rand_core 0.6.4",
- "serde",
+ "getrandom 0.4.3",
+ "rand_core 0.10.1",
  "zeroize",
 ]
 
