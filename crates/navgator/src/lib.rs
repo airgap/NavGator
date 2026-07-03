@@ -4029,7 +4029,14 @@ impl AppState {
         let frame = egui::Frame::default()
             .fill(ctx.global_style().visuals.window_fill)
             .corner_radius(egui::CornerRadius { nw: 12, ne: 12, sw: 0, se: 0 })
-            .inner_margin(6.0);
+            // Small bottom margin: a 6px bottom left a dark `bg2` gap between the omnibar and the
+            // tab strip that read as a "dark band" over the tabs. Keep 6 up top (window rounding).
+            .inner_margin(egui::Margin {
+                left: 6,
+                right: 6,
+                top: 6,
+                bottom: 2,
+            });
         let toolbar = egui::TopBottomPanel::top("toolbar")
             .frame(frame)
             .show_separator_line(false)
@@ -4859,12 +4866,21 @@ impl AppState {
         };
         let n = order.len().max(1) as f32;
 
-        // Pin the strip to the tab height (+ the frame's 2px top/bottom margins) so the panel can't
-        // grow taller than the pills. Left free, the horizontal ScrollArea reserves a gutter for its
-        // (hidden) scrollbar, which made the panel taller than the tabs and left a bare-`bg2` band
-        // above the vertically-centred pills — the "dark region" over the tab strip.
+        // Frame with a 0px TOP margin (the default panel frame's 2px top, plus the toolbar's bottom
+        // margin, formed the dark `bg2` gap over the tabs). exact_height pins the strip to the tab
+        // height (+ the 2px bottom margin) so the panel doesn't also grow past the pills.
         let outer = egui::TopBottomPanel::top("tabs")
-            .exact_height(tab_h + 4.0)
+            .frame(
+                egui::Frame::default()
+                    .fill(ctx.global_style().visuals.panel_fill)
+                    .inner_margin(egui::Margin {
+                        left: 8,
+                        right: 8,
+                        top: 0,
+                        bottom: 2,
+                    }),
+            )
+            .exact_height(tab_h + 2.0)
             .show_separator_line(false)
             .show(ctx, |ui| {
             // In "fill" mode tabs share the strip width evenly (clamped); "fit" uses content width.
