@@ -4024,7 +4024,10 @@ impl AppState {
             .fill(ctx.global_style().visuals.window_fill)
             .corner_radius(egui::CornerRadius { nw: 12, ne: 12, sw: 0, se: 0 })
             .inner_margin(6.0);
-        let toolbar = egui::TopBottomPanel::top("toolbar").frame(frame).show(ctx, |ui| {
+        let toolbar = egui::TopBottomPanel::top("toolbar")
+            .frame(frame)
+            .show_separator_line(false)
+            .show(ctx, |ui| {
             // Pin the row to the omnibar height (the tallest control) up front, so every item —
             // which egui lays out left-to-right and would otherwise top-align before the omnibar
             // grows the row — is vertically centered against it instead of floating too high.
@@ -4845,7 +4848,9 @@ impl AppState {
         };
         let n = order.len().max(1) as f32;
 
-        let outer = egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
+        let outer = egui::TopBottomPanel::top("tabs")
+            .show_separator_line(false)
+            .show(ctx, |ui| {
             // In "fill" mode tabs share the strip width evenly (clamped); "fit" uses content width.
             let fw = if fill {
                 Some((((ui.available_width() - 48.0) / n).clamp(90.0, tab_max_w)).max(90.0))
