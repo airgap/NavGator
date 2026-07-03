@@ -4848,13 +4848,23 @@ impl AppState {
         let order = self.tab_order();
         let mut rects: Vec<egui::Rect> = Vec::with_capacity(order.len());
         let mut pending: Option<TabAction> = None;
-        let (fill, tab_max_w) = {
+        let (fill, tab_max_w, tab_h) = {
             let s = self.browser.settings.borrow();
-            (s.theme.tab_fit == theme::TabFit::Fill, s.theme.tab_max_w as f32)
+            let tk = theme::density_tokens(s.theme.density);
+            (
+                s.theme.tab_fit == theme::TabFit::Fill,
+                s.theme.tab_max_w as f32,
+                tk.tab_h,
+            )
         };
         let n = order.len().max(1) as f32;
 
+        // Pin the strip to the tab height (+ the frame's 2px top/bottom margins) so the panel can't
+        // grow taller than the pills. Left free, the horizontal ScrollArea reserves a gutter for its
+        // (hidden) scrollbar, which made the panel taller than the tabs and left a bare-`bg2` band
+        // above the vertically-centred pills — the "dark region" over the tab strip.
         let outer = egui::TopBottomPanel::top("tabs")
+            .exact_height(tab_h + 4.0)
             .show_separator_line(false)
             .show(ctx, |ui| {
             // In "fill" mode tabs share the strip width evenly (clamped); "fit" uses content width.
@@ -7906,6 +7916,16 @@ impl ApplicationHandler<WakeUp> for App {
                     && !resp.consumed
                 {
                     let _ = state.window.drag_window();
+                    // The OS window-drag swallows the button-release, so egui never sees the pointer
+                    // go up and keeps it "pressed" — which suppresses hover cursors (on_hover_cursor
+                    // only fires when no button is down) until the next click. Reset egui's pointer
+                    // so the per-widget hover cursors recover the moment the drag ends.
+                    state
+                        .egui
+                        .borrow()
+                        .egui_ctx
+                        .input_mut(|i| i.pointer = egui::PointerState::default());
+                    state.window.request_redraw();
                     return;
                 }
                 // Split: a left-press in a pane focuses that pane (so chrome + input follow it).
