@@ -7900,6 +7900,7 @@ impl ApplicationHandler<WakeUp> for App {
             WindowEvent::MouseInput {
                 state: bs,
                 button,
+                device_id,
                 ..
             } => {
                 // Borderless edge resize takes priority.
@@ -7933,14 +7934,21 @@ impl ApplicationHandler<WakeUp> for App {
                 {
                     let _ = state.window.drag_window();
                     // The OS window-drag swallows the button-release, so egui never sees the pointer
-                    // go up and keeps it "pressed" — which suppresses hover cursors (on_hover_cursor
-                    // only fires when no button is down) until the next click. Reset egui's pointer
-                    // so the per-widget hover cursors recover the moment the drag ends.
-                    state
+                    // go up: it was already fed the *press* (line ~7824) and, with no matching
+                    // release, stays "pressed" — which suppresses hover cursors (egui only shows a
+                    // hover/on_hover_cursor icon when no button is down) until the next real click.
+                    // Resetting `input.pointer` isn't enough: the press is buffered in egui-winit and
+                    // re-applied next frame. Feed egui a synthetic release (same device/button) so the
+                    // buffered press balances out and the per-widget cursors recover after the drag.
+                    let release = WindowEvent::MouseInput {
+                        device_id,
+                        state: ElementState::Released,
+                        button: MouseButton::Left,
+                    };
+                    let _ = state
                         .egui
-                        .borrow()
-                        .egui_ctx
-                        .input_mut(|i| i.pointer = egui::PointerState::default());
+                        .borrow_mut()
+                        .on_window_event(&state.window, &release);
                     state.window.request_redraw();
                     return;
                 }
