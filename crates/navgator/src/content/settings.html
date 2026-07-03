@@ -10,107 +10,229 @@
   html,body { height:100%; margin:0; }
   body {
     background: var(--bg); color: var(--fg);
-    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    display:flex; flex-direction:column; align-items:center;
-    padding: 7vh 24px 28px; min-height:100%;
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display:flex; min-height:100%;
   }
-  .head { width:min(760px,94vw); margin:0 0 24px; }
-  h1 { font-size:34px; font-weight:800; letter-spacing:-1px; margin:0; }
-  h1 .g { color: var(--accent); }
-  .sub { color: var(--muted); margin:6px 0 0; font-size:14px; }
-  .card { width:min(760px,94vw); background: var(--panel); border:1px solid var(--line);
-    border-radius:14px; padding:18px 20px; margin-bottom:16px; }
-  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:1px; color: var(--muted);
+  a { color: inherit; }
+
+  /* ---- master (left rail) ---- */
+  .rail { flex:none; width:248px; border-right:1px solid var(--line);
+    padding:26px 14px; position:sticky; top:0; height:100vh; overflow:auto; }
+  .brand { display:flex; align-items:center; gap:10px; padding:0 10px 20px; font-weight:800;
+    font-size:18px; letter-spacing:-.3px; }
+  .brand .dot { width:11px; height:11px; border-radius:50%; background: var(--accent); }
+  .nav a { display:flex; align-items:center; gap:11px; text-decoration:none; color: var(--muted);
+    padding:9px 12px; border-radius:9px; font-weight:600; font-size:14px; cursor:pointer;
+    transition:background .12s, color .12s; }
+  .nav a:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); color: var(--fg); }
+  .nav a.on { background: var(--accent); color:#0e1014; }
+
+  /* ---- detail (right) ---- */
+  .detail { flex:1; min-width:0; padding:34px min(6vw,56px); max-width:900px; }
+  h1 { font-size:26px; font-weight:800; letter-spacing:-.5px; margin:0 0 4px; }
+  .sub { color: var(--muted); font-size:13.5px; margin:0 0 26px; }
+  section { display:none; }
+  section.on { display:block; }
+  .grp { margin:0 0 30px; }
+  .grp > h2 { font-size:12px; text-transform:uppercase; letter-spacing:1.3px; color: var(--muted);
     font-weight:700; margin:0 0 12px; }
-  .card .note { color: var(--muted); font-size:13px; margin:0 0 12px; }
-  .card .warn { color:#d69a3c; }
-  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:0 0 6px; }
-  .row .lbl { min-width:120px; color: var(--muted); font-size:13px; }
+  .grp .note { color: var(--muted); font-size:13px; margin:-4px 0 12px; }
+  .grp .note code { font-family:ui-monospace,monospace; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+
+  /* pills / swatches / cards */
   .pill { display:inline-block; text-decoration:none; font-size:13px; font-weight:600;
-    color: var(--fg); border:1px solid var(--line); border-radius:999px; padding:6px 14px;
-    transition:border-color .15s; }
+    color: var(--fg); border:1px solid var(--line); border-radius:999px; padding:7px 15px;
+    transition:border-color .12s, background .12s; cursor:pointer; }
   .pill:hover { border-color: var(--accent); }
   .pill.on { background: var(--accent); border-color: var(--accent); color:#0e1014; }
-  .field { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:8px 0 0; }
-  .field input[type=text] { flex:1; min-width:200px; background: var(--bg); color: var(--fg);
+  .swrow { display:flex; flex-wrap:wrap; gap:11px; }
+  .sw { width:30px; height:30px; border-radius:50%; display:inline-block; cursor:pointer;
+    box-shadow:0 0 0 2px var(--bg), 0 0 0 2px var(--line); transition:box-shadow .12s; }
+  .sw:hover { box-shadow:0 0 0 2px var(--bg), 0 0 0 3px var(--accent); }
+  .sw.on { box-shadow:0 0 0 3px var(--bg), 0 0 0 5px var(--accent); }
+  .srfrow { display:grid; grid-template-columns:repeat(3,1fr); gap:9px; }
+  .srf { display:flex; align-items:center; gap:9px; text-decoration:none; font-size:13.5px;
+    font-weight:600; border:1.5px solid var(--line); border-radius:11px; padding:11px 13px;
+    cursor:pointer; transition:border-color .12s; }
+  .srf:hover { border-color: var(--accent); }
+  .srf.on { border-color: var(--accent); }
+  .srf .chip { width:15px; height:15px; border-radius:4px; flex:none; box-shadow:inset 0 0 0 1px rgba(0,0,0,.15); }
+  .presets { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; }
+  .preset { display:flex; align-items:center; gap:12px; text-decoration:none; border:1.5px solid var(--line);
+    border-radius:13px; padding:12px 14px; cursor:pointer; transition:border-color .12s; }
+  .preset:hover { border-color: var(--accent); }
+  .preset .pg { width:26px; height:26px; border-radius:8px; flex:none; }
+  .preset .pmeta { display:flex; flex-direction:column; line-height:1.35; }
+  .preset .pmeta b { font-size:13.5px; }
+  .preset .pmeta span { font-size:11px; color: var(--muted); font-family:ui-monospace,monospace; }
+
+  /* sliders */
+  .slider { display:flex; align-items:center; gap:14px; margin:2px 0; }
+  .slider label { min-width:120px; font-size:13.5px; color: var(--muted); }
+  .slider input[type=range] { flex:1; accent-color: var(--accent); }
+  .slider .val { min-width:52px; text-align:right; font-family:ui-monospace,monospace; font-size:13px; }
+
+  /* toggle rows */
+  .trow { display:flex; align-items:center; justify-content:space-between; padding:11px 0;
+    border-bottom:1px solid var(--line); font-size:14px; }
+  .trow:last-child { border-bottom:none; }
+  .tog { width:40px; height:23px; border-radius:999px; background: var(--line); position:relative;
+    display:inline-block; cursor:pointer; transition:background .15s; flex:none; }
+  .tog.on { background: var(--accent); }
+  .tog .knob { position:absolute; top:3px; left:3px; width:17px; height:17px; border-radius:50%;
+    background:#fff; transition:left .15s; box-shadow:0 1px 3px rgba(0,0,0,.35); }
+  .tog.on .knob { left:20px; }
+
+  /* fields + buttons */
+  .field { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:4px 0 0; }
+  .field input[type=text] { flex:1; min-width:220px; background: var(--bg); color: var(--fg);
     border:1px solid var(--line); border-radius:9px; padding:9px 12px; font:inherit; font-size:14px; }
   .field input[type=text]:focus { outline:none; border-color: var(--accent); }
-  .field button { background: var(--panel); color: var(--fg); border:1px solid var(--line);
-    border-radius:9px; padding:9px 14px; font:inherit; font-size:14px; font-weight:600; cursor:pointer;
-    transition:border-color .15s; }
-  .field button:hover { border-color: var(--accent); }
-  .status { color: var(--muted); font-size:13px; margin:8px 0 0; }
-  .btnrow { display:flex; flex-wrap:wrap; gap:10px; }
-  .btn { display:inline-block; background: var(--panel); border:1px solid var(--line); border-radius:11px;
-    padding:11px 18px; color: var(--fg); text-decoration:none; font-size:14px; transition:border-color .15s; }
+  .btn { display:inline-block; text-decoration:none; background: var(--panel); color: var(--fg);
+    border:1px solid var(--line); border-radius:9px; padding:9px 15px; font:inherit; font-size:14px;
+    font-weight:600; cursor:pointer; transition:border-color .12s; }
   .btn:hover { border-color: var(--accent); }
-  footer { margin-top:auto; padding-top:42px; color:var(--muted); font-size:12px; }
-  footer a { color: var(--muted); }
+  .stat { color: var(--muted); font-size:13px; margin:4px 0; }
 </style>
 </head>
 <body>
-  <div class="head">
-    <h1>Nav<span class="g">Gator</span> settings</h1>
-    <p class="sub">Everything the ☰ menu manages, on a page. Each change applies instantly and is saved to disk.</p>
-  </div>
-
-  <div class="card">
-    <h2>Search</h2>
-    <div class="row"><span class="lbl">Engine</span>__ENGINE_PILLS__</div>
-    <form class="field" method="get" action="gator://settings">
-      <input type="text" name="search" value="__SEARCH_VALUE__" placeholder="https://example.com/?q=%s" spellcheck="false" autocomplete="off">
-      <button type="submit">Set custom URL</button>
-    </form>
-    <p class="note">Use <code>%s</code> where the query goes. Picking a preset above overwrites this.</p>
-  </div>
-
-  <div class="card">
-    <h2>Appearance</h2>
-    <div class="row"><span class="lbl">Theme</span>__THEME_PILLS__</div>
-    <div class="row"><span class="lbl">Dark mode</span>__DARK_TOGGLE__</div>
-    <form class="field" method="get" action="gator://settings">
-      <input type="text" name="accent" value="__ACCENT_VALUE__" placeholder="#5b8cff" spellcheck="false" autocomplete="off">
-      <button type="submit">Set accent</button>
-    </form>
-    <p class="note">Accent is any CSS <code>#rrggbb</code>. A theme preset sets accent + dark together.</p>
-  </div>
-
-  <div class="card">
-    <h2>Privacy</h2>
-    <div class="row"><span class="lbl">Block ads &amp; trackers</span>__ADS_TOGGLE__</div>
-    <p class="note">__ADS_BLOCKED__ ad/tracker request(s) blocked this session.</p>
-  </div>
-
-  <div class="card">
-    <h2>Setup</h2>
-    <div class="btnrow">
-      <a class="btn" href="gator://settings?action=import">Import bookmarks &amp; history</a>
-      <a class="btn" href="gator://settings?action=default">Set as default browser</a>
+  <nav class="rail">
+    <div class="brand"><span class="dot"></span>Settings</div>
+    <div class="nav" id="nav">
+      <a data-s="appearance">Appearance</a>
+      <a data-s="search">Search</a>
+      <a data-s="newtab">New tab</a>
+      <a data-s="privacy">Privacy &amp; security</a>
+      <a data-s="sync">Sync</a>
+      <a data-s="passwords">Passwords</a>
+      <a data-s="about">About</a>
     </div>
-    <p class="status">__IMPORT_MSG__</p>
-  </div>
+  </nav>
 
-  <div class="card">
-    <h2>Lyku sync</h2>
-    <p class="note warn">Early access — syncs to your Lyku account. Expect rough edges.</p>
-    <div class="row"><span class="lbl">Sync bookmarks</span>__SYNC_BOOKMARKS__</div>
-    <div class="row"><span class="lbl">Sync history</span>__SYNC_HISTORY__</div>
-    <div class="row"><span class="lbl">Sync passwords</span>__SYNC_PASSWORDS__</div>
-    <p class="note">API key: <strong>__KEY_STATUS__</strong>. Set it from the <strong>☰ menu → Lyku sync</strong> — entering a key in a page URL would leak it into the address bar and session.</p>
-    <div class="btnrow">
-      <a class="btn" href="gator://settings?action=sync">Sync now</a>
-    </div>
-    <p class="status">__SYNC_STATUS__</p>
-  </div>
+  <main class="detail">
+    <!-- APPEARANCE -->
+    <section id="appearance">
+      <h1>Appearance</h1>
+      <p class="sub">Theme the entire browser. Changes apply live.</p>
 
-  <div class="card">
-    <h2>Passwords (E2EE)</h2>
-    <p class="note">__PW_STATE__</p>
-    <div class="btnrow">
-      <a class="btn" href="gator://passwords">Manage saved logins</a>
-    </div>
-  </div>
+      <div class="grp"><h2>Presets</h2><div class="presets">__PRESET_CARDS__</div></div>
+      <div class="grp"><h2>Accent</h2><div class="swrow">__ACCENT_SWATCHES__</div></div>
+      <div class="grp"><h2>Surface</h2><div class="srfrow">__BASE_PILLS__</div></div>
+      <div class="grp"><h2>Typography</h2><div class="row">__FONT_PILLS__</div></div>
+      <div class="grp"><h2>Density</h2><div class="row">__DENSITY_PILLS__</div></div>
+      <div class="grp">
+        <h2>Corner radius</h2><div class="row">__RADIUS_PILLS__</div>
+      </div>
+      <div class="grp">
+        <h2>Glass blur</h2><div class="row">__GLASS_PILLS__</div>
+      </div>
+      <div class="grp">
+        <h2>Tabs</h2>
+        <div class="row" style="margin-bottom:10px">__TABPOS_PILLS__</div>
+        <div class="row" style="margin-bottom:10px">__TABFIT_PILLS__</div>
+        <p class="note" style="margin-top:4px">Max tab width</p>
+        <div class="row">__TABMAXW_PILLS__</div>
+      </div>
+      <div class="grp"><h2>New-tab wallpaper</h2><div class="row">__WALLPAPER_PILLS__</div></div>
+    </section>
 
-  <footer>gator://settings &middot; <a href="gator://welcome">welcome</a></footer>
+    <!-- SEARCH -->
+    <section id="search">
+      <h1>Search</h1>
+      <p class="sub">The default engine for the address bar and the new-tab search box.</p>
+      <div class="grp"><h2>Search engine</h2><div class="row">__ENGINE_PILLS__</div></div>
+      <div class="grp"><h2>Custom search URL</h2>
+        <p class="note">Use <code>%s</code> where the query goes.</p>
+        <form class="field" id="searchForm">
+          <input type="text" id="searchInput" value="__SEARCH_VALUE__" placeholder="https://example.com/?q=%s">
+          <button class="btn" type="submit">Save</button>
+        </form>
+      </div>
+    </section>
+
+    <!-- NEW TAB -->
+    <section id="newtab">
+      <h1>New tab</h1>
+      <p class="sub">Which modules show on the new-tab page.</p>
+      <div class="grp"><h2>Modules</h2>__MODULE_TOGGLES__</div>
+    </section>
+
+    <!-- PRIVACY -->
+    <section id="privacy">
+      <h1>Privacy &amp; security</h1>
+      <p class="sub">NavGator blocks ads and trackers by default.</p>
+      <div class="grp"><h2>Content blocking</h2>
+        <div class="trow"><span>Block ads &amp; trackers</span>__ADS_TOGGLE__</div>
+        <p class="note" style="margin-top:12px">__ADS_BLOCKED__ ad/tracker request(s) blocked this session.</p>
+      </div>
+    </section>
+
+    <!-- SYNC -->
+    <section id="sync">
+      <h1>Sync</h1>
+      <p class="sub">Lyku sync (early access). Your API key is stored locally.</p>
+      <div class="grp"><h2>Collections</h2>
+        <div class="trow"><span>Bookmarks</span>__SYNC_BOOKMARKS__</div>
+        <div class="trow"><span>History</span>__SYNC_HISTORY__</div>
+        <div class="trow"><span>Passwords</span>__SYNC_PASSWORDS__</div>
+      </div>
+      <div class="grp"><h2>Status</h2>
+        <p class="stat">API key: __KEY_STATUS__</p>
+        <p class="stat">__SYNC_STATUS__</p>
+        <p style="margin-top:10px"><a class="btn" href="gator://settings?action=sync#sync">Sync now</a></p>
+      </div>
+      <div class="grp"><h2>Import</h2>
+        <p class="stat">__IMPORT_MSG__</p>
+        <p style="margin-top:6px"><a class="btn" href="gator://settings?action=import#sync">Import from another browser</a></p>
+      </div>
+    </section>
+
+    <!-- PASSWORDS -->
+    <section id="passwords">
+      <h1>Passwords</h1>
+      <p class="sub">__PW_STATE__</p>
+      <div class="grp"><p><a class="btn" href="gator://passwords">Open the password manager</a></p></div>
+    </section>
+
+    <!-- ABOUT -->
+    <section id="about">
+      <h1>About NavGator</h1>
+      <p class="sub">A native browser with an egui chrome over a Servo engine.</p>
+      <div class="grp">
+        <p><a class="btn" href="gator://about">About &amp; shortcuts</a></p>
+        <p style="margin-top:10px"><a class="btn" href="gator://settings?action=default#about">Make NavGator the default browser</a></p>
+      </div>
+    </section>
+  </main>
+
+<script>
+  // Client-side master-detail: show the section named by location.hash; default to appearance.
+  function show(name) {
+    name = name || 'appearance';
+    var secs = document.querySelectorAll('main section');
+    for (var i = 0; i < secs.length; i++) secs[i].className = (secs[i].id === name) ? 'on' : '';
+    var links = document.querySelectorAll('#nav a');
+    for (var j = 0; j < links.length; j++) {
+      links[j].className = (links[j].getAttribute('data-s') === name) ? 'on' : '';
+    }
+  }
+  function currentSection(){ return (location.hash || '#appearance').slice(1); }
+  var navLinks = document.querySelectorAll('#nav a');
+  for (var k = 0; k < navLinks.length; k++) {
+    navLinks[k].addEventListener('click', function(){ location.hash = this.getAttribute('data-s'); });
+  }
+  window.addEventListener('hashchange', function(){ show(currentSection()); });
+  show(currentSection());
+  // A slider change navigates back to settings with the new value, keeping this section open.
+  function go(key, val){ location.href = 'gator://settings?' + key + '=' + val + '#' + currentSection(); }
+  // Custom search URL submit.
+  var sf = document.getElementById('searchForm');
+  if (sf) sf.addEventListener('submit', function(e){
+    e.preventDefault();
+    var v = document.getElementById('searchInput').value.trim();
+    if (v) location.href = 'gator://settings?search=' + encodeURIComponent(v) + '#search';
+  });
+</script>
 </body>
 </html>

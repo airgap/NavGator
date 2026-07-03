@@ -61,8 +61,6 @@ mod password;
 mod keyring_store;
 mod theme;
 mod fonts;
-mod widgets;
-mod studio;
 mod palette;
 mod userscripts;
 mod archive;
@@ -1708,19 +1706,23 @@ enum SettingsApply {
     SyncBookmarks(bool),
     SyncHistory(bool),
     SyncPasswords(bool),
+    /// A rich-theme change from the Appearance section: (key, value), applied to `Settings::theme`
+    /// (key ∈ base/accentk/density/font/tabpos/tabfit/wallpaper/preset/radius/glass/tabmaxw/module).
+    ThemeSet(String, String),
     Action(String),
 }
 
-/// A `gator://settings` toggle rendered as a pill that links to the OPPOSITE value. Shared by
-/// the dark/block_ads/sync_* boolean settings on the in-page settings UI.
-fn toggle_link(key: &str, on: bool) -> String {
+/// A `gator://settings` toggle rendered as an iOS-style switch that links to the OPPOSITE value.
+/// `section` is the settings hash (`privacy`/`sync`/…) so a toggle keeps its page open on reload.
+/// Shared by the block_ads/sync_* boolean settings on the in-page settings UI.
+fn toggle_link(key: &str, on: bool, section: &str) -> String {
     let next = if on { "off" } else { "on" };
     format!(
-        "<a class=\"pill{}\" href=\"gator://settings?{}={}\">{}</a>",
+        "<a class=\"tog{}\" href=\"gator://settings?{}={}#{}\"><span class=\"knob\"></span></a>",
         if on { " on" } else { "" },
         key,
         next,
-        if on { "On" } else { "Off" },
+        section,
     )
 }
 
@@ -2355,10 +2357,6 @@ struct AppState {
     location_dirty: Cell<bool>,
     /// Ctrl+L sets this; the next egui frame focuses + selects the address bar.
     focus_omnibox: Cell<bool>,
-    /// Whether the native settings window is open.
-    show_settings: Cell<bool>,
-    /// Whether the Studio (live interface customization) side panel is open.
-    show_studio: Cell<bool>,
     /// DevTools console (Ctrl+Shift+J): recent page `console.*` messages (capped), the open
     /// flag, and the filter box. Global (most-recent across tabs) for now — per-tab is a follow-up.
     console_log: RefCell<std::collections::VecDeque<ConsoleMessage>>,
@@ -2944,6 +2942,75 @@ impl AppState {
                     s.sync_passwords = b;
                     changed = true;
                 }
+                SettingsApply::ThemeSet(key, value) => {
+                    let ok = match key.as_str() {
+                        "base" => theme::Base::from_key(&value)
+                            .map(|b| s.theme.set_base(b))
+                            .is_some(),
+                        "accentk" => theme::Accent::from_key(&value)
+                            .map(|a| s.theme.accent = a)
+                            .is_some(),
+                        "density" => theme::Density::from_key(&value)
+                            .map(|d| s.theme.density = d)
+                            .is_some(),
+                        "font" => theme::FontChoice::from_key(&value)
+                            .map(|f| s.theme.font = f)
+                            .is_some(),
+                        "tabpos" => theme::TabPos::from_key(&value)
+                            .map(|p| s.theme.tab_pos = p)
+                            .is_some(),
+                        "tabfit" => {
+                            s.theme.tab_fit = if value == "fit" {
+                                theme::TabFit::Fit
+                            } else {
+                                theme::TabFit::Fill
+                            };
+                            true
+                        }
+                        "wallpaper" => theme::Wallpaper::from_key(&value)
+                            .map(|w| s.theme.wallpaper = w)
+                            .is_some(),
+                        "preset" => value
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|i| theme::Preset::ALL.get(i).copied())
+                            .map(|p| p.merge_into(&mut s.theme))
+                            .is_some(),
+                        "radius" => value
+                            .parse::<u8>()
+                            .ok()
+                            .map(|r| s.theme.radius = r.min(30))
+                            .is_some(),
+                        "glass" => value
+                            .parse::<u8>()
+                            .ok()
+                            .map(|g| s.theme.glass = g.min(60))
+                            .is_some(),
+                        "tabmaxw" => value
+                            .parse::<u16>()
+                            .ok()
+                            .map(|w| s.theme.tab_max_w = w.clamp(120, 340))
+                            .is_some(),
+                        "module" => {
+                            let (m, on) = value.split_once(':').unwrap_or(("", "off"));
+                            let on = on == "on";
+                            match m {
+                                "clock" => s.modules.clock = on,
+                                "search" => s.modules.search = on,
+                                "sites" => s.modules.sites = on,
+                                "notes" => s.modules.notes = on,
+                                "feed" => s.modules.feed = on,
+                                _ => {}
+                            }
+                            !m.is_empty()
+                        }
+                        _ => false,
+                    };
+                    if ok {
+                        sync_legacy_theme(&mut s);
+                        changed = true;
+                    }
+                }
                 SettingsApply::Action(a) => action = Some(a),
             }
             if changed {
@@ -2985,24 +3052,10 @@ impl AppState {
                 )
             }))
             .collect();
-        let theme_pills: String = THEMES
-            .iter()
-            .enumerate()
-            .map(|(i, (n, a, d))| {
-                let on = *a == s.accent && *d == s.dark;
-                format!(
-                    "<a class=\"pill{}\" href=\"gator://settings?theme={}\">{}</a>",
-                    if on { " on" } else { "" },
-                    i,
-                    html_escape(n),
-                )
-            })
-            .collect();
-        let dark_toggle = toggle_link("dark", s.dark);
-        let ads_toggle = toggle_link("block_ads", s.block_ads);
-        let sync_bookmarks = toggle_link("sync_bookmarks", s.sync_bookmarks);
-        let sync_history = toggle_link("sync_history", s.sync_history);
-        let sync_passwords = toggle_link("sync_passwords", s.sync_passwords);
+        let ads_toggle = toggle_link("block_ads", s.block_ads, "privacy");
+        let sync_bookmarks = toggle_link("sync_bookmarks", s.sync_bookmarks, "sync");
+        let sync_history = toggle_link("sync_history", s.sync_history, "sync");
+        let sync_passwords = toggle_link("sync_passwords", s.sync_passwords, "sync");
         let key_status = if s.sync_api_key.is_empty() {
             "Not set"
         } else {
@@ -3020,13 +3073,144 @@ impl AppState {
             "Locked — unlock from the ☰ menu to enable autofill.".to_string()
         };
 
+        // ---- Appearance (rich theme) control HTML, ported from the old Studio panel ----
+        let th = s.theme;
+        let pills = |param: &str, section: &str, opts: Vec<(&str, &str, bool)>| -> String {
+            opts.iter()
+                .map(|(val, label, on)| {
+                    format!(
+                        "<a class=\"pill{}\" href=\"gator://settings?{param}={val}#{section}\">{}</a>",
+                        if *on { " on" } else { "" },
+                        html_escape(label)
+                    )
+                })
+                .collect()
+        };
+        let preset_cards: String = theme::Preset::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let (c1, c2) = p.swatch();
+                format!(
+                    "<a class=\"preset\" href=\"gator://settings?preset={i}#appearance\"><span class=\"pg\" style=\"background:linear-gradient(135deg,{},{})\"></span><span class=\"pmeta\"><b>{}</b><span>{}</span></span></a>",
+                    color_hex(c1),
+                    color_hex(c2),
+                    html_escape(p.label()),
+                    html_escape(p.sub_label())
+                )
+            })
+            .collect();
+        let base_pills: String = theme::Base::ALL
+            .iter()
+            .map(|b| {
+                let bg2 = color_hex(theme::Theme { base: *b, ..th }.palette().bg2);
+                format!(
+                    "<a class=\"srf{}\" href=\"gator://settings?base={}#appearance\"><span class=\"chip\" style=\"background:{}\"></span>{}</a>",
+                    if *b == th.base { " on" } else { "" },
+                    b.key(),
+                    bg2,
+                    html_escape(b.label())
+                )
+            })
+            .collect();
+        let accent_sw: String = theme::Theme::accents_for_base(th.base)
+            .iter()
+            .map(|a| {
+                let hex = color_hex(theme::Theme { accent: *a, ..th }.palette().accent);
+                format!(
+                    "<a class=\"sw{}\" style=\"background:{}\" href=\"gator://settings?accentk={}#appearance\" title=\"{}\"></a>",
+                    if *a == th.accent { " on" } else { "" },
+                    hex,
+                    a.key(),
+                    html_escape(a.label())
+                )
+            })
+            .collect();
+        let font_pills = pills(
+            "font",
+            "appearance",
+            theme::FontChoice::ALL.iter().map(|f| (f.key(), f.label(), *f == th.font)).collect(),
+        );
+        let density_pills = pills(
+            "density",
+            "appearance",
+            theme::Density::ALL.iter().map(|d| (d.key(), d.label(), *d == th.density)).collect(),
+        );
+        let tabpos_pills = pills(
+            "tabpos",
+            "appearance",
+            theme::TabPos::ALL.iter().map(|p| (p.key(), p.label(), *p == th.tab_pos)).collect(),
+        );
+        let tabfit_pills = pills(
+            "tabfit",
+            "appearance",
+            vec![
+                ("fill", "Fill width", th.tab_fit == theme::TabFit::Fill),
+                ("fit", "Fit to title", th.tab_fit == theme::TabFit::Fit),
+            ],
+        );
+        let wallpaper_pills = pills(
+            "wallpaper",
+            "appearance",
+            theme::Wallpaper::ALL.iter().map(|w| (w.key(), w.label(), *w == th.wallpaper)).collect(),
+        );
+        let module_toggles: String = [
+            ("clock", "Clock & greeting", s.modules.clock),
+            ("search", "Search bar", s.modules.search),
+            ("sites", "Top sites", s.modules.sites),
+            ("notes", "Notes", s.modules.notes),
+            ("feed", "Reading list", s.modules.feed),
+        ]
+        .iter()
+        .map(|(k, label, on)| {
+            format!(
+                "<div class=\"trow\"><span>{}</span><a class=\"tog{}\" href=\"gator://settings?module={}:{}#newtab\"><span class=\"knob\"></span></a></div>",
+                html_escape(label),
+                if *on { " on" } else { "" },
+                k,
+                if *on { "off" } else { "on" }
+            )
+        })
+        .collect();
+
+        // Servo's <input type=range> isn't interactive, so numeric theme values use discrete
+        // pill steps (plain links) instead of sliders. The pill nearest the current value is "on".
+        let step_pills = |param: &str, cur: u16, steps: &[u16]| -> String {
+            let closest = steps
+                .iter()
+                .copied()
+                .min_by_key(|s| (*s as i32 - cur as i32).abs())
+                .unwrap_or(0);
+            steps
+                .iter()
+                .map(|v| {
+                    format!(
+                        "<a class=\"pill{}\" href=\"gator://settings?{param}={v}#appearance\">{v}px</a>",
+                        if *v == closest { " on" } else { "" }
+                    )
+                })
+                .collect()
+        };
+        let radius_pills = step_pills("radius", th.radius as u16, &[0, 6, 12, 18, 24, 30]);
+        let glass_pills = step_pills("glass", th.glass as u16, &[0, 12, 24, 36, 48, 60]);
+        let tabmaxw_pills = step_pills("tabmaxw", th.tab_max_w, &[140, 180, 220, 260, 300, 340]);
+
         let html = include_str!("content/settings.html")
             .replace("__ACCENT__", &accent)
+            .replace("__PRESET_CARDS__", &preset_cards)
+            .replace("__BASE_PILLS__", &base_pills)
+            .replace("__ACCENT_SWATCHES__", &accent_sw)
+            .replace("__FONT_PILLS__", &font_pills)
+            .replace("__DENSITY_PILLS__", &density_pills)
+            .replace("__TABPOS_PILLS__", &tabpos_pills)
+            .replace("__TABFIT_PILLS__", &tabfit_pills)
+            .replace("__WALLPAPER_PILLS__", &wallpaper_pills)
+            .replace("__RADIUS_PILLS__", &radius_pills)
+            .replace("__GLASS_PILLS__", &glass_pills)
+            .replace("__TABMAXW_PILLS__", &tabmaxw_pills)
+            .replace("__MODULE_TOGGLES__", &module_toggles)
             .replace("__ENGINE_PILLS__", &engine_pills)
             .replace("__SEARCH_VALUE__", &html_escape(&s.search))
-            .replace("__THEME_PILLS__", &theme_pills)
-            .replace("__ACCENT_VALUE__", &html_escape(&s.accent))
-            .replace("__DARK_TOGGLE__", &dark_toggle)
             .replace("__ADS_TOGGLE__", &ads_toggle)
             .replace("__ADS_BLOCKED__", &blocked.to_string())
             .replace("__SYNC_BOOKMARKS__", &sync_bookmarks)
@@ -3196,13 +3380,12 @@ impl AppState {
             self.load_favicons(ctx);
             if !self.fullscreen.get() {
                 self.draw_chrome(ctx);
-                self.draw_studio(ctx);
             } else {
                 self.toolbar_height.set(0.0);
                 self.content_left.set(0.0);
                 self.content_right.set(0.0);
             }
-            self.draw_settings(ctx);
+            // Settings + the Studio are now the gator://settings page, not egui overlays.
             self.draw_dialogs(ctx);
 
             // Status bar (hovered link URL / load status), bottom-left over the page.
@@ -3754,86 +3937,6 @@ impl AppState {
         theme::apply_style(ctx, &th);
     }
 
-    /// The Studio: a right-hand side panel for live interface customization (the design's
-    /// "Interface settings"). Mirrors `draw_settings`' deferred-borrow discipline — it edits
-    /// copies of `theme`/`modules`, then writes back + persists only if something changed.
-    /// Sets `content_right` so the page area shrinks to the panel's left edge (and input over
-    /// the panel is treated as chrome). Reserves no space and paints nothing when closed.
-    fn draw_studio(&self, ctx: &egui::Context) {
-        if !self.show_studio.get() {
-            self.content_right.set(0.0);
-            return;
-        }
-
-        let (mut theme, mut modules) = {
-            let s = self.browser.settings.borrow();
-            (s.theme, s.modules)
-        };
-        let pal = theme.palette();
-        let orig_base = theme.base;
-        let mut changed = false;
-        let mut close = false;
-
-        let frame = egui::Frame::NONE
-            .fill(pal.bg2)
-            .stroke(egui::Stroke::new(1.0, pal.border))
-            .inner_margin(egui::Margin::same(20))
-            .shadow(egui::Shadow {
-                offset: [-12, 0],
-                blur: 40,
-                spread: 0,
-                color: egui::Color32::from_black_alpha(90),
-            });
-
-        let panel = egui::SidePanel::right("studio")
-            .resizable(false)
-            .exact_width(366.0)
-            .frame(frame)
-            .show(ctx, |ui| {
-                // Header: glowing accent dot + title + close ×.
-                ui.horizontal(|ui| {
-                    let (dot, _) =
-                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                    ui.painter().circle_filled(dot.center(), 4.5, pal.accent);
-                    ui.label(
-                        egui::RichText::new("Interface settings")
-                            .size(15.0)
-                            .strong()
-                            .color(pal.text),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Flat vector × (the UI font has no "✕" glyph → .notdef box).
-                        if icon_button(ui, true, "Close", &pal, icon::close).clicked() {
-                            close = true;
-                        }
-                    });
-                });
-                ui.add_space(10.0);
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    changed |= studio::studio_body(ui, &mut theme, &mut modules, &pal);
-                });
-            });
-
-        self.content_right.set(panel.response.rect.width());
-
-        if changed {
-            let mut s = self.browser.settings.borrow_mut();
-            s.theme = theme;
-            s.modules = modules;
-            if theme.base != orig_base {
-                s.theme_base_explicit = true; // user picked a base → stop following the OS scheme
-            }
-            sync_legacy_theme(&mut s);
-            save_settings(&s);
-            drop(s);
-            self.window.request_redraw();
-        }
-        if close {
-            self.show_studio.set(false);
-            self.window.request_redraw();
-        }
-    }
-
     /// Execute a command-palette action: mutate theme/modules/tabs/studio, persist, repaint.
     fn run_palette(&self, action: palette::PaletteAction) {
         use palette::PaletteAction as A;
@@ -3843,8 +3946,8 @@ impl AppState {
                 return;
             }
             A::ToggleStudio => {
-                self.show_studio.set(!self.show_studio.get());
-                self.window.request_redraw();
+                // The Studio is now the Appearance section of gator://settings.
+                self.navigate_from_omnibox("gator://settings#appearance");
                 return;
             }
             A::OpenWhy => {
@@ -3970,10 +4073,10 @@ impl AppState {
                         ui.allocate_exact_size(egui::vec2(40.0, 24.0), egui::Sense::hover());
                     self.drag_rect.set(drag_handle);
                     if icon_button(ui, true, "Settings", &pal, icon::menu).clicked() {
-                        self.show_settings.set(!self.show_settings.get());
+                        self.navigate_from_omnibox("gator://settings");
                     }
-                    if icon_button(ui, true, "Customize interface (Studio)", &pal, icon::studio).clicked() {
-                        self.show_studio.set(!self.show_studio.get());
+                    if icon_button(ui, true, "Customize appearance", &pal, icon::studio).clicked() {
+                        self.navigate_from_omnibox("gator://settings#appearance");
                     }
                     // Add-ons (userscripts) puzzle icon: toggles the registry-driven popover. A
                     // count bubble shows how many enabled add-ons match the current tab's URL.
@@ -4271,7 +4374,7 @@ impl AppState {
                     } else if is_cmd {
                         // Command palette: filter the catalog by the text after `>`.
                         let filter = loc.trim_start().trim_start_matches('>').trim().to_lowercase();
-                        let items: Vec<_> = palette::palette_catalog(self.show_studio.get())
+                        let items: Vec<_> = palette::palette_catalog()
                             .into_iter()
                             .filter(|(label, _, _)| label.to_lowercase().contains(&filter))
                             .collect();
@@ -4915,294 +5018,6 @@ impl AppState {
             self.focused_pane().drag_tab.set(None);
         }
         self.window.request_redraw();
-    }
-
-    fn draw_settings(&self, ctx: &egui::Context) {
-        if !self.show_settings.get() {
-            return;
-        }
-        let mut open = true;
-        let mut sync_clicked = false;
-        let mut unlock_pass: Option<String> = None;
-        let mut import_clicked = false;
-        let mut default_clicked = false;
-        // Set to Some(on) when the "Remember passphrase in OS keyring" checkbox is toggled, so the
-        // keyring store/clear (which needs the password_store + settings borrows released) happens
-        // after the Settings window closure below rather than inside it.
-        let mut remember_toggled: Option<bool> = None;
-        // The Settings body is long (search → appearance → privacy → userscripts → setup →
-        // sync → passwords). Without a height cap it grew taller than the viewport and spilled
-        // off the top and bottom edges (title bar clipped, no way to scroll). Cap it to the
-        // viewport and let the body scroll internally.
-        let settings_max_h = (ctx.screen_rect().height() - 120.0).max(320.0);
-        egui::Window::new("Settings")
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .max_height(settings_max_h)
-            .vscroll(true)
-            .show(ctx, |ui| {
-                let mut s = self.browser.settings.borrow_mut();
-                let mut changed = false;
-                ui.label("Search engine");
-                let current = SEARCH_ENGINES
-                    .iter()
-                    .find(|(_, t)| *t == s.search)
-                    .map(|(n, _)| *n)
-                    .unwrap_or("Custom");
-                egui::ComboBox::from_id_salt("search_engine")
-                    .selected_text(current)
-                    .show_ui(ui, |ui| {
-                        for (name, template) in SEARCH_ENGINES {
-                            changed |= ui
-                                .selectable_value(&mut s.search, template.to_string(), *name)
-                                .changed();
-                        }
-                    })
-                    .response
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                ui.add_space(4.0);
-                ui.label("Custom search URL (use %s for the query)");
-                changed |= ui.text_edit_singleline(&mut s.search).changed();
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("Appearance").strong());
-                ui.label(
-                    egui::RichText::new("Theme, fonts, density, tabs & more — live.")
-                        .small()
-                        .weak(),
-                );
-                ui.add_space(4.0);
-                // No emoji — the UI font renders 🎨 as a .notdef box (see no-emoji rule).
-                if ui.button("Open the Studio").clicked() {
-                    self.show_studio.set(true);
-                    // Close this modal so the Studio isn't opened hidden underneath it.
-                    self.show_settings.set(false);
-                }
-                ui.add_space(6.0);
-
-                ui.label("New-tab wallpaper (image URL)");
-                changed |= ui
-                    .add(
-                        egui::TextEdit::singleline(&mut s.wallpaper)
-                            .hint_text("https://…/image.jpg (blank = themed background)"),
-                    )
-                    .changed();
-
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new("Privacy").strong());
-                changed |= ui
-                    .checkbox(&mut s.block_ads, "Block ads & trackers")
-                    .changed();
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} ad/tracker request(s) blocked this session.",
-                        self.browser.adblock_blocked.get()
-                    ))
-                    .small()
-                    .weak(),
-                );
-
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new("Userscripts").strong());
-                let usdir = userscripts_dir()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} add-on(s) from {}",
-                        self.browser.userscripts_count, usdir
-                    ))
-                    .small()
-                    .weak(),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "Drop *.user.js files there and relaunch — each is permission-gated and \
-                         runs only on its matched sites.",
-                    )
-                    .small()
-                    .weak(),
-                );
-                if ui.button("Manage userscripts…").clicked() {
-                    if let Some(tab) = self.active_tab() {
-                        if let Ok(u) = Url::parse("gator://extensions") {
-                            tab.load(u);
-                        }
-                    }
-                    self.show_settings.set(false);
-                }
-
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new("Setup").strong());
-                if ui
-                    .button("Import bookmarks & history (Chrome / Firefox / …)")
-                    .clicked()
-                {
-                    import_clicked = true;
-                }
-                if ui.button("Set NavGator as default browser").clicked() {
-                    default_clicked = true;
-                }
-                if let Some(msg) = self.browser.import_msg.borrow().clone() {
-                    ui.add_space(2.0);
-                    ui.label(egui::RichText::new(msg).small().weak());
-                }
-
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new("Lyku sync").strong());
-                ui.label(
-                    egui::RichText::new(
-                        "Early access — syncs to your Lyku account. Expect rough edges.",
-                    )
-                    .small()
-                    .color(egui::Color32::from_rgb(0xd6, 0x9a, 0x3c)),
-                );
-                ui.add_space(4.0);
-                ui.label("Lyku API key");
-                changed |= ui
-                    .add(
-                        egui::TextEdit::singleline(&mut s.sync_api_key)
-                            .password(true)
-                            .hint_text("lyk_…"),
-                    )
-                    .changed();
-                ui.add_space(2.0);
-                changed |= ui.checkbox(&mut s.sync_bookmarks, "Sync bookmarks").changed();
-                changed |= ui.checkbox(&mut s.sync_history, "Sync history").changed();
-                changed |= ui
-                    .checkbox(&mut s.sync_passwords, "Sync passwords (E2EE — unlock below)")
-                    .changed();
-                if changed {
-                    sync_legacy_theme(&mut s);
-                    save_settings(&s);
-                }
-                ui.add_space(6.0);
-                let busy = self.browser.syncing.get();
-                if ui
-                    .add_enabled(
-                        !busy,
-                        egui::Button::new(if busy { "Syncing…" } else { "Sync now" }),
-                    )
-                    .clicked()
-                {
-                    sync_clicked = true;
-                }
-                let status = self.browser.sync_status.borrow();
-                if !status.is_empty() {
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new(status.as_str()).small().weak());
-                }
-
-                // Passwords (E2EE) — unlock the store to enable autofill + saving.
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new("Passwords (E2EE)").strong());
-                if self.browser.password_store.borrow().is_unlocked() {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Unlocked — {} saved. Use the 🔑 toolbar button to save the current page's login.",
-                            self.browser.password_store.borrow().len()
-                        ))
-                        .small()
-                        .weak(),
-                    );
-                    ui.horizontal(|ui| {
-                        if ui.button("Lock").clicked() {
-                            self.browser.password_store.borrow_mut().lock();
-                            *self.browser.password_msg.borrow_mut() = Some("Password store locked.".into());
-                        }
-                        if ui.button("Manage saved logins").clicked() {
-                            if let (Ok(u), Some(tab)) =
-                                (Url::parse("gator://passwords"), self.active_tab())
-                            {
-                                self.location_dirty.set(false);
-                                tab.load(u);
-                            }
-                            self.show_settings.set(false);
-                        }
-                    });
-                    // Auto-unlock on launch via the OS keyring. Lock keeps the keyring entry (so a
-                    // relaunch auto-unlocks); only un-checking this box deletes it. Lock != Forget.
-                    if ui
-                        .checkbox(
-                            &mut s.remember_passphrase,
-                            "Remember passphrase in OS keyring",
-                        )
-                        .changed()
-                    {
-                        remember_toggled = Some(s.remember_passphrase);
-                        save_settings(&s);
-                    }
-                } else {
-                    ui.label(
-                        egui::RichText::new(
-                            "Unlock with your sync passphrase to enable login autofill + saving.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                    ui.add(
-                        egui::TextEdit::singleline(&mut *self.browser.password_input.borrow_mut())
-                            .password(true)
-                            .hint_text("sync passphrase"),
-                    );
-                    if ui.button("Unlock").clicked() {
-                        unlock_pass = Some(self.browser.password_input.borrow().clone());
-                    }
-                    // Gates future unlocks: when on, the next successful unlock (manual or
-                    // auto-on-launch) stores the passphrase in the OS keyring.
-                    if ui
-                        .checkbox(
-                            &mut s.remember_passphrase,
-                            "Remember passphrase in OS keyring",
-                        )
-                        .changed()
-                    {
-                        remember_toggled = Some(s.remember_passphrase);
-                        save_settings(&s);
-                    }
-                }
-                if let Some(msg) = self.browser.password_msg.borrow().clone() {
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new(msg).small().weak());
-                }
-            });
-        if let Some(p) = unlock_pass {
-            self.unlock_passwords(&p);
-            self.browser.password_input.borrow_mut().clear();
-        }
-        // Apply the "Remember passphrase" toggle outside the settings/store borrows. Turning it ON
-        // while already unlocked stores the live passphrase immediately; otherwise it'll be stored
-        // on the next unlock. Turning it OFF deletes the keyring entry ("Forget on this device").
-        if let Some(on) = remember_toggled {
-            if on {
-                if let Some(pass) = self.browser.password_store.borrow().passphrase() {
-                    let _ = keyring_store::store(pass);
-                }
-            } else {
-                keyring_store::clear();
-            }
-        }
-        if import_clicked {
-            self.import_browser_data();
-        }
-        if default_clicked {
-            self.make_default_browser();
-        }
-        if sync_clicked {
-            self.start_sync();
-        }
-        if !open {
-            self.show_settings.set(false);
-        }
     }
 
     fn draw_dialogs(&self, ctx: &egui::Context) {
@@ -7114,6 +6929,10 @@ impl WebViewDelegate for AppState {
                         "sync_history" => SettingsApply::SyncHistory(v == "on"),
                         "sync_passwords" => SettingsApply::SyncPasswords(v == "on"),
                         "action" => SettingsApply::Action(v.into_owned()),
+                        "base" | "accentk" | "density" | "font" | "tabpos" | "tabfit"
+                        | "wallpaper" | "preset" | "radius" | "glass" | "tabmaxw" | "module" => {
+                            SettingsApply::ThemeSet(k.into_owned(), v.into_owned())
+                        }
                         _ => apply,
                     };
                 }
@@ -7708,8 +7527,6 @@ fn open_window(
         location: RefCell::new(String::new()),
         location_dirty: Cell::new(false),
         focus_omnibox: Cell::new(false),
-        show_settings: Cell::new(false),
-        show_studio: Cell::new(false),
         console_log: RefCell::new(std::collections::VecDeque::new()),
         show_console: Cell::new(false),
         console_filter: RefCell::new(String::new()),

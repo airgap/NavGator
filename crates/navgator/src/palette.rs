@@ -27,9 +27,8 @@ pub(crate) enum PaletteAction {
     ReaderMode,
 }
 
-/// The full command catalog: (label, right-aligned mono hint, action). `studio_open`
-/// flips the studio label between "Open"/"Hide".
-pub(crate) fn palette_catalog(studio_open: bool) -> Vec<(String, &'static str, PaletteAction)> {
+/// The full command catalog: (label, right-aligned mono hint, action).
+pub(crate) fn palette_catalog() -> Vec<(String, &'static str, PaletteAction)> {
     vec![
         ("New tab".to_string(), "⌘T", PaletteAction::NewTab),
         (
@@ -63,13 +62,8 @@ pub(crate) fn palette_catalog(studio_open: bool) -> Vec<(String, &'static str, P
             PaletteAction::ShrinkTabs,
         ),
         (
-            if studio_open {
-                "Hide customization studio"
-            } else {
-                "Open customization studio"
-            }
-            .to_string(),
-            "Studio",
+            "Customize appearance".to_string(),
+            "Settings",
             PaletteAction::ToggleStudio,
         ),
         (
