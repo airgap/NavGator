@@ -8408,6 +8408,22 @@ impl ApplicationHandler<WakeUp> for App {
                     sandbox: sandbox_enabled(),
                     ..Default::default()
                 };
+                // Point the engine at our profile dir so its net-layer state persists across
+                // restarts: cookies (logins survive a restart), HSTS, HTTP auth, and the HTTP
+                // cache (LYK-1382 — cold starts reuse cached bodies instead of re-downloading).
+                // Without this the engine keeps all of that in memory only. Private/incognito
+                // webviews use a separate in-memory state and are unaffected.
+                if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME")
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| {
+                        std::env::var_os("HOME")
+                            .map(|h| std::path::PathBuf::from(h).join(".config"))
+                    })
+                    .map(|base| base.join("navgator"))
+                {
+                    let _ = std::fs::create_dir_all(&dir);
+                    opts.config_dir = Some(dir);
+                }
                 // Engine diagnostics dumps, e.g. `NAVGATOR_DEBUG=scroll-tree,display-list`
                 // (see servo_config DiagnosticsLoggingOption for the full list). Combine with
                 // NAVGATOR_SINGLE_PROCESS=1 so the dumps land in this process's log.
@@ -8496,6 +8512,10 @@ impl ApplicationHandler<WakeUp> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WakeUp) {
         let App::Running { browser, windows } = self else { return };
         if let WakeUp::Exit = event {
+            // Gracefully shut the engine down first so its network thread flushes cookies, HSTS,
+            // auth, and the HTTP cache to disk (we otherwise leak the Servo handles at exit, so
+            // Servo's own Drop-based shutdown never runs). See Servo::shutdown / LYK-1382.
+            browser.servo.shutdown();
             event_loop.exit();
             return;
         }
@@ -8529,6 +8549,7 @@ impl ApplicationHandler<WakeUp> for App {
                 retire_window(state);
             }
             if windows.is_empty() {
+                browser.servo.shutdown();
                 event_loop.exit();
             } else {
                 for w in windows.values() {
@@ -8554,6 +8575,7 @@ impl ApplicationHandler<WakeUp> for App {
                         retire_window(st);
                     }
                     if windows.is_empty() {
+                        browser.servo.shutdown();
                         event_loop.exit();
                     } else {
                         // Repaint the survivors so they don't sit stale after a sibling closed.
