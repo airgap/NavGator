@@ -16,6 +16,36 @@ ARCH="$(uname -m)"; [ "$ARCH" = "arm64" ] && ARCH="aarch64"
 DIST="$ROOT/dist"
 rm -rf "$DIST"; mkdir -p "$DIST"
 
+# --- build-stamped app icon --------------------------------------------------
+# NavGator is in active development, so every build stamps its {version}-{commit}
+# into a badge on the top-right of the app icon (Dock/Finder/task bar tell builds
+# apart at a glance). stamp-icon.py emits stamped icons into a temp dir WITHOUT
+# touching the committed clean icons; the variables below point the packaging
+# steps at the stamped files, falling back to the committed ones if Pillow or the
+# script is unavailable (a build never fails over the badge).
+BUILD="$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null || echo 0)"
+LABEL="$VERSION-$BUILD"
+STAMPDIR="$(mktemp -d)"
+trap 'rm -rf "$STAMPDIR"' EXIT
+ICNS_SRC="$ROOT/packaging/navgator.icns"       # defaults: committed clean icons
+ICON_BUNDLE="$ROOT/packaging/navgator.icon"
+LINUX_PNG="$ROOT/packaging/navgator.png"
+if python3 "$ROOT/scripts/stamp-icon.py" --label "$LABEL" \
+      --art "$ROOT/packaging/navgator.icon/Assets/gator3.png" \
+      --icon-bundle "$ROOT/packaging/navgator.icon" --out-dir "$STAMPDIR"; then
+    [ -f "$STAMPDIR/navgator.png" ] && LINUX_PNG="$STAMPDIR/navgator.png"
+    [ -d "$STAMPDIR/navgator.icon" ] && ICON_BUNDLE="$STAMPDIR/navgator.icon"
+    # macOS: pack the stamped iconset into a .icns (iconutil is macOS-only).
+    if command -v iconutil >/dev/null && [ -d "$STAMPDIR/navgator.iconset" ] \
+        && iconutil -c icns "$STAMPDIR/navgator.iconset" -o "$STAMPDIR/navgator.icns"; then
+        ICNS_SRC="$STAMPDIR/navgator.icns"
+    fi
+    echo "icon: stamped build badge '$LABEL'"
+else
+    echo "icon: stamp-icon skipped (Pillow missing?) — shipping clean unstamped icons" >&2
+fi
+# -----------------------------------------------------------------------------
+
 echo "=== building release (navgator $VERSION) ==="
 cargo build --release -p navgator --locked
 BIN="$ROOT/target/release/navgator"
@@ -155,10 +185,10 @@ Linux)
         # AppImage spec wants the .desktop + icon at the AppDir root; keep the
         # FHS copies too so the integrated/installed form is well-formed.
         cp packaging/navgator.desktop "$APPDIR/usr/share/applications/"
-        cp packaging/navgator.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/" 2>/dev/null || true
+        cp "$LINUX_PNG" "$APPDIR/usr/share/icons/hicolor/256x256/apps/navgator.png" 2>/dev/null || true
         cp packaging/navgator.desktop "$APPDIR/"
-        cp packaging/navgator.png "$APPDIR/" 2>/dev/null || true
-        cp packaging/navgator.png "$APPDIR/.DirIcon" 2>/dev/null || true
+        cp "$LINUX_PNG" "$APPDIR/navgator.png" 2>/dev/null || true
+        cp "$LINUX_PNG" "$APPDIR/.DirIcon" 2>/dev/null || true
         # Prefer the committed AppRun launcher (exec-forwards args, keeps resources
         # resolvable via current_exe); fall back to a symlink if it is missing.
         if [ -f packaging/AppRun ]; then
@@ -188,10 +218,10 @@ Darwin)
     # macOS uses the .icns named by CFBundleIconFile (Info.plist) — a bare PNG is ignored.
     # Fail loudly rather than the old silent `|| true`: an icon-less .app is a release defect
     # (this is exactly how a pre-icon build shipped with no Dock/Finder icon).
-    if [ -f packaging/navgator.icns ]; then
-        cp packaging/navgator.icns "$APP/Contents/Resources/navgator.icns"
+    if [ -f "$ICNS_SRC" ]; then
+        cp "$ICNS_SRC" "$APP/Contents/Resources/navgator.icns"
     else
-        echo "ERROR: packaging/navgator.icns missing — refusing to ship an icon-less .app" >&2
+        echo "ERROR: $ICNS_SRC missing — refusing to ship an icon-less .app" >&2
         exit 1
     fi
 
@@ -202,9 +232,9 @@ Darwin)
     # legacy .icns on its grey "squircle jail" plate. Must run BEFORE signing so the
     # Assets.car + Info.plist change get sealed by codesign.
     ACTOOL="$(xcrun --find actool 2>/dev/null || true)"
-    if [ -n "$ACTOOL" ] && [ -d packaging/navgator.icon ]; then
+    if [ -n "$ACTOOL" ] && [ -d "$ICON_BUNDLE" ]; then
         CARDIR="$(mktemp -d)"
-        if "$ACTOOL" packaging/navgator.icon --compile "$CARDIR" --app-icon navgator \
+        if "$ACTOOL" "$ICON_BUNDLE" --compile "$CARDIR" --app-icon navgator \
               --enable-on-demand-resources NO --development-region en \
               --target-device mac --platform macosx \
               --enable-icon-stack-fallback-generation=disabled --include-all-app-icons \
