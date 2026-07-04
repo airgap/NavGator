@@ -2136,12 +2136,14 @@ struct Tab {
     /// This tab's own UserContentManager (per-site userscript injection, design §4 Option A).
     /// Built once at tab-creation time and attached to `webview`; the engine captures the UCM at
     /// build time and offers no post-build setter (Servo `WebView::user_content_manager` is a
-    /// getter only), so we keep the same Rc and `add_script` matching scripts on navigation —
-    /// new scripts take effect on the *next* load (Servo's documented UCM caveat).
+    /// getter only), so we keep the same Rc and `add_script`/`remove_script` matching scripts on
+    /// navigation — changes take effect on the *next* load (Servo's documented UCM caveat).
     ucm: Option<Rc<UserContentManager>>,
-    /// Add-on ids already injected into this tab's `ucm`, so repeat navigations don't add the
-    /// same wrapped script twice (the engine has no "clear UCM" primitive).
-    injected_addons: RefCell<Vec<userscripts::AddonId>>,
+    /// Add-on ids currently injected into this tab's `ucm`, paired with the `Rc<UserScript>` that
+    /// was added — so repeat navigations don't add the same wrapped script twice, AND so a script
+    /// whose `@match` no longer applies can be removed via `ucm.remove_script` on the next
+    /// navigation (LYK-1256; the engine grew a remove primitive post-catchup).
+    injected_addons: RefCell<Vec<(userscripts::AddonId, Rc<UserScript>)>>,
     /// URLs blocked by the adblocker on the CURRENT page (cleared on navigation), surfaced by
     /// the gator://why "block receipt". Capped to bound a tracker-heavy page.
     blocked: RefCell<Vec<String>>,
@@ -5523,27 +5525,33 @@ impl AppState {
     /// Per-site userscript injection (design §4 Option A). For the navigated `url`, find the
     /// enabled add-ons whose `@match` accepts it (and `@exclude` doesn't), wrap each via
     /// `userscripts::wrap_userscript` with a per-injection capability token bound to the add-on
-    /// id, and `add_script` them into this tab's `UserContentManager` (skipping any already
-    /// injected into this tab). Servo applies new UCM scripts on the *next* load, so we inject
-    /// from `request_navigation` *before* the load is allowed — but because the engine offers no
-    /// way to swap or clear a UCM after build, scripts accumulate in the tab's UCM across its
-    /// lifetime; `@match` filtering for the *current* navigation is enforced here at add time.
+    /// id, and reconcile this tab's `UserContentManager` against the URL being navigated to:
+    /// `remove_script` any already-injected add-on whose `@match`/`@include` no longer applies, and
+    /// `add_script` newly-matching ones (skipping any already injected). Called from
+    /// `request_navigation` *before* the load is allowed, so the change takes effect on that load
+    /// (Servo applies UCM edits on the *next* load). This fixes the old accumulation bug (LYK-1256):
+    /// a script attached on site A used to keep running after the tab navigated to a non-matching
+    /// site B, because the engine had no remove primitive — it does now.
     fn inject_userscripts(&self, webview: &WebView, url: &str) {
         let Some((pane, tab_idx)) = self.locate_tab(webview) else {
             return;
         };
-        // Collect the wrapped scripts to add (id + js), reading source files outside the borrow.
+        // Collect the wrapped scripts to add (id + js) and the set of ids that match this URL,
+        // reading source files outside the tab borrow.
         let salt = self.browser.gm_salt; // [u8; 16] is Copy — avoids borrowing self in the closure.
-        let to_add: Vec<(userscripts::AddonId, String)> = {
+        let (matching_ids, to_add): (Vec<userscripts::AddonId>, Vec<(userscripts::AddonId, String)>) = {
             let reg = self.browser.addons.borrow();
-            let already = {
+            let already: Vec<userscripts::AddonId> = {
                 let tabs = self.pane(pane).tabs.borrow();
                 match tabs.get(tab_idx) {
-                    Some(t) => t.injected_addons.borrow().clone(),
+                    Some(t) => t.injected_addons.borrow().iter().map(|(id, _)| id.clone()).collect(),
                     None => return,
                 }
             };
-            reg.enabled_matching(url)
+            let matching = reg.enabled_matching(url);
+            let matching_ids: Vec<userscripts::AddonId> =
+                matching.iter().map(|a| a.id.clone()).collect();
+            let to_add = matching
                 .into_iter()
                 .filter(|a| !already.contains(&a.id))
                 .filter_map(|a| {
@@ -5558,11 +5566,9 @@ impl AppState {
                     let cap = addon_cap_token(&salt, &a.id);
                     Some((a.id.clone(), userscripts::wrap_userscript(a, &src, &cap)))
                 })
-                .collect()
+                .collect();
+            (matching_ids, to_add)
         };
-        if to_add.is_empty() {
-            return;
-        }
         let tabs = self.pane(pane).tabs.borrow();
         let Some(tab) = tabs.get(tab_idx) else {
             return;
@@ -5570,9 +5576,22 @@ impl AppState {
         let Some(ucm) = &tab.ucm else {
             return;
         };
+        let mut injected = tab.injected_addons.borrow_mut();
+        // Drop scripts whose @match no longer applies to this navigation, so a site-A script stops
+        // running once the tab moves to a non-matching site B (LYK-1256).
+        injected.retain(|(id, rc)| {
+            if matching_ids.contains(id) {
+                true
+            } else {
+                ucm.remove_script(rc.clone());
+                false
+            }
+        });
+        // Add newly-matching scripts, retaining each Rc so it can be removed on a later navigation.
         for (id, js) in to_add {
-            ucm.add_script(Rc::new(UserScript::new(js, None)));
-            tab.injected_addons.borrow_mut().push(id);
+            let script = Rc::new(UserScript::new(js, None));
+            ucm.add_script(script.clone());
+            injected.push((id, script));
         }
     }
 
@@ -5831,6 +5850,11 @@ impl AppState {
         let target = omnibox_target(raw, &self.browser.settings.borrow().search);
         if let (Ok(url), Some(tab)) = (Url::parse(&target), self.active_tab()) {
             self.location_dirty.set(false);
+            // Reconcile this tab's userscripts BEFORE the load starts. The omnibox uses `tab.load`,
+            // which bypasses `request_navigation`, so without this a script scoped to the old site
+            // would linger for one more load (UCM edits apply on the *next* load); doing it here
+            // removes it in time for this navigation (LYK-1256).
+            self.inject_userscripts(&tab, url.as_str());
             tab.load(url);
         }
     }
