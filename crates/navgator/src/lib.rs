@@ -1958,6 +1958,61 @@ const DOM_PROBE_JS: &str = r#"(function(){try{var _o=XMLHttpRequest.prototype.op
 /// (`Element.animate` returns a dead object; no `getAnimations`/playback/interpolation), so
 /// `element.animate(...)` never drives style. This injects a compact, spec-shaped polyfill at
 /// document-start on every page — it self-gates off when the engine's WAAPI is complete.
+/// requestIdleCallback / cancelIdleCallback polyfill (LYK-1403). swervo exposes neither;
+/// this schedules the callback past the current turn (and a frame when available) with an
+/// IdleDeadline shim, honoring the `timeout` option. Injected with the WAAPI polyfill.
+const RIC_POLYFILL_JS: &str = r#"(function () {
+"use strict";
+if (typeof window.requestIdleCallback === "function" &&
+typeof window.cancelIdleCallback === "function") return;
+if (window.__ngRic) return;
+window.__ngRic = 1;
+var now = function () {
+return (window.performance && performance.now && performance.now()) || Date.now();
+};
+var pending = {};
+var nextId = 1;
+var FRAME_BUDGET = 50; // ms, per the spec's suggested cap for timeRemaining()
+window.requestIdleCallback = function (callback, options) {
+var id = nextId++;
+var timeoutMs = options && typeof options.timeout === "number" ? options.timeout : 0;
+var scheduledAt = now();
+var entry = { cb: callback, soon: 0, hard: 0, done: false };
+function fire(didTimeout) {
+if (entry.done || !pending[id]) return;
+entry.done = true;
+if (entry.soon) clearTimeout(entry.soon);
+if (entry.hard) clearTimeout(entry.hard);
+delete pending[id];
+var startRun = now();
+callback({
+didTimeout: !!didTimeout,
+timeRemaining: function () {
+return Math.max(0, FRAME_BUDGET - (now() - startRun));
+},
+});
+}
+entry.soon = setTimeout(function () {
+var raf = window.requestAnimationFrame;
+if (raf) raf(function () { setTimeout(function () { fire(false); }, 0); });
+else fire(false);
+}, 1);
+if (timeoutMs > 0) {
+entry.hard = setTimeout(function () { fire(true); }, timeoutMs);
+}
+pending[id] = entry;
+return id;
+};
+window.cancelIdleCallback = function (id) {
+var e = pending[id];
+if (e) {
+if (e.soon) clearTimeout(e.soon);
+if (e.hard) clearTimeout(e.hard);
+delete pending[id];
+}
+};
+})();"#;
+
 const WAAPI_POLYFILL_JS: &str = r#"(function () {
 "use strict";
 try {
@@ -6456,6 +6511,7 @@ impl AppState {
         // Runs at document-start (before page scripts), so its `Element.prototype.animate` is in
         // place when a page calls it; it self-gates off if native WAAPI is functional.
         ucm.add_script(Rc::new(UserScript::new(WAAPI_POLYFILL_JS.to_string(), None)));
+        ucm.add_script(Rc::new(UserScript::new(RIC_POLYFILL_JS.to_string(), None)));
         if std::env::var_os("NAVGATOR_DOMPROBE").is_some() {
             // Diagnostic: run the DOM probe at document-start so its +3s/+6s snapshots fire
             // even when the page never reaches LoadStatus::Complete.
