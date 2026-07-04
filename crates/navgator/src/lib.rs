@@ -1954,6 +1954,562 @@ const DOM_PROBE_JS: &str = r#"(function(){try{var _o=XMLHttpRequest.prototype.op
 //      nothing back.
 //   2. The trigger is click/keydown, NOT focusin — Servo doesn't reliably dispatch focus events.
 // Fires at most once per document (the warning is about the site, not each keystroke).
+/// Web Animations API polyfill (LYK-1411). swervo ships the WAAPI DOM interfaces as stubs
+/// (`Element.animate` returns a dead object; no `getAnimations`/playback/interpolation), so
+/// `element.animate(...)` never drives style. This injects a compact, spec-shaped polyfill at
+/// document-start on every page — it self-gates off when the engine's WAAPI is complete.
+const WAAPI_POLYFILL_JS: &str = r#"(function () {
+"use strict";
+try {
+if (
+typeof Animation === "function" &&
+typeof Animation.prototype.play === "function" &&
+typeof Element.prototype.getAnimations === "function" &&
+typeof Animation.prototype.finished !== "undefined"
+) {
+return; // native WAAPI is functional; leave it alone.
+}
+} catch (e) {}
+if (window.__ngWaapi) return;
+window.__ngWaapi = 1;
+var raf =
+window.requestAnimationFrame ||
+function (cb) {
+return setTimeout(function () {
+cb(Date.now());
+}, 16);
+};
+function cubicBezier(p1x, p1y, p2x, p2y) {
+var cx = 3 * p1x,
+bx = 3 * (p2x - p1x) - cx,
+ax = 1 - cx - bx;
+var cy = 3 * p1y,
+by = 3 * (p2y - p1y) - cy,
+ay = 1 - cy - by;
+function fx(t) {
+return ((ax * t + bx) * t + cx) * t;
+}
+function dfx(t) {
+return (3 * ax * t + 2 * bx) * t + cx;
+}
+return function (x) {
+if (x <= 0) return 0;
+if (x >= 1) return 1;
+var t = x;
+for (var i = 0; i < 8; i++) {
+var e = fx(t) - x;
+if (Math.abs(e) < 1e-4) break;
+var d = dfx(t);
+if (Math.abs(d) < 1e-6) break;
+t -= e / d;
+}
+return ((ay * t + by) * t + cy) * t;
+};
+}
+var EASINGS = {
+linear: function (t) {
+return t;
+},
+ease: cubicBezier(0.25, 0.1, 0.25, 1),
+"ease-in": cubicBezier(0.42, 0, 1, 1),
+"ease-out": cubicBezier(0, 0, 0.58, 1),
+"ease-in-out": cubicBezier(0.42, 0, 0.58, 1),
+"step-start": function (t) {
+return t > 0 ? 1 : 0;
+},
+"step-end": function (t) {
+return t >= 1 ? 1 : 0;
+},
+};
+function parseEasing(str) {
+if (!str || str === "linear") return EASINGS.linear;
+if (EASINGS[str]) return EASINGS[str];
+var m = /cubic-bezier\(([^)]+)\)/.exec(str);
+if (m) {
+var a = m[1].split(",").map(parseFloat);
+return cubicBezier(a[0], a[1], a[2], a[3]);
+}
+m = /steps\(\s*(\d+)\s*(?:,\s*(\w+))?\s*\)/.exec(str);
+if (m) {
+var n = parseInt(m[1], 10),
+pos = m[2] || "end";
+return function (t) {
+if (t >= 1) return 1;
+if (t <= 0) return 0;
+var step = Math.floor(t * n);
+if (pos === "start" || pos === "jump-start") step += 1;
+return Math.min(1, step / n);
+};
+}
+return EASINGS.linear;
+}
+function parseColor(s) {
+s = s.trim();
+var m = /^#([0-9a-f]{3,8})$/i.exec(s);
+if (m) {
+var h = m[1];
+if (h.length === 3)
+h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+if (h.length === 4)
+h = h[0]+h[0]+h[1]+h[1]+h[2]+h[2]+h[3]+h[3];
+return [
+parseInt(h.slice(0, 2), 16),
+parseInt(h.slice(2, 4), 16),
+parseInt(h.slice(4, 6), 16),
+h.length >= 8 ? parseInt(h.slice(6, 8), 16) / 255 : 1,
+];
+}
+m = /^rgba?\(([^)]+)\)$/i.exec(s);
+if (m) {
+var p = m[1].split(/[,\/\s]+/).filter(Boolean).map(parseFloat);
+return [p[0], p[1], p[2], p.length > 3 ? p[3] : 1];
+}
+return null;
+}
+function lerp(a, b, t) {
+return a + (b - a) * t;
+}
+function makeInterp(from, to) {
+from = String(from).trim();
+to = String(to).trim();
+if (/^-?[\d.]+$/.test(from) && /^-?[\d.]+$/.test(to)) {
+var a = parseFloat(from),
+b = parseFloat(to);
+return function (t) {
+return String(lerp(a, b, t));
+};
+}
+var cf = parseColor(from),
+ct = parseColor(to);
+if (cf && ct) {
+return function (t) {
+return (
+"rgba(" +
+Math.round(lerp(cf[0], ct[0], t)) +
+"," +
+Math.round(lerp(cf[1], ct[1], t)) +
+"," +
+Math.round(lerp(cf[2], ct[2], t)) +
+"," +
+lerp(cf[3], ct[3], t) +
+")"
+);
+};
+}
+var numRe = /-?[\d.]+/g;
+var skelFrom = from.replace(numRe, " ");
+var skelTo = to.replace(numRe, " ");
+if (skelFrom === skelTo) {
+var nf = from.match(numRe) || [];
+var nt = to.match(numRe) || [];
+if (nf.length === nt.length && nf.length > 0) {
+var fa = nf.map(parseFloat),
+ta = nt.map(parseFloat);
+var parts = from.split(numRe); // literal segments around numbers
+return function (t) {
+var out = parts[0];
+for (var i = 0; i < fa.length; i++) {
+out += fmtNum(lerp(fa[i], ta[i], t)) + parts[i + 1];
+}
+return out;
+};
+}
+}
+return null; // discrete
+}
+function fmtNum(n) {
+return Math.abs(n) < 1e-6 ? "0" : parseFloat(n.toFixed(4)).toString();
+}
+var SPECIAL = { offset: 1, easing: 1, composite: 1 };
+function normalizeKeyframes(input) {
+if (input == null) return [];
+var frames = [];
+if (Array.isArray(input)) {
+frames = input.map(function (k) {
+var o = {};
+for (var p in k) o[p] = k[p];
+return o;
+});
+} else {
+var props = Object.keys(input);
+var maxLen = 1;
+props.forEach(function (p) {
+if (!SPECIAL[p] && Array.isArray(input[p]))
+maxLen = Math.max(maxLen, input[p].length);
+});
+for (var i = 0; i < maxLen; i++) frames.push({});
+props.forEach(function (p) {
+var v = input[p];
+if (SPECIAL[p]) {
+for (var i = 0; i < maxLen; i++)
+frames[i][p] = Array.isArray(v)
+? v[Math.min(i, v.length - 1)]
+: v;
+} else {
+var arr = Array.isArray(v) ? v : [v];
+for (var j = 0; j < maxLen; j++)
+frames[j][p] = arr[Math.min(j, arr.length - 1)];
+}
+});
+}
+var n = frames.length;
+if (n) {
+if (frames[0].offset == null) frames[0].offset = 0;
+if (frames[n - 1].offset == null) frames[n - 1].offset = 1;
+}
+var lastIdx = 0,
+lastOff = frames.length ? frames[0].offset || 0 : 0;
+for (var i = 1; i < n; i++) {
+if (frames[i].offset != null) {
+var span = frames[i].offset - lastOff;
+for (var k = lastIdx + 1; k < i; k++)
+frames[k].offset = lastOff + (span * (k - lastIdx)) / (i - lastIdx);
+lastIdx = i;
+lastOff = frames[i].offset;
+}
+}
+return frames;
+}
+function buildTracks(frames, defaultEasing) {
+var tracks = {};
+frames.forEach(function (f) {
+var ease = f.easing || defaultEasing;
+for (var p in f) {
+if (SPECIAL[p]) continue;
+(tracks[p] = tracks[p] || []).push({
+offset: f.offset,
+value: f[p],
+easing: ease,
+});
+}
+});
+for (var p in tracks)
+tracks[p].sort(function (a, b) {
+return a.offset - b.offset;
+});
+return tracks;
+}
+var allAnimations = [];
+function normalizeTiming(options) {
+var t = {
+delay: 0,
+endDelay: 0,
+duration: 0,
+iterations: 1,
+iterationStart: 0,
+easing: "linear",
+direction: "normal",
+fill: "none",
+};
+if (typeof options === "number") {
+t.duration = options;
+} else if (options && typeof options === "object") {
+for (var k in t) if (options[k] != null) t[k] = options[k];
+if (options.duration === "auto") t.duration = 0;
+}
+if (typeof t.duration !== "number" || isNaN(t.duration)) t.duration = 0;
+return t;
+}
+function KEffect(target, keyframes, options) {
+this.target = target;
+this.timing = normalizeTiming(options);
+this._frames = normalizeKeyframes(keyframes);
+this._tracks = buildTracks(this._frames, this.timing.easing);
+this.id = (options && typeof options === "object" && options.id) || "";
+}
+KEffect.prototype.getTiming = function () {
+return this.timing;
+};
+KEffect.prototype.getKeyframes = function () {
+return this._frames.map(function (f) {
+var o = {};
+for (var p in f) o[p] = f[p];
+return o;
+});
+};
+KEffect.prototype._sample = function (progress, applyBase) {
+var el = this.target;
+if (!el || !el.style) return;
+for (var p in this._tracks) {
+var kf = this._tracks[p];
+var val;
+if (progress <= kf[0].offset) val = kf[0].value;
+else if (progress >= kf[kf.length - 1].offset)
+val = kf[kf.length - 1].value;
+else {
+var lo = kf[0];
+for (var i = 1; i < kf.length; i++) {
+if (progress <= kf[i].offset) {
+var hi = kf[i];
+var span = hi.offset - lo.offset || 1;
+var localT = (progress - lo.offset) / span;
+var eased = parseEasing(lo.easing)(localT);
+var interp = makeInterp(lo.value, hi.value);
+val = interp ? interp(eased) : (eased < 0.5 ? lo.value : hi.value);
+break;
+}
+lo = kf[i];
+}
+}
+setStyleProp(el, p, val);
+}
+};
+KEffect.prototype._clear = function () {
+var el = this.target;
+if (!el || !el.style) return;
+for (var p in this._tracks) setStyleProp(el, p, "");
+};
+function setStyleProp(el, prop, val) {
+var css = prop.replace(/[A-Z]/g, function (m) {
+return "-" + m.toLowerCase();
+});
+try {
+el.style.setProperty(css, val === "" ? "" : String(val), "important");
+} catch (e) {
+try {
+el.style[prop] = val;
+} catch (e2) {}
+}
+}
+function Anim(effect) {
+this.effect = effect;
+this._startTime = null;
+this._currentTime = 0;
+this.playbackRate = 1;
+this.playState = "idle";
+this._pauseTime = null;
+this._finished = null;
+this._finishedResolve = null;
+this._finishedReject = null;
+this.onfinish = null;
+this.oncancel = null;
+this.id = effect ? effect.id : "";
+allAnimations.push(this);
+}
+Object.defineProperty(Anim.prototype, "currentTime", {
+get: function () {
+return this._currentTime;
+},
+set: function (v) {
+this._currentTime = v || 0;
+if (this.playState === "running")
+this._startTime = now() - this._currentTime / this.playbackRate;
+this._tick(now(), true);
+},
+});
+Object.defineProperty(Anim.prototype, "finished", {
+get: function () {
+var self = this;
+if (!this._finished) {
+this._finished = new Promise(function (res, rej) {
+self._finishedResolve = res;
+self._finishedReject = rej;
+});
+if (this.playState === "finished") this._finishedResolve(this);
+}
+return this._finished;
+},
+});
+Object.defineProperty(Anim.prototype, "ready", {
+get: function () {
+return Promise.resolve(this);
+},
+});
+function now() {
+return (window.performance && performance.now && performance.now()) || Date.now();
+}
+Anim.prototype._totalDuration = function () {
+var t = this.effect.timing;
+var iters = t.iterations === Infinity ? Infinity : t.iterations;
+return t.delay + t.duration * iters + t.endDelay;
+};
+Anim.prototype.play = function () {
+if (this.playState === "finished") {
+if (
+this._currentTime >= this.effect.timing.delay +
+this.effect.timing.duration * (this.effect.timing.iterations || 1)
+)
+this._currentTime = 0;
+}
+this.playState = "running";
+this._startTime = now() - this._currentTime / this.playbackRate;
+scheduleTick();
+return this;
+};
+Anim.prototype.pause = function () {
+this.playState = "paused";
+return this;
+};
+Anim.prototype.reverse = function () {
+this.playbackRate = -this.playbackRate;
+if (this.playState !== "running") this.play();
+else this._startTime = now() - this._currentTime / this.playbackRate;
+return this;
+};
+Anim.prototype.finish = function () {
+var t = this.effect.timing;
+var end = t.delay + t.duration * (t.iterations === Infinity ? 1 : t.iterations);
+this._currentTime = this.playbackRate >= 0 ? end : 0;
+this._tick(now(), true);
+this._doFinish();
+return this;
+};
+Anim.prototype.cancel = function () {
+this.playState = "idle";
+this._currentTime = 0;
+this.effect._clear();
+if (this._finishedReject)
+this._finishedReject(mkAbort());
+this._finished = null;
+if (typeof this.oncancel === "function")
+this.oncancel({ type: "cancel", target: this });
+dispatch(this, "cancel");
+var i = allAnimations.indexOf(this);
+if (i >= 0) allAnimations.splice(i, 1);
+return this;
+};
+function mkAbort() {
+try {
+return new DOMException("The animation was aborted.", "AbortError");
+} catch (e) {
+var er = new Error("aborted");
+er.name = "AbortError";
+return er;
+}
+}
+Anim.prototype._doFinish = function () {
+if (this.playState === "finished") return;
+this.playState = "finished";
+if (this._finishedResolve) this._finishedResolve(this);
+if (typeof this.onfinish === "function")
+this.onfinish({ type: "finish", target: this });
+dispatch(this, "finish");
+};
+Anim.prototype._listeners = null;
+Anim.prototype.addEventListener = function (type, fn) {
+(this._listeners = this._listeners || {});
+(this._listeners[type] = this._listeners[type] || []).push(fn);
+};
+Anim.prototype.removeEventListener = function (type, fn) {
+if (!this._listeners || !this._listeners[type]) return;
+var a = this._listeners[type],
+i = a.indexOf(fn);
+if (i >= 0) a.splice(i, 1);
+};
+function dispatch(anim, type) {
+if (anim._listeners && anim._listeners[type])
+anim._listeners[type].slice().forEach(function (fn) {
+try {
+fn.call(anim, { type: type, target: anim });
+} catch (e) {}
+});
+}
+Anim.prototype._tick = function (nowMs, forceSample) {
+var t = this.effect.timing;
+if (this.playState === "running") {
+this._currentTime = (nowMs - this._startTime) * this.playbackRate;
+}
+var ct = this._currentTime;
+var active = ct - t.delay;
+var dur = t.duration;
+var iterations = t.iterations;
+var beforePhase = active < 0;
+var totalActive = dur * (iterations === Infinity ? Infinity : iterations);
+var afterPhase = iterations !== Infinity && active >= totalActive;
+var fill = t.fill;
+var fillBackwards = fill === "backwards" || fill === "both";
+var fillForwards = fill === "forwards" || fill === "both";
+var iterProgress, currentIter;
+if (dur <= 0) {
+iterProgress = afterPhase ? 1 : 0;
+currentIter = 0;
+} else if (beforePhase) {
+iterProgress = t.iterationStart % 1;
+currentIter = Math.floor(t.iterationStart);
+} else if (afterPhase) {
+var it = iterations;
+iterProgress = 1;
+currentIter = Math.max(0, Math.ceil(it) - 1);
+if (it % 1 === 0) iterProgress = 1;
+} else {
+var overall = t.iterationStart + active / dur;
+currentIter = Math.floor(overall);
+iterProgress = overall - currentIter;
+}
+var dir = t.direction;
+var reverse = false;
+if (dir === "reverse") reverse = true;
+else if (dir === "alternate") reverse = currentIter % 2 === 1;
+else if (dir === "alternate-reverse") reverse = currentIter % 2 === 0;
+var directed = reverse ? 1 - iterProgress : iterProgress;
+var shouldSample =
+(!beforePhase && !afterPhase) ||
+(beforePhase && fillBackwards) ||
+(afterPhase && fillForwards) ||
+forceSample;
+if (shouldSample) {
+this.effect._sample(directed, true);
+} else if (beforePhase && !fillBackwards) {
+this.effect._clear();
+} else if (afterPhase && !fillForwards) {
+this.effect._clear();
+}
+if (afterPhase && this.playState === "running") {
+this._doFinish();
+}
+};
+var ticking = false;
+function scheduleTick() {
+if (ticking) return;
+ticking = true;
+raf(tickAll);
+}
+function tickAll() {
+ticking = false;
+var nowMs = now();
+var anyRunning = false;
+for (var i = 0; i < allAnimations.length; i++) {
+var a = allAnimations[i];
+if (a.playState === "running") {
+a._tick(nowMs, false);
+if (a.playState === "running") anyRunning = true;
+}
+}
+if (anyRunning) scheduleTick();
+}
+function animate(keyframes, options) {
+var effect = new KEffect(this, keyframes, options);
+var anim = new Anim(effect);
+anim.play(); // auto-play, auto-rewind
+return anim;
+}
+function getAnimations() {
+var el = this;
+return allAnimations.filter(function (a) {
+return a.effect && a.effect.target === el && a.playState !== "idle";
+});
+}
+try {
+Element.prototype.animate = animate;
+Element.prototype.getAnimations = getAnimations;
+if (window.Document)
+Document.prototype.getAnimations = function () {
+return allAnimations.filter(function (a) {
+return a.playState !== "idle";
+});
+};
+window.Animation = Anim;
+window.KeyframeEffect = function (target, keyframes, options) {
+return new KEffect(target, keyframes, options);
+};
+window.__ngWaapiVersion = 1;
+} catch (e) {
+try {
+console.log("NGWAAPI install error " + e);
+} catch (e2) {}
+}
+})();"#;
+
 const FIREWALL_JS: &str = r#"(function(){if(window.__ngcf)return;window.__ngcf=1;function chk(){if(window.__ngck)return;window.__ngck=1;try{(new Image()).src='navgator://credfw?o='+encodeURIComponent(location.origin)+'&h='+encodeURIComponent(location.hostname)}catch(e){}}['click','focusin','keydown'].forEach(function(ev){document.addEventListener(ev,function(e){var t=e.target;if(t&&t.tagName==='INPUT'&&(t.type==='password'||/cc-number|cardnumber/i.test(t.getAttribute('autocomplete')||'')))chk()},true)})})()"#;
 
 /// The origin (`scheme://host[:port]`) of a URL, for matching saved logins. None for non-web.
@@ -5893,12 +6449,14 @@ impl AppState {
     /// add-ons whose `@match` accepts each navigated URL (the engine captures the UCM at build
     /// time and has no post-build setter, so we keep this Rc per tab and grow it on navigation).
     fn make_tab_ucm(&self) -> Option<Rc<UserContentManager>> {
-        let probe = std::env::var_os("NAVGATOR_DOMPROBE").is_some();
-        if self.browser.addons.borrow().addons.is_empty() && !probe {
-            return None;
-        }
+        // The UCM is now always created: it carries the always-on Web Animations API polyfill
+        // (LYK-1411) so `element.animate(...)` actually animates until the engine's WAAPI is
+        // complete. Userscripts + the DOM probe stack on top of it.
         let ucm = Rc::new(UserContentManager::new(&self.browser.servo));
-        if probe {
+        // Runs at document-start (before page scripts), so its `Element.prototype.animate` is in
+        // place when a page calls it; it self-gates off if native WAAPI is functional.
+        ucm.add_script(Rc::new(UserScript::new(WAAPI_POLYFILL_JS.to_string(), None)));
+        if std::env::var_os("NAVGATOR_DOMPROBE").is_some() {
             // Diagnostic: run the DOM probe at document-start so its +3s/+6s snapshots fire
             // even when the page never reaches LoadStatus::Complete.
             ucm.add_script(Rc::new(UserScript::new(DOM_PROBE_JS.to_string(), None)));
