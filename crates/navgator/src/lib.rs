@@ -1636,7 +1636,10 @@ fn navgator_preferences() -> Preferences {
     // `wakelock.rs` is a spec-compliant Screen Wake Lock (permission-gated, rejects cleanly when
     // denied). (Excluded: webvtt — vttcue::GetCueAsHTML is a `todo!()` panic; sharedworker/
     // abort_controller/resize_observer/mutation_observer/crypto_subtle are already default-on.)
-    p.dom_cookiestore_enabled = true; // CookieStore API (async cookie read/write)
+    p.dom_cookiestore_enabled = true;
+    // Cache API (window.caches / Cache / CacheStorage) — storage-thread-backed, SQLite
+    // persistence in the profile dir (LYK-1365 Phase 1).
+    p.dom_cache_api_enabled = true; // CookieStore API (async cookie read/write)
     p.dom_wakelock_enabled = true; // Screen Wake Lock (navigator.wakeLock.request)
     // CSS Masking: stylo gates mask-* parsing behind `layout.unimplemented`. swervo now paints
     // mask-image (single-layer alpha mask → display_list mask clip), so opt in to parsing it.
