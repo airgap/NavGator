@@ -2050,6 +2050,10 @@ return true;
 };
 }
 } catch (e) { try { console.log("NGPLAT checkVisibility err " + e); } catch (e2) {} }
+try {
+if (typeof window.ServiceWorkerRegistration === "undefined")
+window.ServiceWorkerRegistration = function ServiceWorkerRegistration() {};
+} catch (e) { try { console.log("NGPLAT swstub err " + e); } catch (e2) {} }
 })();"#;
 
 const RIC_POLYFILL_JS: &str = r#"(function () {
