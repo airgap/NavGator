@@ -1631,6 +1631,13 @@ fn navgator_preferences() -> Preferences {
     p.dom_sanitizer_enabled = true; // HTML Sanitizer API (security pitch)
     p.dom_exec_command_enabled = true; // contenteditable rich-text editing
     p.dom_storage_manager_api_enabled = true; // navigator.storage
+    // Enablement audit (LYK-1383): default-OFF stock prefs whose swervo impls are complete +
+    // additive. `cookiestore.rs` is a full 746-line Get/Set/Delete impl over the cookie jar;
+    // `wakelock.rs` is a spec-compliant Screen Wake Lock (permission-gated, rejects cleanly when
+    // denied). (Excluded: webvtt — vttcue::GetCueAsHTML is a `todo!()` panic; sharedworker/
+    // abort_controller/resize_observer/mutation_observer/crypto_subtle are already default-on.)
+    p.dom_cookiestore_enabled = true; // CookieStore API (async cookie read/write)
+    p.dom_wakelock_enabled = true; // Screen Wake Lock (navigator.wakeLock.request)
     // CSS Masking: stylo gates mask-* parsing behind `layout.unimplemented`. swervo now paints
     // mask-image (single-layer alpha mask → display_list mask clip), so opt in to parsing it.
     // The other layout.unimplemented-gated properties remain parse-only no-ops.
