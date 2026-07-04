@@ -7781,17 +7781,28 @@ impl ApplicationHandler<WakeUp> for App {
         let servo = ServoBuilder::default()
             .event_loop_waker(Box::new(waker))
             .preferences(navgator_preferences())
-            .opts(Opts {
-                // Process-isolate page content — a crash or exploit in a content process can't
-                // take down the chrome (the security half of the pitch). Set
-                // `NAVGATOR_SINGLE_PROCESS=1` to run single-process for diagnostics (so page JS
-                // console errors / panics land in the main log instead of a separate content proc).
-                multiprocess: std::env::var_os("NAVGATOR_SINGLE_PROCESS").is_none(),
-                // OS-confine each content process (gaol: user namespace + chroot + seccomp).
-                // Opt-in (see sandbox_enabled): gaol panics unrecoverably where unprivileged
-                // namespaces are denied, which sysctls don't reliably predict.
-                sandbox: sandbox_enabled(),
-                ..Default::default()
+            .opts({
+                let mut opts = Opts {
+                    // Process-isolate page content — a crash or exploit in a content process can't
+                    // take down the chrome (the security half of the pitch). Set
+                    // `NAVGATOR_SINGLE_PROCESS=1` to run single-process for diagnostics (so page JS
+                    // console errors / panics land in the main log instead of a separate content proc).
+                    multiprocess: std::env::var_os("NAVGATOR_SINGLE_PROCESS").is_none(),
+                    // OS-confine each content process (gaol: user namespace + chroot + seccomp).
+                    // Opt-in (see sandbox_enabled): gaol panics unrecoverably where unprivileged
+                    // namespaces are denied, which sysctls don't reliably predict.
+                    sandbox: sandbox_enabled(),
+                    ..Default::default()
+                };
+                // Engine diagnostics dumps, e.g. `NAVGATOR_DEBUG=scroll-tree,display-list`
+                // (see servo_config DiagnosticsLoggingOption for the full list). Combine with
+                // NAVGATOR_SINGLE_PROCESS=1 so the dumps land in this process's log.
+                if let Ok(d) = std::env::var("NAVGATOR_DEBUG") {
+                    if let Err(e) = opts.debug.extend_from_string(&d) {
+                        eprintln!("NAVGATOR_DEBUG: {e}");
+                    }
+                }
+                opts
             })
             .build();
         servo.setup_logging();
