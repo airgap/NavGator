@@ -38,7 +38,8 @@ use euclid::default::{Point2D, Rect, Size2D};
 use navgator_engine::{
     AuthenticationRequest, ColorPicker, ConsoleLogLevel, CreateNewWebViewRequest, Cursor, DeviceIntRect,
     DeviceIntSize, DevicePoint, EmbedderControl,
-    EmbedderControlId, EventLoopWaker, FilePicker, FilterPattern, Image, InputEvent, JSValue, Key,
+    EmbedderControlId, EventLoopWaker, FilePicker, FilterPattern, Image, InputEvent, InputEventId,
+    InputEventResult, JSValue, Key,
     KeyState, KeyboardEvent, LoadStatus, MediaSessionEvent, MediaSessionPlaybackState, Modifiers,
     MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
     NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, Opts, PermissionRequest,
@@ -733,17 +734,17 @@ mod icon {
         p.line_segment([pos2(r.center().x - dx, end_y), pos2(r.center().x, tip_y)], st);
         p.line_segment([pos2(r.center().x, tip_y), pos2(r.center().x + dx, end_y)], st);
     }
-    /// Circular reload arrow: a ~290° arc with a filled triangular arrowhead at the top gap,
-    /// pointing clockwise (the direction of rotation).
+    /// Circular reload arrow: a near-full ring with a clean gap at the top and a filled arrowhead
+    /// at the right side of the gap, pointing up into it — the conventional "refresh" look.
     pub fn reload(p: &Painter, r: Rect, c: Color32) {
-        use egui::vec2;
+        use std::f32::consts::{FRAC_PI_2, TAU};
         let st = Stroke::new(1.7, c);
         let center = r.center();
-        let rad = r.width() * 0.30;
-        // Arc sweeps clockwise, leaving a gap at the top for the arrowhead.
-        let start = -0.62_f32; // just right of straight up
-        let sweep = 5.05_f32; // ~289°
-        let steps = 30;
+        let rad = r.width() * 0.32;
+        let g = 0.62_f32; // half-width of the top gap, radians
+        let start = -FRAC_PI_2 + g; // just clockwise (right) of 12 o'clock
+        let sweep = TAU - 2.0 * g; // most of the circle
+        let steps = 48;
         let pts: Vec<_> = (0..=steps)
             .map(|i| {
                 let a = start + sweep * (i as f32 / steps as f32);
@@ -751,13 +752,14 @@ mod icon {
             })
             .collect();
         p.add(egui::Shape::line(pts, st));
-        // Filled arrowhead at the arc start (top), apex along the clockwise tangent.
+        // Arrowhead at the START end (right of the gap), apex pointing up-left into the gap
+        // (counter to the sweep), so the arrow reads as sweeping clockwise back to the top.
         let tip = pos2(center.x + rad * start.cos(), center.y + rad * start.sin());
-        let tangent = vec2(-start.sin(), start.cos()); // clockwise (increasing angle)
+        let tangent = vec2(start.sin(), -start.cos()); // toward the gap (up-left)
         let radial = vec2(start.cos(), start.sin()); // outward
-        let apex = tip + tangent * 4.6;
-        let b1 = tip + radial * 3.4;
-        let b2 = tip - radial * 3.4;
+        let apex = tip + tangent * 5.2;
+        let b1 = tip + radial * 3.6;
+        let b2 = tip - radial * 3.6;
         p.add(egui::Shape::convex_polygon(vec![apex, b1, b2], c, Stroke::NONE));
     }
     /// Key: a ring on the left, a stem to the right, two teeth.
@@ -792,14 +794,15 @@ fn icon_button(
     } else {
         pal.muted
     };
+    // Hover background: a rounded fill behind the glyph, matching the New Tab button. The corner
+    // follows the theme (egui derives `widgets.hovered.corner_radius` from `Theme::radius_sm`).
+    if enabled && resp.hovered() {
+        let cr = ui.visuals().widgets.hovered.corner_radius;
+        ui.painter().rect_filled(rect.shrink(2.0), cr, pal.elev);
+    }
     let icon_box = egui::Rect::from_center_size(rect.center(), egui::vec2(13.0, 13.0));
     draw(ui.painter(), icon_box, col);
-    // Clickable chrome shows a pointer on hover (web-style), not the default arrow.
-    let resp = if enabled {
-        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-    } else {
-        resp
-    };
+    // Chrome buttons keep the Default arrow cursor (no pointing-hand).
     if tip.is_empty() {
         resp
     } else {
@@ -2256,6 +2259,25 @@ enum TabAction {
     PopOut(usize),
 }
 
+/// A NavGator keyboard shortcut that page content is allowed to *override* (Chrome's "tier-2"
+/// accelerator model): the key is forwarded to the page first, and this action runs only if the
+/// page doesn't `preventDefault` it (dispatched from `notify_input_event_handled`). Contrast the
+/// reserved shortcuts (new/close/switch tab, new window, quit, reload, focus omnibox) which are
+/// handled up front and never reach the page.
+#[derive(Clone, Copy)]
+enum KeyShortcut {
+    CommandPalette,
+    Bookmark,
+    Find,
+    History,
+    Downloads,
+    DevTools,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    ToggleSplit,
+}
+
 /// Browser-global state shared by every window via `Rc<BrowserState>`: the single Servo engine
 /// and the app-wide services (settings, profile, adblock, Lyku sync, passwords, downloads, IPC).
 /// One instance for the whole process; each window's `AppState` holds a clone of the `Rc`.
@@ -2395,6 +2417,11 @@ struct AppState {
     page_cursor: Cell<CursorIcon>,
     ctrl: Cell<bool>,
     shift: Cell<bool>,
+    alt: Cell<bool>,
+    /// Overridable (tier-2) keyboard shortcuts awaiting the page's verdict: `InputEventId` of the
+    /// forwarded key → the shortcut to run if the page doesn't consume it. Drained in
+    /// `notify_input_event_handled`. See [`KeyShortcut`].
+    pending_shortcuts: RefCell<HashMap<InputEventId, KeyShortcut>>,
     weak_self: RefCell<Weak<AppState>>,
     /// Record/replay HTTP archive (regression fixtures), active only when `NAVGATOR_ARCHIVE_DIR` +
     /// `NAVGATOR_ARCHIVE_MODE` are set. `None` = normal live network loading. See [`archive`].
@@ -4143,12 +4170,14 @@ impl AppState {
 
                     let id = egui::Id::new("location_input");
                     let mut loc = self.location.borrow_mut();
-                    let (pal, omni_h, omni_px) = {
+                    let (pal, omni_h, omni_px, set_radius) = {
                         let s = self.browser.settings.borrow();
                         let tk = theme::density_tokens(s.theme.density);
-                        (s.theme.palette(), tk.omni_h, tk.omni_px)
+                        (s.theme.palette(), tk.omni_h, tk.omni_px, s.theme.radius)
                     };
-                    let rad = (omni_h * 0.5) as u8;
+                    // Corners follow the theme's set radius (not a forced full pill), capped at
+                    // half the bar height so a large radius can't overshoot into a stadium.
+                    let rad = set_radius.min((omni_h * 0.5) as u8);
                     // Ctrl/Cmd+K opens the command palette regardless of focus. Handled here on the
                     // egui side because the winit shortcut handler is bypassed while a text field
                     // (the omnibar) has focus, so Ctrl+K did nothing once the omnibar was focused.
@@ -4192,23 +4221,7 @@ impl AppState {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    egui::Frame::NONE
-                                        .stroke(egui::Stroke::new(1.0, pal.border))
-                                        .corner_radius(egui::CornerRadius::same(5))
-                                        .inner_margin(egui::Margin::symmetric(5, 1))
-                                        .show(ui, |ui| {
-                                            ui.label(
-                                                egui::RichText::new(if cfg!(target_os = "macos") {
-                                                    "⌘K"
-                                                } else {
-                                                    "Ctrl K"
-                                                })
-                                                .monospace()
-                                                .size(10.5)
-                                                .color(pal.muted),
-                                            );
-                                        });
-                                    ui.add_space(4.0);
+                                    // (The ⌘K/Ctrl K keycap hint was removed; the shortcut still works.)
                                     let starred = self
                                         .focused_pane()
                                         .tabs
@@ -4857,32 +4870,36 @@ impl AppState {
         let order = self.tab_order();
         let mut rects: Vec<egui::Rect> = Vec::with_capacity(order.len());
         let mut pending: Option<TabAction> = None;
-        let (fill, tab_max_w, tab_h) = {
+        let (fill, tab_max_w, tab_h, set_radius) = {
             let s = self.browser.settings.borrow();
             let tk = theme::density_tokens(s.theme.density);
             (
                 s.theme.tab_fit == theme::TabFit::Fill,
                 s.theme.tab_max_w as f32,
                 tk.tab_h,
+                s.theme.radius,
             )
         };
         let n = order.len().max(1) as f32;
 
-        // Frame with a 0px TOP margin (the default panel frame's 2px top, plus the toolbar's bottom
-        // margin, formed the dark `bg2` gap over the tabs). exact_height pins the strip to the tab
-        // height (+ the 2px bottom margin) so the panel doesn't also grow past the pills.
+        // Frame with 0px top AND bottom margins (any top margin re-forms the dark `bg2` gap over the
+        // tabs; any bottom margin is a dead strip between the tabs and the page). exact_height pins
+        // the strip to exactly the tab height so the panel doesn't grow past the pills either way.
         let outer = egui::TopBottomPanel::top("tabs")
             .frame(
                 egui::Frame::default()
                     .fill(ctx.global_style().visuals.panel_fill)
+                    // left: 2 puts the first tab's favicon in the same column as the toolbar's
+                    // back/forward icons above (they start at frame left 6 + the button's own
+                    // inset), instead of the old dead 8px gutter to the left of the tabs.
                     .inner_margin(egui::Margin {
-                        left: 8,
+                        left: 2,
                         right: 8,
                         top: 0,
-                        bottom: 2,
+                        bottom: 0,
                     }),
             )
-            .exact_height(tab_h + 2.0)
+            .exact_height(tab_h)
             .show_separator_line(false)
             .show(ctx, |ui| {
             // In "fill" mode tabs share the strip width evenly (clamped); "fit" uses content width.
@@ -4906,10 +4923,8 @@ impl AppState {
                         ui.with_layout(
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
-                                let mut last_bottom = ui.max_rect().bottom();
                                 for &i in &order {
                                     let (act, resp) = self.tab_row(ui, i, active, false, fw);
-                                    last_bottom = resp.rect.bottom();
                                     rects.push(resp.rect);
                                     if resp.hovered() && i != active {
                                         self.draw_tab_preview(ui, i, resp.rect, false);
@@ -4921,25 +4936,32 @@ impl AppState {
                                         pending = Some(act);
                                     }
                                 }
-                                // New-tab button, just right of the last tab: a square cell sized
-                                // to the tab height so the `+` sits equidistant from top, bottom
-                                // and (via the equal left gap) the tab.
-                                let h = (last_bottom - ui.max_rect().top()).clamp(28.0, 44.0);
-                                ui.add_space((h * 0.28).round());
-                                let (rect, resp) =
-                                    ui.allocate_exact_size(egui::vec2(h, h), egui::Sense::click());
+                                // New-tab button, just right of the last tab: a square cell the
+                                // exact height of a tab. The `+` is drawn at the cell center and the
+                                // hover fill is a symmetric inset, so its top/bottom/left/right
+                                // margins are all equal; the cell is vertically centered in the
+                                // strip alongside the tabs (Align::Center), so it lines up with them.
+                                ui.add_space(4.0);
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    egui::vec2(tab_h, tab_h),
+                                    egui::Sense::click(),
+                                );
                                 let resp = resp.on_hover_text("New tab (Ctrl+T)");
                                 let c = if resp.hovered() { pal.text } else { pal.muted };
                                 let p = ui.painter();
                                 if resp.hovered() {
+                                    // Equal inset on all four sides; corner follows the set radius,
+                                    // capped so it can't over-round the small square.
+                                    let inset = (tab_h * 0.14).round();
+                                    let nt_rad = set_radius.min(((tab_h - 2.0 * inset) * 0.5) as u8);
                                     p.rect_filled(
-                                        rect.shrink(4.0),
-                                        egui::CornerRadius::same(7),
+                                        rect.shrink(inset),
+                                        egui::CornerRadius::same(nt_rad),
                                         pal.elev,
                                     );
                                 }
                                 let cc = rect.center();
-                                let s = (h * 0.22).round();
+                                let s = (tab_h * 0.20).round();
                                 let st = egui::Stroke::new(1.9, c);
                                 p.line_segment(
                                     [egui::pos2(cc.x - s, cc.y), egui::pos2(cc.x + s, cc.y)],
@@ -6707,11 +6729,50 @@ impl AppState {
         clients.retain_mut(|c| writeln!(c, "{line}").is_ok());
     }
 
-    /// Forward a mouse/keyboard/wheel input to the active page webview.
-    fn forward_to_page(&self, event: InputEvent) {
-        if let Some(tab) = self.active_tab() {
-            tab.notify_input_event(event);
+    /// Forward a mouse/keyboard/wheel input to the active page webview. Returns the engine's
+    /// `InputEventId` for the event (used to correlate the page's verdict in
+    /// `notify_input_event_handled`), or `None` if there is no active tab to receive it.
+    fn forward_to_page(&self, event: InputEvent) -> Option<InputEventId> {
+        self.active_tab().map(|tab| tab.notify_input_event(event))
+    }
+
+    /// Run an overridable (tier-2) keyboard shortcut — either immediately (when there is no page to
+    /// forward the key to, or a dialog/omnibar already owns it) or from `notify_input_event_handled`
+    /// once the page has declined to consume the key. See [`KeyShortcut`].
+    fn run_key_shortcut(&self, shortcut: KeyShortcut) {
+        match shortcut {
+            KeyShortcut::CommandPalette => {
+                *self.location.borrow_mut() = ">".to_string();
+                self.location_dirty.set(true);
+                self.focus_omnibox.set(true);
+            }
+            KeyShortcut::Bookmark => self.toggle_bookmark_active(),
+            KeyShortcut::Find => {
+                self.find_open.set(true);
+                self.find_focus.set(true);
+            }
+            KeyShortcut::History => {
+                if let (Ok(url), Some(tab)) = (Url::parse("gator://history"), self.active_tab()) {
+                    self.location_dirty.set(false);
+                    tab.load(url);
+                }
+            }
+            KeyShortcut::Downloads => {
+                if let (Ok(url), Some(tab)) = (Url::parse("gator://downloads"), self.active_tab()) {
+                    self.location_dirty.set(false);
+                    tab.load(url);
+                }
+            }
+            KeyShortcut::DevTools => {
+                self.show_console.set(!self.show_console.get());
+                self.console_filter_focus.set(self.show_console.get());
+            }
+            KeyShortcut::ZoomIn => self.zoom_in(),
+            KeyShortcut::ZoomOut => self.zoom_out(),
+            KeyShortcut::ZoomReset => self.zoom_reset(),
+            KeyShortcut::ToggleSplit => self.toggle_split(),
         }
+        self.window.request_redraw();
     }
 
     /// Device-px y at which the page area begins (below the chrome).
@@ -6746,6 +6807,25 @@ impl AppState {
 impl WebViewDelegate for AppState {
     fn notify_new_frame_ready(&self, _webview: WebView) {
         self.window.request_redraw();
+    }
+
+    /// The page has finished processing an input event we forwarded. For overridable (tier-2)
+    /// keyboard shortcuts, this is the verdict: run our shortcut only if the page did NOT consume
+    /// the key — i.e. it neither called `preventDefault` nor let Servo's own `<input>` handler eat
+    /// it. Mirrors how Chrome runs a browser accelerator only for unhandled key events.
+    fn notify_input_event_handled(
+        &self,
+        _webview: WebView,
+        event_id: InputEventId,
+        result: InputEventResult,
+    ) {
+        if let Some(shortcut) = self.pending_shortcuts.borrow_mut().remove(&event_id) {
+            if !result
+                .intersects(InputEventResult::DefaultPrevented | InputEventResult::Consumed)
+            {
+                self.run_key_shortcut(shortcut);
+            }
+        }
     }
 
     /// The page changed the CSS cursor under the pointer (e.g. a link → pointer, text → I-beam).
@@ -7603,6 +7683,8 @@ fn open_window(
         page_cursor: Cell::new(CursorIcon::Default),
         ctrl: Cell::new(false),
         shift: Cell::new(false),
+        alt: Cell::new(false),
+        pending_shortcuts: RefCell::new(HashMap::new()),
         weak_self: RefCell::new(Weak::new()),
         archive: archive::ResourceArchive::from_env(),
         wants_close: Cell::new(false),
@@ -7849,6 +7931,7 @@ impl ApplicationHandler<WakeUp> for App {
             WindowEvent::ModifiersChanged(m) => {
                 state.ctrl.set(m.state().control_key());
                 state.shift.set(m.state().shift_key());
+                state.alt.set(m.state().alt_key());
             }
             _ => {}
         }
@@ -8036,8 +8119,31 @@ impl ApplicationHandler<WakeUp> for App {
             WindowEvent::KeyboardInput {
                 event: key_event, ..
             } => {
-                // Ctrl-based shortcuts are handled here and not forwarded.
-                if matches!(key_event.state, ElementState::Pressed) && state.ctrl.get() {
+                // ── Keyboard model (mirrors Chrome's two tiers) ─────────────────────────────────
+                let pressed = matches!(key_event.state, ElementState::Pressed);
+                // Modifiers forwarded to the page so its own keydown handlers + text-editing
+                // shortcuts see the real chord (Ctrl+A/C/X/V — LYK-1309 — and site shortcuts).
+                let modifiers = {
+                    let mut m = Modifiers::empty();
+                    if state.ctrl.get() {
+                        m |= Modifiers::CONTROL;
+                    }
+                    if state.shift.get() {
+                        m |= Modifiers::SHIFT;
+                    }
+                    if state.alt.get() {
+                        m |= Modifiers::ALT;
+                    }
+                    m
+                };
+
+                // A plain Ctrl / Ctrl+Shift chord (never with Alt — adding Alt makes it a different,
+                // non-reserved combo that belongs to the page, e.g. crossdraw.app's Ctrl+Shift+Alt+N).
+                if pressed && state.ctrl.get() && !state.alt.get() {
+                    // Tier 1 — RESERVED shortcuts: tab/window lifecycle, tab switching, quit, reload
+                    // and the omnibox escape hatch. Handled here and NEVER delivered to the page, so a
+                    // hostile or buggy page can't trap the user (block closing a tab, opening a window,
+                    // switching away, quitting).
                     match &key_event.logical_key {
                         WinitKey::Character(c) if c.eq_ignore_ascii_case("t") => {
                             if state.shift.get() {
@@ -8061,19 +8167,6 @@ impl ApplicationHandler<WakeUp> for App {
                             state.window.request_redraw();
                             return;
                         }
-                        WinitKey::Character(c) if c.eq_ignore_ascii_case("k") => {
-                            // Command palette: prefill `>` and focus the omnibar.
-                            *state.location.borrow_mut() = ">".to_string();
-                            state.location_dirty.set(true);
-                            state.focus_omnibox.set(true);
-                            state.window.request_redraw();
-                            return;
-                        }
-                        WinitKey::Character(c) if c == "\\" => {
-                            // Toggle split view.
-                            state.toggle_split();
-                            return;
-                        }
                         WinitKey::Character(c) if c.eq_ignore_ascii_case("n") => {
                             // New OS window (queued; opened by the event loop on the next redraw).
                             state
@@ -8090,61 +8183,18 @@ impl ApplicationHandler<WakeUp> for App {
                             }
                             return;
                         }
-                        WinitKey::Character(c) if c.eq_ignore_ascii_case("d") => {
-                            state.toggle_bookmark_active();
-                            return;
-                        }
-                        WinitKey::Character(c) if c.eq_ignore_ascii_case("f") => {
-                            state.find_open.set(true);
-                            state.find_focus.set(true);
-                            state.window.request_redraw();
-                            return;
-                        }
-                        WinitKey::Character(c) if c.eq_ignore_ascii_case("h") => {
-                            if let (Ok(url), Some(tab)) =
-                                (Url::parse("gator://history"), state.active_tab())
-                            {
-                                state.location_dirty.set(false);
-                                tab.load(url);
+                        // Ctrl+1..9 select a tab (Ctrl+0 is zoom-reset, a tier-2 shortcut below).
+                        WinitKey::Character(c)
+                            if c.parse::<usize>().map(|n| (1..=9).contains(&n)).unwrap_or(false) =>
+                        {
+                            let n = c.parse::<usize>().unwrap_or(0);
+                            let len = state.focused_pane().tabs.borrow().len();
+                            if n == 9 && len > 0 {
+                                state.select_tab(state.focused.get(), len - 1);
+                            } else if (1..=8).contains(&n) && n <= len {
+                                state.select_tab(state.focused.get(), n - 1);
                             }
                             return;
-                        }
-                        WinitKey::Character(c) if c.eq_ignore_ascii_case("j") => {
-                            if state.shift.get() {
-                                // Ctrl+Shift+J: toggle the DevTools console panel.
-                                state.show_console.set(!state.show_console.get());
-                                state.console_filter_focus.set(state.show_console.get());
-                                state.window.request_redraw();
-                            } else if let (Ok(url), Some(tab)) =
-                                (Url::parse("gator://downloads"), state.active_tab())
-                            {
-                                state.location_dirty.set(false);
-                                tab.load(url);
-                            }
-                            return;
-                        }
-                        WinitKey::Character(c) if c == "=" || c == "+" => {
-                            state.zoom_in();
-                            return;
-                        }
-                        WinitKey::Character(c) if c == "-" || c == "_" => {
-                            state.zoom_out();
-                            return;
-                        }
-                        WinitKey::Character(c) if c == "0" => {
-                            state.zoom_reset();
-                            return;
-                        }
-                        WinitKey::Character(c) => {
-                            if let Ok(n) = c.parse::<usize>() {
-                                let len = state.focused_pane().tabs.borrow().len();
-                                if n == 9 && len > 0 {
-                                    state.select_tab(state.focused.get(), len - 1);
-                                } else if (1..=8).contains(&n) && n <= len {
-                                    state.select_tab(state.focused.get(), n - 1);
-                                }
-                                return;
-                            }
                         }
                         WinitKey::Named(NamedKey::Tab) => {
                             let len = state.focused_pane().tabs.borrow().len();
@@ -8161,20 +8211,73 @@ impl ApplicationHandler<WakeUp> for App {
                         }
                         _ => {}
                     }
+
+                    // Tier 2 — OVERRIDABLE shortcuts: palette, bookmark, find, history, downloads,
+                    // devtools, zoom, split. Forward the key to the page FIRST and run ours only if
+                    // the page doesn't consume it (see `notify_input_event_handled`). This lets web
+                    // apps own Ctrl+F etc. exactly like Chrome.
+                    let fallback = match &key_event.logical_key {
+                        WinitKey::Character(c) if c.eq_ignore_ascii_case("k") => {
+                            Some(KeyShortcut::CommandPalette)
+                        }
+                        WinitKey::Character(c) if c.eq_ignore_ascii_case("d") => {
+                            Some(KeyShortcut::Bookmark)
+                        }
+                        WinitKey::Character(c) if c.eq_ignore_ascii_case("f") => {
+                            Some(KeyShortcut::Find)
+                        }
+                        WinitKey::Character(c) if c.eq_ignore_ascii_case("h") => {
+                            Some(KeyShortcut::History)
+                        }
+                        WinitKey::Character(c) if c.eq_ignore_ascii_case("j") => {
+                            Some(if state.shift.get() {
+                                KeyShortcut::DevTools
+                            } else {
+                                KeyShortcut::Downloads
+                            })
+                        }
+                        WinitKey::Character(c) if c == "=" || c == "+" => Some(KeyShortcut::ZoomIn),
+                        WinitKey::Character(c) if c == "-" || c == "_" => Some(KeyShortcut::ZoomOut),
+                        WinitKey::Character(c) if c == "0" => Some(KeyShortcut::ZoomReset),
+                        WinitKey::Character(c) if c == "\\" => Some(KeyShortcut::ToggleSplit),
+                        _ => None,
+                    };
+                    if let Some(shortcut) = fallback {
+                        // Forward to the page unless egui already owns the key (omnibar/find focused),
+                        // a dialog is up, or there is no page — in those cases run ours immediately.
+                        let forwarded = if resp.consumed || dialog_open {
+                            None
+                        } else {
+                            winit_key_to_servo(&key_event.logical_key).and_then(|key| {
+                                let mut ke = KeyboardEvent::from_state_and_key(KeyState::Down, key);
+                                ke.event.modifiers = modifiers;
+                                state.forward_to_page(InputEvent::Keyboard(ke))
+                            })
+                        };
+                        match forwarded {
+                            Some(id) => {
+                                let mut pend = state.pending_shortcuts.borrow_mut();
+                                // Defensive bound: if verdicts ever stop arriving (tab torn down
+                                // mid-flight), don't let the map grow without limit.
+                                if pend.len() > 128 {
+                                    pend.clear();
+                                }
+                                pend.insert(id, shortcut);
+                            }
+                            None => state.run_key_shortcut(shortcut),
+                        }
+                        return;
+                    }
                 }
-                // F5 reloads the active tab (Ctrl+R is handled above; F5 carries no Ctrl).
-                if matches!(key_event.state, ElementState::Pressed)
-                    && matches!(key_event.logical_key, WinitKey::Named(NamedKey::F5))
-                {
+                // F5 reloads the active tab (Ctrl+R is reserved above; F5 carries no Ctrl).
+                if pressed && matches!(key_event.logical_key, WinitKey::Named(NamedKey::F5)) {
                     if let Some(tab) = state.active_tab() {
                         tab.reload();
                     }
                     return;
                 }
-                // Esc closes a context menu, else exits page fullscreen.
-                if matches!(key_event.state, ElementState::Pressed)
-                    && matches!(key_event.logical_key, WinitKey::Named(NamedKey::Escape))
-                {
+                // Esc closes find, else a context menu, else exits page fullscreen.
+                if pressed && matches!(key_event.logical_key, WinitKey::Named(NamedKey::Escape)) {
                     if state.find_open.get() {
                         state.find_close();
                         return;
@@ -8191,24 +8294,14 @@ impl ApplicationHandler<WakeUp> for App {
                         return;
                     }
                 }
+                // Everything else → the page (both key-down and key-up).
                 if !(resp.consumed || dialog_open) {
                     if let Some(key) = winit_key_to_servo(&key_event.logical_key) {
                         let key_state = match key_event.state {
                             ElementState::Pressed => KeyState::Down,
                             ElementState::Released => KeyState::Up,
                         };
-                        // Carry the active modifiers so the page's text editing shortcuts fire.
-                        // Without this, swervo's textinput ShortcutMatcher never sees CONTROL and
-                        // Ctrl+A/C/X/V fall through to typing the literal letter (LYK-1309).
-                        let mut modifiers = Modifiers::empty();
-                        if state.ctrl.get() {
-                            modifiers |= Modifiers::CONTROL;
-                        }
-                        if state.shift.get() {
-                            modifiers |= Modifiers::SHIFT;
-                        }
-                        let mut keyboard_event =
-                            KeyboardEvent::from_state_and_key(key_state, key);
+                        let mut keyboard_event = KeyboardEvent::from_state_and_key(key_state, key);
                         keyboard_event.event.modifiers = modifiers;
                         state.forward_to_page(InputEvent::Keyboard(keyboard_event));
                     }
