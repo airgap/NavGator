@@ -1961,6 +1961,97 @@ const DOM_PROBE_JS: &str = r#"(function(){try{var _o=XMLHttpRequest.prototype.op
 /// requestIdleCallback / cancelIdleCallback polyfill (LYK-1403). swervo exposes neither;
 /// this schedules the callback past the current turn (and a frame when available) with an
 /// IdleDeadline shim, honoring the `timeout` option. Injected with the WAAPI polyfill.
+/// Platform polyfills for a couple of commonly-used web APIs swervo lacks (found via a
+/// feature-detect scan): `scheduler.postTask`/`scheduler.yield` (used by React/Next
+/// schedulers) and `Element.checkVisibility`. Each self-gates off if native. Injected
+/// with the WAAPI + rIC polyfills at document-start.
+const PLATFORM_POLYFILLS_JS: &str = r#"(function () {
+"use strict";
+try {
+if (typeof self.scheduler === "undefined" || typeof self.scheduler.postTask !== "function") {
+var chan = typeof MessageChannel === "function" ? new MessageChannel() : null;
+var flushQueued = false;
+var pumps = [];
+if (chan) chan.port1.onmessage = function () { var f = pumps.shift(); if (f) f(); };
+function nextTick(fn) { if (chan) { pumps.push(fn); chan.port2.postMessage(0); } else setTimeout(fn, 0); }
+var PRIOS = ["user-blocking", "user-visible", "background"];
+var queues = { "user-blocking": [], "user-visible": [], background: [] };
+function schedule() {
+if (flushQueued) return;
+flushQueued = true;
+nextTick(dispatch);
+}
+function dispatch() {
+flushQueued = false;
+for (var i = 0; i < PRIOS.length; i++) {
+var q = queues[PRIOS[i]];
+if (q.length) { var task = q.shift(); task(); break; }
+}
+for (var j = 0; j < PRIOS.length; j++) if (queues[PRIOS[j]].length) { schedule(); break; }
+}
+var scheduler = self.scheduler || {};
+scheduler.postTask = function (callback, options) {
+options = options || {};
+var priority = queues[options.priority] ? options.priority : "user-visible";
+var delay = options.delay > 0 ? options.delay : 0;
+var signal = options.signal;
+return new Promise(function (resolve, reject) {
+if (signal && signal.aborted) {
+reject(signal.reason || new DOMException("Aborted", "AbortError"));
+return;
+}
+var ran = false;
+function run() {
+if (ran) return; ran = true;
+if (signal) try { signal.removeEventListener("abort", onAbort); } catch (e) {}
+try { resolve(callback()); } catch (e) { reject(e); }
+}
+function onAbort() {
+if (ran) return; ran = true;
+var idx = queues[priority].indexOf(run);
+if (idx >= 0) queues[priority].splice(idx, 1);
+reject(signal.reason || new DOMException("Aborted", "AbortError"));
+}
+if (signal) try { signal.addEventListener("abort", onAbort); } catch (e) {}
+function enqueue() { queues[priority].push(run); schedule(); }
+if (delay > 0) setTimeout(enqueue, delay); else enqueue();
+});
+};
+if (typeof scheduler.yield !== "function") {
+scheduler.yield = function () {
+return new Promise(function (resolve) {
+queues["user-visible"].push(resolve); schedule();
+});
+};
+}
+self.scheduler = scheduler;
+}
+} catch (e) { try { console.log("NGPLAT scheduler err " + e); } catch (e2) {} }
+try {
+if (typeof Element.prototype.checkVisibility !== "function") {
+Element.prototype.checkVisibility = function (options) {
+options = options || {};
+var el = this;
+if (!el.isConnected) return false;
+var node = el;
+while (node && node.nodeType === 1) {
+var cs;
+try { cs = getComputedStyle(node); } catch (e) { return false; }
+if (!cs) break;
+if (cs.display === "none") return false;
+if (cs.contentVisibility === "hidden") return false;
+if ((options.visibilityProperty || options.checkVisibilityCSS) &&
+(cs.visibility === "hidden" || cs.visibility === "collapse")) return false;
+if ((options.opacityProperty || options.checkOpacity) && parseFloat(cs.opacity) === 0) return false;
+node = node.parentElement;
+}
+if (el.getClientRects && el.getClientRects().length === 0) return false;
+return true;
+};
+}
+} catch (e) { try { console.log("NGPLAT checkVisibility err " + e); } catch (e2) {} }
+})();"#;
+
 const RIC_POLYFILL_JS: &str = r#"(function () {
 "use strict";
 if (typeof window.requestIdleCallback === "function" &&
@@ -6512,6 +6603,7 @@ impl AppState {
         // place when a page calls it; it self-gates off if native WAAPI is functional.
         ucm.add_script(Rc::new(UserScript::new(WAAPI_POLYFILL_JS.to_string(), None)));
         ucm.add_script(Rc::new(UserScript::new(RIC_POLYFILL_JS.to_string(), None)));
+        ucm.add_script(Rc::new(UserScript::new(PLATFORM_POLYFILLS_JS.to_string(), None)));
         if std::env::var_os("NAVGATOR_DOMPROBE").is_some() {
             // Diagnostic: run the DOM probe at document-start so its +3s/+6s snapshots fire
             // even when the page never reaches LoadStatus::Complete.
