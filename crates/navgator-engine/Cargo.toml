@@ -21,11 +21,11 @@ description = "The only navgator crate that touches the Servo fork — quarantin
 # DEFAULT features stay on (baked-in-resources, clipboard, js_jit). `media-gstreamer` (for
 # <video>/<audio> decode) is enabled per-target below — desktop only, since Android has no
 # desktop GStreamer. The stylo and webrender forks are wired via the workspace-root `[patch]` tables.
-servo = { git = "https://github.com/airgap/swervo", rev = "2c50320a8f2488621358cd45c4ffef80ebf18cb6" }
+servo = { git = "https://github.com/airgap/swervo", rev = "4c2b2ad724b5c72d2dde92f150f20d86ab65b1ac" }
 
 # servo-embedder-traits (lib name `embedder_traits`): EventLoopWaker lives here and
 # isn't re-exported by `servo`. Same rev as `servo`.
-embedder_traits = { git = "https://github.com/airgap/swervo", rev = "2c50320a8f2488621358cd45c4ffef80ebf18cb6", package = "servo-embedder-traits" }
+embedder_traits = { git = "https://github.com/airgap/swervo", rev = "4c2b2ad724b5c72d2dde92f150f20d86ab65b1ac", package = "servo-embedder-traits" }
 
 # `http` (HeaderMap/StatusCode/HeaderValue) — needed to build WebResourceResponse for the
 # gator:// internal-page interception. Unifies with the engine's own http (servo uses 1.x).
@@ -35,4 +35,4 @@ http = "1"
 # Android has no desktop GStreamer — the engine builds without it there (Android media is a
 # future servo-media backend). Cargo unions these features onto the base `servo` dep above.
 [target.'cfg(not(target_os = "android"))'.dependencies]
-servo = { git = "https://github.com/airgap/swervo", rev = "2c50320a8f2488621358cd45c4ffef80ebf18cb6", features = ["media-gstreamer"] }
+servo = { git = "https://github.com/airgap/swervo", rev = "4c2b2ad724b5c72d2dde92f150f20d86ab65b1ac", features = ["media-gstreamer"] }
