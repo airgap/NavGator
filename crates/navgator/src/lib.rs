@@ -1639,7 +1639,13 @@ fn navgator_preferences() -> Preferences {
     p.dom_cookiestore_enabled = true;
     // Cache API (window.caches / Cache / CacheStorage) — storage-thread-backed, SQLite
     // persistence in the profile dir (LYK-1365 Phase 1).
-    p.dom_cache_api_enabled = true; // CookieStore API (async cookie read/write)
+    p.dom_cache_api_enabled = true;
+    // ServiceWorker engine support (LYK-1365): registration+lifecycle work and FetchEvent
+    // interception is wired, but the pref stays off until the Phase-3 end-to-end validation.
+    // Set NAVGATOR_SW=1 to test.
+    if std::env::var_os("NAVGATOR_SW").is_some() {
+        p.dom_serviceworker_enabled = true;
+    } // CookieStore API (async cookie read/write)
     p.dom_wakelock_enabled = true; // Screen Wake Lock (navigator.wakeLock.request)
     // CSS Masking: stylo gates mask-* parsing behind `layout.unimplemented`. swervo now paints
     // mask-image (single-layer alpha mask → display_list mask clip), so opt in to parsing it.
