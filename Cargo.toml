@@ -21,14 +21,14 @@ lto = "thin"
 # stylo fork now carries the `background-clip: text` keyword (LYK-1296) + light-dark()/dark system colors (LYK-1250);
 # Cargo honours these workspace-root patches across the entire (swervo-transitive) graph.
 [patch."https://github.com/servo/stylo"]
-selectors            = { git = "https://github.com/airgap/stylo", rev = "ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700" }
-servo_arc            = { git = "https://github.com/airgap/stylo", rev = "ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700" }
-stylo                = { git = "https://github.com/airgap/stylo", rev = "ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700" }
-stylo_atoms          = { git = "https://github.com/airgap/stylo", rev = "ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700" }
-stylo_dom            = { git = "https://github.com/airgap/stylo", rev = "ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700" }
-stylo_malloc_size_of = { git = "https://github.com/airgap/stylo", rev = "ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700" }
-stylo_static_prefs   = { git = "https://github.com/airgap/stylo", rev = "ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700" }
-stylo_traits         = { git = "https://github.com/airgap/stylo", rev = "ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700" }
+selectors            = { git = "https://github.com/airgap/stylo", rev = "e892e3ba2e43be561ff2b2b8de08d005f89d9746" }
+servo_arc            = { git = "https://github.com/airgap/stylo", rev = "e892e3ba2e43be561ff2b2b8de08d005f89d9746" }
+stylo                = { git = "https://github.com/airgap/stylo", rev = "e892e3ba2e43be561ff2b2b8de08d005f89d9746" }
+stylo_atoms          = { git = "https://github.com/airgap/stylo", rev = "e892e3ba2e43be561ff2b2b8de08d005f89d9746" }
+stylo_dom            = { git = "https://github.com/airgap/stylo", rev = "e892e3ba2e43be561ff2b2b8de08d005f89d9746" }
+stylo_malloc_size_of = { git = "https://github.com/airgap/stylo", rev = "e892e3ba2e43be561ff2b2b8de08d005f89d9746" }
+stylo_static_prefs   = { git = "https://github.com/airgap/stylo", rev = "e892e3ba2e43be561ff2b2b8de08d005f89d9746" }
+stylo_traits         = { git = "https://github.com/airgap/stylo", rev = "e892e3ba2e43be561ff2b2b8de08d005f89d9746" }
 
 # webrender is consumed from crates.io (0.69 / 0.2.2); redirect to our fork's 0.69-branch HEAD.
 [patch.crates-io]
