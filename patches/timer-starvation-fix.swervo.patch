@@ -1,0 +1,62 @@
+diff --git a/components/script/timers.rs b/components/script/timers.rs
+index cfbe9546b78..6f59d68aefb 100644
+--- a/components/script/timers.rs
++++ b/components/script/timers.rs
+@@ -325,22 +325,35 @@ impl OneshotTimers {
+     /// <https://html.spec.whatwg.org/multipage/#timer-initialisation-steps>
+     pub(crate) fn fire_timer(&self, id: TimerEventId, global: &GlobalScope, cx: &mut JSContext) {
+         // Step 9.2. If id does not exist in global's map of setTimeout and setInterval IDs, then abort these steps.
+-        let expected_id = self.expected_event_id.get();
+-        if expected_id != id {
+-            debug!(
+-                "ignoring timer fire event {:?} (expected {:?})",
+-                id, expected_id
+-            );
++        // A timer event is tagged with the `expected_event_id` that was current when it was
++        // scheduled. A *stale* event (superseded by a later `schedule_timer_call`, e.g. because a
++        // sooner timer was added) previously returned here immediately — running none of the timers
++        // that had genuinely come due and not rescheduling. Under a workload that schedules timers
++        // faster than the shortest delay (rAF shims, animation/poll loops — duolingo is one), every
++        // in-flight event becomes stale before it fires, so longer timers were starved forever.
++        //
++        // Instead, always dispatch the timers that are actually due below (each is removed from the
++        // queue as it runs, so a later duplicate event finds nothing to do — no double firing). Only
++        // the current, non-stale event reschedules, so we don't spin on repeated rescheduling.
++        let is_stale = self.expected_event_id.get() != id;
++
++        if self.suspended_since.get().is_some() {
+             return;
+         }
+ 
+-        assert!(self.suspended_since.get().is_none());
+-
+         let base_time = self.base_time();
+ 
+-        // Since the event id was the expected one, at least one timer should be due.
+-        if base_time < self.timers.borrow().back().unwrap().scheduled_for {
+-            warn!("Unexpected timing!");
++        // If the soonest timer isn't due yet (a stale event can fire ahead of its timer), there is
++        // nothing to run this turn; still ensure a fresh event is pending for the soonest timer.
++        if self
++            .timers
++            .borrow()
++            .back()
++            .is_none_or(|timer| base_time < timer.scheduled_for)
++        {
++            if !is_stale {
++                self.schedule_timer_call();
++            }
+             return;
+         }
+ 
+@@ -431,7 +444,9 @@ impl OneshotTimers {
+             }
+         }
+ 
+-        self.schedule_timer_call();
++        if !is_stale {
++            self.schedule_timer_call();
++        }
+     }
+ 
+     fn base_time(&self) -> Instant {
