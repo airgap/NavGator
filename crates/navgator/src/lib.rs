@@ -3087,6 +3087,53 @@ fn connect_allows(connect: &[String], host: &str) -> bool {
     })
 }
 
+/// Perform a GM_xmlhttpRequest (net.fetch) on a background thread (LYK-1257). Returns
+/// `(ok, json)`: `ok=true` with a `{status,statusText,responseText,responseHeaders,finalUrl}`
+/// object for any completed HTTP response (incl. 4xx/5xx — GM_xhr's onload fires for those too);
+/// `ok=false` with `{error}` for a transport failure (onerror). Redirects are disabled so the
+/// `@connect` host check (done on the initial host) can't be side-stepped by a cross-host redirect.
+fn gm_net_fetch(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    data: Option<&str>,
+) -> (bool, String) {
+    let agent = ureq::builder()
+        .redirects(0)
+        .timeout(std::time::Duration::from_secs(30))
+        .build();
+    let mut req = agent.request(method, url);
+    for (k, v) in headers {
+        req = req.set(k, v);
+    }
+    let result = match data {
+        Some(body) => req.send_string(body),
+        None => req.call(),
+    };
+    match result {
+        Ok(resp) | Err(ureq::Error::Status(_, resp)) => {
+            let status = resp.status();
+            let status_text = resp.status_text().to_string();
+            let final_url = resp.get_url().to_string();
+            let hdr_lines: Vec<String> = resp
+                .headers_names()
+                .iter()
+                .filter_map(|n| resp.header(n).map(|v| format!("{n}: {v}")))
+                .collect();
+            let text = resp.into_string().unwrap_or_default();
+            let obj = serde_json::json!({
+                "status": status,
+                "statusText": status_text,
+                "responseText": text,
+                "responseHeaders": hdr_lines.join("\r\n"),
+                "finalUrl": final_url,
+            });
+            (true, obj.to_string())
+        }
+        Err(e) => (false, serde_json::json!({ "error": format!("{e}") }).to_string()),
+    }
+}
+
 /// One-line, human-readable description of a userscript match pattern for the consent dialog /
 /// settings page. Pure formatting; mirrors the `userscripts` module's two pattern flavours.
 fn describe_match_pattern(p: &userscripts::MatchPattern) -> String {
@@ -3431,6 +3478,11 @@ struct BrowserState {
     /// Text queued by a userscript's `GM_setClipboard` (bridge `clipboard.set`); drained inside the
     /// egui pass, which is where the clipboard sink is reachable (LYK-1257).
     pending_clipboard: RefCell<Option<String>>,
+    /// In-flight `net.fetch` (GM_xmlhttpRequest) calls: global id -> (page webview, page callback id).
+    /// The off-thread fetch resolves via `WakeUp::GmFetchDone`, which looks the webview up here and
+    /// pushes the result through the page's `__ngGmResolve` (LYK-1257 net.fetch).
+    gm_fetch_pending: RefCell<HashMap<u64, (WebView, u64)>>,
+    gm_fetch_seq: Cell<u64>,
 }
 
 /// Per-window state: its OS window, render contexts, egui, panes/tabs, and all chrome/overlay
@@ -7046,6 +7098,19 @@ impl AppState {
     /// Fire-and-forget calls (`storage.set/delete`, `notify`, `tabs.open`, `clipboard.set`) work;
     /// data-returning calls (`storage.get/list`, `net.fetch`) need a native `evaluate_javascript`
     /// push-path back into the page — not yet built (issue #4). The capability gate holds regardless.
+    /// Resolve an off-thread net.fetch (GM_xmlhttpRequest) on the UI thread: look up the page +
+    /// callback id and push the result through `window.__ngGmResolve` (LYK-1257).
+    fn resolve_gm_fetch(&self, id: u64, ok: bool, json: String) {
+        let entry = self.browser.gm_fetch_pending.borrow_mut().remove(&id);
+        if let Some((webview, cb)) = entry {
+            let ok_js = if ok { "true" } else { "false" };
+            webview.evaluate_javascript(
+                format!("window.__ngGmResolve({}, {}, {})", cb, ok_js, js_string(&json)),
+                |_| {},
+            );
+        }
+    }
+
     fn handle_gm_bridge(&self, webview: &WebView, url: &Url) -> Vec<u8> {
         use userscripts::Permission;
         let deny = |msg: &str| -> Vec<u8> {
@@ -7152,8 +7217,35 @@ impl AppState {
                 if !connect_allows(&connect, &host) {
                     return deny("connect-not-allowed");
                 }
-                // Gate passed; the actual cross-origin fetch is not yet wired (needs async HTTP).
-                deny("net-fetch-unimplemented")
+                let Some(cb) = cb_id else { return deny("no-cb") };
+                // Off-thread fetch (the bridge handler runs on the UI thread and must stay
+                // non-blocking); the response is pushed back via WakeUp::GmFetchDone -> the page's
+                // __ngGmResolve, resolving the GM_xmlhttpRequest promise (LYK-1257 net.fetch).
+                let id = self.browser.gm_fetch_seq.get() + 1;
+                self.browser.gm_fetch_seq.set(id);
+                self.browser
+                    .gm_fetch_pending
+                    .borrow_mut()
+                    .insert(id, (webview.clone(), cb));
+                let method =
+                    args.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_uppercase();
+                let headers: Vec<(String, String)> = args
+                    .get("headers")
+                    .and_then(|v| v.as_object())
+                    .map(|o| {
+                        o.iter()
+                            .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let data = args.get("data").and_then(|v| v.as_str()).map(str::to_string);
+                let target = target.to_string();
+                let proxy = self.browser.event_proxy.clone();
+                std::thread::spawn(move || {
+                    let (ok, json) = gm_net_fetch(&method, &target, &headers, data.as_deref());
+                    let _ = proxy.send_event(WakeUp::GmFetchDone { id, ok, json });
+                });
+                return b"{\"ok\":true,\"async\":true}".to_vec();
             }
             "notify.show" => {
                 if !granted.contains(Permission::Notifications) {
@@ -9807,6 +9899,8 @@ impl ApplicationHandler<WakeUp> for App {
             pending_windows: RefCell::new(Vec::new()),
             pending_tabs: RefCell::new(Vec::new()),
             pending_clipboard: RefCell::new(None),
+            gm_fetch_pending: RefCell::new(HashMap::new()),
+            gm_fetch_seq: Cell::new(0),
         });
 
         // Restore the previous session's tabs unless the user passed an explicit URL on the
@@ -9856,6 +9950,7 @@ impl ApplicationHandler<WakeUp> for App {
                 WakeUp::Ipc(cmd) => state.handle_ipc(cmd),
                 WakeUp::SyncDone(outcome) => state.apply_sync(outcome),
                 WakeUp::CosmeticReady => state.flush_cosmetic(),
+                WakeUp::GmFetchDone { id, ok, json } => state.resolve_gm_fetch(id, ok, json),
                 WakeUp::Wake | WakeUp::Exit => {}
             }
         }
@@ -10362,6 +10457,8 @@ enum WakeUp {
     SyncDone(sync::SyncOutcome),
     /// Cosmetic-filter CSS is ready to inject (deferred out of the JS-eval callback).
     CosmeticReady,
+    /// An off-thread GM_xmlhttpRequest (net.fetch) finished; resolve it on the UI thread (LYK-1257).
+    GmFetchDone { id: u64, ok: bool, json: String },
 }
 
 impl EventLoopWaker for Waker {
