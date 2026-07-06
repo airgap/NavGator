@@ -118,6 +118,19 @@ pub fn desktop_main() -> Result<(), Box<dyn Error>> {
         match a.next().as_deref() {
             Some("--content-process") => {
                 let token = a.next().expect("--content-process requires an IPC token");
+                // Crash recovery (LYK-1410): relay this content process's panics to the engine's
+                // constellation. Servo only turns an `error!` log emitted while the thread is
+                // panicking into a `LogEntry::Panic` crash report (see FromScriptLogger), but
+                // `run_content_process` never installs a hook that logs panics — so a script-thread
+                // panic just hit stderr and the constellation never fired `notify_crashed`, leaving
+                // the tab dead with no crash page and no auto-reload. Install a hook that logs the
+                // panic (picked up by the BothLogger `set_logger` wires up inside run_content_process)
+                // and still runs the default hook for the stderr backtrace.
+                let default_hook = std::panic::take_hook();
+                std::panic::set_hook(Box::new(move |info| {
+                    log::error!("{info}");
+                    default_hook(info);
+                }));
                 run_content_process(token);
                 return Ok(());
             }
@@ -2843,6 +2856,14 @@ struct Tab {
     /// Set when Servo reports this tab's renderer pipeline panicked; cleared on the next
     /// fresh load. While set, the tab is showing the `gator://crash` recovery page.
     crashed: bool,
+    /// Crash-recovery loop-guard (LYK-1410): a renderer panic auto-reloads the same URL, but a
+    /// page that panics on load would crash-loop forever. `crash_reloads` counts consecutive
+    /// auto-reloads within a cooldown window; once it exceeds the budget we stop auto-reloading
+    /// and fall back to the manual `gator://crash` page. `last_crash` timestamps the last panic:
+    /// a crash more than the cooldown after the previous one is treated as fresh (counter resets),
+    /// so a tab that recovers and runs fine for a while gets a full budget again.
+    crash_reloads: u32,
+    last_crash: Option<std::time::Instant>,
     /// Pinned tabs sort ahead of the rest, render compact (favicon only), have no close
     /// button, and survive "close other tabs".
     pinned: bool,
@@ -4532,6 +4553,8 @@ impl AppState {
             favicon_pending: None,
             favicon_tex: None,
             crashed: false,
+                crash_reloads: 0,
+                last_crash: None,
             pinned: false,
             starred: false,
             ucm,
@@ -4582,6 +4605,8 @@ impl AppState {
                 favicon_pending: None,
                 favicon_tex: None,
                 crashed: false,
+                crash_reloads: 0,
+                last_crash: None,
                 pinned: false,
                 starred: false,
                 ucm,
@@ -6660,6 +6685,8 @@ impl AppState {
                 favicon_pending: None,
                 favicon_tex: None,
                 crashed: false,
+                crash_reloads: 0,
+                last_crash: None,
                 pinned: false,
                 starred: false,
                 ucm,
@@ -8232,31 +8259,66 @@ impl WebViewDelegate for AppState {
         });
     }
 
-    /// A pipeline in this tab's webview panicked. Mark the tab crashed and navigate it to the
-    /// internal `gator://crash` recovery page (served by `load_web_resource`), carrying the
-    /// crashed URL + panic reason so the page can offer a Reload-back-to-that-URL button.
-    /// `tab.load` re-spawns the pipeline, so the tab stays usable.
+    /// A pipeline in this tab's webview panicked. First panic auto-reloads the same URL (the
+    /// pipeline re-spawns, so the tab recovers transparently, LYK-1410). A loop-guard caps
+    /// consecutive auto-reloads within a cooldown window — a page that panics on load would
+    /// otherwise crash-loop — after which we fall back to the manual `gator://crash` recovery page
+    /// (carrying the crashed URL + panic reason so it can offer a Reload-back-to-that-URL button).
     fn notify_crashed(&self, webview: WebView, reason: String, _backtrace: Option<String>) {
+        /// Auto-reload at most this many times per crash-loop before showing the manual page.
+        const MAX_CRASH_RELOADS: u32 = 3;
+        /// Two crashes farther apart than this count as independent (the reload budget resets),
+        /// so a tab that recovers and runs a while gets a full budget for a later, unrelated crash.
+        const CRASH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(20);
+
         let Some((p, i)) = self.locate_tab(&webview) else {
             return;
         };
-        let crashed_url = {
+        // Decide under the borrow, act after releasing it. `reload_url = Some` → auto-reload that
+        // URL; `None` → show the crash page for `crashed_url`.
+        let (reload_url, crashed_url, attempt) = {
             let mut tabs = self.pane(p).tabs.borrow_mut();
-            tabs[i].crashed = true;
-            tabs[i].loading = false;
-            // Don't offer a reload back to our own crash page if it somehow crashes again.
-            if tabs[i].url.starts_with("gator://crash") {
-                String::new()
+            let tab = &mut tabs[i];
+            tab.loading = false;
+            let now = std::time::Instant::now();
+            let looping = tab
+                .last_crash
+                .is_some_and(|t| now.duration_since(t) < CRASH_COOLDOWN);
+            tab.crash_reloads = if looping { tab.crash_reloads + 1 } else { 1 };
+            tab.last_crash = Some(now);
+            // Never auto-reload our own crash page, an empty URL, or once the budget is spent.
+            let reloadable = !tab.url.is_empty() && !tab.url.starts_with("gator://crash");
+            if reloadable && tab.crash_reloads <= MAX_CRASH_RELOADS {
+                tab.crashed = false; // recovering, not parking on the crash page
+                (Some(tab.url.clone()), String::new(), tab.crash_reloads)
             } else {
-                tabs[i].url.clone()
+                tab.crashed = true;
+                let crashed_url = if tab.url.starts_with("gator://crash") {
+                    String::new()
+                } else {
+                    tab.url.clone()
+                };
+                (None, crashed_url, tab.crash_reloads)
             }
         };
-        let recovery = Url::parse_with_params(
-            "gator://crash",
-            &[("url", crashed_url.as_str()), ("reason", reason.as_str())],
-        );
-        if let Ok(recovery) = recovery {
-            webview.load(recovery);
+        match reload_url {
+            Some(url) => {
+                eprintln!(
+                    "navgator: renderer crashed, auto-reloading {url} (attempt {attempt}/{MAX_CRASH_RELOADS}): {reason}"
+                );
+                if let Ok(u) = Url::parse(&url) {
+                    webview.load(u);
+                }
+            },
+            None => {
+                let recovery = Url::parse_with_params(
+                    "gator://crash",
+                    &[("url", crashed_url.as_str()), ("reason", reason.as_str())],
+                );
+                if let Ok(recovery) = recovery {
+                    webview.load(recovery);
+                }
+            },
         }
         self.window.request_redraw();
     }
@@ -8507,6 +8569,15 @@ impl ApplicationHandler<WakeUp> for App {
                     // `NAVGATOR_SINGLE_PROCESS=1` to run single-process for diagnostics (so page JS
                     // console errors / panics land in the main log instead of a separate content proc).
                     multiprocess: std::env::var_os("NAVGATOR_SINGLE_PROCESS").is_none(),
+                    // Don't take the whole browser down when one pipeline panics (LYK-1410). Servo's
+                    // default `hard_fail: true` `process::exit(1)`s in the constellation's panic
+                    // handler — meant for test runners — which would bypass our graceful
+                    // `notify_crashed` recovery entirely. With this off, a content-process panic is
+                    // reported to the embedder (→ `notify_crashed` → auto-reload / crash page) and
+                    // the constellation spins up a replacement pipeline, keeping the rest of the
+                    // browser alive. In single-process mode this has no effect (a panic there is
+                    // unrecoverable regardless), so crash recovery implies multiprocess.
+                    hard_fail: false,
                     // OS-confine each content process (gaol: user namespace + chroot + seccomp).
                     // Opt-in (see sandbox_enabled): gaol panics unrecoverably where unprivileged
                     // namespaces are denied, which sysctls don't reliably predict.
