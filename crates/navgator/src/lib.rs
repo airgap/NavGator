@@ -1960,6 +1960,144 @@ s.textContent='html,body{margin:0;background:#111418;color:#e6e8eb}#ngreader{max
 document.head.appendChild(s);
 }catch(e){console.log('reader error '+e);}})()"#;
 
+/// Linkhint keyboard navigation (Vimium-style), LYK-1274. Injected at document-start into the
+/// main frame of every page. `f` overlays letter labels on every visible clickable element; type
+/// a label to follow it. `F` opens a link in a new tab, `y` yanks (copies) a link's URL, `Esc`
+/// cancels. Runs entirely in-page (no engine hooks) so it works regardless of page CSP. Only the
+/// activation keys are swallowed when idle, and never while an input/textarea/contenteditable is
+/// focused, so normal typing is untouched.
+const LINKHINT_JS: &str = r#"(function () {
+  "use strict";
+  if (window.top !== window.self) return;
+  var CHARS = "fjdkslaghrueiwovncm";
+  var layer = null, hints = [], typed = "", mode = null;
+  function editable(el) {
+    if (!el) return false;
+    var t = el.tagName;
+    return t === "INPUT" || t === "TEXTAREA" || t === "SELECT" || el.isContentEditable;
+  }
+  function clickables() {
+    var sel = "a[href], button, input:not([type=hidden]):not([disabled]), select, textarea, " +
+      "[role=button], [role=link], [onclick], [tabindex]:not([tabindex='-1']), summary, label[for]";
+    var els = Array.prototype.slice.call(document.querySelectorAll(sel));
+    var vw = window.innerWidth, vh = window.innerHeight, out = [];
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i], r = el.getBoundingClientRect();
+      if (r.width < 1 || r.height < 1) continue;
+      if (r.bottom < 0 || r.right < 0 || r.top > vh || r.left > vw) continue;
+      var st = window.getComputedStyle(el);
+      if (st.visibility === "hidden" || st.display === "none" || st.opacity === "0") continue;
+      out.push({ el: el, r: r });
+    }
+    return out;
+  }
+  function labelsFor(n) {
+    var len = 1, cap = CHARS.length;
+    while (cap < n) { len++; cap *= CHARS.length; }
+    var res = [];
+    for (var i = 0; i < n; i++) {
+      var s = "", x = i, k;
+      for (k = 0; k < len; k++) { s = CHARS[x % CHARS.length] + s; x = Math.floor(x / CHARS.length); }
+      res.push(s.toUpperCase());
+    }
+    return res;
+  }
+  function activate(m) {
+    var items = clickables();
+    if (!items.length) return;
+    mode = m; typed = ""; hints = [];
+    var labs = labelsFor(items.length);
+    layer = document.createElement("div");
+    layer.id = "ng-linkhint-layer";
+    layer.style.cssText = "position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647;pointer-events:none";
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i], lab = labs[i];
+      var b = document.createElement("div");
+      b.textContent = lab;
+      b.style.cssText = "position:fixed;left:" + Math.max(0, Math.round(it.r.left)) + "px;top:" +
+        Math.max(0, Math.round(it.r.top)) + "px;background:#fbec5d;color:#1a1a1a;" +
+        "border:1px solid #b9931f;border-radius:3px;padding:0 3px;font:bold 11px/1.4 monospace;" +
+        "box-shadow:0 1px 3px rgba(0,0,0,.35);letter-spacing:1px";
+      layer.appendChild(b);
+      hints.push({ el: it.el, label: lab, node: b });
+    }
+    document.documentElement.appendChild(layer);
+  }
+  function deactivate() {
+    if (layer && layer.parentNode) layer.parentNode.removeChild(layer);
+    layer = null; hints = []; typed = ""; mode = null;
+  }
+  function refilter() {
+    var matches = 0, last = null;
+    for (var i = 0; i < hints.length; i++) {
+      var h = hints[i];
+      if (h.label.indexOf(typed) === 0) {
+        h.node.style.display = "";
+        h.node.innerHTML = "<span style='opacity:.3'>" + typed + "</span>" + h.label.slice(typed.length);
+        matches++; last = h;
+      } else {
+        h.node.style.display = "none";
+      }
+    }
+    if (matches === 1 && last.label === typed) {
+      var el = last.el, m = mode;
+      deactivate();
+      perform(el, m);
+    } else if (matches === 0) { deactivate(); }
+  }
+  function flash(el) {
+    var r = el.getBoundingClientRect();
+    var f = document.createElement("div");
+    f.style.cssText = "position:fixed;left:" + r.left + "px;top:" + r.top + "px;width:" + r.width +
+      "px;height:" + r.height + "px;background:rgba(120,210,120,.45);z-index:2147483647;" +
+      "pointer-events:none;transition:opacity .45s";
+    document.documentElement.appendChild(f);
+    setTimeout(function () { f.style.opacity = "0"; }, 30);
+    setTimeout(function () { if (f.parentNode) f.parentNode.removeChild(f); }, 550);
+  }
+  function copyText(s) {
+    s = String(s).trim();
+    try { if (navigator.clipboard) navigator.clipboard.writeText(s); } catch (e) {}
+    try {
+      var ta = document.createElement("textarea");
+      ta.value = s;
+      ta.style.cssText = "position:fixed;top:0;left:0;opacity:0;pointer-events:none";
+      document.documentElement.appendChild(ta);
+      ta.focus(); ta.select();
+      document.execCommand("copy");
+      ta.parentNode.removeChild(ta);
+    } catch (e) {}
+  }
+  function perform(el, mode) {
+    try {
+      if (mode === "yank") {
+        copyText(el.href || el.getAttribute("href") || el.textContent || "");
+        flash(el);
+        return;
+      }
+      if (mode === "newtab" && el.href) { window.open(el.href, "_blank"); return; }
+      var t = el.tagName;
+      if (t === "INPUT" || t === "TEXTAREA" || t === "SELECT") { el.focus(); }
+      else { el.click(); }
+    } catch (e) {}
+  }
+  window.addEventListener("keydown", function (e) {
+    if (layer) {
+      e.preventDefault(); e.stopPropagation();
+      if (e.key === "Escape") { deactivate(); return; }
+      if (e.key === "Backspace") { typed = typed.slice(0, -1); refilter(); return; }
+      var c = (e.key || "").toUpperCase();
+      if (c.length === 1 && CHARS.toUpperCase().indexOf(c) >= 0) { typed += c; refilter(); }
+      return;
+    }
+    if (e.ctrlKey || e.altKey || e.metaKey) return;
+    if (editable(e.target) || editable(document.activeElement)) return;
+    if (e.key === "f") { e.preventDefault(); e.stopPropagation(); activate("follow"); }
+    else if (e.key === "F") { e.preventDefault(); e.stopPropagation(); activate("newtab"); }
+    else if (e.key === "y") { e.preventDefault(); e.stopPropagation(); activate("yank"); }
+  }, true);
+})()"#;
+
 /// DOM-render diagnostic, injected only when `NAVGATOR_DOMPROBE` is set. Snapshots DOM size +
 /// laid-out box count at load, +3s and +6s, logging to the console (captured with
 /// `NAVGATOR_CONSOLE`). Distinguishes a silent CSR hydration failure's two modes: DOM populated
@@ -6709,6 +6847,8 @@ impl AppState {
         ucm.add_script(Rc::new(UserScript::new(WAAPI_POLYFILL_JS.to_string(), None)));
         ucm.add_script(Rc::new(UserScript::new(RIC_POLYFILL_JS.to_string(), None)));
         ucm.add_script(Rc::new(UserScript::new(PLATFORM_POLYFILLS_JS.to_string(), None)));
+        // Linkhint keyboard navigation (Vimium-style): `f`/`F`/`y` overlay + follow (LYK-1274).
+        ucm.add_script(Rc::new(UserScript::new(LINKHINT_JS.to_string(), None)));
         if std::env::var_os("NAVGATOR_DOMPROBE").is_some() {
             // Diagnostic: run the DOM probe at document-start so its +3s/+6s snapshots fire
             // even when the page never reaches LoadStatus::Complete.
