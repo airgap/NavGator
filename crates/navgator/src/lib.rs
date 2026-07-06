@@ -60,6 +60,7 @@ use navgator_protocol::IpcCommand;
 mod sync;
 mod password;
 mod autofill;
+mod highlights;
 mod keyring_store;
 mod theme;
 mod fonts;
@@ -2048,6 +2049,61 @@ const AUTOFILL_FORM_JS: &str = r#"function(p){
   return n;
 }"#;
 
+/// Highlight the current text selection (LYK-1281). Called as `(HIGHLIGHT_JS)(color)`: wraps the
+/// selected range in a `<mark class=ng-hl>`, then returns a text-quote anchor
+/// `{text,prefix,suffix,color}` (or "" if nothing/uncollapsible is selected) for storage.
+const HIGHLIGHT_JS: &str = r#"function(color){
+  try{
+    var sel=window.getSelection();
+    if(!sel||sel.rangeCount===0||sel.isCollapsed)return "";
+    var text=sel.toString();
+    if(!text||!text.trim())return "";
+    var range=sel.getRangeAt(0);
+    var mark=document.createElement('mark');
+    mark.className='ng-hl';
+    mark.style.cssText='background:'+color+';color:inherit;border-radius:2px';
+    mark.appendChild(range.extractContents());
+    range.insertNode(mark);
+    sel.removeAllRanges();
+    var body=document.body?document.body.innerText:'';
+    var i=body.indexOf(text);
+    var prefix=i>=0?body.slice(Math.max(0,i-30),i):'';
+    var suffix=i>=0?body.slice(i+text.length,i+text.length+30):'';
+    return JSON.stringify({text:text,prefix:prefix,suffix:suffix,color:color});
+  }catch(e){return "";}
+}"#;
+
+/// Re-apply saved highlights on load (LYK-1281). Called as `(REAPPLY_JS)(anchorsJson)`: for each
+/// anchor, find the first un-highlighted text node containing its text and wrap it. Single-text-node
+/// matches only in v1 (fuzzy cross-node re-anchoring is a follow-up).
+const REAPPLY_JS: &str = r#"function(anchorsStr){
+  try{
+    var anchors=JSON.parse(anchorsStr);
+    for(var k=0;k<anchors.length;k++){apply(anchors[k]);}
+  }catch(e){}
+  function apply(a){
+    if(!a.text||!document.body)return;
+    var walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null);
+    var node;
+    while(node=walker.nextNode()){
+      if(node.parentNode&&node.parentNode.className==='ng-hl')continue;
+      var i=node.nodeValue.indexOf(a.text);
+      if(i>=0){
+        try{
+          var range=document.createRange();
+          range.setStart(node,i);range.setEnd(node,i+a.text.length);
+          var mark=document.createElement('mark');
+          mark.className='ng-hl';
+          mark.style.cssText='background:'+(a.color||'#fde68a')+';color:inherit;border-radius:2px';
+          mark.appendChild(range.extractContents());
+          range.insertNode(mark);
+        }catch(e){}
+        return;
+      }
+    }
+  }
+}"#;
+
 /// Read the active login form's username + password (for manual save). Returns JSON or "".
 const READ_FORM_JS: &str = r#"(function(){
   var pw=document.querySelector('input[type="password"]');
@@ -3293,6 +3349,7 @@ enum KeyShortcut {
     ZoomReset,
     ToggleSplit,
     Autofill,
+    Highlight,
 }
 
 /// Browser-global state shared by every window via `Rc<BrowserState>`: the single Servo engine
@@ -3351,6 +3408,8 @@ struct BrowserState {
     /// E2EE form-autofill profile (addresses + cards, LYK-1371). Shares the vault passphrase —
     /// unlocked/locked in lockstep with `password_store`.
     autofill_store: RefCell<autofill::AutofillStore>,
+    /// E2EE per-origin text highlights (LYK-1281). Also shares the vault passphrase.
+    highlight_store: RefCell<highlights::HighlightStore>,
     /// Result of the last bookmark import (shown in Settings).
     import_msg: RefCell<Option<String>>,
     event_proxy: EventLoopProxy<WakeUp>,
@@ -7829,9 +7888,10 @@ impl AppState {
     /// Unlock the E2EE password store with the passphrase (decrypts saved logins into memory).
     fn unlock_passwords(&self, passphrase: &str) {
         let result = self.browser.password_store.borrow_mut().unlock(passphrase);
-        // The autofill profile shares the vault passphrase — unlock it in lockstep (LYK-1371).
+        // The autofill profile + highlights share the vault passphrase — unlock in lockstep.
         if result.is_ok() {
             let _ = self.browser.autofill_store.borrow_mut().unlock(passphrase);
+            let _ = self.browser.highlight_store.borrow_mut().unlock(passphrase);
         }
         // On a successful unlock, persist the passphrase to the OS keyring iff the user opted in.
         // This is the only place (besides the checkbox-on path) the plaintext is written out, and
@@ -7930,6 +7990,77 @@ impl AppState {
             )
         };
         let js = format!("({})({})", AUTOFILL_FORM_JS, obj);
+        webview.evaluate_javascript(js, |_| {});
+    }
+
+    /// Highlight the active tab's current text selection (Ctrl+Shift+H, LYK-1281). Wraps the
+    /// selection in-page and stores a text-quote anchor per-origin in the E2EE highlight store, so
+    /// it re-draws on revisit. Prompts the vault-unlock overlay if the store is locked.
+    fn highlight_selection(&self) {
+        if !self.browser.highlight_store.borrow().is_unlocked() {
+            self.show_unlock.set(true);
+            self.window.request_redraw();
+            return;
+        }
+        let (webview, origin) = {
+            let tabs = self.focused_pane().tabs.borrow();
+            let Some(t) = tabs.get(self.focused_pane().active.get()) else {
+                return;
+            };
+            let Some(origin) = origin_of(&t.url) else {
+                return; // http(s) only
+            };
+            (t.webview.clone(), origin)
+        };
+        let js = format!("({})({})", HIGHLIGHT_JS, js_string("#fde68a"));
+        let me = self.weak_self.borrow().clone();
+        webview.evaluate_javascript(js, move |res| {
+            let Some(me) = me.upgrade() else {
+                return;
+            };
+            let Ok(JSValue::String(s)) = res else {
+                return;
+            };
+            if s.is_empty() {
+                return;
+            }
+            let Ok(hl) = serde_json::from_str::<highlights::Highlight>(&s) else {
+                return;
+            };
+            me.browser.highlight_store.borrow_mut().add(&origin, hl);
+            let pass = me.browser.password_store.borrow().passphrase().map(str::to_string);
+            if let Some(pass) = pass {
+                let _ = me.browser.highlight_store.borrow().save(&pass);
+            }
+            me.window.request_redraw();
+        });
+    }
+
+    /// Re-draw saved highlights on the just-loaded page (LYK-1281). No-op if the store is locked or
+    /// the origin has none.
+    fn reapply_highlights(&self, pane: usize, tab_idx: usize) {
+        if !self.browser.highlight_store.borrow().is_unlocked() {
+            return;
+        }
+        let (webview, origin) = {
+            let tabs = self.pane(pane).tabs.borrow();
+            let Some(t) = tabs.get(tab_idx) else {
+                return;
+            };
+            let Some(origin) = origin_of(&t.url) else {
+                return;
+            };
+            (t.webview.clone(), origin)
+        };
+        let anchors = {
+            let store = self.browser.highlight_store.borrow();
+            let hls = store.for_origin(&origin);
+            if hls.is_empty() {
+                return;
+            }
+            serde_json::to_string(hls).unwrap_or_default()
+        };
+        let js = format!("({})({})", REAPPLY_JS, js_string(&anchors));
         webview.evaluate_javascript(js, |_| {});
     }
 
@@ -8273,6 +8404,7 @@ impl AppState {
             KeyShortcut::Autofill => {
                 self.autofill_form(self.focused.get(), self.focused_pane().active.get());
             }
+            KeyShortcut::Highlight => self.highlight_selection(),
         }
         self.window.request_redraw();
     }
@@ -8818,6 +8950,7 @@ impl WebViewDelegate for AppState {
             }
             if matches!(status, LoadStatus::Complete) {
                 self.autofill(p, i);
+                self.reapply_highlights(p, i); // re-draw saved highlights (LYK-1281)
                 self.apply_cosmetic(p, i);
                 if let Some(t) = self.pane(p).tabs.borrow().get(i) {
                     if t.url.starts_with("http://") || t.url.starts_with("https://") {
@@ -9447,6 +9580,9 @@ impl ApplicationHandler<WakeUp> for App {
             autofill_store: RefCell::new(autofill::AutofillStore::load(
                 config_file("autofill.enc").unwrap_or_else(|| PathBuf::from("autofill.enc")),
             )),
+            highlight_store: RefCell::new(highlights::HighlightStore::load(
+                config_file("highlights.enc").unwrap_or_else(|| PathBuf::from("highlights.enc")),
+            )),
             import_msg: RefCell::new(None),
             event_proxy,
             pending_windows: RefCell::new(Vec::new()),
@@ -9892,9 +10028,13 @@ impl ApplicationHandler<WakeUp> for App {
                         WinitKey::Character(c) if c.eq_ignore_ascii_case("f") => {
                             Some(KeyShortcut::Find)
                         }
-                        WinitKey::Character(c) if c.eq_ignore_ascii_case("h") => {
-                            Some(KeyShortcut::History)
-                        }
+                        WinitKey::Character(c) if c.eq_ignore_ascii_case("h") => Some(
+                            if state.shift.get() {
+                                KeyShortcut::Highlight // Ctrl+Shift+H — highlight selection (LYK-1281)
+                            } else {
+                                KeyShortcut::History
+                            },
+                        ),
                         WinitKey::Character(c) if c.eq_ignore_ascii_case("j") => {
                             Some(if state.shift.get() {
                                 KeyShortcut::DevTools
