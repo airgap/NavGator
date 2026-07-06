@@ -4508,6 +4508,7 @@ impl AppState {
             self.load_favicons(ctx);
             if !self.fullscreen.get() {
                 self.draw_chrome(ctx);
+                self.draw_trust_tint(ctx);
             } else {
                 self.toolbar_height.set(0.0);
                 self.content_left.set(0.0);
@@ -5161,6 +5162,58 @@ impl AppState {
     }
 
     /// Toolbar (nav + address + window controls) and the tab strip.
+    /// Ambient trust HUD (LYK-1275): a thin colored strip along the top frame edge, coloured from
+    /// security truth for the active tab — RED when the vault holds a login for a look-alike host
+    /// (typosquat/phishing) but NOT this one; GREEN when you have a saved login for this exact
+    /// origin; AMBER when trackers were blocked on this page. Priority red > green > amber. Only a
+    /// native chrome can recolor its own frame from real origin truth — a page can't overdraw it.
+    fn draw_trust_tint(&self, ctx: &egui::Context) {
+        let (origin, host, blocked) = {
+            let tabs = self.focused_pane().tabs.borrow();
+            let Some(t) = tabs.get(self.focused_pane().active.get()) else {
+                return;
+            };
+            let Some(origin) = origin_of(&t.url) else {
+                return; // http(s) only — gator://, file:// etc. get no tint.
+            };
+            let Some(host) = Url::parse(&t.url).ok().and_then(|u| u.host_str().map(str::to_string))
+            else {
+                return;
+            };
+            (origin, host, !t.blocked.borrow().is_empty())
+        };
+        let tint = {
+            let store = self.browser.password_store.borrow();
+            let unlocked = store.is_unlocked();
+            let here = unlocked && !store.for_origin(&origin).is_empty();
+            let lookalike = unlocked
+                && !here
+                && store
+                    .all()
+                    .iter()
+                    .filter_map(|c| {
+                        Url::parse(&c.origin).ok().and_then(|u| u.host_str().map(str::to_string))
+                    })
+                    .any(|s| s != host && levenshtein(&s, &host) <= 2);
+            if lookalike {
+                egui::Color32::from_rgb(0xE5, 0x48, 0x4D) // red — look-alike/phishing
+            } else if here {
+                egui::Color32::from_rgb(0x3E, 0xCF, 0x8E) // green — known/trusted origin
+            } else if blocked {
+                egui::Color32::from_rgb(0xF5, 0xA5, 0x24) // amber — trackers blocked here
+            } else {
+                return;
+            }
+        };
+        let sr = ctx.screen_rect();
+        let strip = egui::Rect::from_min_size(sr.min, egui::vec2(sr.width(), 4.0));
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("trust_tint"),
+        ))
+        .rect_filled(strip, 0.0, tint);
+    }
+
     fn draw_chrome(&self, ctx: &egui::Context) {
         let frame = egui::Frame::default()
             .fill(ctx.global_style().visuals.window_fill)
