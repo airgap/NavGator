@@ -36,6 +36,10 @@ path = "src/main.rs"
 navgator-engine = { path = "../navgator-engine" }
 navgator-protocol = { path = "../navgator-protocol" }
 
+# The `log` facade — used only to install a content-process panic hook that relays panics to the
+# engine's constellation logger (crash recovery, LYK-1410). Version tracks the engine's own `log`.
+log = "0.4"
+
 # Windowing / geometry (versions matched to the engine's workspace).
 winit = "0.30.13"
 euclid = "0.22"
