@@ -37,6 +37,10 @@
   .grp > h2 { font-size:12px; text-transform:uppercase; letter-spacing:1.3px; color: var(--muted);
     font-weight:700; margin:0 0 12px; }
   .grp .note { color: var(--muted); font-size:13px; margin:-4px 0 12px; }
+  .updbanner { background: var(--panel); border:1px solid var(--accent); border-radius:10px;
+    padding:11px 14px; margin:0 0 14px; font-size:14px; }
+  .updbanner b { color: var(--accent); }
+  .updbanner a { color: var(--accent); font-weight:600; }
   .grp .note code { font-family:ui-monospace,monospace; }
   .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
 
@@ -167,6 +171,7 @@
         <p class="note" style="margin-top:12px">__ADS_BLOCKED__ ad/tracker request(s) blocked this session.</p>
       </div>
       <div class="grp"><h2>Software updates</h2>
+        __UPDATE_STATUS__
         <div class="row">__UPDATE_PILLS__</div>
         <p class="note" style="margin-top:12px">Currently on version __CURRENT_VERSION__. NavGator checks for a newer release in the background &mdash; it never downloads or installs on its own. <a href="gator://about">About &amp; update status</a></p>
       </div>

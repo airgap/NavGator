@@ -4721,6 +4721,23 @@ impl AppState {
             }))
             .collect();
         let ads_toggle = toggle_link("block_ads", s.block_ads, "privacy");
+        // When a newer build has been detected this session, surface it prominently here too (the
+        // ☰ menu dot leads here) — not just on gator://about (LYK-1495).
+        let update_status = match &*self.browser.update_info.borrow() {
+            Some((ver, url, _)) => {
+                let dl = if url.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" &mdash; <a href=\"{}\">Download</a>", html_escape(url))
+                };
+                format!(
+                    "<div class=\"updbanner\">&#11014; Update available: <b>{}</b>{}</div>",
+                    html_escape(ver),
+                    dl
+                )
+            }
+            None => String::new(),
+        };
         let update_pills: String = UPDATE_FREQS
             .iter()
             .map(|(k, label)| {
@@ -4892,6 +4909,7 @@ impl AppState {
             .replace("__SEARCH_VALUE__", &html_escape(&s.search))
             .replace("__ADS_TOGGLE__", &ads_toggle)
             .replace("__ADS_BLOCKED__", &blocked.to_string())
+            .replace("__UPDATE_STATUS__", &update_status)
             .replace("__UPDATE_PILLS__", &update_pills)
             .replace("__CURRENT_VERSION__", &build_version())
             .replace("__SYNC_BOOKMARKS__", &sync_bookmarks)
@@ -5939,8 +5957,21 @@ impl AppState {
                     let (drag_handle, _) =
                         ui.allocate_exact_size(egui::vec2(40.0, 24.0), egui::Sense::hover());
                     self.drag_rect.set(drag_handle);
-                    if icon_button(ui, true, "Settings", &pal, icon::menu).clicked() {
-                        self.navigate_from_omnibox("gator://settings");
+                    {
+                        let menu_resp = icon_button(ui, true, "Settings", &pal, icon::menu);
+                        if menu_resp.clicked() {
+                            self.navigate_from_omnibox("gator://settings");
+                        }
+                        // Update indicator (LYK-1495): a persistent green dot on the app menu when a
+                        // newer build has been detected — the toast is transient and the
+                        // gator://about banner is easy to miss, so this is the durable signal.
+                        // gator://settings (where ☰ leads) shows the details.
+                        if self.browser.update_info.borrow().is_some() {
+                            let p = ui.painter();
+                            let center = menu_resp.rect.right_top() + egui::vec2(-6.0, 6.0);
+                            p.circle_filled(center, 5.0, egui::Color32::from_rgb(0x3E, 0xCF, 0x8E));
+                            p.circle_stroke(center, 5.0, egui::Stroke::new(1.5, pal.bg));
+                        }
                     }
                     if icon_button(ui, true, "Customize appearance", &pal, icon::studio).clicked() {
                         self.navigate_from_omnibox("gator://settings#appearance");
