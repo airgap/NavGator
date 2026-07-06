@@ -247,6 +247,38 @@ fn save_permission_grants(m: &HashMap<(String, String), bool>) {
     let _ = std::fs::write(path, s);
 }
 
+/// Site Loadout (LYK-1271): per-origin sticky overrides for toggles that are otherwise global.
+/// Same on-disk shape as the permission ledger — `origin \t feature \t 1|0` per line, feature ∈
+/// {`force_dark`, `block_ads`}. An origin with no entry for a feature falls back to the global
+/// setting. Auto-applied on navigation; set from the ⌘K palette ("This site: …").
+fn load_site_loadouts() -> HashMap<(String, String), bool> {
+    let mut m = HashMap::new();
+    if let Some(text) = config_file("site_loadouts.tsv").and_then(|p| std::fs::read_to_string(p).ok())
+    {
+        for line in text.lines() {
+            let mut it = line.splitn(3, '\t');
+            if let (Some(o), Some(f), Some(v)) = (it.next(), it.next(), it.next()) {
+                m.insert((o.to_string(), f.to_string()), v.trim() == "1");
+            }
+        }
+    }
+    m
+}
+
+fn save_site_loadouts(m: &HashMap<(String, String), bool>) {
+    let Some(path) = config_file("site_loadouts.tsv") else {
+        return;
+    };
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let s: String = m
+        .iter()
+        .map(|((o, f), v)| format!("{}\t{}\t{}\n", o, f, if *v { "1" } else { "0" }))
+        .collect();
+    let _ = std::fs::write(path, s);
+}
+
 /// Pure parser for the session file (see `load_session` / `save_session`). Lines are URLs; a
 /// `#PANE1` marker switches subsequent URLs to pane 1; non-URL lines are skipped.
 fn parse_session(text: &str) -> (Vec<Url>, Vec<Url>) {
@@ -3261,6 +3293,9 @@ struct BrowserState {
     /// Permission ledger: persistent (origin, feature) → allow/deny grants, so a site asked once
     /// is never asked again. "Allow/Block always" persist here; "once" is not stored.
     permission_grants: RefCell<HashMap<(String, String), bool>>,
+    /// Site Loadout (LYK-1271): per-origin `(origin, feature)` → on/off overrides for otherwise
+    /// global toggles (force-dark, ad-blocking). Missing key ⇒ use the global setting.
+    site_loadouts: RefCell<HashMap<(String, String), bool>>,
     /// Cosmetic-filter CSS pending injection, deferred out of the eval callback to avoid
     /// re-entering Servo's JS evaluator. Each entry is `(webview, css)`.
     pending_cosmetic: RefCell<Vec<(WebView, String)>>,
@@ -5056,6 +5091,14 @@ impl AppState {
                 self.toggle_force_dark();
                 return;
             }
+            A::ToggleSiteDark => {
+                self.toggle_site_loadout("force_dark");
+                return;
+            }
+            A::ToggleSiteAdblock => {
+                self.toggle_site_loadout("block_ads");
+                return;
+            }
             A::ReaderMode => {
                 self.activate_reader_mode();
                 return;
@@ -5088,6 +5131,8 @@ impl AppState {
                 | A::OpenWhy
                 | A::OpenExport
                 | A::ToggleForceDark
+                | A::ToggleSiteDark
+                | A::ToggleSiteAdblock
                 | A::ReaderMode => {}
             }
             sync_legacy_theme(&mut s);
@@ -7864,11 +7909,68 @@ impl AppState {
     /// collect the page's class/id set, then inject a `<style>` hiding the matching selectors —
     /// generic rules are filtered to the page's actual classes/ids, so this stays cheap.
     /// Inject (or remove) the force-dark stylesheet on an http(s) page, per the current setting.
+    /// Effective per-origin value for a Site Loadout feature (LYK-1271): the origin's override if
+    /// set, else the global default. `global` is the fallback (the current global setting).
+    fn site_loadout(&self, origin: Option<&str>, feature: &str, global: bool) -> bool {
+        origin
+            .and_then(|o| {
+                self.browser
+                    .site_loadouts
+                    .borrow()
+                    .get(&(o.to_string(), feature.to_string()))
+                    .copied()
+            })
+            .unwrap_or(global)
+    }
+
+    fn effective_force_dark(&self, origin: Option<&str>) -> bool {
+        let global = self.browser.settings.borrow().force_dark;
+        self.site_loadout(origin, "force_dark", global)
+    }
+
+    fn effective_block_ads(&self, origin: Option<&str>) -> bool {
+        let global = self.browser.settings.borrow().block_ads;
+        self.site_loadout(origin, "block_ads", global)
+    }
+
+    /// Toggle a Site Loadout feature for the active tab's origin, persist it, and apply: force-dark
+    /// re-injects immediately; ad-blocking reloads so the network gate re-runs (LYK-1271).
+    fn toggle_site_loadout(&self, feature: &str) {
+        let (origin, webview, url) = {
+            let tabs = self.focused_pane().tabs.borrow();
+            match tabs.get(self.focused_pane().active.get()) {
+                Some(t) => (origin_of(&t.url), t.webview.clone(), t.url.clone()),
+                None => return,
+            }
+        };
+        let Some(origin) = origin else {
+            *self.browser.password_msg.borrow_mut() =
+                Some("Site loadouts apply to http(s) sites only.".into());
+            self.window.request_redraw();
+            return;
+        };
+        let global = match feature {
+            "force_dark" => self.browser.settings.borrow().force_dark,
+            "block_ads" => self.browser.settings.borrow().block_ads,
+            _ => false,
+        };
+        let key = (origin, feature.to_string());
+        let new_val = !self.browser.site_loadouts.borrow().get(&key).copied().unwrap_or(global);
+        self.browser.site_loadouts.borrow_mut().insert(key, new_val);
+        save_site_loadouts(&self.browser.site_loadouts.borrow());
+        match feature {
+            "force_dark" => self.apply_force_dark(&webview, &url),
+            "block_ads" => webview.reload(),
+            _ => {}
+        }
+        self.window.request_redraw();
+    }
+
     fn apply_force_dark(&self, webview: &WebView, url: &str) {
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             return; // gator:// pages are already themed — don't invert them.
         }
-        let on = self.browser.settings.borrow().force_dark;
+        let on = self.effective_force_dark(origin_of(url).as_deref());
         let js = if on { FORCE_DARK_JS } else { FORCE_DARK_OFF_JS };
         webview.evaluate_javascript(js.to_string(), |_| {});
     }
@@ -8253,11 +8355,15 @@ impl WebViewDelegate for AppState {
             // Ad/tracker blocking. This delegate already intercepts every load, so a matched
             // request is intercepted with an empty 204 instead of being fetched. `source` is the
             // requesting tab's URL, so first-vs-third-party rules resolve correctly.
-            if matches!(url.scheme(), "http" | "https") && self.browser.settings.borrow().block_ads {
-                let loc = self.locate_tab(&webview);
-                let source = loc
-                    .and_then(|(p, i)| self.pane(p).tabs.borrow().get(i).map(|t| t.url.clone()))
-                    .unwrap_or_default();
+            let loc = self.locate_tab(&webview);
+            let source = loc
+                .and_then(|(p, i)| self.pane(p).tabs.borrow().get(i).map(|t| t.url.clone()))
+                .unwrap_or_default();
+            // Ad-blocking respects the top-frame origin's Site Loadout override, else the global
+            // setting (LYK-1271) — so a trusted site can be exempted (or a site force-blocked).
+            if matches!(url.scheme(), "http" | "https")
+                && self.effective_block_ads(origin_of(&source).as_deref())
+            {
                 if let Ok(req) = adblock::request::Request::new(url.as_str(), &source, "other") {
                     if self.browser.adblock.check_network_request(&req).matched {
                         self.browser.adblock_blocked.set(self.browser.adblock_blocked.get() + 1);
@@ -8610,7 +8716,6 @@ impl WebViewDelegate for AppState {
             if matches!(status, LoadStatus::Complete) {
                 self.autofill(p, i);
                 self.apply_cosmetic(p, i);
-                let force_dark = self.browser.settings.borrow().force_dark;
                 if let Some(t) = self.pane(p).tabs.borrow().get(i) {
                     if t.url.starts_with("http://") || t.url.starts_with("https://") {
                         // Credential-firewall sensor (#19).
@@ -8622,9 +8727,10 @@ impl WebViewDelegate for AppState {
                             t.webview.evaluate_javascript(DOM_PROBE_JS.to_string(), |_| {});
                         }
                     }
-                    if force_dark {
-                        self.apply_force_dark(&t.webview, &t.url);
-                    }
+                    // Always reconcile force-dark: apply_force_dark itself resolves the effective
+                    // value (per-origin Site Loadout override, else global), so a per-site override
+                    // takes effect on navigation even when the global toggle is off (LYK-1271).
+                    self.apply_force_dark(&t.webview, &t.url);
                 }
             }
             if matches!(status, LoadStatus::Complete)
@@ -9224,6 +9330,7 @@ impl ApplicationHandler<WakeUp> for App {
             ),
             adblock_blocked: Cell::new(0),
             permission_grants: RefCell::new(load_permission_grants()),
+            site_loadouts: RefCell::new(load_site_loadouts()),
             pending_cosmetic: RefCell::new(Vec::new()),
             sync_status: RefCell::new(String::new()),
             syncing: Cell::new(false),

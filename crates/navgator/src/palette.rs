@@ -24,6 +24,8 @@ pub(crate) enum PaletteAction {
     OpenWhy,
     OpenExport,
     ToggleForceDark,
+    ToggleSiteDark,
+    ToggleSiteAdblock,
     ReaderMode,
 }
 
@@ -45,6 +47,16 @@ pub(crate) fn palette_catalog() -> Vec<(String, &'static str, PaletteAction)> {
             "Toggle force-dark mode".to_string(),
             "Appearance",
             PaletteAction::ToggleForceDark,
+        ),
+        (
+            "This site: toggle dark mode".to_string(),
+            "Loadout",
+            PaletteAction::ToggleSiteDark,
+        ),
+        (
+            "This site: toggle ad-blocking".to_string(),
+            "Loadout",
+            PaletteAction::ToggleSiteAdblock,
         ),
         (
             "Reader mode".to_string(),
