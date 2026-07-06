@@ -3387,6 +3387,10 @@ struct BrowserState {
     /// Ad/tracker blocking engine (adblock-rust) + a session blocked counter.
     adblock: adblock::Engine,
     adblock_blocked: Cell<u64>,
+    /// Tracker Provenance (LYK-1284): session-wide `tracker host -> { site host -> block count }`,
+    /// aggregated from every blocked third-party request. Surfaced at gator://exposure as a map of
+    /// who's watching you across sites. In-memory only (cleared on restart).
+    tracker_provenance: RefCell<HashMap<String, HashMap<String, u32>>>,
     /// Permission ledger: persistent (origin, feature) → allow/deny grants, so a site asked once
     /// is never asked again. "Allow/Block always" persist here; "once" is not stored.
     permission_grants: RefCell<HashMap<(String, String), bool>>,
@@ -3708,6 +3712,83 @@ impl AppState {
         }
     }
 
+    /// Render `gator://exposure`: the Tracker Provenance map (LYK-1284) — every blocked tracker this
+    /// session, ranked by how many distinct sites it tried to follow you across, each listing those
+    /// sites + block counts. 100% local (aggregated from the interceptor's own decisions).
+    fn render_gator_exposure(&self) -> Vec<u8> {
+        let accent = self.browser.settings.borrow().accent.clone();
+        let body = {
+            let prov = self.browser.tracker_provenance.borrow();
+            if prov.is_empty() {
+                "<div class=\"note\">No trackers blocked yet this session. Browse a few sites and \
+                 come back — this page maps which trackers tried to follow you across them.</div>"
+                    .to_string()
+            } else {
+                let mut rows: Vec<(&String, usize, u32, Vec<(&String, u32)>)> = prov
+                    .iter()
+                    .map(|(tracker, sites)| {
+                        let total: u32 = sites.values().copied().sum();
+                        let mut sv: Vec<(&String, u32)> =
+                            sites.iter().map(|(s, c)| (s, *c)).collect();
+                        sv.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                        (tracker, sites.len(), total, sv)
+                    })
+                    .collect();
+                // Most invasive first: widest cross-site reach, then most blocks.
+                rows.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then_with(|| a.0.cmp(b.0)));
+                let mut out = String::new();
+                for (tracker, nsites, total, sites) in rows.iter() {
+                    let chips: String = sites
+                        .iter()
+                        .map(|(s, c)| {
+                            format!("<span class=\"chip\">{} <b>{}</b></span>", html_escape(s), c)
+                        })
+                        .collect();
+                    out.push_str(&format!(
+                        "<div class=\"row\"><div class=\"tk\"><span class=\"name\">{}</span>\
+                         <span class=\"stat\">{} site{} &middot; {} block{}</span></div>\
+                         <div class=\"sites\">{}</div></div>",
+                        html_escape(tracker),
+                        nsites,
+                        if *nsites == 1 { "" } else { "s" },
+                        total,
+                        if *total == 1 { "" } else { "s" },
+                        chips,
+                    ));
+                }
+                format!("<div class=\"list\">{out}</div>")
+            }
+        };
+        let html = format!(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Exposure &middot; NavGator</title>\
+             <style>\
+             body{{font:15px/1.5 var(--font,system-ui),sans-serif;color:var(--fg);background:var(--bg);\
+             margin:0;padding:40px 24px;display:flex;justify-content:center}}\
+             .wrap{{width:min(820px,94vw)}}\
+             h1{{font-size:26px;margin:0 0 4px}} .g{{color:{accent}}}\
+             .sub{{color:var(--muted);margin:0 0 26px}}\
+             .list{{display:flex;flex-direction:column;gap:10px}}\
+             .row{{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}}\
+             .tk{{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}}\
+             .name{{font-size:16px;font-weight:700;word-break:break-all}}\
+             .stat{{color:{accent};font-size:12px;font-weight:600}}\
+             .sites{{margin-top:9px;display:flex;flex-wrap:wrap;gap:6px}}\
+             .chip{{font-size:12px;color:var(--muted);background:var(--line);border-radius:20px;padding:3px 10px}}\
+             .chip b{{color:var(--fg)}}\
+             .note{{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:24px;color:var(--muted)}}\
+             a{{color:{accent}}} footer{{margin-top:38px;color:var(--muted);font-size:12px}}\
+             </style></head><body><div class=\"wrap\">\
+             <h1>Nav<span class=\"g\">Gator</span> exposure</h1>\
+             <p class=\"sub\">Trackers blocked this session, ranked by how many sites they tried to \
+             follow you across. Nothing leaves your machine.</p>\
+             {body}\
+             <footer>gator://exposure &middot; <a href=\"gator://why\">this page's receipt</a> &middot; \
+             <a href=\"gator://welcome\">welcome</a></footer>\
+             </div></body></html>"
+        );
+        self.themed(html)
+    }
+
     /// Render `gator://why`: the per-page "block receipt" — every request the ad/tracker blocker
     /// stopped on the page the user was viewing, grouped by host. Surfaces data the interceptor
     /// already computes; nothing leaves the machine.
@@ -3758,7 +3839,8 @@ impl AppState {
              .empty{{color:var(--muted)}}</style></head><body>\
              <h1>Block receipt</h1>\
              <p class=\"sub\">{} request(s) the ad/tracker blocker stopped on the page you were \
-             viewing, grouped by host. Computed on-device; nothing left the machine.</p>{}</body></html>",
+             viewing, grouped by host. Computed on-device; nothing left the machine. \
+             <a href=\"gator://exposure\">See the session-wide tracker map &rarr;</a></p>{}</body></html>",
             total, body
         );
         self.themed(html)
@@ -8611,6 +8693,21 @@ impl WebViewDelegate for AppState {
                                 }
                             }
                         }
+                        // Aggregate into the session-wide Tracker Provenance map: tracker host ->
+                        // { site host -> count } (LYK-1284), for gator://exposure.
+                        if let (Some(tracker), Some(site)) = (
+                            url.host_str().map(str::to_string),
+                            Url::parse(&source).ok().and_then(|u| u.host_str().map(str::to_string)),
+                        ) {
+                            *self
+                                .browser
+                                .tracker_provenance
+                                .borrow_mut()
+                                .entry(tracker)
+                                .or_default()
+                                .entry(site)
+                                .or_insert(0) += 1;
+                        }
                         let response =
                             WebResourceResponse::new(url).status_code(StatusCode::NO_CONTENT);
                         let intercepted = load.intercept(response);
@@ -8624,6 +8721,7 @@ impl WebViewDelegate for AppState {
         let body = match url.host_str().unwrap_or("welcome") {
             "welcome" | "newtab" | "home" => self.render_gator_welcome(),
             "why" => self.render_gator_why(),
+            "exposure" => self.render_gator_exposure(),
             "export" => {
                 if url.query_pairs().any(|(k, v)| k == "get" && v == "all") {
                     self.export_json()
@@ -9565,6 +9663,7 @@ impl ApplicationHandler<WakeUp> for App {
                 adblock::lists::ParseOptions::default(),
             ),
             adblock_blocked: Cell::new(0),
+            tracker_provenance: RefCell::new(HashMap::new()),
             permission_grants: RefCell::new(load_permission_grants()),
             site_loadouts: RefCell::new(load_site_loadouts()),
             pending_cosmetic: RefCell::new(Vec::new()),
