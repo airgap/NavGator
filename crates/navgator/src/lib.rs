@@ -1149,11 +1149,66 @@ struct Profile {
     bookmarks: Vec<Bookmark>,
 }
 
-fn config_file(name: &str) -> Option<PathBuf> {
+/// The active profile's on-disk directory (LYK-1376). `<config>/navgator` for the default profile;
+/// `<config>/navgator/profiles/<name>` when `NAVGATOR_PROFILE` names a non-default profile. ALL
+/// navgator state (settings, history, bookmarks, the E2EE vault, userscripts, …) plus the engine's
+/// net state (cookies/HSTS/HTTP-auth via `opts.config_dir`) live here, so a profile is a fully
+/// isolated identity. The name is sanitized to a single path segment (no traversal).
+/// The unprofiled navgator root (`<config>/navgator`) — the default profile's dir and the parent of
+/// `profiles/`. Used to enumerate profiles.
+fn navgator_root() -> Option<PathBuf> {
     let base = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("navgator").join(name))
+    Some(base.join("navgator"))
+}
+
+/// The active profile's name (`NAVGATOR_PROFILE`, sanitized), or "default".
+fn active_profile() -> String {
+    env::var("NAVGATOR_PROFILE")
+        .ok()
+        .map(|p| sanitize_profile_name(&p))
+        .filter(|p| !p.is_empty() && p != "default")
+        .unwrap_or_else(|| "default".to_string())
+}
+
+fn profile_base() -> Option<PathBuf> {
+    let mut dir = navgator_root()?;
+    let name = active_profile();
+    if name != "default" {
+        dir = dir.join("profiles").join(name);
+    }
+    Some(dir)
+}
+
+/// Launch a second navgator process bound to profile `name` (a fully isolated identity: separate
+/// cookies, history, vault, …). Reaped in a detached thread (LYK-1376).
+fn spawn_profile(name: &str) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    if let Ok(mut child) = std::process::Command::new(exe)
+        .env("NAVGATOR_PROFILE", name)
+        .spawn()
+    {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
+/// Reduce a profile name to a single safe path segment: ASCII alphanumerics, `-`, `_` and spaces
+/// only (trimmed), so a crafted `NAVGATOR_PROFILE` can't escape the profiles dir.
+fn sanitize_profile_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' '))
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn config_file(name: &str) -> Option<PathBuf> {
+    Some(profile_base()?.join(name))
 }
 
 /// Open a file or folder with the OS default handler — a download's "Open" / "Show folder"
@@ -3917,6 +3972,86 @@ impl AppState {
              <footer>gator://trail &middot; <a href=\"gator://exposure\">tracker map</a> &middot; \
              <a href=\"gator://welcome\">welcome</a></footer>\
              </div></body></html>"
+        );
+        self.themed(html)
+    }
+
+    /// Render `gator://profiles` (LYK-1376): list the isolated identity profiles and open one in a
+    /// new window (a fresh navgator process with its own cookies/history/vault). The current window's
+    /// profile is marked; a form creates + opens a new one.
+    fn render_gator_profiles(&self) -> Vec<u8> {
+        let accent = self.browser.settings.borrow().accent.clone();
+        let current = active_profile();
+        let mut names = vec!["default".to_string()];
+        if let Some(root) = navgator_root() {
+            if let Ok(entries) = std::fs::read_dir(root.join("profiles")) {
+                for e in entries.flatten() {
+                    if e.path().is_dir() {
+                        if let Some(n) = e.file_name().to_str() {
+                            names.push(n.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        let rows: String = names
+            .iter()
+            .map(|n| {
+                let action = if *n == current {
+                    "<span class=\"cur\">this window</span>".to_string()
+                } else {
+                    format!("<a href=\"gator://profiles?open={}\">Open &rarr;</a>", html_escape(n))
+                };
+                let letter = n
+                    .chars()
+                    .find(|c| c.is_alphanumeric())
+                    .map(|c| c.to_uppercase().to_string())
+                    .unwrap_or_else(|| "•".to_string());
+                format!(
+                    "<div class=\"row\"><span class=\"ico\">{}</span>\
+                     <span class=\"name\">{}</span>{}</div>",
+                    html_escape(&letter),
+                    html_escape(n),
+                    action,
+                )
+            })
+            .collect();
+        let html = format!(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Profiles &middot; NavGator</title>\
+             <style>\
+             body{{font:15px/1.5 var(--font,system-ui),sans-serif;color:var(--fg);background:var(--bg);\
+             margin:0;padding:40px 24px;display:flex;justify-content:center}}\
+             .wrap{{width:min(640px,94vw)}}\
+             h1{{font-size:26px;margin:0 0 4px}} .g{{color:{accent}}}\
+             .sub{{color:var(--muted);margin:0 0 26px}}\
+             .list{{display:flex;flex-direction:column;gap:8px;margin-bottom:26px}}\
+             .row{{display:flex;align-items:center;gap:14px;background:var(--panel);border:1px solid var(--line);\
+             border-radius:11px;padding:12px 16px}}\
+             .ico{{flex:none;width:34px;height:34px;line-height:34px;text-align:center;border-radius:9px;\
+             background:var(--line);color:{accent};font-weight:700}}\
+             .name{{flex:1;font-weight:600}}\
+             .row a{{color:{accent};text-decoration:none;font-weight:600}} .row a:hover{{text-decoration:underline}}\
+             .cur{{color:var(--muted);font-size:12px;font-weight:600}}\
+             h2{{font-size:15px;margin:0 0 10px}}\
+             form{{display:flex;gap:8px}}\
+             input{{flex:1;padding:9px 11px;border-radius:9px;border:1px solid var(--line);background:var(--panel);color:var(--fg)}}\
+             button{{font:600 14px system-ui;padding:9px 16px;border-radius:9px;border:none;background:{accent};color:#0b0b0b;cursor:pointer}}\
+             a{{color:{accent}}} footer{{margin-top:34px;color:var(--muted);font-size:12px}}\
+             </style></head><body><div class=\"wrap\">\
+             <h1>Nav<span class=\"g\">Gator</span> profiles</h1>\
+             <p class=\"sub\">Each profile is a separate identity — its own cookies, history, saved \
+             logins, autofill and highlights. Opening one launches a new window.</p>\
+             <div class=\"list\">{rows}</div>\
+             <h2>New profile</h2>\
+             <form method=\"get\" action=\"gator://profiles\">\
+             <input name=\"new\" placeholder=\"e.g. work, personal\" autocomplete=\"off\" spellcheck=\"false\">\
+             <button type=\"submit\">Create &amp; open</button></form>\
+             <footer>gator://profiles &middot; current: <strong>{cur}</strong> &middot; \
+             <a href=\"gator://welcome\">welcome</a></footer>\
+             </div></body></html>",
+            cur = html_escape(&current),
         );
         self.themed(html)
     }
@@ -8913,6 +9048,26 @@ impl WebViewDelegate for AppState {
             "why" => self.render_gator_why(),
             "exposure" => self.render_gator_exposure(),
             "trail" => self.render_gator_trail(),
+            "profiles" => {
+                // ?open=<name> launches that profile in a new window; ?new=<name> creates it first.
+                for (k, v) in url.query_pairs() {
+                    let name = sanitize_profile_name(&v);
+                    if name.is_empty() {
+                        continue;
+                    }
+                    match k.as_ref() {
+                        "new" => {
+                            if let Some(root) = navgator_root() {
+                                let _ = std::fs::create_dir_all(root.join("profiles").join(&name));
+                            }
+                            spawn_profile(&name);
+                        }
+                        "open" => spawn_profile(&name),
+                        _ => {}
+                    }
+                }
+                self.render_gator_profiles()
+            }
             "export" => {
                 if url.query_pairs().any(|(k, v)| k == "get" && v == "all") {
                     self.export_json()
@@ -9824,14 +9979,9 @@ impl ApplicationHandler<WakeUp> for App {
                 // cache (LYK-1382 — cold starts reuse cached bodies instead of re-downloading).
                 // Without this the engine keeps all of that in memory only. Private/incognito
                 // webviews use a separate in-memory state and are unaffected.
-                if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME")
-                    .map(std::path::PathBuf::from)
-                    .or_else(|| {
-                        std::env::var_os("HOME")
-                            .map(|h| std::path::PathBuf::from(h).join(".config"))
-                    })
-                    .map(|base| base.join("navgator"))
-                {
+                // Per-profile (LYK-1376): the engine's cookie/HSTS/auth state lands in the active
+                // profile's dir, so profiles have isolated logins.
+                if let Some(dir) = profile_base() {
                     let _ = std::fs::create_dir_all(&dir);
                     opts.config_dir = Some(dir);
                 }
