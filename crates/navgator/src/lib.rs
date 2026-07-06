@@ -666,11 +666,12 @@ fn phishing_reason(host: &str) -> Option<String> {
     None
 }
 
-/// Default update-manifest URL — a small JSON document, either NavGator's own
-/// `{"version":"x.y.z","url":"...","notes":"..."}` or a GitHub release (`tag_name`/`html_url`/`body`).
-/// Overridable via `NAVGATOR_UPDATE_URL` (self-host / enterprise / testing); set it empty to disable
-/// the auto-check entirely.
-const DEFAULT_UPDATE_URL: &str = "https://airgap.github.io/NavGator/latest.json";
+/// Default update-manifest URL — the `latest`-channel manifest `scripts/publish.sh` uploads to R2
+/// (served via the `dl.lyku.org` custom domain, same base the lyku.org/apps download links use). A
+/// small JSON document: either NavGator's own `{"version","url","notes"}` or a GitHub release
+/// (`tag_name`/`html_url`/`body`). Overridable via `NAVGATOR_UPDATE_URL` (self-host / enterprise /
+/// testing); set it empty to disable the auto-check entirely.
+const DEFAULT_UPDATE_URL: &str = "https://dl.lyku.org/navgator/latest/latest.json";
 
 /// The effective update-manifest URL (env override wins). Empty string disables the check.
 fn update_url() -> String {

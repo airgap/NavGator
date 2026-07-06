@@ -19,3 +19,7 @@
 /.idea
 /.vscode
 __pycache__/
+
+# Runtime / test cruft (Servo per-origin IndexedDB "bottles" written when the engine
+# runs from the repo cwd; never source)
+/bottles/

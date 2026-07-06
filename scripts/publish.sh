@@ -63,4 +63,33 @@ for f in "$DIST"/navgator-*.tar.gz "$DIST"/navgator-*.AppImage "$DIST"/navgator-
     echo "✓ published $name ($plat)"
     published=$((published + 1))
 done
+
+# --- update manifest (LYK-1495 / LYK-1498) -----------------------------------
+# A tiny JSON the running app polls (default DEFAULT_UPDATE_URL =
+# dl.lyku.org/navgator/latest/latest.json) to detect a newer build. `version` is
+# <cargo ver>-<commit count> — the SAME string build.rs bakes into the binary
+# (build_version()) and scripts/package.sh stamps on the app-icon badge — so every
+# build is announced even without a semver bump, which is what early dev wants.
+# Uploaded to each channel next to the artifacts; the app defaults to `latest`.
+BUILD="$(git rev-list --count HEAD 2>/dev/null || echo 0)"
+SUBJECT="$(git log -1 --pretty=%s 2>/dev/null || echo '')"
+MANIFEST="$(mktemp)"
+python3 - "$VERSION-$BUILD" "$SHA" "$SUBJECT" > "$MANIFEST" <<'PY'
+import json, sys
+version, sha, subject = (sys.argv + ["", "", ""])[1:4]
+note = f"Build {version} ({sha})" + (f": {subject}" if subject else "")
+json.dump({
+    "version": version,
+    "url": "https://lyku.org/apps/NavGator",
+    "notes": note,
+    "commit": sha,
+}, sys.stdout, indent=2)
+PY
+for chan in "v$VERSION" "dev-$SHA" "latest"; do
+    wr r2 object put "$R2_BUCKET/navgator/$chan/latest.json" \
+        --file "$MANIFEST" --content-type application/json
+done
+rm -f "$MANIFEST"
+echo "✓ published update manifest ($VERSION-$BUILD) to R2"
+
 echo "✓ published $published artifact(s) to R2 + registered with lyku.org/apps"
