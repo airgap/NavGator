@@ -3391,6 +3391,9 @@ struct BrowserState {
     /// aggregated from every blocked third-party request. Surfaced at gator://exposure as a map of
     /// who's watching you across sites. In-memory only (cleared on restart).
     tracker_provenance: RefCell<HashMap<String, HashMap<String, u32>>>,
+    /// Trail Graph (LYK-1284): session-wide cross-site navigation edges, `to host -> { from host ->
+    /// count }` — "how did I get here?". Captured on same-tab navigation. Surfaced at gator://trail.
+    nav_graph: RefCell<HashMap<String, HashMap<String, u32>>>,
     /// Permission ledger: persistent (origin, feature) → allow/deny grants, so a site asked once
     /// is never asked again. "Allow/Block always" persist here; "once" is not stored.
     permission_grants: RefCell<HashMap<(String, String), bool>>,
@@ -3782,7 +3785,84 @@ impl AppState {
              <p class=\"sub\">Trackers blocked this session, ranked by how many sites they tried to \
              follow you across. Nothing leaves your machine.</p>\
              {body}\
-             <footer>gator://exposure &middot; <a href=\"gator://why\">this page's receipt</a> &middot; \
+             <footer>gator://exposure &middot; <a href=\"gator://trail\">how you got here</a> &middot; \
+             <a href=\"gator://why\">this page's receipt</a> &middot; \
+             <a href=\"gator://welcome\">welcome</a></footer>\
+             </div></body></html>"
+        );
+        self.themed(html)
+    }
+
+    /// Render `gator://trail`: the Trail Graph (LYK-1284) — cross-site navigation edges this
+    /// session ("how did I get here?"), each destination site listing which sites led to it. 100%
+    /// local. Same page shell as gator://exposure.
+    fn render_gator_trail(&self) -> Vec<u8> {
+        let accent = self.browser.settings.borrow().accent.clone();
+        let body = {
+            let graph = self.browser.nav_graph.borrow();
+            if graph.is_empty() {
+                "<div class=\"note\">No cross-site navigations yet this session. Follow some links \
+                 across different sites and come back — this traces how you arrived at each one.</div>"
+                    .to_string()
+            } else {
+                let mut rows: Vec<(&String, usize, u32, Vec<(&String, u32)>)> = graph
+                    .iter()
+                    .map(|(to, froms)| {
+                        let total: u32 = froms.values().copied().sum();
+                        let mut fv: Vec<(&String, u32)> =
+                            froms.iter().map(|(f, c)| (f, *c)).collect();
+                        fv.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                        (to, froms.len(), total, fv)
+                    })
+                    .collect();
+                rows.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then_with(|| a.0.cmp(b.0)));
+                let mut out = String::new();
+                for (to, nfrom, total, froms) in rows.iter() {
+                    let chips: String = froms
+                        .iter()
+                        .map(|(f, c)| {
+                            format!("<span class=\"chip\">{} <b>{}</b></span>", html_escape(f), c)
+                        })
+                        .collect();
+                    out.push_str(&format!(
+                        "<div class=\"row\"><div class=\"tk\"><span class=\"name\">&rarr; {}</span>\
+                         <span class=\"stat\">reached from {} site{} &middot; {} hop{}</span></div>\
+                         <div class=\"sites\">{}</div></div>",
+                        html_escape(to),
+                        nfrom,
+                        if *nfrom == 1 { "" } else { "s" },
+                        total,
+                        if *total == 1 { "" } else { "s" },
+                        chips,
+                    ));
+                }
+                format!("<div class=\"list\">{out}</div>")
+            }
+        };
+        let html = format!(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Trail &middot; NavGator</title>\
+             <style>\
+             body{{font:15px/1.5 var(--font,system-ui),sans-serif;color:var(--fg);background:var(--bg);\
+             margin:0;padding:40px 24px;display:flex;justify-content:center}}\
+             .wrap{{width:min(820px,94vw)}}\
+             h1{{font-size:26px;margin:0 0 4px}} .g{{color:{accent}}}\
+             .sub{{color:var(--muted);margin:0 0 26px}}\
+             .list{{display:flex;flex-direction:column;gap:10px}}\
+             .row{{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}}\
+             .tk{{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}}\
+             .name{{font-size:16px;font-weight:700;word-break:break-all}}\
+             .stat{{color:{accent};font-size:12px;font-weight:600}}\
+             .sites{{margin-top:9px;display:flex;flex-wrap:wrap;gap:6px}}\
+             .chip{{font-size:12px;color:var(--muted);background:var(--line);border-radius:20px;padding:3px 10px}}\
+             .chip b{{color:var(--fg)}}\
+             .note{{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:24px;color:var(--muted)}}\
+             a{{color:{accent}}} footer{{margin-top:38px;color:var(--muted);font-size:12px}}\
+             </style></head><body><div class=\"wrap\">\
+             <h1>Nav<span class=\"g\">Gator</span> trail</h1>\
+             <p class=\"sub\">How you got here: cross-site navigations this session, grouped by \
+             destination. Nothing leaves your machine.</p>\
+             {body}\
+             <footer>gator://trail &middot; <a href=\"gator://exposure\">tracker map</a> &middot; \
              <a href=\"gator://welcome\">welcome</a></footer>\
              </div></body></html>"
         );
@@ -8722,6 +8802,7 @@ impl WebViewDelegate for AppState {
             "welcome" | "newtab" | "home" => self.render_gator_welcome(),
             "why" => self.render_gator_why(),
             "exposure" => self.render_gator_exposure(),
+            "trail" => self.render_gator_trail(),
             "export" => {
                 if url.query_pairs().any(|(k, v)| k == "get" && v == "all") {
                     self.export_json()
@@ -8934,6 +9015,26 @@ impl WebViewDelegate for AppState {
 
     fn notify_url_changed(&self, webview: WebView, url: Url) {
         if let Some((p, i)) = self.locate_tab(&webview) {
+            // Trail Graph (LYK-1284): record the cross-site navigation edge (prev host -> new host)
+            // before overwriting the tab's URL — the prev URL is the referrer for a same-tab click.
+            if matches!(url.scheme(), "http" | "https") {
+                let prev = self.pane(p).tabs.borrow()[i].url.clone();
+                if let (Some(from), Some(to)) = (
+                    Url::parse(&prev).ok().and_then(|u| u.host_str().map(str::to_string)),
+                    url.host_str().map(str::to_string),
+                ) {
+                    if from != to {
+                        *self
+                            .browser
+                            .nav_graph
+                            .borrow_mut()
+                            .entry(to)
+                            .or_default()
+                            .entry(from)
+                            .or_insert(0) += 1;
+                    }
+                }
+            }
             self.pane(p).tabs.borrow_mut()[i].url = url.to_string();
             // New page → reset its gator://why block receipt (it accumulates as resources load).
             if matches!(url.scheme(), "http" | "https") {
@@ -9664,6 +9765,7 @@ impl ApplicationHandler<WakeUp> for App {
             ),
             adblock_blocked: Cell::new(0),
             tracker_provenance: RefCell::new(HashMap::new()),
+            nav_graph: RefCell::new(HashMap::new()),
             permission_grants: RefCell::new(load_permission_grants()),
             site_loadouts: RefCell::new(load_site_loadouts()),
             pending_cosmetic: RefCell::new(Vec::new()),
