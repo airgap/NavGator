@@ -1686,6 +1686,11 @@ fn navgator_preferences() -> Preferences {
     // Tier-1 — real backends, high payoff (validate hardening before relying on them).
     p.dom_indexeddb_enabled = true; // rusqlite backend → web apps / PWAs
     p.dom_webgl2_enabled = true; // 3D / maps / games
+    // WebGPU (LYK-1380): swervo's wgpu-backed stack is complete (compute + canvas rendering) — it
+    // just needed the `webgpu` cargo feature (enabled in navgator-engine/Cargo.toml) plus this
+    // pref. Verified: a WGSL compute shader and a canvas render pass both run. Powers modern
+    // graphics/games + in-browser ML (transformers.js, WebLLM).
+    p.dom_webgpu_enabled = true;
     // MSE: adaptive-streaming DOM API — single + multi-segment VP8/WebM play (LYK-1361).
     p.dom_mediasource_enabled = true;
     // EME Clear Key: CENC decrypt element + `encrypted` event — encrypted H.264 plays end to

@@ -35,4 +35,4 @@ http = "1"
 # Android has no desktop GStreamer — the engine builds without it there (Android media is a
 # future servo-media backend). Cargo unions these features onto the base `servo` dep above.
 [target.'cfg(not(target_os = "android"))'.dependencies]
-servo = { git = "https://github.com/airgap/swervo", rev = "b8b55c1133dca08b5775b46d0c719dfcf301a430", features = ["media-gstreamer"] }
+servo = { git = "https://github.com/airgap/swervo", rev = "b8b55c1133dca08b5775b46d0c719dfcf301a430", features = ["media-gstreamer", "webgpu"] }
