@@ -153,6 +153,7 @@ pub fn desktop_main() -> Result<(), Box<dyn Error>> {
 /// Built-in search engines offered in Settings; the first is the default. The welcome page
 /// and the omnibox both substitute the query for `%s` in the selected template.
 const SEARCH_ENGINES: &[(&str, &str)] = &[
+    ("DuckDuckGo (No AI)", "https://noai.duckduckgo.com/?q=%s"),
     ("DuckDuckGo", "https://duckduckgo.com/?q=%s"),
     ("Kagi", "https://kagi.com/search?q=%s"),
     ("Bing", "https://www.bing.com/search?q=%s"),
@@ -506,7 +507,7 @@ struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            search: "https://duckduckgo.com/?q=%s".to_string(),
+            search: "https://noai.duckduckgo.com/?q=%s".to_string(),
             accent: "#5b8cff".to_string(),
             dark: true,
             sync_api_key: String::new(),
