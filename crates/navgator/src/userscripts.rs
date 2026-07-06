@@ -926,8 +926,8 @@ const GM_XHR: &str = r#"  const GM_xmlhttpRequest = (opts) => {
      .catch((err) => { if (typeof o.onerror === "function") o.onerror(err); });
     return p;
   };
-  const GM = (typeof GM === "object" && GM) || {};
-  GM.xmlHttpRequest = GM_xmlhttpRequest;
+  window.GM = window.GM || {};
+  window.GM.xmlHttpRequest = GM_xmlhttpRequest;
 "#;
 
 const GM_STORAGE: &str = r#"  const GM_setValue = (k, v) => __bridge("storage.set", { key: String(k), value: v });
