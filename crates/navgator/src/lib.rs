@@ -4531,7 +4531,7 @@ impl AppState {
             .url(seed.clone())
             .hidpi_scale_factor(Scale::new(self.scale.get() as f32))
             .delegate(me);
-        let ucm = self.make_tab_ucm();
+        let (ucm, seeded) = self.make_tab_ucm(seed.as_str());
         if let Some(ucm) = &ucm {
             builder = builder.user_content_manager(ucm.clone());
         }
@@ -4559,7 +4559,7 @@ impl AppState {
             pinned: false,
             starred: false,
             ucm,
-            injected_addons: RefCell::new(Vec::new()),
+            injected_addons: RefCell::new(seeded),
             blocked: RefCell::new(Vec::new()),
             audible: Cell::new(false),
             thumb_pending: None,
@@ -4585,7 +4585,7 @@ impl AppState {
                 .url(url.clone())
                 .hidpi_scale_factor(Scale::new(self.scale.get() as f32))
                 .delegate(me.clone());
-            let ucm = self.make_tab_ucm();
+            let (ucm, seeded) = self.make_tab_ucm(url.as_str());
             if let Some(ucm) = &ucm {
                 builder = builder.user_content_manager(ucm.clone());
             }
@@ -4611,7 +4611,7 @@ impl AppState {
                 pinned: false,
                 starred: false,
                 ucm,
-                injected_addons: RefCell::new(Vec::new()),
+                injected_addons: RefCell::new(seeded),
                 blocked: RefCell::new(Vec::new()),
                 audible: Cell::new(false),
                 thumb_pending: None,
@@ -6273,43 +6273,52 @@ impl AppState {
     /// (Servo applies UCM edits on the *next* load). This fixes the old accumulation bug (LYK-1256):
     /// a script attached on site A used to keep running after the tab navigated to a non-matching
     /// site B, because the engine had no remove primitive — it does now.
+    /// Wrap the enabled userscripts whose `@match` applies to `url`, skipping any id already in
+    /// `already`. Returns (all matching ids, (id, wrapped-js) to add). Shared by the per-navigation
+    /// path (`inject_userscripts`) and first-load pre-seeding (`make_tab_ucm`, LYK-1255) so both wrap
+    /// scripts identically. Reads source files while borrowing only the add-on registry.
+    fn matching_wrapped_scripts(
+        &self,
+        url: &str,
+        already: &[userscripts::AddonId],
+    ) -> (Vec<userscripts::AddonId>, Vec<(userscripts::AddonId, String)>) {
+        let salt = self.browser.gm_salt; // [u8; 16] is Copy — avoids borrowing self in the closure.
+        let reg = self.browser.addons.borrow();
+        let matching = reg.enabled_matching(url);
+        let matching_ids: Vec<userscripts::AddonId> = matching.iter().map(|a| a.id.clone()).collect();
+        let to_add = matching
+            .into_iter()
+            .filter(|a| !already.contains(&a.id))
+            .filter_map(|a| {
+                // Refutable destructure (`else`) so adding AddonSource::WebExtension later is
+                // additive, not a compile break here (forward-compat, design §8). The `else`
+                // is unreachable while Userscript is the only variant — allow that until then.
+                #[allow(irrefutable_let_patterns)]
+                let userscripts::AddonSource::Userscript { path, .. } = &a.source else {
+                    return None;
+                };
+                let src = std::fs::read_to_string(path).ok()?;
+                let cap = addon_cap_token(&salt, &a.id);
+                Some((a.id.clone(), userscripts::wrap_userscript(a, &src, &cap)))
+            })
+            .collect();
+        (matching_ids, to_add)
+    }
+
     fn inject_userscripts(&self, webview: &WebView, url: &str) {
         let Some((pane, tab_idx)) = self.locate_tab(webview) else {
             return;
         };
-        // Collect the wrapped scripts to add (id + js) and the set of ids that match this URL,
-        // reading source files outside the tab borrow.
-        let salt = self.browser.gm_salt; // [u8; 16] is Copy — avoids borrowing self in the closure.
-        let (matching_ids, to_add): (Vec<userscripts::AddonId>, Vec<(userscripts::AddonId, String)>) = {
-            let reg = self.browser.addons.borrow();
-            let already: Vec<userscripts::AddonId> = {
-                let tabs = self.pane(pane).tabs.borrow();
-                match tabs.get(tab_idx) {
-                    Some(t) => t.injected_addons.borrow().iter().map(|(id, _)| id.clone()).collect(),
-                    None => return,
-                }
-            };
-            let matching = reg.enabled_matching(url);
-            let matching_ids: Vec<userscripts::AddonId> =
-                matching.iter().map(|a| a.id.clone()).collect();
-            let to_add = matching
-                .into_iter()
-                .filter(|a| !already.contains(&a.id))
-                .filter_map(|a| {
-                    // Refutable destructure (`else`) so adding AddonSource::WebExtension later is
-                    // additive, not a compile break here (forward-compat, design §8). The `else`
-                    // is unreachable while Userscript is the only variant — allow that until then.
-                    #[allow(irrefutable_let_patterns)]
-                    let userscripts::AddonSource::Userscript { path, .. } = &a.source else {
-                        return None;
-                    };
-                    let src = std::fs::read_to_string(path).ok()?;
-                    let cap = addon_cap_token(&salt, &a.id);
-                    Some((a.id.clone(), userscripts::wrap_userscript(a, &src, &cap)))
-                })
-                .collect();
-            (matching_ids, to_add)
+        // Ids already present in this tab's UCM (pre-seeded at make_tab_ucm or injected on an
+        // earlier navigation) — skip re-adding them. Reads the tab briefly, then drops the borrow.
+        let already: Vec<userscripts::AddonId> = {
+            let tabs = self.pane(pane).tabs.borrow();
+            match tabs.get(tab_idx) {
+                Some(t) => t.injected_addons.borrow().iter().map(|(id, _)| id.clone()).collect(),
+                None => return,
+            }
         };
+        let (matching_ids, to_add) = self.matching_wrapped_scripts(url, &already);
         let tabs = self.pane(pane).tabs.borrow();
         let Some(tab) = tabs.get(tab_idx) else {
             return;
@@ -6633,7 +6642,18 @@ impl AppState {
     /// no-UCM behavior). The UCM starts empty; `inject_userscripts` later `add_script`s the
     /// add-ons whose `@match` accepts each navigated URL (the engine captures the UCM at build
     /// time and has no post-build setter, so we keep this Rc per tab and grow it on navigation).
-    fn make_tab_ucm(&self) -> Option<Rc<UserContentManager>> {
+    /// Build a tab's UserContentManager and pre-seed it with the userscripts that match
+    /// `initial_url`. Returns the UCM plus the seeded `(id, script)` pairs, which the caller must
+    /// store in the new `Tab`'s `injected_addons` so `inject_userscripts` doesn't re-add them.
+    ///
+    /// Pre-seeding BEFORE `WebViewBuilder::build()` is what makes `@run-at document-start` scripts
+    /// run on the tab's FIRST load: Servo applies UCM scripts added *after* build only on the next
+    /// load, and the tab isn't in the pane list yet, so the post-build `inject_userscripts` no-ops
+    /// on the first navigation. (LYK-1255)
+    fn make_tab_ucm(
+        &self,
+        initial_url: &str,
+    ) -> (Option<Rc<UserContentManager>>, Vec<(userscripts::AddonId, Rc<UserScript>)>) {
         // The UCM is now always created: it carries the always-on Web Animations API polyfill
         // (LYK-1411) so `element.animate(...)` actually animates until the engine's WAAPI is
         // complete. Userscripts + the DOM probe stack on top of it.
@@ -6648,14 +6668,22 @@ impl AppState {
             // even when the page never reaches LoadStatus::Complete.
             ucm.add_script(Rc::new(UserScript::new(DOM_PROBE_JS.to_string(), None)));
         }
-        Some(ucm)
+        // Pre-seed userscripts matching the tab's initial URL (LYK-1255).
+        let (_matching_ids, to_add) = self.matching_wrapped_scripts(initial_url, &[]);
+        let mut seeded = Vec::with_capacity(to_add.len());
+        for (id, js) in to_add {
+            let script = Rc::new(UserScript::new(js, None));
+            ucm.add_script(script.clone());
+            seeded.push((id, script));
+        }
+        (Some(ucm), seeded)
     }
 
     fn new_tab(&self, url: Url) {
         let Some(me) = self.weak_self.borrow().upgrade() else {
             return;
         };
-        let ucm = self.make_tab_ucm();
+        let (ucm, seeded) = self.make_tab_ucm(url.as_str());
         let mut builder = WebViewBuilder::new(&self.browser.servo, self.focused_pane().context.clone())
             .url(url)
             .hidpi_scale_factor(Scale::new(self.scale.get() as f32))
@@ -6664,10 +6692,15 @@ impl AppState {
             builder = builder.user_content_manager(ucm.clone());
         }
         let webview = builder.build();
-        self.adopt_tab(webview, ucm);
+        self.adopt_tab(webview, ucm, seeded);
     }
 
-    fn adopt_tab(&self, webview: WebView, ucm: Option<Rc<UserContentManager>>) {
+    fn adopt_tab(
+        &self,
+        webview: WebView,
+        ucm: Option<Rc<UserContentManager>>,
+        seeded: Vec<(userscripts::AddonId, Rc<UserScript>)>,
+    ) {
         let (w, h) = self.focused_pane().content_px.get();
         if w > 0 && h > 0 {
             webview.resize(PhysicalSize::new(w, h));
@@ -6691,7 +6724,7 @@ impl AppState {
                 pinned: false,
                 starred: false,
                 ucm,
-                injected_addons: RefCell::new(Vec::new()),
+                injected_addons: RefCell::new(seeded),
                 blocked: RefCell::new(Vec::new()),
                 audible: Cell::new(false),
                 thumb_pending: None,
@@ -8101,7 +8134,9 @@ impl WebViewDelegate for AppState {
         let Some(me) = self.weak_self.borrow().upgrade() else {
             return;
         };
-        let ucm = self.make_tab_ucm();
+        // A window.open popup's URL isn't known upfront, so no first-load pre-seed here;
+        // userscripts still attach on the popup's first navigation via inject_userscripts.
+        let (ucm, seeded) = self.make_tab_ucm("");
         // Build into the FOCUSED pane's context — `adopt_tab` pushes into `focused_pane()`, so
         // using pane0's context would bind a popup opened in the right split pane to the wrong FBO.
         let mut builder = request
@@ -8112,7 +8147,7 @@ impl WebViewDelegate for AppState {
             builder = builder.user_content_manager(ucm.clone());
         }
         let webview = builder.build();
-        self.adopt_tab(webview, ucm);
+        self.adopt_tab(webview, ucm, seeded);
     }
 
     fn notify_closed(&self, webview: WebView) {
