@@ -3080,6 +3080,14 @@ struct BrowserState {
     /// URLs queued to open in brand-new OS windows (Ctrl+N / tab pop-out); drained by the
     /// event loop on the next redraw, which can create windows (it owns the `windows` map).
     pending_windows: RefCell<Vec<Url>>,
+    /// `(url, active)` queued by a userscript's `GM_openInTab` (bridge `tabs.open`) to open as tabs
+    /// in this window; drained by the event loop after `update()` so `new_tab` runs outside the
+    /// `load_web_resource` callback that produced them. `active=false` opens in the background
+    /// (GM_openInTab's default), keeping focus on the current tab (LYK-1257).
+    pending_tabs: RefCell<Vec<(Url, bool)>>,
+    /// Text queued by a userscript's `GM_setClipboard` (bridge `clipboard.set`); drained inside the
+    /// egui pass, which is where the clipboard sink is reachable (LYK-1257).
+    pending_clipboard: RefCell<Option<String>>,
 }
 
 /// Per-window state: its OS window, render contexts, egui, panes/tabs, and all chrome/overlay
@@ -4155,6 +4163,11 @@ impl AppState {
         let _ = self.content_context.make_current();
         let mut egui = self.egui.borrow_mut();
         egui.run(&self.window, |ctx| {
+            // Flush a userscript's GM_setClipboard (bridge clipboard.set) to the OS clipboard —
+            // egui-winit performs the copy from this command during the frame (LYK-1257).
+            if let Some(text) = self.browser.pending_clipboard.borrow_mut().take() {
+                ctx.copy_text(text);
+            }
             self.apply_theme(ctx);
             self.load_favicons(ctx);
             if !self.fullscreen.get() {
@@ -6353,10 +6366,11 @@ impl AppState {
     /// Call arguments travel in the URL `?a=` query (URL-encoded JSON) rather than a request body,
     /// because Servo's `WebResourceRequest` exposes only method/headers/url to `load_web_resource`
     /// — never the body. `storage.{list,set,get,delete}` are fully implemented here (local per-add-on
-    /// JSON store). `net.fetch` enforces the capability AND the `@connect` host allow-list, but the
-    /// actual cross-origin fetch is not yet wired (needs an async HTTP client off the UI thread) and
-    /// returns `net-fetch-unimplemented` once it passes the gates. `notify.show`/`tabs.open`/
-    /// `clipboard.set` are gated but not yet performed (`not-implemented`).
+    /// JSON store). `notify.show` (in-app toast), `tabs.open` (http(s) only, queued to `pending_tabs`),
+    /// and `clipboard.set` (queued to `pending_clipboard`, flushed in the egui pass) perform their
+    /// actions (LYK-1257). `net.fetch` enforces the capability AND the `@connect` host allow-list, but
+    /// the actual cross-origin fetch is not yet wired (needs an async HTTP client off the UI thread AND
+    /// the data-return push-path) and returns `net-fetch-unimplemented` once it passes the gates.
     ///
     /// TRANSPORT (verified on a live run): Servo delivers neither a page `fetch()` NOR an XHR of the
     /// custom `navgator://` scheme to this intercept (both throw NetworkError) — only a subresource
@@ -6472,19 +6486,51 @@ impl AppState {
                 if !granted.contains(Permission::Notifications) {
                     return deny("permission-denied");
                 }
-                deny("not-implemented")
+                // Fire-and-forget: surface the notification as the in-app toast (the same transient
+                // banner downloads use). `text` is required; `title` prefixes it when present.
+                let Some(text) = args.get("text").and_then(|v| v.as_str()) else {
+                    return deny("bad-args");
+                };
+                let msg = match args.get("title").and_then(|v| v.as_str()) {
+                    Some(title) if !title.is_empty() => format!("{title}: {text}"),
+                    _ => text.to_string(),
+                };
+                *self.browser.download_toast.borrow_mut() = Some(msg);
+                self.window.request_redraw();
+                b"{\"ok\":true}".to_vec()
             }
             "tabs.open" => {
                 if !granted.contains(Permission::TabControl) {
                     return deny("permission-denied");
                 }
-                deny("not-implemented")
+                // Only http(s) — never let a script open privileged schemes (gator://, file://,
+                // navgator://) in a fresh tab. Queue it; the event loop opens it after this
+                // `load_web_resource` callback returns (creating a WebView here would re-enter Servo).
+                let Some(target) = args.get("url").and_then(|v| v.as_str()) else {
+                    return deny("bad-args");
+                };
+                let Ok(parsed) = Url::parse(target) else { return deny("bad-url") };
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    return deny("scheme-not-allowed");
+                }
+                // `active` (default true if absent) decides foreground vs background open.
+                let active = args.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
+                self.browser.pending_tabs.borrow_mut().push((parsed, active));
+                self.window.request_redraw();
+                b"{\"ok\":true}".to_vec()
             }
             "clipboard.set" => {
                 if !granted.contains(Permission::Clipboard) {
                     return deny("permission-denied");
                 }
-                deny("not-implemented")
+                // Queue the text; it's copied to the OS clipboard inside the egui pass (the only
+                // place the clipboard sink is reachable). `data` is stringified JS-side.
+                let Some(data) = args.get("data").and_then(|v| v.as_str()) else {
+                    return deny("bad-args");
+                };
+                *self.browser.pending_clipboard.borrow_mut() = Some(data.to_string());
+                self.window.request_redraw();
+                b"{\"ok\":true}".to_vec()
             }
             _ => deny("unknown-call"),
         }
@@ -8689,6 +8735,8 @@ impl ApplicationHandler<WakeUp> for App {
             import_msg: RefCell::new(None),
             event_proxy,
             pending_windows: RefCell::new(Vec::new()),
+            pending_tabs: RefCell::new(Vec::new()),
+            pending_clipboard: RefCell::new(None),
         });
 
         // Restore the previous session's tabs unless the user passed an explicit URL on the
@@ -8805,6 +8853,19 @@ impl ApplicationHandler<WakeUp> for App {
                 for url in pending {
                     let (wid, ws) = open_window(event_loop, &browser, vec![url]);
                     windows.insert(wid, ws);
+                }
+                // Tabs requested by GM_openInTab (bridge tabs.open) — opened here, outside the
+                // load_web_resource callback that queued them (LYK-1257). A background open
+                // (active=false, GM_openInTab's default) restores focus to the prior tab after
+                // new_tab selects the new one, reusing select_tab's webview show/hide.
+                let pending_tabs: Vec<(Url, bool)> =
+                    browser.pending_tabs.borrow_mut().drain(..).collect();
+                for (url, active) in pending_tabs {
+                    let prev = state.focused_pane().active.get();
+                    state.new_tab(url);
+                    if !active {
+                        state.select_tab(state.focused.get(), prev);
+                    }
                 }
                 return;
             }
