@@ -1087,6 +1087,24 @@ fn config_file(name: &str) -> Option<PathBuf> {
     Some(base.join("navgator").join(name))
 }
 
+/// Open a file or folder with the OS default handler — a download's "Open" / "Show folder"
+/// action (LYK-1408). Best-effort and non-blocking; a spawn failure (no desktop opener) is ignored.
+fn open_in_system(path: &Path) {
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    if let Ok(mut child) = std::process::Command::new(program).arg(path).spawn() {
+        // Reap in a detached thread so the short-lived opener doesn't linger as a zombie.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
 /// All adblock filter rules: the bundled starter list plus any cached EasyList / EasyPrivacy.
 fn load_filter_rules() -> Vec<String> {
     let mut rules: Vec<String> = include_str!("content/blocklist.txt")
@@ -3651,7 +3669,7 @@ impl AppState {
                 "<p class=\"empty\">No downloads yet. Files you download are saved to ~/Downloads.</p>".to_string()
             } else {
                 let mut out = String::new();
-                for d in dl.iter().rev() {
+                for (idx, d) in dl.iter().enumerate().rev() {
                     let name = d.path.rsplit('/').next().unwrap_or(&d.path);
                     let (cls, label) = if !d.done {
                         ("run", "downloading…")
@@ -3665,15 +3683,26 @@ impl AppState {
                         .find(|c| c.is_alphanumeric())
                         .map(|c| c.to_uppercase().to_string())
                         .unwrap_or_else(|| "•".to_string());
+                    // A finished file gets Open / Show-folder actions (routed through the
+                    // gator://downloads command links, applied via the system opener) — LYK-1408.
+                    let acts = if d.done && d.success {
+                        format!(
+                            "<div class=\"acts\"><a href=\"gator://downloads?open={idx}\">Open</a>\
+                             <a href=\"gator://downloads?reveal={idx}\">Show folder</a></div>"
+                        )
+                    } else {
+                        String::new()
+                    };
                     out.push_str(&format!(
                         "<div class=\"row\"><span class=\"ico\">{}</span><div class=\"meta\">\
                          <div class=\"name\">{}</div><div class=\"path\">{}</div></div>\
-                         <span class=\"state {}\">{}</span></div>",
+                         <span class=\"state {}\">{}</span>{}</div>",
                         html_escape(&letter),
                         html_escape(name),
                         html_escape(&d.path),
                         cls,
                         label,
+                        acts,
                     ));
                 }
                 format!("<div class=\"list\">{out}</div>")
@@ -7992,7 +8021,25 @@ impl WebViewDelegate for AppState {
             }
             "history" => self.render_gator_history(),
             "about" => self.render_gator_about(),
-            "downloads" => self.render_gator_downloads(),
+            "downloads" => {
+                // Command links: ?open=<idx> opens the finished file, ?reveal=<idx> its folder,
+                // via the system opener. Resolve the path under the borrow, then act (LYK-1408).
+                for (k, v) in url.query_pairs() {
+                    let Ok(idx) = v.parse::<usize>() else { continue };
+                    let target = {
+                        let dl = self.browser.downloads.borrow();
+                        dl.get(idx).filter(|d| d.done && d.success).and_then(|d| match k.as_ref() {
+                            "open" => Some(PathBuf::from(&d.path)),
+                            "reveal" => Path::new(&d.path).parent().map(Path::to_path_buf),
+                            _ => None,
+                        })
+                    };
+                    if let Some(t) = target {
+                        open_in_system(&t);
+                    }
+                }
+                self.render_gator_downloads()
+            }
             "passwords" => {
                 let mut remove = None;
                 for (k, v) in url.query_pairs() {
