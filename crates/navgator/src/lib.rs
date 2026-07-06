@@ -59,6 +59,7 @@ use navgator_protocol::IpcCommand;
 
 mod sync;
 mod password;
+mod autofill;
 mod keyring_store;
 mod theme;
 mod fonts;
@@ -1934,6 +1935,47 @@ const AUTOFILL_JS: &str = r#"function(u,p){
   return 1;
 }"#;
 
+/// Form-autofill JS (LYK-1371): fill address + card fields from a profile object. Called as
+/// `(AUTOFILL_FORM_JS)(p)`. Matches WHATWG `autocomplete` tokens (plus a couple of `type=`/`name=`
+/// fallbacks); blank profile fields are skipped. Returns the number of fields filled.
+const AUTOFILL_FORM_JS: &str = r#"function(p){
+  var n=0;
+  function fill(sel,val){
+    if(!val)return;
+    var e=document.querySelector(sel);
+    if(e&&e.value!==undefined){
+      e.value=val;
+      e.dispatchEvent(new Event('input',{bubbles:true}));
+      e.dispatchEvent(new Event('change',{bubbles:true}));
+      n++;
+    }
+  }
+  fill('[autocomplete="name"],[autocomplete~="name"]', p.full_name);
+  if(p.full_name){
+    var parts=p.full_name.trim().split(/\s+/);
+    var given=parts.shift()||'';
+    fill('[autocomplete="given-name"]', given);
+    fill('[autocomplete="family-name"]', parts.join(' '));
+  }
+  fill('[autocomplete="email"],input[type="email"]', p.email);
+  fill('[autocomplete="tel"],input[type="tel"]', p.phone);
+  fill('[autocomplete="organization"]', p.organization);
+  fill('[autocomplete="street-address"],[autocomplete="address-line1"]', p.address1);
+  fill('[autocomplete="address-line2"]', p.address2);
+  fill('[autocomplete="address-level2"]', p.city);
+  fill('[autocomplete="address-level1"]', p.region);
+  fill('[autocomplete="postal-code"]', p.postal_code);
+  fill('[autocomplete="country"],[autocomplete="country-name"]', p.country);
+  fill('[autocomplete="cc-name"]', p.cc_name);
+  fill('[autocomplete="cc-number"]', p.cc_number);
+  fill('[autocomplete="cc-exp-month"]', p.cc_exp_month);
+  fill('[autocomplete="cc-exp-year"]', p.cc_exp_year);
+  if(p.cc_exp_month&&p.cc_exp_year){
+    fill('[autocomplete="cc-exp"]', p.cc_exp_month+'/'+p.cc_exp_year);
+  }
+  return n;
+}"#;
+
 /// Read the active login form's username + password (for manual save). Returns JSON or "".
 const READ_FORM_JS: &str = r#"(function(){
   var pw=document.querySelector('input[type="password"]');
@@ -3178,6 +3220,7 @@ enum KeyShortcut {
     ZoomOut,
     ZoomReset,
     ToggleSplit,
+    Autofill,
 }
 
 /// Browser-global state shared by every window via `Rc<BrowserState>`: the single Servo engine
@@ -3230,6 +3273,9 @@ struct BrowserState {
     password_store: RefCell<password::PasswordStore>,
     password_input: RefCell<String>,
     password_msg: RefCell<Option<String>>,
+    /// E2EE form-autofill profile (addresses + cards, LYK-1371). Shares the vault passphrase —
+    /// unlocked/locked in lockstep with `password_store`.
+    autofill_store: RefCell<autofill::AutofillStore>,
     /// Result of the last bookmark import (shown in Settings).
     import_msg: RefCell<Option<String>>,
     event_proxy: EventLoopProxy<WakeUp>,
@@ -3305,6 +3351,10 @@ struct AppState {
     show_addons: Cell<bool>,
     /// Logical-px rect of the 🧩 toolbar badge, so the add-ons popover anchors under it.
     addon_badge_rect: Cell<egui::Rect>,
+    /// Whether the vault-unlock passphrase overlay is open, and the toolbar rect it anchors under
+    /// (LYK-1371 — restores an interactive unlock after Settings moved off the ☰ menu).
+    show_unlock: Cell<bool>,
+    unlock_anchor: Cell<egui::Rect>,
     /// Active native overlays (dialogs, pickers, context menu).
     dialogs: RefCell<Vec<Dialog>>,
     /// URLs of recently-closed tabs, for Ctrl+Shift+T (reopen most-recent).
@@ -3711,6 +3761,85 @@ impl AppState {
         let html = include_str!("content/downloads.html")
             .replace("__ACCENT__", &accent)
             .replace("__ROWS__", &rows);
+        self.themed(html)
+    }
+
+    /// Render the `gator://autofill` manager (LYK-1371): view/edit the single address + card
+    /// profile. A GET form submits every field as a query param (Servo doesn't hand the embedder a
+    /// POST body), applied + saved in the dispatch arm. Requires the vault to be unlocked.
+    fn render_gator_autofill(&self) -> Vec<u8> {
+        let unlocked = self.browser.autofill_store.borrow().is_unlocked();
+        let inner = if !unlocked {
+            "<div class=\"note\">Your autofill profile is protected by your vault. \
+             Unlock it in <a href=\"gator://settings#privacy\">Settings → Privacy &amp; security</a> \
+             (the same passphrase as saved passwords), then reload this page.</div>"
+                .to_string()
+        } else {
+            let store = self.browser.autofill_store.borrow();
+            let p = store.profile();
+            let field = |name: &str, label: &str, val: &str, ph: &str| {
+                format!(
+                    "<label class=\"fld\"><span>{}</span>\
+                     <input name=\"{}\" value=\"{}\" placeholder=\"{}\" autocomplete=\"off\" spellcheck=\"false\"></label>",
+                    html_escape(label),
+                    name,
+                    html_escape(val),
+                    html_escape(ph),
+                )
+            };
+            format!(
+                "<form method=\"get\" action=\"gator://autofill\">\
+                 <h2>Contact</h2><div class=\"grid\">{}{}{}{}</div>\
+                 <h2>Address</h2><div class=\"grid\">{}{}{}{}{}{}</div>\
+                 <h2>Payment card <span class=\"hint\">— the security code (CVC) is never stored</span></h2>\
+                 <div class=\"grid\">{}{}{}{}</div>\
+                 <div class=\"acts\"><button type=\"submit\">Save profile</button></div></form>",
+                field("full_name", "Full name", &p.full_name, "Jane Doe"),
+                field("email", "Email", &p.email, "jane@example.com"),
+                field("phone", "Phone", &p.phone, "+1 555 0100"),
+                field("organization", "Organization", &p.organization, ""),
+                field("address1", "Street address", &p.address1, "123 Main St"),
+                field("address2", "Address line 2", &p.address2, "Apt 4"),
+                field("city", "City", &p.city, "Springfield"),
+                field("region", "State / Region", &p.region, "CA"),
+                field("postal_code", "Postal code", &p.postal_code, "94016"),
+                field("country", "Country", &p.country, "United States"),
+                field("cc_name", "Cardholder name", &p.cc_name, "JANE DOE"),
+                field("cc_number", "Card number", &p.cc_number, "4111 1111 1111 1111"),
+                field("cc_exp_month", "Exp month (MM)", &p.cc_exp_month, "08"),
+                field("cc_exp_year", "Exp year (YYYY)", &p.cc_exp_year, "2029"),
+            )
+        };
+        let accent = self.browser.settings.borrow().accent.clone();
+        let html = format!(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Autofill · NavGator</title>\
+             <style>\
+             body{{font:15px/1.5 var(--font,system-ui),sans-serif;color:var(--fg);\
+             background:var(--bg);margin:0;padding:40px 24px;display:flex;justify-content:center}}\
+             .wrap{{width:min(720px,94vw)}}\
+             h1{{font-size:26px;margin:0 0 4px}} .g{{color:{accent}}}\
+             .sub{{color:var(--muted);margin:0 0 26px}}\
+             h2{{font-size:15px;margin:26px 0 12px;font-weight:700}}\
+             .hint{{color:var(--muted);font-weight:400;font-size:13px}}\
+             .grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}\
+             .fld{{display:flex;flex-direction:column;gap:5px;min-width:0}}\
+             .fld span{{font-size:12px;color:var(--muted)}}\
+             .fld input{{font:14px monospace;padding:9px 11px;border-radius:9px;\
+             border:1px solid var(--line);background:var(--panel);color:var(--fg)}}\
+             .acts{{margin-top:22px}}\
+             button{{font:600 14px system-ui;padding:10px 18px;border-radius:9px;border:none;\
+             background:{accent};color:#0b0b0b;cursor:pointer}}\
+             .note{{background:var(--panel);border:1px solid var(--line);border-radius:12px;\
+             padding:24px;color:var(--muted)}} a{{color:{accent}}}\
+             footer{{margin-top:38px;color:var(--muted);font-size:12px}}\
+             </style></head><body><div class=\"wrap\">\
+             <h1>Nav<span class=\"g\">Gator</span> autofill</h1>\
+             <p class=\"sub\">One saved identity, encrypted with your vault. Press \
+             <strong>Ctrl+Shift+A</strong> on any page to fill its address &amp; card fields.</p>\
+             {inner}\
+             <footer>gator://autofill &middot; <a href=\"gator://welcome\">welcome</a></footer>\
+             </div></body></html>"
+        );
         self.themed(html)
     }
 
@@ -5078,10 +5207,18 @@ impl AppState {
                             self.show_addons.set(!self.show_addons.get());
                         }
                     }
-                    if self.browser.password_store.borrow().is_unlocked()
-                        && icon_button(ui, true, "Save this page's login", &pal, icon::key).clicked()
-                    {
-                        self.save_login_active();
+                    if self.browser.password_store.borrow().is_unlocked() {
+                        if icon_button(ui, true, "Save this page's login", &pal, icon::key).clicked() {
+                            self.save_login_active();
+                        }
+                    } else {
+                        // Locked: a key button opens the passphrase overlay (unlocks the vault for
+                        // saved logins + autofill, LYK-1371).
+                        let resp = icon_button(ui, false, "Unlock vault (passwords + autofill)", &pal, icon::key);
+                        self.unlock_anchor.set(resp.rect);
+                        if resp.clicked() {
+                            self.show_unlock.set(!self.show_unlock.get());
+                        }
                     }
                     // Zoom indicator: only shown when the active tab isn't at 100%.
                     // Click resets the page zoom; in the right-to-left layout this sits
@@ -5426,6 +5563,7 @@ impl AppState {
 
         // 🧩 add-ons popover (registry-driven), anchored under the toolbar badge.
         self.draw_addons_popover(ctx);
+        self.draw_unlock_overlay(ctx);
 
         let vertical = self.browser.settings.borrow().theme.tab_pos == theme::TabPos::Left;
         let mut bottom = if vertical {
@@ -6707,6 +6845,81 @@ impl AppState {
     /// installed add-on with an "active on this page" dot and a quick enable/disable toggle, plus
     /// a footer link to the full manager (gator://extensions). Toggled by `show_addons`; dismissed
     /// on outside click (context-menu pattern). Registry-driven, so it's kind-agnostic.
+    /// The vault-unlock passphrase overlay (LYK-1371). A small egui popover anchored under the
+    /// toolbar key button; unlocking opens both the password store and the autofill profile.
+    fn draw_unlock_overlay(&self, ctx: &egui::Context) {
+        if !self.show_unlock.get() {
+            return;
+        }
+        if self.browser.password_store.borrow().is_unlocked() {
+            self.show_unlock.set(false);
+            return;
+        }
+        let pal = self.browser.settings.borrow().theme.palette();
+        let anchor = self.unlock_anchor.get();
+        let pos = if anchor == egui::Rect::NOTHING {
+            ctx.screen_rect().center()
+        } else {
+            anchor.left_bottom() + egui::vec2(-200.0, 6.0)
+        };
+        let mut do_unlock = false;
+        egui::Area::new(egui::Id::new("vault_unlock"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(pal.bg2)
+                    .stroke(egui::Stroke::new(1.0, pal.border))
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_min_width(240.0);
+                        ui.label(egui::RichText::new("Unlock vault").strong().color(pal.text));
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new("Encrypts your saved logins + autofill profile.")
+                                .small()
+                                .color(pal.muted),
+                        );
+                        ui.add_space(7.0);
+                        let entered = {
+                            let mut pass = self.browser.password_input.borrow_mut();
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut *pass)
+                                    .password(true)
+                                    .hint_text("Passphrase")
+                                    .desired_width(220.0),
+                            );
+                            // Keep the field focused while empty so the overlay is typeable the
+                            // moment it opens (no extra click needed).
+                            if pass.is_empty() {
+                                resp.request_focus();
+                            }
+                            resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                        };
+                        ui.add_space(7.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Unlock").clicked() || entered {
+                                do_unlock = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.show_unlock.set(false);
+                            }
+                        });
+                    });
+            });
+        if do_unlock {
+            let pass = self.browser.password_input.borrow().clone();
+            if !pass.is_empty() {
+                self.unlock_passwords(&pass);
+                if self.browser.password_store.borrow().is_unlocked() {
+                    self.browser.password_input.borrow_mut().clear();
+                    self.show_unlock.set(false);
+                }
+            }
+        }
+    }
+
     fn draw_addons_popover(&self, ctx: &egui::Context) {
         if !self.show_addons.get() {
             return;
@@ -7475,6 +7688,10 @@ impl AppState {
     /// Unlock the E2EE password store with the passphrase (decrypts saved logins into memory).
     fn unlock_passwords(&self, passphrase: &str) {
         let result = self.browser.password_store.borrow_mut().unlock(passphrase);
+        // The autofill profile shares the vault passphrase — unlock it in lockstep (LYK-1371).
+        if result.is_ok() {
+            let _ = self.browser.autofill_store.borrow_mut().unlock(passphrase);
+        }
         // On a successful unlock, persist the passphrase to the OS keyring iff the user opted in.
         // This is the only place (besides the checkbox-on path) the plaintext is written out, and
         // it goes nowhere but the OS keyring. Failure is non-fatal — the user can unlock manually
@@ -7521,6 +7738,57 @@ impl AppState {
             return;
         };
         let js = format!("({})({}, {})", AUTOFILL_JS, js_string(&user), js_string(&pass));
+        webview.evaluate_javascript(js, |_| {});
+    }
+
+    /// Fill the active page's address/card fields from the (unlocked) autofill profile — invoked by
+    /// the user (Ctrl+Shift+A), never automatically, since it injects card data (LYK-1371). The
+    /// values go straight from the store into the form via evaluate_javascript, never touching
+    /// page-readable storage (mirrors `autofill`).
+    fn autofill_form(&self, pane: usize, tab_idx: usize) {
+        if !self.browser.autofill_store.borrow().is_unlocked() {
+            // Prompt for the vault passphrase; the user re-presses Ctrl+Shift+A once unlocked.
+            self.show_unlock.set(true);
+            self.window.request_redraw();
+            return;
+        }
+        let webview = {
+            let tabs = self.pane(pane).tabs.borrow();
+            let Some(t) = tabs.get(tab_idx) else {
+                return;
+            };
+            t.webview.clone()
+        };
+        let obj = {
+            let store = self.browser.autofill_store.borrow();
+            let p = store.profile();
+            if p.is_blank() {
+                *self.browser.password_msg.borrow_mut() =
+                    Some("No autofill profile yet — add one at gator://autofill.".into());
+                self.window.request_redraw();
+                return;
+            }
+            format!(
+                "{{full_name:{},email:{},phone:{},organization:{},address1:{},address2:{},\
+                 city:{},region:{},postal_code:{},country:{},cc_name:{},cc_number:{},\
+                 cc_exp_month:{},cc_exp_year:{}}}",
+                js_string(&p.full_name),
+                js_string(&p.email),
+                js_string(&p.phone),
+                js_string(&p.organization),
+                js_string(&p.address1),
+                js_string(&p.address2),
+                js_string(&p.city),
+                js_string(&p.region),
+                js_string(&p.postal_code),
+                js_string(&p.country),
+                js_string(&p.cc_name),
+                js_string(&p.cc_number),
+                js_string(&p.cc_exp_month),
+                js_string(&p.cc_exp_year),
+            )
+        };
+        let js = format!("({})({})", AUTOFILL_FORM_JS, obj);
         webview.evaluate_javascript(js, |_| {});
     }
 
@@ -7797,6 +8065,9 @@ impl AppState {
             KeyShortcut::ZoomOut => self.zoom_out(),
             KeyShortcut::ZoomReset => self.zoom_reset(),
             KeyShortcut::ToggleSplit => self.toggle_split(),
+            KeyShortcut::Autofill => {
+                self.autofill_form(self.focused.get(), self.focused_pane().active.get());
+            }
         }
         self.window.request_redraw();
     }
@@ -8039,6 +8310,48 @@ impl WebViewDelegate for AppState {
                     }
                 }
                 self.render_gator_downloads()
+            }
+            "autofill" => {
+                // A GET-form submit arrives as query params (Servo hands the embedder no POST body);
+                // apply every present field and persist under the vault passphrase (LYK-1371).
+                if url.query().is_some() && self.browser.autofill_store.borrow().is_unlocked() {
+                    let mut p = self.browser.autofill_store.borrow().profile().clone();
+                    for (k, v) in url.query_pairs() {
+                        let val = v.into_owned();
+                        match k.as_ref() {
+                            "full_name" => p.full_name = val,
+                            "email" => p.email = val,
+                            "phone" => p.phone = val,
+                            "organization" => p.organization = val,
+                            "address1" => p.address1 = val,
+                            "address2" => p.address2 = val,
+                            "city" => p.city = val,
+                            "region" => p.region = val,
+                            "postal_code" => p.postal_code = val,
+                            "country" => p.country = val,
+                            "cc_name" => p.cc_name = val,
+                            "cc_number" => p.cc_number = val,
+                            "cc_exp_month" => p.cc_exp_month = val,
+                            "cc_exp_year" => p.cc_exp_year = val,
+                            _ => {}
+                        }
+                    }
+                    p.updated = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    self.browser.autofill_store.borrow_mut().set_profile(p);
+                    let pass = self
+                        .browser
+                        .password_store
+                        .borrow()
+                        .passphrase()
+                        .map(str::to_string);
+                    if let Some(pass) = pass {
+                        let _ = self.browser.autofill_store.borrow().save(&pass);
+                    }
+                }
+                self.render_gator_autofill()
             }
             "passwords" => {
                 let mut remove = None;
@@ -8750,6 +9063,8 @@ fn open_window(
         console_filter_focus: Cell::new(false),
         show_addons: Cell::new(false),
         addon_badge_rect: Cell::new(egui::Rect::NOTHING),
+        show_unlock: Cell::new(false),
+        unlock_anchor: Cell::new(egui::Rect::NOTHING),
         dialogs: RefCell::new(Vec::new()),
         closed_tabs: RefCell::new(Vec::new()),
         why_log: RefCell::new(Vec::new()),
@@ -8919,6 +9234,9 @@ impl ApplicationHandler<WakeUp> for App {
             )),
             password_input: RefCell::new(String::new()),
             password_msg: RefCell::new(None),
+            autofill_store: RefCell::new(autofill::AutofillStore::load(
+                config_file("autofill.enc").unwrap_or_else(|| PathBuf::from("autofill.enc")),
+            )),
             import_msg: RefCell::new(None),
             event_proxy,
             pending_windows: RefCell::new(Vec::new()),
@@ -9378,6 +9696,13 @@ impl ApplicationHandler<WakeUp> for App {
                         WinitKey::Character(c) if c == "-" || c == "_" => Some(KeyShortcut::ZoomOut),
                         WinitKey::Character(c) if c == "0" => Some(KeyShortcut::ZoomReset),
                         WinitKey::Character(c) if c == "\\" => Some(KeyShortcut::ToggleSplit),
+                        // Ctrl+Shift+A fills the page's address/card fields (LYK-1371); plain
+                        // Ctrl+A stays the page's select-all.
+                        WinitKey::Character(c)
+                            if c.eq_ignore_ascii_case("a") && state.shift.get() =>
+                        {
+                            Some(KeyShortcut::Autofill)
+                        }
                         _ => None,
                     };
                     if let Some(shortcut) = fallback {
