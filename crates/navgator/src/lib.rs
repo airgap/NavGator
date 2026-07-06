@@ -5973,6 +5973,25 @@ impl AppState {
                             p.circle_stroke(center, 5.0, egui::Stroke::new(1.5, pal.bg));
                         }
                     }
+                    // Current-profile indicator (LYK-1376): when running a non-default identity, show
+                    // its name (accent pill, left of ☰) so you always know which profile you're in —
+                    // profiles have separate cookies/vault/history, so acting in the wrong one matters.
+                    // Click to switch (gator://profiles).
+                    let prof = active_profile();
+                    if prof != "default" {
+                        let resp = ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(&prof).size(11.0).strong().color(pal.bg),
+                                )
+                                .fill(pal.accent)
+                                .min_size(egui::vec2(0.0, 22.0)),
+                            )
+                            .on_hover_text("Current profile — click to switch");
+                        if resp.clicked() {
+                            self.navigate_from_omnibox("gator://profiles");
+                        }
+                    }
                     if icon_button(ui, true, "Customize appearance", &pal, icon::studio).clicked() {
                         self.navigate_from_omnibox("gator://settings#appearance");
                     }
