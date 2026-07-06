@@ -647,6 +647,44 @@ fn phishing_reason(host: &str) -> Option<String> {
     None
 }
 
+/// Default update-manifest URL — a small JSON document, either NavGator's own
+/// `{"version":"x.y.z","url":"...","notes":"..."}` or a GitHub release (`tag_name`/`html_url`/`body`).
+/// Overridable via `NAVGATOR_UPDATE_URL` (self-host / enterprise / testing); set it empty to disable
+/// the auto-check entirely.
+const DEFAULT_UPDATE_URL: &str = "https://navgator.airgap.dev/latest.json";
+
+/// The effective update-manifest URL (env override wins). Empty string disables the check.
+fn update_url() -> String {
+    std::env::var("NAVGATOR_UPDATE_URL").unwrap_or_else(|_| DEFAULT_UPDATE_URL.to_string())
+}
+
+/// True if dotted-numeric `remote` is strictly newer than `current` (e.g. `0.2.0` > `0.1.9`). A
+/// leading `v` and non-numeric suffixes (`-beta`, build metadata) are tolerated; missing components
+/// count as 0. Pure + unit-tested — the core of update detection.
+fn version_is_newer(remote: &str, current: &str) -> bool {
+    fn parts(v: &str) -> Vec<u64> {
+        v.trim()
+            .trim_start_matches(['v', 'V'])
+            .split(['.', '-', '+'])
+            .map(|p| {
+                p.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse()
+                    .unwrap_or(0)
+            })
+            .collect()
+    }
+    let (r, c) = (parts(remote), parts(current));
+    for i in 0..r.len().max(c.len()) {
+        let (rv, cv) = (r.get(i).copied().unwrap_or(0), c.get(i).copied().unwrap_or(0));
+        if rv != cv {
+            return rv > cv;
+        }
+    }
+    false
+}
+
 /// Flat vector chrome icons drawn via the egui painter — native, crisp, theme-coloured, and immune
 /// to missing font glyphs (emoji/symbols like the puzzle, close-✕ and maximize-▢ otherwise render
 /// as `.notdef` squares without an emoji font). Each fn paints into the icon's square bounding box.
@@ -3510,6 +3548,9 @@ struct BrowserState {
     /// Downloads (engine-streamed to ~/Downloads) + a transient toast for the latest one.
     downloads: RefCell<Vec<Download>>,
     download_toast: RefCell<Option<String>>,
+    /// Auto-update detection (LYK/self): `(version, download_url, notes)` of a newer release found by
+    /// the background update check, or None. Surfaced as a toast + a gator://about banner.
+    update_info: RefCell<Option<(String, String, String)>>,
     /// E2EE password store, the Settings passphrase input buffer, and a transient status line.
     password_store: RefCell<password::PasswordStore>,
     password_input: RefCell<String>,
@@ -4840,9 +4881,33 @@ impl AppState {
     /// shortcuts, and links back to welcome/history. Templated like `gator://welcome`.
     fn render_gator_about(&self) -> Vec<u8> {
         let accent = self.browser.settings.borrow().accent.clone();
+        let update = match &*self.browser.update_info.borrow() {
+            Some((ver, url, notes)) => {
+                let dl = if url.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" &middot; <a href=\"{}\">Download</a>", html_escape(url))
+                };
+                let note = if notes.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("<div class=\"unote\">{}</div>", html_escape(notes.trim()))
+                };
+                format!(
+                    "<div class=\"update\">&#11014; NavGator <b>{}</b> is available.{}{}</div>",
+                    html_escape(ver),
+                    dl,
+                    note
+                )
+            }
+            None => "<p class=\"uptodate\">You're on the latest known version. \
+                     <a href=\"gator://about?check\">Check for updates</a></p>"
+                .to_string(),
+        };
         let html = include_str!("content/about.html")
             .replace("__ACCENT__", &accent)
-            .replace("__VERSION__", env!("CARGO_PKG_VERSION"));
+            .replace("__VERSION__", env!("CARGO_PKG_VERSION"))
+            .replace("__UPDATE__", &update);
         self.themed(html)
     }
 
@@ -7233,6 +7298,61 @@ impl AppState {
     /// Fire-and-forget calls (`storage.set/delete`, `notify`, `tabs.open`, `clipboard.set`) work;
     /// data-returning calls (`storage.get/list`, `net.fetch`) need a native `evaluate_javascript`
     /// push-path back into the page — not yet built (issue #4). The capability gate holds regardless.
+    /// Auto-update detection: on a background thread, fetch the update manifest and — if it names a
+    /// version newer than this build — notify the UI (`WakeUp::UpdateAvailable`). Detection only;
+    /// NavGator never self-installs. Non-blocking, fully fallible-safe (any network/parse problem is
+    /// silently ignored). Disabled if the manifest URL is empty.
+    fn check_for_update(&self) {
+        let url = update_url();
+        if url.trim().is_empty() {
+            return;
+        }
+        let proxy = self.browser.event_proxy.clone();
+        std::thread::spawn(move || {
+            let agent = ureq::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build();
+            let Ok(resp) = agent.get(&url).call() else {
+                return;
+            };
+            let Ok(text) = resp.into_string() else {
+                return;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+                return;
+            };
+            // Accept NavGator's own manifest {version,url,notes} or a GitHub release
+            // {tag_name,html_url,body}.
+            let field = |a: &str, b: &str| {
+                v.get(a)
+                    .or_else(|| v.get(b))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let version = field("version", "tag_name");
+            if version.is_empty() || !version_is_newer(&version, env!("CARGO_PKG_VERSION")) {
+                return;
+            }
+            let dl = field("url", "html_url");
+            let notes = field("notes", "body");
+            let _ = proxy.send_event(WakeUp::UpdateAvailable {
+                version,
+                url: dl,
+                notes,
+            });
+        });
+    }
+
+    /// Record + surface a detected update (UI thread): a transient toast plus a persistent
+    /// gator://about banner.
+    fn on_update_available(&self, version: String, url: String, notes: String) {
+        *self.browser.download_toast.borrow_mut() =
+            Some(format!("NavGator {version} is available — see gator://about"));
+        *self.browser.update_info.borrow_mut() = Some((version, url, notes));
+        self.window.request_redraw();
+    }
+
     /// Resolve an off-thread net.fetch (GM_xmlhttpRequest) on the UI thread: look up the page +
     /// callback id and push the result through `window.__ngGmResolve` (LYK-1257).
     fn resolve_gm_fetch(&self, id: u64, ok: bool, json: String) {
@@ -9076,7 +9196,13 @@ impl WebViewDelegate for AppState {
                 }
             }
             "history" => self.render_gator_history(),
-            "about" => self.render_gator_about(),
+            "about" => {
+                // ?check re-runs the update check (async; a newer version surfaces as a toast/banner).
+                if url.query_pairs().any(|(k, _)| k == "check") {
+                    self.check_for_update();
+                }
+                self.render_gator_about()
+            }
             "downloads" => {
                 // Command links: ?open=<idx> opens the finished file, ?reveal=<idx> its folder,
                 // via the system opener. Resolve the path under the borrow, then act (LYK-1408).
@@ -10033,6 +10159,7 @@ impl ApplicationHandler<WakeUp> for App {
             syncing: Cell::new(false),
             downloads: RefCell::new(Vec::new()),
             download_toast: RefCell::new(None),
+            update_info: RefCell::new(None),
             password_store: RefCell::new(password::PasswordStore::load(
                 config_file("passwords.enc").unwrap_or_else(|| PathBuf::from("passwords.enc")),
             )),
@@ -10078,6 +10205,10 @@ impl ApplicationHandler<WakeUp> for App {
         // decided (new/changed scripts default to disabled-pending-consent in load_addons).
         state.prompt_pending_consents();
 
+        // Auto-update detection: one background check at launch. Non-blocking; a newer release
+        // surfaces as a toast + a gator://about banner. Detection only — no self-install.
+        state.check_for_update();
+
         let mut windows = HashMap::new();
         windows.insert(window_id, state);
         *self = App::Running { browser, windows };
@@ -10101,6 +10232,11 @@ impl ApplicationHandler<WakeUp> for App {
                 WakeUp::SyncDone(outcome) => state.apply_sync(outcome),
                 WakeUp::CosmeticReady => state.flush_cosmetic(),
                 WakeUp::GmFetchDone { id, ok, json } => state.resolve_gm_fetch(id, ok, json),
+                WakeUp::UpdateAvailable {
+                    version,
+                    url,
+                    notes,
+                } => state.on_update_available(version, url, notes),
                 WakeUp::Wake | WakeUp::Exit => {}
             }
         }
@@ -10609,6 +10745,8 @@ enum WakeUp {
     CosmeticReady,
     /// An off-thread GM_xmlhttpRequest (net.fetch) finished; resolve it on the UI thread (LYK-1257).
     GmFetchDone { id: u64, ok: bool, json: String },
+    /// The background update check found a newer release; surface it on the UI thread.
+    UpdateAvailable { version: String, url: String, notes: String },
 }
 
 impl EventLoopWaker for Waker {
@@ -10708,8 +10846,21 @@ mod adblock_tests {
 mod chrome_helper_tests {
     use super::{
         color_hex, favicon_hue, is_hex_color, levenshtein, omnibox_target, parse_session,
-        phishing_reason, strip_tracking_params,
+        phishing_reason, strip_tracking_params, version_is_newer,
     };
+
+    #[test]
+    fn version_is_newer_compares_correctly() {
+        assert!(version_is_newer("0.2.0", "0.1.0"));
+        assert!(version_is_newer("1.0.0", "0.9.9"));
+        assert!(version_is_newer("0.1.10", "0.1.9")); // numeric, not lexical
+        assert!(version_is_newer("v0.2.0", "0.1.0")); // leading v tolerated
+        assert!(version_is_newer("0.2.0-beta", "0.1.0")); // suffix tolerated
+        assert!(!version_is_newer("0.1.0", "0.1.0")); // equal
+        assert!(!version_is_newer("0.1.0", "0.2.0")); // older
+        assert!(!version_is_newer("0.1.0", "0.1.0-beta")); // equal numeric core
+        assert!(version_is_newer("0.1.0.1", "0.1.0")); // extra component
+    }
 
     #[test]
     fn phishing_reason_flags_impersonation_but_not_legit() {
