@@ -611,6 +611,41 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// On-device phishing heuristics (LYK-1288): flag a host as a likely impersonation with NO
+/// network / Safe-Browsing lookup. Two signals: (1) a punycode/IDN label (homograph attacks —
+/// `xn--80ak6aa92e.com` renders as `apple.com`); (2) a well-known brand appearing as a distinct
+/// host token (split on `.`/`-`) while the registered domain isn't that brand
+/// (`paypal.secure-login.com`, `apple-id.com`). Returns a human-readable reason, or None. Pure +
+/// unit-tested; used by the credential firewall (advisory on a password field) and the trust tint
+/// (red). Registered domain is approximated as the last two labels — fine for common TLDs; a
+/// multi-part TLD (`.co.uk`) may misparse, which only affects the brand signal's precision.
+fn phishing_reason(host: &str) -> Option<String> {
+    if host.is_empty() {
+        return None;
+    }
+    if host.split('.').any(|l| l.starts_with("xn--")) {
+        return Some(format!(
+            "\"{host}\" uses punycode (xn--), which can render as a look-alike of a real domain (homograph attack)."
+        ));
+    }
+    const BRANDS: &[&str] = &[
+        "paypal", "icloud", "google", "gmail", "microsoft", "outlook", "office365", "amazon",
+        "facebook", "instagram", "netflix", "github", "dropbox", "linkedin", "coinbase", "binance",
+        "wellsfargo", "chase", "citibank", "bankofamerica", "americanexpress",
+    ];
+    let labels: Vec<&str> = host.split('.').collect();
+    let reg_first = labels[labels.len().saturating_sub(2).min(labels.len() - 1)];
+    let tokens: Vec<&str> = host.split(['.', '-']).collect();
+    for &b in BRANDS {
+        if tokens.iter().any(|&t| t == b) && reg_first != b {
+            return Some(format!(
+                "\"{host}\" carries the brand \"{b}\" but its domain isn't {b}'s real site — it may be impersonating {b}."
+            ));
+        }
+    }
+    None
+}
+
 /// Flat vector chrome icons drawn via the egui painter — native, crisp, theme-coloured, and immune
 /// to missing font glyphs (emoji/symbols like the puzzle, close-✕ and maximize-▢ otherwise render
 /// as `.notdef` squares without an emoji font). Each fn paints into the icon's square bounding box.
@@ -5182,7 +5217,10 @@ impl AppState {
             };
             (origin, host, !t.blocked.borrow().is_empty())
         };
-        let tint = {
+        let red = egui::Color32::from_rgb(0xE5, 0x48, 0x4D);
+        let tint = if phishing_reason(&host).is_some() {
+            red // red — on-device phishing heuristic (punycode / brand impersonation), LYK-1288
+        } else {
             let store = self.browser.password_store.borrow();
             let unlocked = store.is_unlocked();
             let here = unlocked && !store.for_origin(&origin).is_empty();
@@ -5196,7 +5234,7 @@ impl AppState {
                     })
                     .any(|s| s != host && levenshtein(&s, &host) <= 2);
             if lookalike {
-                egui::Color32::from_rgb(0xE5, 0x48, 0x4D) // red — look-alike/phishing
+                red // red — look-alike of a saved-credential origin
             } else if here {
                 egui::Color32::from_rgb(0x3E, 0xCF, 0x8E) // green — known/trusted origin
             } else if blocked {
@@ -8041,6 +8079,13 @@ impl AppState {
         if host.is_empty() {
             return;
         }
+        // Proactive on-device phishing heuristic (punycode / brand impersonation) — fires even
+        // with no saved credentials and the vault locked (LYK-1288).
+        if let Some(reason) = phishing_reason(host) {
+            *self.browser.password_msg.borrow_mut() = Some(format!("⚠ Possible phishing: {reason}"));
+            self.window.request_redraw();
+            return;
+        }
         let saved: Vec<String> = {
             let store = self.browser.password_store.borrow();
             if !store.is_unlocked() || !store.for_origin(origin).is_empty() {
@@ -10057,8 +10102,29 @@ mod adblock_tests {
 mod chrome_helper_tests {
     use super::{
         color_hex, favicon_hue, is_hex_color, levenshtein, omnibox_target, parse_session,
-        strip_tracking_params,
+        phishing_reason, strip_tracking_params,
     };
+
+    #[test]
+    fn phishing_reason_flags_impersonation_but_not_legit() {
+        // Legit sites → no warning.
+        assert!(phishing_reason("github.com").is_none());
+        assert!(phishing_reason("www.paypal.com").is_none());
+        assert!(phishing_reason("shop.apple.com").is_none()); // "apple" not in the brand list; fine
+        assert!(phishing_reason("mail.google.com").is_none());
+        assert!(phishing_reason("localhost").is_none());
+        assert!(phishing_reason("127.0.0.1").is_none());
+        // Punycode / homograph → flagged.
+        assert!(phishing_reason("xn--80ak6aa92e.com").is_some());
+        assert!(phishing_reason("secure.xn--pple-43d.com").is_some());
+        // Brand as a token but not the registered domain → flagged.
+        assert!(phishing_reason("paypal.secure-login.com").is_some());
+        assert!(phishing_reason("github-login.net").is_some());
+        assert!(phishing_reason("google.com.verify-account.io").is_some());
+        assert!(phishing_reason("coinbase.evil.example").is_some());
+        // Brand embedded in a longer token is NOT an exact-token match → not flagged.
+        assert!(phishing_reason("githubusercontent.com").is_none());
+    }
 
     #[test]
     fn levenshtein_flags_typosquats() {
