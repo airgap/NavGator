@@ -1,0 +1,71 @@
+name: Publish update manifest
+
+# Publishes latest.json — the auto-update manifest that the app's check_for_update() fetches — to
+# GitHub Pages on EVERY push. During early development this announces each build even without a
+# semver bump: the version is <cargo-version>-<commit-count> (e.g. 0.1.0-276), the same monotonic
+# number build.rs bakes into the binary and scripts/package.sh stamps onto the app-icon badge, so
+# the running app can tell it is behind a freshly pushed build.
+#
+# ONE-TIME REPO SETUP: Settings -> Pages -> Source = "GitHub Actions" (the deploy step needs this).
+# The app defaults to https://airgap.github.io/NavGator/latest.json (DEFAULT_UPDATE_URL); any build
+# or user can point elsewhere with the NAVGATOR_UPDATE_URL env var (empty disables the check).
+
+on:
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Serialize deploys so overlapping pushes can't race the Pages publish.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history — the build number is `git rev-list --count HEAD`
+
+      - name: Generate manifest
+        run: |
+          set -euo pipefail
+          VERSION=$(grep '^version' crates/navgator/Cargo.toml | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+          BUILD=$(git rev-list --count HEAD)
+          FULL="$VERSION-$BUILD"
+          SHA=$(git rev-parse --short HEAD)
+          SUBJECT=$(git log -1 --pretty=%s)
+          mkdir -p _site
+          # jq builds the JSON so the commit subject can't break escaping. Fields:
+          #   version : matched against build_version() by version_is_newer()
+          #   url     : where to get the build (releases page for now)
+          #   notes   : shown in the gator://about banner
+          #   commit/channel/built_at : informational
+          jq -n \
+            --arg version "$FULL" \
+            --arg url "https://github.com/${{ github.repository }}/releases" \
+            --arg notes "Build $BUILD ($SHA): $SUBJECT" \
+            --arg commit "$SHA" \
+            --arg channel "${{ github.ref_name }}" \
+            --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{version:$version, url:$url, notes:$notes, commit:$commit, channel:$channel, built_at:$built_at}' \
+            | tee _site/latest.json
+          # Also expose it under the channel name so a stable channel can be pinned later.
+          mkdir -p "_site/${{ github.ref_name }}"
+          cp _site/latest.json "_site/${{ github.ref_name }}/latest.json"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
