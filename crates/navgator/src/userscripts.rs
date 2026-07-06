@@ -838,20 +838,37 @@ pub fn wrap_userscript(addon: &Addon, source: &str, cap_token: &str) -> String {
   // Servo's WebResourceRequest exposes no request BODY to the embedder intercept
   // (load_web_resource sees only method/headers/url), so call args travel in the URL
   // query — readable there via url.query_pairs(). GET keeps it a plain readable request.
-  const __ep = (call, args) =>
+  const __ep = (call, args, cb) =>
     "navgator://gm/" + __cap + "/" + call +
-    "?a=" + encodeURIComponent(JSON.stringify(args == null ? {{}} : args));
+    "?a=" + encodeURIComponent(JSON.stringify(args == null ? {{}} : args)) +
+    (cb != null ? "&cb=" + cb : "");
   // Transport: an Image beacon, NOT fetch()/XHR. A live run proved Servo routes NEITHER fetch nor
   // XHR of a custom (navgator://) scheme to the embedder interceptor (both throw NetworkError) —
   // but a subresource <img> load DOES reach load_web_resource (same path gator://font/* uses).
   // Fire-and-forget only: the "image" load fails and the page reads no response body. handle_gm_bridge
   // still performs the side effect (e.g. storage.set), which is all these calls need.
   const __bridge = (call, args) => {{ try {{ (new Image()).src = __ep(call, args); }} catch (e) {{}} return Promise.resolve(); }};
-  // Data-returning calls can't use the beacon (no readable body) and fetch/XHR are dead, so they
-  // need a native evaluate_javascript push-path (not yet built — see #4). Reject clearly rather than
-  // surface a confusing NetworkError. __nativeFetch/__XHR are retained above for that future path.
-  const __bridgeJson = (call, args) =>
-    Promise.reject(new Error("gm bridge: data-returning '" + call + "' needs the native push-path (Servo blocks custom-scheme fetch/XHR) — see #4"));
+  // Data-returning calls (storage.get/list, net.fetch): register a callback keyed by a per-page id,
+  // fire the beacon carrying that id, and let handle_gm_bridge push the result back through a native
+  // evaluate_javascript(window.__ngGmResolve(id, ok, json)). The registry is page-global (defined
+  // once across all userscripts). A 5s timeout rejects if no push arrives.
+  if (!window.__ngGmResolve) {{
+    window.__ngGmCb = {{}};
+    window.__ngGmSeq = 0;
+    window.__ngGmResolve = function (id, ok, json) {{
+      var cb = window.__ngGmCb[id]; if (!cb) return; delete window.__ngGmCb[id];
+      try {{ ok ? cb.res(json ? JSON.parse(json) : null) : cb.rej(new Error(json || "gm error")); }}
+      catch (e) {{ cb.rej(e); }}
+    }};
+  }}
+  const __bridgeJson = (call, args) => new Promise(function (res, rej) {{
+    try {{
+      var id = ++window.__ngGmSeq;
+      window.__ngGmCb[id] = {{ res: res, rej: rej }};
+      (new Image()).src = __ep(call, args, id);
+      setTimeout(function () {{ if (window.__ngGmCb[id]) {{ delete window.__ngGmCb[id]; rej(new Error("gm bridge timeout")); }} }}, 5000);
+    }} catch (e) {{ rej(e); }}
+  }});
 {gm}  // 3. Original userscript source.
   function __run() {{
 {source}

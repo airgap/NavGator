@@ -7046,7 +7046,7 @@ impl AppState {
     /// Fire-and-forget calls (`storage.set/delete`, `notify`, `tabs.open`, `clipboard.set`) work;
     /// data-returning calls (`storage.get/list`, `net.fetch`) need a native `evaluate_javascript`
     /// push-path back into the page — not yet built (issue #4). The capability gate holds regardless.
-    fn handle_gm_bridge(&self, url: &Url) -> Vec<u8> {
+    fn handle_gm_bridge(&self, webview: &WebView, url: &Url) -> Vec<u8> {
         use userscripts::Permission;
         let deny = |msg: &str| -> Vec<u8> {
             format!("{{\"ok\":false,\"error\":\"{msg}\"}}").into_bytes()
@@ -7069,6 +7069,12 @@ impl AppState {
             .and_then(|(_, v)| serde_json::from_str(&v).ok())
             .unwrap_or(serde_json::Value::Null);
         let arg_key = || args.get("key").and_then(|v| v.as_str()).map(str::to_string);
+        // Data-returning calls carry a `cb` id; the result is pushed back to the page's
+        // __ngGmResolve callback registry after the call runs (LYK-1257 push-path).
+        let cb_id = url
+            .query_pairs()
+            .find(|(k, _)| &**k == "cb")
+            .and_then(|(_, v)| v.parse::<u64>().ok());
 
         // Resolve cap → add-on via the per-process secret salt (unforgeable from a page's public
         // view of the add-on id; design §5/§11). Clone the bits we need so we don't hold the
@@ -7085,7 +7091,7 @@ impl AppState {
             return deny("bad-cap");
         };
 
-        match call.as_str() {
+        let body = match call.as_str() {
             "storage.list" => {
                 if !granted.contains(Permission::Storage) {
                     return deny("permission-denied");
@@ -7200,7 +7206,19 @@ impl AppState {
                 b"{\"ok\":true}".to_vec()
             }
             _ => deny("unknown-call"),
+        };
+        // Push the response back to a data-returning caller (GM_getValue/GM_listValues) via the
+        // page's __ngGmResolve callback registry; fire-and-forget calls carry no `cb` and are
+        // ignored here (LYK-1257 push-path). `cb` is validated as numeric to avoid JS injection.
+        if let Some(cb) = cb_id {
+            if let Ok(s) = std::str::from_utf8(&body) {
+                webview.evaluate_javascript(
+                    format!("window.__ngGmResolve({}, true, {})", cb, js_string(s)),
+                    |_| {},
+                );
+            }
         }
+        body
     }
 
     /// The 🧩 add-ons popover: a theme-matched panel under the toolbar badge listing every
@@ -8668,7 +8686,7 @@ impl WebViewDelegate for AppState {
         // ordinary http(s)/gator loads is one extra cheap scheme compare. The <cap> token
         // identifies the calling add-on and is validated against its `granted` set.
         if url.scheme() == "navgator" && url.host_str() == Some("gm") {
-            let body = self.handle_gm_bridge(&url);
+            let body = self.handle_gm_bridge(&webview, &url);
             let mut headers = HeaderMap::new();
             headers.insert(
                 CONTENT_TYPE,
