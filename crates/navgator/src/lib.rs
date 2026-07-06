@@ -670,11 +670,20 @@ fn phishing_reason(host: &str) -> Option<String> {
 /// `{"version":"x.y.z","url":"...","notes":"..."}` or a GitHub release (`tag_name`/`html_url`/`body`).
 /// Overridable via `NAVGATOR_UPDATE_URL` (self-host / enterprise / testing); set it empty to disable
 /// the auto-check entirely.
-const DEFAULT_UPDATE_URL: &str = "https://navgator.airgap.dev/latest.json";
+const DEFAULT_UPDATE_URL: &str = "https://airgap.github.io/NavGator/latest.json";
 
 /// The effective update-manifest URL (env override wins). Empty string disables the check.
 fn update_url() -> String {
     std::env::var("NAVGATOR_UPDATE_URL").unwrap_or_else(|_| DEFAULT_UPDATE_URL.to_string())
+}
+
+/// This build's full version: the crate semver plus the monotonic build number baked in by
+/// `build.rs` (`CARGO_PKG_VERSION`-`NAVGATOR_BUILD`, e.g. `0.1.0-1234`). It matches the app-icon
+/// badge (`scripts/package.sh`), and — unlike the bare semver — changes on every build, so during
+/// early development the update check can distinguish builds without a semver bump. The `-` form is
+/// parsed fine by [`version_is_newer`] (which splits on `.`/`-`/`+`).
+fn build_version() -> String {
+    format!("{}-{}", env!("CARGO_PKG_VERSION"), env!("NAVGATOR_BUILD"))
 }
 
 /// Read just the persisted `update_freq` from the settings file (default `daily`). Used by the
@@ -4883,7 +4892,7 @@ impl AppState {
             .replace("__ADS_TOGGLE__", &ads_toggle)
             .replace("__ADS_BLOCKED__", &blocked.to_string())
             .replace("__UPDATE_PILLS__", &update_pills)
-            .replace("__CURRENT_VERSION__", env!("CARGO_PKG_VERSION"))
+            .replace("__CURRENT_VERSION__", &build_version())
             .replace("__SYNC_BOOKMARKS__", &sync_bookmarks)
             .replace("__SYNC_HISTORY__", &sync_history)
             .replace("__SYNC_PASSWORDS__", &sync_passwords)
@@ -5045,7 +5054,7 @@ impl AppState {
         };
         let html = include_str!("content/about.html")
             .replace("__ACCENT__", &accent)
-            .replace("__VERSION__", env!("CARGO_PKG_VERSION"))
+            .replace("__VERSION__", &build_version())
             .replace("__UPDATE__", &update);
         self.themed(html)
     }
@@ -7470,7 +7479,7 @@ impl AppState {
                     .to_string()
             };
             let version = field("version", "tag_name");
-            if version.is_empty() || !version_is_newer(&version, env!("CARGO_PKG_VERSION")) {
+            if version.is_empty() || !version_is_newer(&version, &build_version()) {
                 return;
             }
             let dl = field("url", "html_url");
@@ -11084,6 +11093,11 @@ mod chrome_helper_tests {
         assert!(!version_is_newer("0.1.0", "0.2.0")); // older
         assert!(!version_is_newer("0.1.0", "0.1.0-beta")); // equal numeric core
         assert!(version_is_newer("0.1.0.1", "0.1.0")); // extra component
+        // The build-stamped form we actually ship (semver-buildnumber, matches the icon badge):
+        assert!(version_is_newer("0.1.0-1235", "0.1.0-1234")); // newer build, same semver
+        assert!(!version_is_newer("0.1.0-1234", "0.1.0-1234")); // same build
+        assert!(!version_is_newer("0.1.0-1233", "0.1.0-1234")); // older build
+        assert!(version_is_newer("0.2.0-1", "0.1.0-9999")); // semver wins over build number
     }
 
     #[test]
