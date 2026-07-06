@@ -549,6 +549,23 @@ struct Settings {
     /// True once the user has explicitly chosen a theme base (Studio surface chip). Until then
     /// the base follows the OS colour-scheme (dark OS → dark chrome) on each launch.
     theme_base_explicit: bool,
+    /// How often to check for a NavGator update: `never` | `hourly` | `daily` (LYK-1495).
+    update_freq: String,
+    /// True once the user has completed (or skipped) the first-run onboarding screen. Until then,
+    /// launch opens `gator://onboarding` instead of the welcome page.
+    onboarded: bool,
+}
+
+/// The offered update-check cadences (key, label). `daily` is the default.
+const UPDATE_FREQS: &[(&str, &str)] = &[("never", "Never"), ("hourly", "Hourly"), ("daily", "Daily")];
+
+/// The re-check interval for a frequency key, or None for `never`/unknown (no periodic check).
+fn update_freq_interval(freq: &str) -> Option<std::time::Duration> {
+    match freq {
+        "hourly" => Some(std::time::Duration::from_secs(3600)),
+        "daily" => Some(std::time::Duration::from_secs(24 * 3600)),
+        _ => None,
+    }
 }
 
 impl Default for Settings {
@@ -568,6 +585,8 @@ impl Default for Settings {
             theme: theme::Theme::default(),
             modules: theme::Modules::default(),
             theme_base_explicit: false,
+            update_freq: "daily".to_string(),
+            onboarded: false,
         }
     }
 }
@@ -656,6 +675,23 @@ const DEFAULT_UPDATE_URL: &str = "https://navgator.airgap.dev/latest.json";
 /// The effective update-manifest URL (env override wins). Empty string disables the check.
 fn update_url() -> String {
     std::env::var("NAVGATOR_UPDATE_URL").unwrap_or_else(|_| DEFAULT_UPDATE_URL.to_string())
+}
+
+/// Read just the persisted `update_freq` from the settings file (default `daily`). Used by the
+/// scheduler thread, which can't touch the UI-thread `Settings` RefCell, so it re-reads from disk —
+/// this also lets a mid-session frequency change take effect without restarting the thread.
+fn read_update_freq() -> String {
+    settings_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|text| {
+            text.lines().find_map(|l| {
+                l.split_once('=')
+                    .filter(|(k, _)| k.trim() == "update_freq")
+                    .map(|(_, v)| v.trim().to_string())
+            })
+        })
+        .filter(|f| UPDATE_FREQS.iter().any(|(k, _)| *k == f))
+        .unwrap_or_else(|| "daily".to_string())
 }
 
 /// True if dotted-numeric `remote` is strictly newer than `current` (e.g. `0.2.0` > `0.1.9`). A
@@ -994,10 +1030,11 @@ fn sync_legacy_theme(s: &mut Settings) {
 }
 
 fn settings_path() -> Option<PathBuf> {
-    let base = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("navgator").join("settings.conf"))
+    // Per-profile (LYK-1376): settings live under the active profile's dir like all other state,
+    // so profiles have independent search engine / theme / update cadence. The default profile's
+    // path is unchanged (profile_base() == <config>/navgator there), so existing installs migrate
+    // transparently.
+    Some(profile_base()?.join("settings.conf"))
 }
 
 fn load_settings() -> Settings {
@@ -1074,6 +1111,10 @@ fn load_settings() -> Settings {
                     "mod_sites" => s.modules.sites = v.trim() == "true",
                     "mod_notes" => s.modules.notes = v.trim() == "true",
                     "mod_feed" => s.modules.feed = v.trim() == "true",
+                    "update_freq" if UPDATE_FREQS.iter().any(|(k, _)| *k == v.trim()) => {
+                        s.update_freq = v.trim().to_string()
+                    }
+                    "onboarded" => s.onboarded = v.trim() == "true",
                     _ => {}
                 }
             }
@@ -1091,7 +1132,7 @@ fn save_settings(s: &Settings) {
         let _ = std::fs::write(
             &path,
             format!(
-                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nremember_passphrase={}\nblock_ads={}\nforce_dark={}\nwallpaper={}\nth_base={}\nth_accent={}\nth_density={}\nth_font={}\nth_tabpos={}\nth_wallpaper={}\nth_tabfit={}\nth_radius={}\nth_glass={}\nth_tabmaxw={}\nth_base_explicit={}\nmod_clock={}\nmod_search={}\nmod_sites={}\nmod_notes={}\nmod_feed={}\n",
+                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nremember_passphrase={}\nblock_ads={}\nforce_dark={}\nwallpaper={}\nth_base={}\nth_accent={}\nth_density={}\nth_font={}\nth_tabpos={}\nth_wallpaper={}\nth_tabfit={}\nth_radius={}\nth_glass={}\nth_tabmaxw={}\nth_base_explicit={}\nmod_clock={}\nmod_search={}\nmod_sites={}\nmod_notes={}\nmod_feed={}\nupdate_freq={}\nonboarded={}\n",
                 s.search,
                 s.accent,
                 s.dark,
@@ -1119,6 +1160,8 @@ fn save_settings(s: &Settings) {
                 s.modules.sites,
                 s.modules.notes,
                 s.modules.feed,
+                s.update_freq,
+                s.onboarded,
             ),
         );
     }
@@ -1927,6 +1970,8 @@ enum SettingsApply {
     /// A rich-theme change from the Appearance section: (key, value), applied to `Settings::theme`
     /// (key ∈ base/accentk/density/font/tabpos/tabfit/wallpaper/preset/radius/glass/tabmaxw/module).
     ThemeSet(String, String),
+    /// Update-check cadence change (`never`/`hourly`/`daily`) from the settings page (LYK-1495).
+    UpdateFreq(String),
     Action(String),
 }
 
@@ -4533,6 +4578,12 @@ impl AppState {
                     s.dark = b;
                     changed = true;
                 }
+                SettingsApply::UpdateFreq(v) => {
+                    if UPDATE_FREQS.iter().any(|(k, _)| *k == v) {
+                        s.update_freq = v;
+                        changed = true;
+                    }
+                }
                 SettingsApply::BlockAds(b) => {
                     s.block_ads = b;
                     changed = true;
@@ -4660,6 +4711,17 @@ impl AppState {
             }))
             .collect();
         let ads_toggle = toggle_link("block_ads", s.block_ads, "privacy");
+        let update_pills: String = UPDATE_FREQS
+            .iter()
+            .map(|(k, label)| {
+                format!(
+                    "<a class=\"pill{}\" href=\"gator://settings?update_freq={}#privacy\">{}</a>",
+                    if *k == s.update_freq { " on" } else { "" },
+                    k,
+                    html_escape(label),
+                )
+            })
+            .collect();
         let sync_bookmarks = toggle_link("sync_bookmarks", s.sync_bookmarks, "sync");
         let sync_history = toggle_link("sync_history", s.sync_history, "sync");
         let sync_passwords = toggle_link("sync_passwords", s.sync_passwords, "sync");
@@ -4820,6 +4882,8 @@ impl AppState {
             .replace("__SEARCH_VALUE__", &html_escape(&s.search))
             .replace("__ADS_TOGGLE__", &ads_toggle)
             .replace("__ADS_BLOCKED__", &blocked.to_string())
+            .replace("__UPDATE_PILLS__", &update_pills)
+            .replace("__CURRENT_VERSION__", env!("CARGO_PKG_VERSION"))
             .replace("__SYNC_BOOKMARKS__", &sync_bookmarks)
             .replace("__SYNC_HISTORY__", &sync_history)
             .replace("__SYNC_PASSWORDS__", &sync_passwords)
@@ -4879,6 +4943,81 @@ impl AppState {
 
     /// Render the `gator://about` page: name, version, a one-line blurb, the keyboard
     /// shortcuts, and links back to welcome/history. Templated like `gator://welcome`.
+    /// Render `gator://onboarding` (LYK-1495): the first-run setup screen. Lets the user pick a
+    /// search engine (default DuckDuckGo No-AI), an update-check cadence (default Daily), and
+    /// confirm ad/tracker blocking, then "Get started" applies them and moves on to the welcome page.
+    fn render_gator_onboarding(&self) -> Vec<u8> {
+        let (accent, cur_search, cur_freq, cur_ads) = {
+            let s = self.browser.settings.borrow();
+            (s.accent.clone(), s.search.clone(), s.update_freq.clone(), s.block_ads)
+        };
+        let engines: String = SEARCH_ENGINES
+            .iter()
+            .map(|(n, t)| {
+                format!(
+                    "<label class=\"opt\"><input type=\"radio\" name=\"search\" value=\"{}\"{}>\
+                     <span>{}</span></label>",
+                    html_escape(t),
+                    if *t == cur_search { " checked" } else { "" },
+                    html_escape(n),
+                )
+            })
+            .collect();
+        let freqs: String = UPDATE_FREQS
+            .iter()
+            .map(|(k, label)| {
+                format!(
+                    "<label class=\"opt\"><input type=\"radio\" name=\"update_freq\" value=\"{}\"{}>\
+                     <span>{}</span></label>",
+                    k,
+                    if *k == cur_freq { " checked" } else { "" },
+                    html_escape(label),
+                )
+            })
+            .collect();
+        let ads_checked = if cur_ads { " checked" } else { "" };
+        let html = format!(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Welcome to NavGator</title>\
+             <style>\
+             body{{font:15px/1.5 var(--font,system-ui),sans-serif;color:var(--fg);background:var(--bg);\
+             margin:0;padding:8vh 24px 40px;display:flex;justify-content:center}}\
+             .wrap{{width:min(560px,94vw)}}\
+             h1{{font-size:34px;font-weight:800;letter-spacing:-1px;margin:0 0 4px}} .g{{color:{accent}}}\
+             .sub{{color:var(--muted);margin:0 0 30px;font-size:16px}}\
+             .card{{background:var(--panel);border:1px solid var(--line);border-radius:14px;\
+             padding:16px 18px;margin-bottom:14px}}\
+             .card h2{{font-size:13px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);\
+             font-weight:700;margin:0 0 12px}}\
+             .opts{{display:flex;flex-direction:column;gap:2px}}\
+             .opt{{display:flex;align-items:center;gap:11px;padding:8px 6px;border-radius:9px;cursor:pointer;font-size:15px}}\
+             .opt:hover{{background:var(--line)}}\
+             .opt input{{accent-color:{accent};width:17px;height:17px;flex:none}}\
+             .actions{{display:flex;align-items:center;gap:18px;margin-top:24px}}\
+             button{{font:700 16px system-ui;padding:13px 26px;border-radius:11px;border:none;\
+             background:{accent};color:#0b0b0b;cursor:pointer}}\
+             .skip{{color:var(--muted);text-decoration:none;font-size:14px}} .skip:hover{{color:var(--fg)}}\
+             .fine{{color:var(--muted);font-size:12px;margin-top:22px}}\
+             </style></head><body><div class=\"wrap\">\
+             <h1>Welcome to Nav<span class=\"g\">Gator</span></h1>\
+             <p class=\"sub\">A privacy-first browser. Two quick choices and you're set — \
+             everything's changeable later in Settings.</p>\
+             <form method=\"get\" action=\"gator://onboarding\">\
+             <input type=\"hidden\" name=\"done\" value=\"1\">\
+             <div class=\"card\"><h2>Search engine</h2><div class=\"opts\">{engines}</div></div>\
+             <div class=\"card\"><h2>Check for updates</h2><div class=\"opts\">{freqs}</div></div>\
+             <div class=\"card\"><h2>Privacy</h2><div class=\"opts\">\
+             <label class=\"opt\"><input type=\"checkbox\" name=\"block_ads\" value=\"on\"{ads_checked}>\
+             <span>Block ads &amp; trackers <b>(recommended)</b></span></label></div></div>\
+             <div class=\"actions\"><button type=\"submit\">Get started &rarr;</button>\
+             <a class=\"skip\" href=\"gator://onboarding?skip=1\">Skip for now</a></div>\
+             </form>\
+             <p class=\"fine\">NavGator only checks whether a newer version exists — it never \
+             downloads or installs updates on its own.</p>\
+             </div></body></html>"
+        );
+        self.themed(html)
+    }
+
     fn render_gator_about(&self) -> Vec<u8> {
         let accent = self.browser.settings.borrow().accent.clone();
         let update = match &*self.browser.update_info.borrow() {
@@ -7344,6 +7483,33 @@ impl AppState {
         });
     }
 
+    /// Spawn the periodic update-check scheduler (LYK-1495). One background thread wakes every 60s,
+    /// re-reads `update_freq` from disk (so a mid-session change is honored), and fires
+    /// `WakeUp::UpdateCheckTick` each time a full `hourly`/`daily` interval has elapsed. `never`
+    /// simply resets the accumulator — no check. Cheap: a 60s sleep + a tiny file read.
+    fn spawn_update_scheduler(&self) {
+        let proxy = self.browser.event_proxy.clone();
+        std::thread::spawn(move || {
+            const TICK: std::time::Duration = std::time::Duration::from_secs(60);
+            let mut elapsed = std::time::Duration::ZERO;
+            loop {
+                std::thread::sleep(TICK);
+                match update_freq_interval(&read_update_freq()) {
+                    None => elapsed = std::time::Duration::ZERO, // `never`
+                    Some(interval) => {
+                        elapsed += TICK;
+                        if elapsed >= interval {
+                            elapsed = std::time::Duration::ZERO;
+                            if proxy.send_event(WakeUp::UpdateCheckTick).is_err() {
+                                return; // event loop gone → app exiting
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Record + surface a detected update (UI thread): a transient toast plus a persistent
     /// gator://about banner.
     fn on_update_available(&self, version: String, url: String, notes: String) {
@@ -9203,6 +9369,47 @@ impl WebViewDelegate for AppState {
                 }
                 self.render_gator_about()
             }
+            "onboarding" => {
+                // First-run setup. `?done` applies the form; `?skip` keeps defaults. Either way we
+                // mark onboarded (so we don't nag again) and move on to the welcome page (LYK-1495).
+                let q: Vec<(String, String)> = url
+                    .query_pairs()
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+                let has = |key: &str| q.iter().any(|(k, _)| k == key);
+                if has("done") || has("skip") {
+                    {
+                        let mut s = self.browser.settings.borrow_mut();
+                        if has("done") {
+                            if let Some((_, v)) = q.iter().find(|(k, _)| k == "search") {
+                                if !v.trim().is_empty() {
+                                    s.search = v.clone();
+                                }
+                            }
+                            if let Some((_, v)) = q.iter().find(|(k, _)| k == "update_freq") {
+                                if UPDATE_FREQS.iter().any(|(k, _)| *k == v.as_str()) {
+                                    s.update_freq = v.clone();
+                                }
+                            }
+                            // Unchecked checkboxes don't submit, so presence == on.
+                            s.block_ads = has("block_ads");
+                        }
+                        s.onboarded = true;
+                    }
+                    save_settings(&self.browser.settings.borrow());
+                    // Kick a first check now that a cadence is chosen (unless disabled).
+                    if self.browser.settings.borrow().update_freq != "never" {
+                        self.check_for_update();
+                    }
+                    b"<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+                        <meta http-equiv=\"refresh\" content=\"0;url=gator://welcome\">\
+                        <title>NavGator</title></head><body>\
+                        <script>location.replace('gator://welcome')</script></body></html>"
+                        .to_vec()
+                } else {
+                    self.render_gator_onboarding()
+                }
+            }
             "downloads" => {
                 // Command links: ?open=<idx> opens the finished file, ?reveal=<idx> its folder,
                 // via the system opener. Resolve the path under the borrow, then act (LYK-1408).
@@ -9320,6 +9527,7 @@ impl WebViewDelegate for AppState {
                         "sync_bookmarks" => SettingsApply::SyncBookmarks(v == "on"),
                         "sync_history" => SettingsApply::SyncHistory(v == "on"),
                         "sync_passwords" => SettingsApply::SyncPasswords(v == "on"),
+                        "update_freq" => SettingsApply::UpdateFreq(v.into_owned()),
                         "action" => SettingsApply::Action(v.into_owned()),
                         "base" | "accentk" | "density" | "font" | "tabpos" | "tabfit"
                         | "wallpaper" | "preset" | "radius" | "glass" | "tabmaxw" | "module" => {
@@ -10182,8 +10390,12 @@ impl ApplicationHandler<WakeUp> for App {
 
         // Restore the previous session's tabs unless the user passed an explicit URL on the
         // command line. A missing/empty session => the welcome page (handled by open_window).
+        let first_run = !browser.settings.borrow().onboarded;
         let (restored, restored_pane1) = if cli_url_given() {
             (Vec::new(), Vec::new())
+        } else if first_run {
+            // First launch: open the onboarding screen instead of restoring/welcome (LYK-1495).
+            (vec![Url::parse("gator://onboarding").expect("valid gator URL")], Vec::new())
         } else {
             load_session()
         };
@@ -10205,9 +10417,18 @@ impl ApplicationHandler<WakeUp> for App {
         // decided (new/changed scripts default to disabled-pending-consent in load_addons).
         state.prompt_pending_consents();
 
-        // Auto-update detection: one background check at launch. Non-blocking; a newer release
-        // surfaces as a toast + a gator://about banner. Detection only — no self-install.
-        state.check_for_update();
+        // Auto-update detection (LYK-1495): a launch check (skipped when disabled, or until the
+        // user has picked a cadence in onboarding) plus a scheduler for periodic hourly/daily
+        // re-checks. Non-blocking; a newer release surfaces as a toast + a gator://about banner.
+        // Detection only — no self-install.
+        {
+            let s = browser.settings.borrow();
+            if s.onboarded && s.update_freq != "never" {
+                drop(s);
+                state.check_for_update();
+            }
+        }
+        state.spawn_update_scheduler();
 
         let mut windows = HashMap::new();
         windows.insert(window_id, state);
@@ -10237,6 +10458,7 @@ impl ApplicationHandler<WakeUp> for App {
                     url,
                     notes,
                 } => state.on_update_available(version, url, notes),
+                WakeUp::UpdateCheckTick => state.check_for_update(),
                 WakeUp::Wake | WakeUp::Exit => {}
             }
         }
@@ -10747,6 +10969,8 @@ enum WakeUp {
     GmFetchDone { id: u64, ok: bool, json: String },
     /// The background update check found a newer release; surface it on the UI thread.
     UpdateAvailable { version: String, url: String, notes: String },
+    /// The update scheduler's periodic timer fired; run a check on the UI thread (LYK-1495).
+    UpdateCheckTick,
 }
 
 impl EventLoopWaker for Waker {
