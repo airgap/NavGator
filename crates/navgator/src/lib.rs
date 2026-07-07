@@ -4099,7 +4099,23 @@ impl AppState {
     /// Render `gator://profiles` (LYK-1376): list the isolated identity profiles and open one in a
     /// new window (a fresh navgator process with its own cookies/history/vault). The current window's
     /// profile is marked; a form creates + opens a new one.
-    fn render_gator_profiles(&self) -> Vec<u8> {
+    /// Permanently remove a profile's directory (LYK-1376). Guarded: refuses the default profile and
+    /// the currently-running one, and only ever touches a single sanitized segment under `profiles/`.
+    fn delete_profile(&self, name: &str) {
+        let name = sanitize_profile_name(name);
+        if name.is_empty() || name == "default" || name == active_profile() {
+            return;
+        }
+        if let Some(root) = navgator_root() {
+            let profiles = root.join("profiles");
+            let dir = profiles.join(&name);
+            if dir.is_dir() && dir.parent() == Some(profiles.as_path()) {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+    }
+
+    fn render_gator_profiles(&self, confirm_delete: Option<&str>) -> Vec<u8> {
         let accent = self.browser.settings.borrow().accent.clone();
         let current = active_profile();
         let mut names = vec!["default".to_string()];
@@ -4116,13 +4132,34 @@ impl AppState {
         }
         names.sort();
         names.dedup();
+        // Two-step delete: ?delete=<name> shows this confirm; the button then adds &confirm=1.
+        let confirm_html = match confirm_delete {
+            Some(name) if name != current && name != "default" && names.iter().any(|n| n == name) => {
+                format!(
+                    "<div class=\"confirm\"><p>Delete profile <b>{0}</b>? This permanently erases its \
+                     cookies, saved logins, history, autofill and settings — it can't be undone.</p>\
+                     <div class=\"cbtns\">\
+                     <a class=\"danger\" href=\"gator://profiles?delete={0}&amp;confirm=1\">Delete permanently</a>\
+                     <a class=\"cancel\" href=\"gator://profiles\">Cancel</a></div></div>",
+                    html_escape(name)
+                )
+            }
+            _ => String::new(),
+        };
         let rows: String = names
             .iter()
             .map(|n| {
                 let action = if *n == current {
                     "<span class=\"cur\">this window</span>".to_string()
-                } else {
+                } else if n == "default" {
+                    // The default profile is the root config dir — it can't be deleted.
                     format!("<a href=\"gator://profiles?open={}\">Open &rarr;</a>", html_escape(n))
+                } else {
+                    format!(
+                        "<a href=\"gator://profiles?open={0}\">Open &rarr;</a>\
+                         <a class=\"del\" href=\"gator://profiles?delete={0}\">Delete</a>",
+                        html_escape(n)
+                    )
                 };
                 let letter = n
                     .chars()
@@ -4153,7 +4190,13 @@ impl AppState {
              background:var(--line);color:{accent};font-weight:700}}\
              .name{{flex:1;font-weight:600}}\
              .row a{{color:{accent};text-decoration:none;font-weight:600}} .row a:hover{{text-decoration:underline}}\
+             .row .del{{color:#e5484d;margin-left:14px}}\
              .cur{{color:var(--muted);font-size:12px;font-weight:600}}\
+             .confirm{{background:var(--panel);border:1px solid #e5484d;border-radius:12px;padding:16px 18px;margin-bottom:20px}}\
+             .confirm p{{margin:0 0 14px}} .confirm b{{color:{accent}}}\
+             .cbtns{{display:flex;gap:10px}}\
+             .danger{{background:#e5484d;color:#fff !important;padding:9px 16px;border-radius:9px;text-decoration:none;font-weight:600}}\
+             .cancel{{padding:9px 16px;color:var(--muted) !important;text-decoration:none;font-weight:600}}\
              h2{{font-size:15px;margin:0 0 10px}}\
              form{{display:flex;gap:8px}}\
              input{{flex:1;padding:9px 11px;border-radius:9px;border:1px solid var(--line);background:var(--panel);color:var(--fg)}}\
@@ -4163,6 +4206,7 @@ impl AppState {
              <h1>Nav<span class=\"g\">Gator</span> profiles</h1>\
              <p class=\"sub\">Each profile is a separate identity — its own cookies, history, saved \
              logins, autofill and highlights. Opening one launches a new window.</p>\
+             {confirm_html}\
              <div class=\"list\">{rows}</div>\
              <h2>New profile</h2>\
              <form method=\"get\" action=\"gator://profiles\">\
@@ -9419,24 +9463,34 @@ impl WebViewDelegate for AppState {
             "exposure" => self.render_gator_exposure(),
             "trail" => self.render_gator_trail(),
             "profiles" => {
-                // ?open=<name> launches that profile in a new window; ?new=<name> creates it first.
-                for (k, v) in url.query_pairs() {
-                    let name = sanitize_profile_name(&v);
-                    if name.is_empty() {
-                        continue;
+                // ?open=<name> launches that profile in a new window; ?new=<name> creates it first;
+                // ?delete=<name> asks to confirm, ?delete=<name>&confirm=1 removes it.
+                let q: Vec<(String, String)> =
+                    url.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+                let get = |key: &str| {
+                    q.iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, v)| sanitize_profile_name(v))
+                        .filter(|n| !n.is_empty())
+                };
+                if let Some(name) = get("new") {
+                    if let Some(root) = navgator_root() {
+                        let _ = std::fs::create_dir_all(root.join("profiles").join(&name));
                     }
-                    match k.as_ref() {
-                        "new" => {
-                            if let Some(root) = navgator_root() {
-                                let _ = std::fs::create_dir_all(root.join("profiles").join(&name));
-                            }
-                            spawn_profile(&name);
-                        }
-                        "open" => spawn_profile(&name),
-                        _ => {}
+                    spawn_profile(&name);
+                }
+                if let Some(name) = get("open") {
+                    spawn_profile(&name);
+                }
+                let mut confirm_target: Option<String> = None;
+                if let Some(name) = get("delete") {
+                    if q.iter().any(|(k, _)| k == "confirm") {
+                        self.delete_profile(&name);
+                    } else {
+                        confirm_target = Some(name);
                     }
                 }
-                self.render_gator_profiles()
+                self.render_gator_profiles(confirm_target.as_deref())
             }
             "export" => {
                 if url.query_pairs().any(|(k, v)| k == "get" && v == "all") {
