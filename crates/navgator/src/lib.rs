@@ -306,31 +306,46 @@ fn parse_session(text: &str) -> (Vec<Url>, Vec<Url>) {
     (p0, p1)
 }
 
-/// Load persisted workspaces (LYK-1266): `(spaces, current index, pane0 tab-workspace indices, pane1
-/// tab-workspace indices)`. An empty `spaces` vec means no file / single-Default behaviour. The tab
-/// indices run parallel to `save_session`'s tab order.
-fn load_workspaces() -> (Vec<Workspace>, usize, Vec<usize>, Vec<usize>) {
-    let (mut spaces, mut cur, mut t0, mut t1) = (Vec::new(), 0usize, Vec::new(), Vec::new());
+/// Persisted workspaces + tab groups (LYK-1266/1374). Empty `spaces` ⇒ no file / single-Default. The
+/// per-tab index vectors run parallel to `save_session`'s tab order (`-1`/group means ungrouped).
+#[derive(Default)]
+struct SavedWorkspaces {
+    spaces: Vec<Workspace>,
+    current: usize,
+    ws0: Vec<usize>,
+    ws1: Vec<usize>,
+    groups: Vec<TabGroup>,
+    grp0: Vec<isize>,
+    grp1: Vec<isize>,
+}
+
+fn load_workspaces() -> SavedWorkspaces {
+    let mut sw = SavedWorkspaces::default();
     if let Some(text) = config_file("workspaces.tsv").and_then(|p| std::fs::read_to_string(p).ok()) {
-        let nums = |s: &str| s.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        let unums = |s: &str| s.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        let inums = |s: &str| s.split_whitespace().filter_map(|x| x.parse().ok()).collect();
         for line in text.lines() {
             let mut it = line.split('\t');
             match it.next() {
-                Some("W") => spaces.push(Workspace {
+                Some("W") => sw.spaces.push(Workspace {
                     name: it.next().unwrap_or("Space").to_string(),
-                    accent: it
-                        .next()
-                        .and_then(theme::Accent::from_key)
-                        .unwrap_or(theme::Accent::Violet),
+                    accent: it.next().and_then(theme::Accent::from_key).unwrap_or(theme::Accent::Violet),
                 }),
-                Some("C") => cur = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
-                Some("T") => t0 = nums(it.next().unwrap_or("")),
-                Some("U") => t1 = nums(it.next().unwrap_or("")),
+                Some("C") => sw.current = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+                Some("T") => sw.ws0 = unums(it.next().unwrap_or("")),
+                Some("U") => sw.ws1 = unums(it.next().unwrap_or("")),
+                Some("G") => sw.groups.push(TabGroup {
+                    name: it.next().unwrap_or("Group").to_string(),
+                    color: it.next().and_then(theme::Accent::from_key).unwrap_or(theme::Accent::Cyan),
+                    collapsed: it.next() == Some("true"),
+                }),
+                Some("TG") => sw.grp0 = inums(it.next().unwrap_or("")),
+                Some("UG") => sw.grp1 = inums(it.next().unwrap_or("")),
                 _ => {}
             }
         }
     }
-    (spaces, cur, t0, t1)
+    sw
 }
 
 /// Scan installed Chromium-family browsers for their JSON `Bookmarks` file and return every
@@ -3455,6 +3470,8 @@ struct Tab {
     /// Which workspace (index into [`AppState::workspaces`]) this tab belongs to (LYK-1266). The
     /// strip shows only the current workspace's tabs.
     workspace: usize,
+    /// Tab group (index into [`AppState::groups`]) or None if ungrouped (LYK-1374).
+    group: Option<usize>,
     /// This tab's own UserContentManager (per-site userscript injection, design §4 Option A).
     /// Built once at tab-creation time and attached to `webview`; the engine captures the UCM at
     /// build time and offers no post-build setter (Servo `WebView::user_content_manager` is a
@@ -3588,6 +3605,12 @@ enum TabAction {
     ToggleOrientation,
     /// Pop this tab out into a brand-new OS window (closes it here, reopens its URL there).
     PopOut(usize),
+    /// Tab groups (LYK-1374): put tab `i` into a new group / an existing group `g` / ungroup it;
+    /// toggle group `g`'s collapsed state (from its chip).
+    NewGroup(usize),
+    AddToGroup(usize, usize),
+    RemoveFromGroup(usize),
+    ToggleGroup(usize),
 }
 
 /// A NavGator keyboard shortcut that page content is allowed to *override* (Chrome's "tier-2"
@@ -3717,6 +3740,22 @@ struct Workspace {
     accent: theme::Accent,
 }
 
+/// One tab group (LYK-1374): a coloured, optionally-collapsed run of tabs within a workspace. Tabs
+/// reference a group by its index in [`AppState::groups`]; `Tab.group == None` means ungrouped.
+struct TabGroup {
+    name: String,
+    color: theme::Accent,
+    collapsed: bool,
+}
+
+/// A rendered strip element (LYK-1374): either a group's header chip or a tab (flat index). The
+/// strip draws a `Vec<StripItem>` so group chips can sit inline with tabs and collapsed groups can
+/// show a chip with no tabs.
+enum StripItem {
+    Group(usize),
+    Tab(usize),
+}
+
 struct AppState {
     /// The shared browser-global engine + services.
     browser: Rc<BrowserState>,
@@ -3756,6 +3795,9 @@ struct AppState {
     /// re-themes the chrome to that workspace's accent. Window-global (both panes filter by it).
     workspaces: RefCell<Vec<Workspace>>,
     current_ws: Cell<usize>,
+    /// Tab groups (LYK-1374): coloured, collapsible runs of tabs. Each [`Tab`] optionally references
+    /// one by index; the strip renders a chip per group inline with its tabs.
+    groups: RefCell<Vec<TabGroup>>,
     /// Address-bar text + whether the user has edited it without navigating.
     location: RefCell<String>,
     location_dirty: Cell<bool>,
@@ -5875,6 +5917,7 @@ impl AppState {
             pinned: false,
             starred: false,
             workspace: self.current_ws.get(),
+            group: None,
             ucm,
             injected_addons: RefCell::new(seeded),
             blocked: RefCell::new(Vec::new()),
@@ -5928,6 +5971,7 @@ impl AppState {
                 pinned: false,
                 starred: false,
                 workspace: self.current_ws.get(),
+                group: None,
                 ucm,
                 injected_addons: RefCell::new(seeded),
                 blocked: RefCell::new(Vec::new()),
@@ -6769,15 +6813,93 @@ impl AppState {
     /// Render-order tab indices: pinned first (in tab order), then the rest. This is the
     /// shared ordering both tab layouts iterate; underlying indices (used by
     /// select/close/move) are unchanged.
-    fn tab_order(&self) -> Vec<usize> {
+    /// The strip render layout for the focused pane (LYK-1266 + LYK-1374): only the current
+    /// workspace's tabs, pinned first (never grouped), then the rest with each group's chip inline
+    /// before its (contiguous) tabs. A collapsed group contributes only its chip. Flat tab indices.
+    fn strip_items(&self) -> Vec<StripItem> {
         let tabs = self.focused_pane().tabs.borrow();
         let ws = self.current_ws.get();
-        let n = tabs.len();
-        // Only the current workspace's tabs are shown; pinned ones sort first (LYK-1266).
+        let ngroups = self.groups.borrow().len();
         let shown = |i: usize| tabs[i].workspace == ws;
-        let mut o: Vec<usize> = (0..n).filter(|&i| shown(i) && tabs[i].pinned).collect();
-        o.extend((0..n).filter(|&i| shown(i) && !tabs[i].pinned));
-        o
+        let mut items = Vec::new();
+        for i in 0..tabs.len() {
+            if shown(i) && tabs[i].pinned {
+                items.push(StripItem::Tab(i));
+            }
+        }
+        let mut emitted = vec![false; ngroups];
+        for i in 0..tabs.len() {
+            if !shown(i) || tabs[i].pinned {
+                continue;
+            }
+            match tabs[i].group {
+                Some(g) if g < ngroups => {
+                    if !emitted[g] {
+                        emitted[g] = true;
+                        items.push(StripItem::Group(g));
+                        if !self.groups.borrow()[g].collapsed {
+                            for j in 0..tabs.len() {
+                                if shown(j) && !tabs[j].pinned && tabs[j].group == Some(g) {
+                                    items.push(StripItem::Tab(j));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => items.push(StripItem::Tab(i)),
+            }
+        }
+        items
+    }
+
+    /// The visible tabs in strip order (flat indices) — drag-reorder + width use this; it stays in
+    /// sync with `strip_items` (collapsed groups' tabs excluded).
+    fn tab_order(&self) -> Vec<usize> {
+        self.strip_items()
+            .into_iter()
+            .filter_map(|it| match it {
+                StripItem::Tab(i) => Some(i),
+                StripItem::Group(_) => None,
+            })
+            .collect()
+    }
+
+    /// Render a tab group's inline chip (LYK-1374): a rounded label tinted with the group's colour,
+    /// showing the name (+ a tab count when collapsed). Returns true when clicked (toggle collapse).
+    fn group_chip(&self, ui: &mut egui::Ui, g: usize, vertical: bool) -> bool {
+        let (label, tint, fg) = {
+            let groups = self.groups.borrow();
+            let Some(gr) = groups.get(g) else {
+                return false;
+            };
+            let th = self.browser.settings.borrow().theme;
+            let c = theme::Theme { accent: gr.color, ..th }.palette().accent;
+            let count = self
+                .focused_pane()
+                .tabs
+                .borrow()
+                .iter()
+                .filter(|t| t.group == Some(g) && t.workspace == self.current_ws.get())
+                .count();
+            let label = if gr.collapsed {
+                format!("{}  {}", gr.name, count)
+            } else {
+                gr.name.clone()
+            };
+            (
+                label,
+                egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 40),
+                c,
+            )
+        };
+        let collapsed_hint = self.groups.borrow().get(g).map(|gr| gr.collapsed).unwrap_or(false);
+        ui.add(
+            egui::Button::new(egui::RichText::new(&label).size(11.0).strong().color(fg))
+                .fill(tint)
+                .min_size(egui::vec2(0.0, if vertical { 24.0 } else { 22.0 })),
+        )
+        .on_hover_text(if collapsed_hint { "Expand group" } else { "Collapse group" })
+        .clicked()
     }
 
     /// Render one tab's favicon/spinner + selectable button (+ trailing × when unpinned),
@@ -6962,6 +7084,7 @@ impl AppState {
         }
 
         let mut menu_act = 0u8;
+        let mut group_act: Option<TabAction> = None;
         tab.context_menu(|ui| {
             if ui.button("New tab").clicked() {
                 menu_act = 1;
@@ -6987,6 +7110,29 @@ impl AppState {
             if ui.button("Move tab to new window").clicked() {
                 menu_act = 6;
             }
+            // Tab groups (LYK-1374). A pinned tab can't be grouped.
+            if !pinned {
+                ui.separator();
+                let cur_group = self.focused_pane().tabs.borrow().get(i).and_then(|t| t.group);
+                if ui.button("Add to new group").clicked() {
+                    group_act = Some(TabAction::NewGroup(i));
+                }
+                for (g, name) in self
+                    .groups
+                    .borrow()
+                    .iter()
+                    .enumerate()
+                    .map(|(g, gr)| (g, gr.name.clone()))
+                    .collect::<Vec<_>>()
+                {
+                    if cur_group != Some(g) && ui.button(format!("Add to \"{name}\"")).clicked() {
+                        group_act = Some(TabAction::AddToGroup(i, g));
+                    }
+                }
+                if cur_group.is_some() && ui.button("Remove from group").clicked() {
+                    group_act = Some(TabAction::RemoveFromGroup(i));
+                }
+            }
         });
         match menu_act {
             1 => act = TabAction::NewTab,
@@ -6996,6 +7142,9 @@ impl AppState {
             5 => act = TabAction::ToggleOrientation,
             6 => act = TabAction::PopOut(i),
             _ => {}
+        }
+        if let Some(a) = group_act {
+            act = a;
         }
 
         (act, tab)
@@ -7053,6 +7202,22 @@ impl AppState {
                 self.window.request_redraw();
                 true
             }
+            TabAction::NewGroup(i) => {
+                self.new_group_for_tab(i);
+                true
+            }
+            TabAction::AddToGroup(i, g) => {
+                self.add_tab_to_group(i, g);
+                true
+            }
+            TabAction::RemoveFromGroup(i) => {
+                self.remove_tab_from_group(i);
+                true
+            }
+            TabAction::ToggleGroup(g) => {
+                self.toggle_group_collapse(g);
+                true
+            }
         }
     }
 
@@ -7096,6 +7261,7 @@ impl AppState {
         let active = self.focused_pane().active.get();
         let scroll_active = self.focused_pane().scroll_active_into_view.take();
         let order = self.tab_order();
+        let items = self.strip_items();
         let mut rects: Vec<egui::Rect> = Vec::with_capacity(order.len());
         let mut pending: Option<TabAction> = None;
         let (fill, tab_max_w, tab_h, set_radius) = {
@@ -7151,17 +7317,26 @@ impl AppState {
                         ui.with_layout(
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
-                                for &i in &order {
-                                    let (act, resp) = self.tab_row(ui, i, active, false, fw);
-                                    rects.push(resp.rect);
-                                    if resp.hovered() && i != active {
-                                        self.draw_tab_preview(ui, i, resp.rect, false);
-                                    }
-                                    if i == active && scroll_active {
-                                        resp.scroll_to_me(None);
-                                    }
-                                    if !matches!(act, TabAction::None) && pending.is_none() {
-                                        pending = Some(act);
+                                for item in &items {
+                                    match *item {
+                                        StripItem::Group(g) => {
+                                            if self.group_chip(ui, g, false) && pending.is_none() {
+                                                pending = Some(TabAction::ToggleGroup(g));
+                                            }
+                                        }
+                                        StripItem::Tab(i) => {
+                                            let (act, resp) = self.tab_row(ui, i, active, false, fw);
+                                            rects.push(resp.rect);
+                                            if resp.hovered() && i != active {
+                                                self.draw_tab_preview(ui, i, resp.rect, false);
+                                            }
+                                            if i == active && scroll_active {
+                                                resp.scroll_to_me(None);
+                                            }
+                                            if !matches!(act, TabAction::None) && pending.is_none() {
+                                                pending = Some(act);
+                                            }
+                                        }
                                     }
                                 }
                                 // New-tab button, just right of the last tab: a square cell the
@@ -7221,6 +7396,7 @@ impl AppState {
         let active = self.focused_pane().active.get();
         let scroll_active = self.focused_pane().scroll_active_into_view.take();
         let order = self.tab_order();
+        let items = self.strip_items();
         let mut rects: Vec<egui::Rect> = Vec::with_capacity(order.len());
         let mut pending: Option<TabAction> = None;
 
@@ -7236,17 +7412,26 @@ impl AppState {
                 }
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for &i in &order {
-                        let (act, resp) = self.tab_row(ui, i, active, true, None);
-                        rects.push(resp.rect);
-                        if resp.hovered() && i != active {
-                            self.draw_tab_preview(ui, i, resp.rect, true);
-                        }
-                        if i == active && scroll_active {
-                            resp.scroll_to_me(None);
-                        }
-                        if !matches!(act, TabAction::None) && pending.is_none() {
-                            pending = Some(act);
+                    for item in &items {
+                        match *item {
+                            StripItem::Group(g) => {
+                                if self.group_chip(ui, g, true) && pending.is_none() {
+                                    pending = Some(TabAction::ToggleGroup(g));
+                                }
+                            }
+                            StripItem::Tab(i) => {
+                                let (act, resp) = self.tab_row(ui, i, active, true, None);
+                                rects.push(resp.rect);
+                                if resp.hovered() && i != active {
+                                    self.draw_tab_preview(ui, i, resp.rect, true);
+                                }
+                                if i == active && scroll_active {
+                                    resp.scroll_to_me(None);
+                                }
+                                if !matches!(act, TabAction::None) && pending.is_none() {
+                                    pending = Some(act);
+                                }
+                            }
                         }
                     }
                 });
@@ -8452,6 +8637,7 @@ impl AppState {
                 pinned: false,
                 starred: false,
                 workspace: self.current_ws.get(),
+                group: None,
                 ucm,
                 injected_addons: RefCell::new(seeded),
                 blocked: RefCell::new(Vec::new()),
@@ -8518,6 +8704,22 @@ impl AppState {
         s.push_str(&format!("T\t{}\n", ws_line(&self.pane0.tabs.borrow())));
         if self.split.get() {
             s.push_str(&format!("U\t{}\n", ws_line(&self.pane1.tabs.borrow())));
+        }
+        // Tab groups (LYK-1374): G lines (name/color/collapsed) + per-tab group index (-1 = none),
+        // parallel to the T/U tab order.
+        for gr in self.groups.borrow().iter() {
+            s.push_str(&format!("G\t{}\t{}\t{}\n", tsv_field(&gr.name), gr.color.key(), gr.collapsed));
+        }
+        let grp_line = |tabs: &[Tab]| -> String {
+            tabs.iter()
+                .filter(|t| !t.url.is_empty())
+                .map(|t| t.group.map(|g| g as isize).unwrap_or(-1).to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        s.push_str(&format!("TG\t{}\n", grp_line(&self.pane0.tabs.borrow())));
+        if self.split.get() {
+            s.push_str(&format!("UG\t{}\n", grp_line(&self.pane1.tabs.borrow())));
         }
         let _ = std::fs::write(path, s);
     }
@@ -8624,6 +8826,107 @@ impl AppState {
         self.switch_workspace(w);
     }
 
+    /// Put tab `i` into a brand-new group (LYK-1374), coloured by index.
+    fn new_group_for_tab(&self, i: usize) {
+        let idx = self.groups.borrow().len();
+        self.groups.borrow_mut().push(TabGroup {
+            name: format!("Group {}", idx + 1),
+            color: ws_accent(idx),
+            collapsed: false,
+        });
+        if let Some(t) = self.focused_pane().tabs.borrow_mut().get_mut(i) {
+            t.group = Some(idx);
+        }
+        self.save_session();
+        self.window.request_redraw();
+    }
+
+    /// Add tab `i` to existing group `g` (LYK-1374).
+    fn add_tab_to_group(&self, i: usize, g: usize) {
+        if g >= self.groups.borrow().len() {
+            return;
+        }
+        if let Some(t) = self.focused_pane().tabs.borrow_mut().get_mut(i) {
+            t.group = Some(g);
+        }
+        self.save_session();
+        self.window.request_redraw();
+    }
+
+    /// Ungroup tab `i`, pruning the group if it's now empty (LYK-1374).
+    fn remove_tab_from_group(&self, i: usize) {
+        if let Some(t) = self.focused_pane().tabs.borrow_mut().get_mut(i) {
+            t.group = None;
+        }
+        self.prune_empty_groups();
+        self.save_session();
+        self.window.request_redraw();
+    }
+
+    /// Drop any group with no remaining tabs (either pane) and renumber the survivors (LYK-1374).
+    fn prune_empty_groups(&self) {
+        let ng = self.groups.borrow().len();
+        if ng == 0 {
+            return;
+        }
+        let mut used = vec![false; ng];
+        for pane in [&self.pane0, &self.pane1] {
+            for t in pane.tabs.borrow().iter() {
+                if let Some(g) = t.group {
+                    if g < ng {
+                        used[g] = true;
+                    }
+                }
+            }
+        }
+        if used.iter().all(|&u| u) {
+            return;
+        }
+        let mut remap = vec![None; ng];
+        let mut next = 0;
+        for g in 0..ng {
+            if used[g] {
+                remap[g] = Some(next);
+                next += 1;
+            }
+        }
+        for pane in [&self.pane0, &self.pane1] {
+            for t in pane.tabs.borrow_mut().iter_mut() {
+                if let Some(g) = t.group {
+                    t.group = if g < ng { remap[g] } else { None };
+                }
+            }
+        }
+        let mut idx = 0;
+        self.groups.borrow_mut().retain(|_| {
+            let keep = used[idx];
+            idx += 1;
+            keep
+        });
+    }
+
+    /// Toggle group `g`'s collapsed state (LYK-1374); if it hides the active tab, select a visible one.
+    fn toggle_group_collapse(&self, g: usize) {
+        {
+            let mut groups = self.groups.borrow_mut();
+            let Some(gr) = groups.get_mut(g) else {
+                return;
+            };
+            gr.collapsed = !gr.collapsed;
+        }
+        let p = self.focused.get();
+        let active = self.pane(p).active.get();
+        let active_hidden = self.pane(p).tabs.borrow().get(active).map(|t| t.group == Some(g)).unwrap_or(false)
+            && self.groups.borrow()[g].collapsed;
+        if active_hidden {
+            if let Some(&i) = self.tab_order().first() {
+                self.select_tab(p, i);
+            }
+        }
+        self.save_session();
+        self.window.request_redraw();
+    }
+
     fn select_tab(&self, pane: usize, i: usize) {
         // Only the focused pane drives keyboard focus and the address bar; selecting a tab in a
         // background split pane still shows/throttles its webviews but must not steal either.
@@ -8718,6 +9021,7 @@ impl AppState {
                 self.select_tab(pane, 0);
             }
         }
+        self.prune_empty_groups(); // closing a group's last tab drops the group (LYK-1374)
         self.save_session();
     }
 
@@ -10814,6 +11118,7 @@ fn open_window(
             accent: browser.settings.borrow().theme.accent,
         }]),
         current_ws: Cell::new(0),
+        groups: RefCell::new(Vec::new()),
         location: RefCell::new(String::new()),
         location_dirty: Cell::new(false),
         focus_omnibox: Cell::new(false),
@@ -11031,22 +11336,37 @@ impl ApplicationHandler<WakeUp> for App {
         // restored tab order) + the active space and its accent. Tabs are already created; we just
         // re-tag them and select a current-space tab. Skipped when there's no workspaces file.
         {
-            let (spaces, cur, t0, t1) = ws_saved;
-            if spaces.len() > 1 {
-                *state.workspaces.borrow_mut() = spaces;
-                let assign = |tabs: &mut Vec<Tab>, idx: &[usize]| {
-                    for (t, &w) in tabs.iter_mut().zip(idx.iter()) {
-                        t.workspace = w;
+            let sw = ws_saved;
+            let has_ws = sw.spaces.len() > 1;
+            let has_groups = !sw.groups.is_empty();
+            if has_ws {
+                *state.workspaces.borrow_mut() = sw.spaces;
+            }
+            if has_groups {
+                *state.groups.borrow_mut() = sw.groups;
+            }
+            if has_ws || has_groups {
+                let apply = |tabs: &mut Vec<Tab>, ws: &[usize], grp: &[isize]| {
+                    for (k, t) in tabs.iter_mut().enumerate() {
+                        if let Some(&w) = ws.get(k) {
+                            t.workspace = w;
+                        }
+                        if let Some(&g) = grp.get(k) {
+                            t.group = (g >= 0).then_some(g as usize);
+                        }
                     }
                 };
-                assign(&mut state.pane0.tabs.borrow_mut(), &t0);
-                assign(&mut state.pane1.tabs.borrow_mut(), &t1);
-                let cw = cur.min(state.workspaces.borrow().len() - 1);
-                state.current_ws.set(cw);
-                state.browser.settings.borrow_mut().theme.accent =
-                    state.workspaces.borrow()[cw].accent;
-                if let Some(&i) = state.ws_indices(0).first() {
-                    state.select_tab(0, i);
+                apply(&mut state.pane0.tabs.borrow_mut(), &sw.ws0, &sw.grp0);
+                apply(&mut state.pane1.tabs.borrow_mut(), &sw.ws1, &sw.grp1);
+                if has_ws {
+                    let cw = sw.current.min(state.workspaces.borrow().len() - 1);
+                    state.current_ws.set(cw);
+                    state.browser.settings.borrow_mut().theme.accent =
+                        state.workspaces.borrow()[cw].accent;
+                }
+                // Select the first VISIBLE tab (respects collapsed groups).
+                if let Some(&i) = state.tab_order().first() {
+                    state.select_tab(state.focused.get(), i);
                 }
             }
         }
