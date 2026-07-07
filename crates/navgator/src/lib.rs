@@ -306,6 +306,33 @@ fn parse_session(text: &str) -> (Vec<Url>, Vec<Url>) {
     (p0, p1)
 }
 
+/// Load persisted workspaces (LYK-1266): `(spaces, current index, pane0 tab-workspace indices, pane1
+/// tab-workspace indices)`. An empty `spaces` vec means no file / single-Default behaviour. The tab
+/// indices run parallel to `save_session`'s tab order.
+fn load_workspaces() -> (Vec<Workspace>, usize, Vec<usize>, Vec<usize>) {
+    let (mut spaces, mut cur, mut t0, mut t1) = (Vec::new(), 0usize, Vec::new(), Vec::new());
+    if let Some(text) = config_file("workspaces.tsv").and_then(|p| std::fs::read_to_string(p).ok()) {
+        let nums = |s: &str| s.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        for line in text.lines() {
+            let mut it = line.split('\t');
+            match it.next() {
+                Some("W") => spaces.push(Workspace {
+                    name: it.next().unwrap_or("Space").to_string(),
+                    accent: it
+                        .next()
+                        .and_then(theme::Accent::from_key)
+                        .unwrap_or(theme::Accent::Violet),
+                }),
+                Some("C") => cur = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+                Some("T") => t0 = nums(it.next().unwrap_or("")),
+                Some("U") => t1 = nums(it.next().unwrap_or("")),
+                _ => {}
+            }
+        }
+    }
+    (spaces, cur, t0, t1)
+}
+
 /// Scan installed Chromium-family browsers for their JSON `Bookmarks` file and return every
 /// bookmarked (url, title). Read-only, no SQLite, no lock — Chrome stores bookmarks as plain JSON.
 fn import_chrome_bookmarks() -> Vec<(String, String)> {
@@ -1581,17 +1608,27 @@ fn favicon_hue(s: &str) -> f32 {
     (h % 360) as f32
 }
 
-/// A distinct, deterministic chrome accent for a named profile (LYK-1376): derived from the name so
-/// each identity looks different at a glance. Picks from the colourful accents only (never the
-/// White/Dark monochrome ones). Seeded onto a fresh non-default profile; the user can override it.
-fn profile_accent(name: &str) -> theme::Accent {
-    let colourful: Vec<theme::Accent> = theme::Accent::ALL
+/// The colourful chrome accents (excludes the White/Dark monochrome ones) — the palette used to
+/// auto-distinguish profiles and workspaces.
+fn colourful_accents() -> Vec<theme::Accent> {
+    theme::Accent::ALL
         .iter()
         .copied()
         .filter(|a| *a != theme::Accent::White && *a != theme::Accent::Dark)
-        .collect();
-    let idx = (favicon_hue(name) as usize) % colourful.len().max(1);
-    colourful[idx]
+        .collect()
+}
+
+/// A distinct, deterministic chrome accent for a named profile (LYK-1376): derived from the name so
+/// each identity looks different at a glance. Seeded onto a fresh non-default profile; user can override.
+fn profile_accent(name: &str) -> theme::Accent {
+    let c = colourful_accents();
+    c[(favicon_hue(name) as usize) % c.len().max(1)]
+}
+
+/// A distinct chrome accent for workspace `idx` (LYK-1266) — cycles the colourful palette by index.
+fn ws_accent(idx: usize) -> theme::Accent {
+    let c = colourful_accents();
+    c[idx % c.len().max(1)]
 }
 
 fn load_profile() -> Profile {
@@ -3415,6 +3452,9 @@ struct Tab {
     pinned: bool,
     /// Whether the omnibar star is filled for this tab (bookmark-style toggle).
     starred: bool,
+    /// Which workspace (index into [`AppState::workspaces`]) this tab belongs to (LYK-1266). The
+    /// strip shows only the current workspace's tabs.
+    workspace: usize,
     /// This tab's own UserContentManager (per-site userscript injection, design §4 Option A).
     /// Built once at tab-creation time and attached to `webview`; the engine captures the UCM at
     /// build time and offers no post-build setter (Servo `WebView::user_content_manager` is a
@@ -3670,6 +3710,13 @@ struct ConsoleMessage {
     text: String,
 }
 
+/// One workspace / "space" (LYK-1266): a display name plus the chrome accent applied while it's the
+/// active workspace. Tabs reference a workspace by its index in [`AppState::workspaces`].
+struct Workspace {
+    name: String,
+    accent: theme::Accent,
+}
+
 struct AppState {
     /// The shared browser-global engine + services.
     browser: Rc<BrowserState>,
@@ -3704,6 +3751,11 @@ struct AppState {
     pane1: PaneGroup,
     split: Cell<bool>,
     focused: Cell<usize>,
+    /// Workspaces / "spaces" (LYK-1266): named, colour-coded tab groups. Every [`Tab`] carries a
+    /// `workspace` index into this list; the tab strip shows only `current_ws`'s tabs, and switching
+    /// re-themes the chrome to that workspace's accent. Window-global (both panes filter by it).
+    workspaces: RefCell<Vec<Workspace>>,
+    current_ws: Cell<usize>,
     /// Address-bar text + whether the user has edited it without navigating.
     location: RefCell<String>,
     location_dirty: Cell<bool>,
@@ -5731,6 +5783,7 @@ impl AppState {
                 last_crash: None,
             pinned: false,
             starred: false,
+            workspace: self.current_ws.get(),
             ucm,
             injected_addons: RefCell::new(seeded),
             blocked: RefCell::new(Vec::new()),
@@ -5783,6 +5836,7 @@ impl AppState {
                 last_crash: None,
                 pinned: false,
                 starred: false,
+                workspace: self.current_ws.get(),
                 ucm,
                 injected_addons: RefCell::new(seeded),
                 blocked: RefCell::new(Vec::new()),
@@ -5928,6 +5982,21 @@ impl AppState {
                 self.toggle_site_loadout("block_ads");
                 return;
             }
+            A::NewWorkspace => {
+                self.new_workspace();
+                return;
+            }
+            A::NextWorkspace => {
+                self.cycle_workspace(true);
+                return;
+            }
+            A::MoveTabToNextWorkspace => {
+                let n = self.workspaces.borrow().len();
+                if n > 1 {
+                    self.move_active_tab_to_ws((self.current_ws.get() + 1) % n);
+                }
+                return;
+            }
             A::ReaderMode => {
                 self.activate_reader_mode();
                 return;
@@ -5962,7 +6031,10 @@ impl AppState {
                 | A::ToggleForceDark
                 | A::ToggleSiteDark
                 | A::ToggleSiteAdblock
-                | A::ReaderMode => {}
+                | A::ReaderMode
+                | A::NewWorkspace
+                | A::NextWorkspace
+                | A::MoveTabToNextWorkspace => {}
             }
             sync_legacy_theme(&mut s);
             save_settings(&s);
@@ -6138,6 +6210,34 @@ impl AppState {
                             .on_hover_text("Current profile — click to switch");
                         if resp.clicked() {
                             self.navigate_from_omnibox("gator://profiles");
+                        }
+                    }
+                    // Workspace indicator (LYK-1266): the current space's name, tinted with its
+                    // accent (== the chrome accent while active). Click cycles; only shown once a
+                    // second workspace exists. Palette has New / Move-tab; Ctrl+Shift+E cycles.
+                    {
+                        let ws_label = {
+                            let ws = self.workspaces.borrow();
+                            (ws.len() > 1)
+                                .then(|| ws.get(self.current_ws.get()).map(|w| w.name.clone()))
+                                .flatten()
+                        };
+                        if let Some(name) = ws_label {
+                            let resp = ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(&name)
+                                            .size(11.0)
+                                            .strong()
+                                            .color(pal.bg),
+                                    )
+                                    .fill(pal.accent)
+                                    .min_size(egui::vec2(0.0, 22.0)),
+                                )
+                                .on_hover_text("Workspace — click to switch (Ctrl+Shift+E)");
+                            if resp.clicked() {
+                                self.cycle_workspace(true);
+                            }
                         }
                     }
                     if icon_button(ui, true, "Customize appearance", &pal, icon::studio).clicked() {
@@ -6575,9 +6675,12 @@ impl AppState {
     /// select/close/move) are unchanged.
     fn tab_order(&self) -> Vec<usize> {
         let tabs = self.focused_pane().tabs.borrow();
+        let ws = self.current_ws.get();
         let n = tabs.len();
-        let mut o: Vec<usize> = (0..n).filter(|&i| tabs[i].pinned).collect();
-        o.extend((0..n).filter(|&i| !tabs[i].pinned));
+        // Only the current workspace's tabs are shown; pinned ones sort first (LYK-1266).
+        let shown = |i: usize| tabs[i].workspace == ws;
+        let mut o: Vec<usize> = (0..n).filter(|&i| shown(i) && tabs[i].pinned).collect();
+        o.extend((0..n).filter(|&i| shown(i) && !tabs[i].pinned));
         o
     }
 
@@ -8252,6 +8355,7 @@ impl AppState {
                 last_crash: None,
                 pinned: false,
                 starred: false,
+                workspace: self.current_ws.get(),
                 ucm,
                 injected_addons: RefCell::new(seeded),
                 blocked: RefCell::new(Vec::new()),
@@ -8293,6 +8397,99 @@ impl AppState {
             }
         }
         let _ = std::fs::write(path, s);
+        self.save_workspaces();
+    }
+
+    /// Persist workspaces (LYK-1266) in a SEPARATE file so `session.tsv` stays a plain URL list
+    /// (session restore is never at risk). Stores each space's name+accent, the current space, and a
+    /// per-tab workspace index parallel to `save_session`'s tab order (same `!url.is_empty()` filter).
+    fn save_workspaces(&self) {
+        let Some(path) = config_file("workspaces.tsv") else {
+            return;
+        };
+        let mut s = String::new();
+        for w in self.workspaces.borrow().iter() {
+            s.push_str(&format!("W\t{}\t{}\n", tsv_field(&w.name), w.accent.key()));
+        }
+        s.push_str(&format!("C\t{}\n", self.current_ws.get()));
+        let ws_line = |tabs: &[Tab]| -> String {
+            tabs.iter()
+                .filter(|t| !t.url.is_empty())
+                .map(|t| t.workspace.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        s.push_str(&format!("T\t{}\n", ws_line(&self.pane0.tabs.borrow())));
+        if self.split.get() {
+            s.push_str(&format!("U\t{}\n", ws_line(&self.pane1.tabs.borrow())));
+        }
+        let _ = std::fs::write(path, s);
+    }
+
+    /// Flat indices of the current workspace's tabs in pane `p`, in order (LYK-1266) — the strip
+    /// shows exactly these, and tab navigation cycles within them.
+    fn ws_indices(&self, p: usize) -> Vec<usize> {
+        let ws = self.current_ws.get();
+        self.pane(p)
+            .tabs
+            .borrow()
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.workspace == ws)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Switch the active workspace (LYK-1266): re-theme the chrome to its accent (applied next
+    /// frame by `apply_theme`) and select one of its tabs — opening a fresh one if it has none.
+    fn switch_workspace(&self, w: usize) {
+        if w == self.current_ws.get() || w >= self.workspaces.borrow().len() {
+            return;
+        }
+        self.current_ws.set(w);
+        let accent = self.workspaces.borrow()[w].accent;
+        self.browser.settings.borrow_mut().theme.accent = accent;
+        let p = self.focused.get();
+        match self.ws_indices(p).first().copied() {
+            Some(i) => self.select_tab(p, i),
+            None => self.new_tab(Url::parse(WELCOME_URL).expect("gator://welcome is valid")),
+        }
+        self.save_session();
+        self.window.request_redraw();
+    }
+
+    /// Cycle to the next/previous workspace, wrapping (LYK-1266).
+    fn cycle_workspace(&self, forward: bool) {
+        let n = self.workspaces.borrow().len();
+        if n <= 1 {
+            return;
+        }
+        let cur = self.current_ws.get();
+        let next = if forward { (cur + 1) % n } else { (cur + n - 1) % n };
+        self.switch_workspace(next);
+    }
+
+    /// Create a new workspace (distinct auto-accent) and switch to it (LYK-1266).
+    fn new_workspace(&self) {
+        let idx = self.workspaces.borrow().len();
+        self.workspaces.borrow_mut().push(Workspace {
+            name: format!("Space {}", idx + 1),
+            accent: ws_accent(idx),
+        });
+        self.switch_workspace(idx);
+    }
+
+    /// Move the focused pane's active tab into workspace `w` and switch there (LYK-1266).
+    fn move_active_tab_to_ws(&self, w: usize) {
+        if w >= self.workspaces.borrow().len() {
+            return;
+        }
+        let p = self.focused.get();
+        let a = self.pane(p).active.get();
+        if let Some(t) = self.pane(p).tabs.borrow_mut().get_mut(a) {
+            t.workspace = w;
+        }
+        self.switch_workspace(w);
     }
 
     fn select_tab(&self, pane: usize, i: usize) {
@@ -8368,16 +8565,27 @@ impl AppState {
             }
             return;
         }
-        let len = self.pane(pane).tabs.borrow().len();
-        let active = self.pane(pane).active.get();
-        let new_active = if active >= len {
-            len - 1
-        } else if active > i {
-            active - 1
-        } else {
-            active
+        // Re-select within the current workspace (LYK-1266) — the nearest remaining tab to the
+        // closed slot. If the workspace just emptied (but the pane still has other-workspace tabs),
+        // follow to a remaining tab's workspace + accent so the chrome never shows a dead selection.
+        let cur_ws = self.current_ws.get();
+        let nearest = {
+            let tabs = self.pane(pane).tabs.borrow();
+            tabs.iter()
+                .enumerate()
+                .filter(|(_, t)| t.workspace == cur_ws)
+                .map(|(j, _)| j)
+                .min_by_key(|&j| (j as isize - i as isize).abs())
         };
-        self.select_tab(pane, new_active);
+        match nearest {
+            Some(pick) => self.select_tab(pane, pick),
+            None => {
+                let w = self.pane(pane).tabs.borrow()[0].workspace;
+                self.current_ws.set(w);
+                self.browser.settings.borrow_mut().theme.accent = self.workspaces.borrow()[w].accent;
+                self.select_tab(pane, 0);
+            }
+        }
         self.save_session();
     }
 
@@ -10434,6 +10642,11 @@ fn open_window(
         pane1: PaneGroup::new(content_context_r),
         split: Cell::new(false),
         focused: Cell::new(0),
+        workspaces: RefCell::new(vec![Workspace {
+            name: "Default".to_string(),
+            accent: browser.settings.borrow().theme.accent,
+        }]),
+        current_ws: Cell::new(0),
         location: RefCell::new(String::new()),
         location_dirty: Cell::new(false),
         focus_omnibox: Cell::new(false),
@@ -10639,10 +10852,36 @@ impl ApplicationHandler<WakeUp> for App {
         } else {
             load_session()
         };
+        // Read persisted workspaces BEFORE creating tabs (LYK-1266): tab creation triggers
+        // save_session -> save_workspaces, which would clobber the file with the default state.
+        let ws_saved = load_workspaces();
         let (window_id, state) = open_window(event_loop, &browser, restored);
         // Re-enter split if the saved session had a second pane.
         if !restored_pane1.is_empty() {
             state.restore_split(restored_pane1);
+        }
+        // Restore workspaces (LYK-1266): the spaces list + each tab's space (parallel to the
+        // restored tab order) + the active space and its accent. Tabs are already created; we just
+        // re-tag them and select a current-space tab. Skipped when there's no workspaces file.
+        {
+            let (spaces, cur, t0, t1) = ws_saved;
+            if spaces.len() > 1 {
+                *state.workspaces.borrow_mut() = spaces;
+                let assign = |tabs: &mut Vec<Tab>, idx: &[usize]| {
+                    for (t, &w) in tabs.iter_mut().zip(idx.iter()) {
+                        t.workspace = w;
+                    }
+                };
+                assign(&mut state.pane0.tabs.borrow_mut(), &t0);
+                assign(&mut state.pane1.tabs.borrow_mut(), &t1);
+                let cw = cur.min(state.workspaces.borrow().len() - 1);
+                state.current_ws.set(cw);
+                state.browser.settings.borrow_mut().theme.accent =
+                    state.workspaces.borrow()[cw].accent;
+                if let Some(&i) = state.ws_indices(0).first() {
+                    state.select_tab(0, i);
+                }
+            }
         }
 
         // Auto-unlock the password store from the OS keyring if the user opted in (browser-global).
@@ -11017,6 +11256,11 @@ impl ApplicationHandler<WakeUp> for App {
                             }
                             return;
                         }
+                        WinitKey::Character(c) if c.eq_ignore_ascii_case("e") && state.shift.get() => {
+                            // Ctrl+Shift+E — cycle to the next workspace (LYK-1266).
+                            state.cycle_workspace(true);
+                            return;
+                        }
                         WinitKey::Character(c) if c.eq_ignore_ascii_case("w") => {
                             state.close_tab(state.focused.get(), state.focused_pane().active.get());
                             return;
@@ -11051,25 +11295,32 @@ impl ApplicationHandler<WakeUp> for App {
                         WinitKey::Character(c)
                             if c.parse::<usize>().map(|n| (1..=9).contains(&n)).unwrap_or(false) =>
                         {
+                            // Jump to the Nth tab of the CURRENT workspace (Ctrl+9 = last) (LYK-1266).
                             let n = c.parse::<usize>().unwrap_or(0);
-                            let len = state.focused_pane().tabs.borrow().len();
-                            if n == 9 && len > 0 {
-                                state.select_tab(state.focused.get(), len - 1);
-                            } else if (1..=8).contains(&n) && n <= len {
-                                state.select_tab(state.focused.get(), n - 1);
+                            let order = state.ws_indices(state.focused.get());
+                            let target = if n == 9 {
+                                order.last().copied()
+                            } else {
+                                order.get(n - 1).copied()
+                            };
+                            if let Some(idx) = target {
+                                state.select_tab(state.focused.get(), idx);
                             }
                             return;
                         }
                         WinitKey::Named(NamedKey::Tab) => {
-                            let len = state.focused_pane().tabs.borrow().len();
-                            if len > 1 {
+                            // Cycle within the current workspace's tabs (LYK-1266).
+                            let order = state.ws_indices(state.focused.get());
+                            if order.len() > 1 {
                                 let cur = state.focused_pane().active.get();
-                                let next = if state.shift.get() {
-                                    (cur + len - 1) % len
-                                } else {
-                                    (cur + 1) % len
-                                };
-                                state.select_tab(state.focused.get(), next);
+                                if let Some(pos) = order.iter().position(|&i| i == cur) {
+                                    let step = if state.shift.get() {
+                                        order.len() - 1
+                                    } else {
+                                        1
+                                    };
+                                    state.select_tab(state.focused.get(), order[(pos + step) % order.len()]);
+                                }
                             }
                             return;
                         }
