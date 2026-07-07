@@ -59,7 +59,7 @@ raw-window-handle = "0.6"
 # resolves cleanly against the engine's glow/winit/raw-window-handle).
 egui = "0.34.3"
 egui_glow = { version = "0.34.3", features = ["winit"] }
-egui-winit = { version = "0.34.3", default-features = false, features = ["clipboard", "wayland"] }
+egui-winit = { version = "0.34.3", default-features = false, features = ["accesskit", "clipboard", "wayland"] }
 glow = "0.17"
 # In-egui file picker (no native GTK/portal dep), as used by servoshell.
 egui-file-dialog = "0.13.0"

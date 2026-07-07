@@ -31,6 +31,9 @@ use egui::text_edit::TextEditState;
 use egui::{LayerId, PaintCallback};
 use egui_file_dialog::{DialogState, FileDialog, Filter};
 use egui_glow::{CallbackFn, EguiGlow};
+// Re-exported by egui-winit only when its `accesskit` feature is on (which we enable): the chrome
+// accessibility transport (LYK-1378).
+use egui_winit::accesskit_winit;
 use euclid::Scale;
 use euclid::default::{Point2D, Rect, Size2D};
 // Everything from the engine comes through navgator-engine, the only crate that touches
@@ -1050,6 +1053,9 @@ fn icon_button(
     if tip.is_empty() {
         resp
     } else {
+        // The button is painted (no text), so give it an accessible name from the tooltip —
+        // otherwise a screen reader announces an unnamed "button" (LYK-1378, chrome a11y).
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tip));
         resp.on_hover_text(tip)
     }
 }
@@ -6541,15 +6547,29 @@ impl AppState {
                                     } else {
                                         ("☆", pal.muted)
                                     };
-                                    if ui
+                                    // Its label is the star glyph, which a screen reader reads as
+                                    // "black/white star" — give it a real name instead (a11y).
+                                    let star_label = if starred {
+                                        "Remove bookmark"
+                                    } else {
+                                        "Bookmark this page"
+                                    };
+                                    let star_resp = ui
                                         .add(
                                             egui::Button::new(
                                                 egui::RichText::new(glyph).size(15.0).color(scol),
                                             )
                                             .frame(false),
                                         )
-                                        .clicked()
-                                    {
+                                        .on_hover_text(star_label);
+                                    star_resp.widget_info(|| {
+                                        egui::WidgetInfo::labeled(
+                                            egui::WidgetType::Button,
+                                            true,
+                                            star_label,
+                                        )
+                                    });
+                                    if star_resp.clicked() {
                                         star_toggle = true;
                                     }
                                     ui.add_sized(
@@ -7106,6 +7126,11 @@ impl AppState {
         }
 
         let tab = resp.on_hover_text(&title);
+        // The tab pill is painted (title drawn, not egui text), so name it for screen readers and
+        // mark the active one selected (LYK-1378, chrome a11y).
+        tab.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, i == active, &title)
+        });
 
         // Close takes priority over select if both registered the click.
         if matches!(act, TabAction::None) {
@@ -7389,6 +7414,9 @@ impl AppState {
                                     egui::Sense::click(),
                                 );
                                 let resp = resp.on_hover_text("New tab (Ctrl+T)");
+                                resp.widget_info(|| {
+                                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "New tab")
+                                });
                                 let c = if resp.hovered() { pal.text } else { pal.muted };
                                 let p = ui.painter();
                                 if resp.hovered() {
@@ -11290,7 +11318,11 @@ fn open_window(
     let content_context_r = Rc::new(window_context.offscreen_context(inner));
 
     let _ = content_context.make_current();
-    let egui = EguiGlow::new(event_loop, content_context.glow_gl_api(), None, None, false);
+    let mut egui = EguiGlow::new(event_loop, content_context.glow_gl_api(), None, None, false);
+    // Expose the chrome's accessibility tree to screen readers (Orca/AT-SPI on Linux, etc.):
+    // AccessKit action requests come back as WakeUp::AccessKit via this proxy (LYK-1378).
+    egui.egui_winit
+        .init_accesskit(event_loop, &window, browser.event_proxy.clone());
     egui.egui_ctx.options_mut(|o| {
         o.zoom_with_keyboard = false;
     });
@@ -11614,6 +11646,30 @@ impl ApplicationHandler<WakeUp> for App {
             event_loop.exit();
             return;
         }
+        // AccessKit events are per-window (a screen-reader action / tree request for one window's
+        // chrome tree); route by window id, not through the browser-global path below.
+        if matches!(event, WakeUp::AccessKit(_)) {
+            if let WakeUp::AccessKit(evt) = event {
+                if let Some(state) = windows.get(&evt.window_id).cloned() {
+                    match evt.window_event {
+                        // egui emits the tree in its next frame's platform output.
+                        accesskit_winit::WindowEvent::InitialTreeRequested => {
+                            state.window.request_redraw();
+                        }
+                        accesskit_winit::WindowEvent::ActionRequested(request) => {
+                            state
+                                .egui
+                                .borrow_mut()
+                                .egui_winit
+                                .on_accesskit_action_request(request);
+                            state.window.request_redraw();
+                        }
+                        accesskit_winit::WindowEvent::AccessibilityDeactivated => {},
+                    }
+                }
+            }
+            return;
+        }
         // These wake-ups act on browser-global data; route through any one window's state, then
         // refresh all windows so chrome (bookmarks bar, sync status) reflects the change.
         if let Some(state) = windows.values().next().cloned() {
@@ -11628,7 +11684,8 @@ impl ApplicationHandler<WakeUp> for App {
                     notes,
                 } => state.on_update_available(version, url, notes),
                 WakeUp::UpdateCheckTick => state.check_for_update(),
-                WakeUp::Wake | WakeUp::Exit => {}
+                // Handled above / no-ops in the browser-global path.
+                WakeUp::Wake | WakeUp::Exit | WakeUp::AccessKit(_) => {}
             }
         }
         // The change above is browser-global (bookmarks bar, sync status, …); refresh EVERY
@@ -12164,6 +12221,15 @@ enum WakeUp {
     UpdateAvailable { version: String, url: String, notes: String },
     /// The update scheduler's periodic timer fired; run a check on the UI thread (LYK-1495).
     UpdateCheckTick,
+    /// An AccessKit event (initial-tree request / screen-reader action) for a window's chrome
+    /// accessibility tree (LYK-1378). Routed by window id to that window's egui integration.
+    AccessKit(accesskit_winit::Event),
+}
+
+impl From<accesskit_winit::Event> for WakeUp {
+    fn from(event: accesskit_winit::Event) -> Self {
+        WakeUp::AccessKit(event)
+    }
 }
 
 impl EventLoopWaker for Waker {
