@@ -7491,6 +7491,68 @@ impl AppState {
         };
         let pointer = ctx.input(|i| i.pointer.interact_pos());
         let still_dragging = ctx.input(|i| i.pointer.any_down());
+
+        // LYK-1261: drag a tab into the right edge of the content area to enter split view with
+        // that tab. Only when not already split; the reorder path owns everything else. The zone
+        // is the right ~third of the window, below a top horizontal strip / right of a left
+        // vertical strip (so it never overlaps the strip the tab is being dragged out of).
+        let screen = ctx.screen_rect();
+        let strip = rects.first().map(|r| r.union(*rects.last().unwrap()));
+        let zone_left = screen.right() - screen.width() * 0.34;
+        let in_split_zone = !self.split.get() &&
+            pointer.is_some_and(|p| {
+                let past_strip = strip.map_or(true, |s| {
+                    if vertical { p.x > s.right() } else { p.y > s.bottom() }
+                });
+                past_strip && p.x > zone_left
+            });
+        if in_split_zone {
+            let top = strip.map_or(screen.top(), |s| if vertical { screen.top() } else { s.bottom() });
+            let zone = egui::Rect::from_min_max(egui::pos2(zone_left, top), screen.max);
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("tab_split_drop_zone"),
+            ));
+            let c = ctx.style().visuals.selection.bg_fill;
+            painter.rect_filled(
+                zone.shrink(6.0),
+                egui::CornerRadius::same(10),
+                egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 44),
+            );
+            painter.rect_stroke(
+                zone.shrink(6.0),
+                egui::CornerRadius::same(10),
+                egui::Stroke::new(2.0, c),
+                egui::StrokeKind::Inside,
+            );
+            painter.text(
+                zone.center(),
+                egui::Align2::CENTER_CENTER,
+                "Split",
+                egui::FontId::proportional(18.0),
+                c,
+            );
+            if !still_dragging {
+                // Drop: recreate the tab in pane 1 at its URL, then remove it from pane 0 (unless
+                // it's the only tab there — then keep it, so pane 0 is never left empty).
+                let url = self
+                    .pane0
+                    .tabs
+                    .borrow()
+                    .get(dragged)
+                    .and_then(|t| Url::parse(&t.url).ok());
+                if let Some(url) = url {
+                    self.enter_split(url);
+                    if self.pane0.tabs.borrow().len() > 1 {
+                        self.close_tab(0, dragged);
+                    }
+                }
+                self.pane0.drag_tab.set(None);
+            }
+            self.window.request_redraw();
+            return;
+        }
+
         let slot = pointer.and_then(|p| self.drag_target_slot(order, rects, p, vertical));
         if let Some(slot) = slot {
             // Insertion indicator: a thin line at the candidate slot's leading edge.
