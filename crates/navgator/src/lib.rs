@@ -4148,6 +4148,97 @@ impl AppState {
         self.themed(html)
     }
 
+    /// Render `gator://spaces` (LYK-1266): the workspace manager — list every space with its colour,
+    /// tab count, an inline rename field, Switch, and Delete (Default can't be deleted), plus a New
+    /// space form. Reached from the toolbar space pill.
+    fn render_gator_spaces(&self) -> Vec<u8> {
+        let (accent, th) = {
+            let s = self.browser.settings.borrow();
+            (s.accent.clone(), s.theme)
+        };
+        let current = self.current_ws.get();
+        let counts = {
+            let mut c = vec![0usize; self.workspaces.borrow().len()];
+            for pane in [&self.pane0, &self.pane1] {
+                for t in pane.tabs.borrow().iter() {
+                    if !t.url.is_empty() {
+                        if let Some(x) = c.get_mut(t.workspace) {
+                            *x += 1;
+                        }
+                    }
+                }
+            }
+            c
+        };
+        let rows: String = self
+            .workspaces
+            .borrow()
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                let dot = color_hex(theme::Theme { accent: w.accent, ..th }.palette().accent);
+                let ct = counts.get(i).copied().unwrap_or(0);
+                let badge = if i == current {
+                    "<span class=\"cur\">active</span>".to_string()
+                } else {
+                    format!("<a href=\"gator://spaces?switch={i}\">Switch</a>")
+                };
+                let del = if i == 0 {
+                    String::new()
+                } else {
+                    format!("<a class=\"del\" href=\"gator://spaces?delete={i}\">Delete</a>")
+                };
+                format!(
+                    "<div class=\"row\"><span class=\"dot\" style=\"background:{dot}\"></span>\
+                     <form class=\"nm\" method=\"get\" action=\"gator://spaces\">\
+                     <input type=\"hidden\" name=\"rename\" value=\"{i}\">\
+                     <input name=\"name\" value=\"{name}\" autocomplete=\"off\" spellcheck=\"false\">\
+                     </form>\
+                     <span class=\"ct\">{ct} tab{plural}</span>{badge}{del}</div>",
+                    name = html_escape(&w.name),
+                    plural = if ct == 1 { "" } else { "s" },
+                )
+            })
+            .collect();
+        let html = format!(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Spaces &middot; NavGator</title>\
+             <style>\
+             body{{font:15px/1.5 var(--font,system-ui),sans-serif;color:var(--fg);background:var(--bg);\
+             margin:0;padding:40px 24px;display:flex;justify-content:center}}\
+             .wrap{{width:min(640px,94vw)}}\
+             h1{{font-size:26px;margin:0 0 4px}} .g{{color:{accent}}}\
+             .sub{{color:var(--muted);margin:0 0 26px}}\
+             .list{{display:flex;flex-direction:column;gap:8px;margin-bottom:26px}}\
+             .row{{display:flex;align-items:center;gap:12px;background:var(--panel);border:1px solid var(--line);\
+             border-radius:11px;padding:10px 14px}}\
+             .dot{{flex:none;width:14px;height:14px;border-radius:50%}}\
+             .nm{{flex:1;margin:0}} .nm input{{width:100%;background:transparent;border:1px solid transparent;\
+             color:var(--fg);font:600 15px system-ui;padding:5px 7px;border-radius:7px}}\
+             .nm input:hover{{border-color:var(--line)}} .nm input:focus{{border-color:{accent};outline:none;background:var(--bg)}}\
+             .ct{{color:var(--muted);font-size:12px;white-space:nowrap}}\
+             .row a{{color:{accent};text-decoration:none;font-weight:600;font-size:13px}} .row a:hover{{text-decoration:underline}}\
+             .row .del{{color:#e5484d}}\
+             .cur{{color:var(--muted);font-size:12px;font-weight:600}}\
+             h2{{font-size:15px;margin:0 0 10px}}\
+             form.new{{display:flex;gap:8px}}\
+             .new input{{flex:1;padding:9px 11px;border-radius:9px;border:1px solid var(--line);background:var(--panel);color:var(--fg)}}\
+             .new button{{font:600 14px system-ui;padding:9px 16px;border-radius:9px;border:none;background:{accent};color:#0b0b0b;cursor:pointer}}\
+             a{{color:{accent}}} footer{{margin-top:30px;color:var(--muted);font-size:12px}}\
+             </style></head><body><div class=\"wrap\">\
+             <h1>Nav<span class=\"g\">Gator</span> spaces</h1>\
+             <p class=\"sub\">Workspaces group tabs and tint the whole browser. Edit a name inline \
+             (Enter to save), switch, or delete. Ctrl+Shift+E cycles.</p>\
+             <div class=\"list\">{rows}</div>\
+             <h2>New space</h2>\
+             <form class=\"new\" method=\"get\" action=\"gator://spaces\">\
+             <input name=\"new\" placeholder=\"e.g. Work, Research\" autocomplete=\"off\" spellcheck=\"false\">\
+             <button type=\"submit\">Create &amp; switch</button></form>\
+             <footer>gator://spaces &middot; <a href=\"gator://welcome\">welcome</a></footer>\
+             </div></body></html>"
+        );
+        self.themed(html)
+    }
+
     /// Render `gator://profiles` (LYK-1376): list the isolated identity profiles and open one in a
     /// new window (a fresh navgator process with its own cookies/history/vault). The current window's
     /// profile is marked; a form creates + opens a new one.
@@ -5997,6 +6088,10 @@ impl AppState {
                 }
                 return;
             }
+            A::ManageWorkspaces => {
+                self.navigate_from_omnibox("gator://spaces");
+                return;
+            }
             A::ReaderMode => {
                 self.activate_reader_mode();
                 return;
@@ -6034,7 +6129,8 @@ impl AppState {
                 | A::ReaderMode
                 | A::NewWorkspace
                 | A::NextWorkspace
-                | A::MoveTabToNextWorkspace => {}
+                | A::MoveTabToNextWorkspace
+                | A::ManageWorkspaces => {}
             }
             sync_legacy_theme(&mut s);
             save_settings(&s);
@@ -6234,9 +6330,9 @@ impl AppState {
                                     .fill(pal.accent)
                                     .min_size(egui::vec2(0.0, 22.0)),
                                 )
-                                .on_hover_text("Workspace — click to switch (Ctrl+Shift+E)");
+                                .on_hover_text("Workspace — manage / switch (Ctrl+Shift+E cycles)");
                             if resp.clicked() {
-                                self.cycle_workspace(true);
+                                self.navigate_from_omnibox("gator://spaces");
                             }
                         }
                     }
@@ -8458,6 +8554,42 @@ impl AppState {
         self.window.request_redraw();
     }
 
+    /// Delete workspace `w` (LYK-1266): its tabs fall back to Default (0), higher spaces shift down,
+    /// and `current_ws` + accent follow. The Default space (index 0) and the last remaining space
+    /// can't be deleted.
+    fn delete_workspace(&self, w: usize) {
+        let n = self.workspaces.borrow().len();
+        if w == 0 || w >= n || n <= 1 {
+            return;
+        }
+        for pane in [&self.pane0, &self.pane1] {
+            for t in pane.tabs.borrow_mut().iter_mut() {
+                if t.workspace == w {
+                    t.workspace = 0;
+                } else if t.workspace > w {
+                    t.workspace -= 1;
+                }
+            }
+        }
+        self.workspaces.borrow_mut().remove(w);
+        let cur = self.current_ws.get();
+        let new_cur = if cur == w {
+            0
+        } else if cur > w {
+            cur - 1
+        } else {
+            cur
+        };
+        self.current_ws.set(new_cur);
+        self.browser.settings.borrow_mut().theme.accent = self.workspaces.borrow()[new_cur].accent;
+        let p = self.focused.get();
+        if let Some(&i) = self.ws_indices(p).first() {
+            self.select_tab(p, i);
+        }
+        self.save_session();
+        self.window.request_redraw();
+    }
+
     /// Cycle to the next/previous workspace, wrapping (LYK-1266).
     fn cycle_workspace(&self, forward: bool) {
         let n = self.workspaces.borrow().len();
@@ -9750,6 +9882,41 @@ impl WebViewDelegate for AppState {
             "why" => self.render_gator_why(),
             "exposure" => self.render_gator_exposure(),
             "trail" => self.render_gator_trail(),
+            "spaces" => {
+                // Workspace manager actions (LYK-1266): switch / delete / rename an existing space,
+                // or new=<name> to create + switch.
+                let q: Vec<(String, String)> = url
+                    .query_pairs()
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+                let num = |key: &str| {
+                    q.iter().find(|(k, _)| k == key).and_then(|(_, v)| v.parse::<usize>().ok())
+                };
+                let sval = |key: &str| {
+                    q.iter().find(|(k, _)| k == key).map(|(_, v)| v.trim().to_string())
+                };
+                if let Some(i) = num("rename") {
+                    if let Some(name) = sval("name").filter(|s| !s.is_empty()) {
+                        if let Some(w) = self.workspaces.borrow_mut().get_mut(i) {
+                            w.name = name.chars().take(24).collect();
+                        }
+                        self.save_session();
+                        self.window.request_redraw();
+                    }
+                } else if let Some(name) = sval("new").filter(|s| !s.is_empty()) {
+                    let idx = self.workspaces.borrow().len();
+                    self.workspaces.borrow_mut().push(Workspace {
+                        name: name.chars().take(24).collect(),
+                        accent: ws_accent(idx),
+                    });
+                    self.switch_workspace(idx);
+                } else if let Some(i) = num("delete") {
+                    self.delete_workspace(i);
+                } else if let Some(i) = num("switch") {
+                    self.switch_workspace(i);
+                }
+                self.render_gator_spaces()
+            }
             "profiles" => {
                 // ?open=<name> launches that profile in a new window; ?new=<name> creates it first;
                 // ?delete=<name> asks to confirm, ?delete=<name>&confirm=1 removes it.

@@ -30,6 +30,7 @@ pub(crate) enum PaletteAction {
     NewWorkspace,
     NextWorkspace,
     MoveTabToNextWorkspace,
+    ManageWorkspaces,
 }
 
 /// The full command catalog: (label, right-aligned mono hint, action).
@@ -80,6 +81,11 @@ pub(crate) fn palette_catalog() -> Vec<(String, &'static str, PaletteAction)> {
             "Move tab to next workspace".to_string(),
             "Spaces",
             PaletteAction::MoveTabToNextWorkspace,
+        ),
+        (
+            "Manage workspaces".to_string(),
+            "Spaces",
+            PaletteAction::ManageWorkspaces,
         ),
         (
             "Toggle vertical tabs".to_string(),
