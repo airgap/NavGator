@@ -29,7 +29,7 @@ import shutil
 import sys
 
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageChops, ImageDraw, ImageFont
 except Exception as e:  # pragma: no cover - exercised via package.sh degrade path
     sys.stderr.write(f"stamp-icon: Pillow unavailable ({e}); skipping stamp\n")
     sys.exit(2)
@@ -61,13 +61,29 @@ def load_font(size):
 
 
 def rounded_master(art_path):
-    """Fit the art into a white 1024 square and round the corners — the same
-    master scripts/make-icon.sh builds (kept intentionally in sync)."""
+    """Build the white 1024 rounded-square master with the gator rising from the BOTTOM
+    edge (its design intent), with no padding — the same master scripts/make-icon.sh builds
+    (kept intentionally in sync).
+
+    The source art is a small (735x824) gator drawn on white with a lot of headroom above
+    it and its feet already flush to the art's bottom edge. The old code thumbnail'd (which
+    never upscales) and centred it, so the gator ended up inset with ~100px of padding on
+    every side. Instead: trim the white margins to the gator's true bounds, scale it to
+    fill the canvas WIDTH, and anchor it to the bottom edge — any height overflow is cropped
+    off the TOP (white headroom only), so the gator reaches the bottom with zero padding."""
     art = Image.open(art_path).convert("RGBA")
-    fitted = art.copy()
-    fitted.thumbnail((CANVAS, CANVAS), Image.LANCZOS)  # preserve aspect, fit box
+    # Trim white margins to the gator's true content box.
+    bbox = ImageChops.difference(
+        art.convert("RGB"), Image.new("RGB", art.size, (255, 255, 255))
+    ).getbbox()
+    if bbox:
+        art = art.crop(bbox)
+    scale = CANVAS / art.width
+    gator = art.resize((CANVAS, round(art.height * scale)), Image.LANCZOS)
+    if gator.height > CANVAS:  # overflow is the headroom above the gator — crop it off the top
+        gator = gator.crop((0, gator.height - CANVAS, CANVAS, gator.height))
     flat = Image.new("RGBA", (CANVAS, CANVAS), (255, 255, 255, 255))
-    flat.paste(fitted, ((CANVAS - fitted.width) // 2, (CANVAS - fitted.height) // 2), fitted)
+    flat.alpha_composite(gator, (0, CANVAS - gator.height))  # anchor to the bottom edge
     mask = Image.new("L", (CANVAS, CANVAS), 0)
     ImageDraw.Draw(mask).rounded_rectangle([0, 0, CANVAS - 1, CANVAS - 1], radius=RADIUS, fill=255)
     flat.putalpha(mask)

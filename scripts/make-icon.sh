@@ -11,8 +11,9 @@
 # it, so local CLT builds fall back to this .icns and Tahoe shows it on its grey
 # "squircle jail" plate). A raster .icns can never escape that plate on Tahoe.
 # Windows/Linux/pre-Tahoe don't mask, so the rounding is baked into all three
-# raster files here. The art's off-center framing is preserved (fit + pad, never
-# recentre). Run on macOS after changing the art, then commit the regenerated files.
+# raster files here. The gator is trimmed of its white margins and anchored to the
+# bottom edge (its design intent: it rises from the bottom with no padding), filling
+# the width. Run on macOS after changing the art, then commit the regenerated files.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ART="$ROOT/packaging/navgator.icon/Assets/gator3.png"
@@ -27,7 +28,11 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # Full-canvas rounded master (white fills the canvas, only the corners transparent).
 magick -size 1024x1024 xc:none -fill white \
   -draw "roundrectangle 0,0,1023,1023,$RADIUS,$RADIUS" "$TMP/mask.png"
-magick "$ART" -strip -resize 1024x1024 -background white -gravity center -extent 1024x1024 "$TMP/flat.png"
+# Trim the art's white margins to the gator's true bounds, scale it to fill the width, and
+# anchor it to the BOTTOM edge (gravity south) so the gator rises from the bottom with no
+# padding (its design intent). -extent crops any height overflow off the top (headroom only)
+# and pads the top of short art with white. Keep in sync with scripts/stamp-icon.py.
+magick "$ART" -strip -fuzz 2% -trim +repage -resize 1024x -background white -gravity south -extent 1024x1024 "$TMP/flat.png"
 magick "$TMP/flat.png" \( "$TMP/mask.png" -alpha extract \) \
   -compose CopyOpacity -composite -define png:color-type=6 "$TMP/master.png"
 
