@@ -881,6 +881,7 @@ mod icon {
             p.rect_stroke(r, CornerRadius::same(2), s(c), StrokeKind::Inside);
         }
     }
+    #[allow(dead_code)] // kept for reuse; the settings button is now a gear
     pub fn menu(p: &Painter, r: Rect, c: Color32) {
         for t in [0.18_f32, 0.5, 0.82] {
             let y = r.top() + r.height() * t;
@@ -888,6 +889,7 @@ mod icon {
         }
     }
     /// 2×2 swatch grid — "customize / themes" (the Studio).
+    #[allow(dead_code)] // kept for reuse; the appearance shortcut was removed from the toolbar
     pub fn studio(p: &Painter, r: Rect, c: Color32) {
         let g = 1.6;
         let cell = (r.width() - g) / 2.0;
@@ -971,15 +973,48 @@ mod icon {
         let b2 = tip - radial * 3.6;
         p.add(egui::Shape::convex_polygon(vec![apex, b1, b2], c, Stroke::NONE));
     }
-    /// Key: a ring on the left, a stem to the right, two teeth.
+    /// Padlock — the passwords / vault control. (Was a tiny sideways key that read as a stray
+    /// glyph; a padlock is the unambiguous "secure / passwords" mark.)
     pub fn key(p: &Painter, r: Rect, c: Color32) {
-        let rad = r.height() * 0.32;
-        let ring = pos2(r.left() + rad, r.center().y);
-        let y = r.center().y;
-        p.circle_stroke(ring, rad, s(c));
-        p.line_segment([pos2(ring.x + rad, y), pos2(r.right(), y)], s(c));
-        p.line_segment([pos2(r.right() - 1.5, y), pos2(r.right() - 1.5, y + 3.5)], s(c));
-        p.line_segment([pos2(r.right() - 5.0, y), pos2(r.right() - 5.0, y + 3.5)], s(c));
+        let st = s(c);
+        // Body: a rounded rect filling the lower half of the cell.
+        let bw = r.width() * 0.58;
+        let bh = r.height() * 0.44;
+        let body = Rect::from_center_size(
+            pos2(r.center().x, r.bottom() - bh * 0.5 - r.height() * 0.08),
+            vec2(bw, bh),
+        );
+        p.rect_stroke(body, CornerRadius::same(2), st, StrokeKind::Inside);
+        // Shackle: a ∩ arc rising from the body's top edge.
+        let sr = bw * 0.34;
+        let sc = pos2(r.center().x, body.top());
+        let n = 14;
+        let pts: Vec<_> = (0..=n)
+            .map(|i| {
+                let a = std::f32::consts::PI * (i as f32 / n as f32);
+                pos2(sc.x - sr * a.cos(), sc.y - sr * a.sin())
+            })
+            .collect();
+        p.add(egui::Shape::line(pts, st));
+        // Keyhole.
+        p.circle_filled(body.center(), 1.3, c);
+    }
+
+    /// Gear — Settings (the conventional cog).
+    pub fn gear(p: &Painter, r: Rect, c: Color32) {
+        use std::f32::consts::TAU;
+        let st = Stroke::new(1.9, c);
+        let center = r.center();
+        let ring = r.height() * 0.19;
+        let tooth = r.height() * 0.16;
+        let teeth = 8;
+        for i in 0..teeth {
+            let a = TAU * (i as f32 / teeth as f32);
+            let d = vec2(a.cos(), a.sin());
+            p.line_segment([center + d * ring, center + d * (ring + tooth)], st);
+        }
+        p.circle_stroke(center, ring, st);
+        p.circle_filled(center, r.height() * 0.055, c);
     }
 }
 
@@ -3779,6 +3814,11 @@ struct AppState {
     /// Logical-px rect of the reserved window-drag handle (left of the window controls). This is
     /// the ONLY region that drags the borderless window — nothing else is draggable.
     drag_rect: Cell<egui::Rect>,
+    /// True while we've manually set a window-edge resize cursor. We set the cursor directly
+    /// (bypassing egui), which desyncs egui's cursor cache — so when the pointer leaves the edge
+    /// onto non-interactive chrome, egui won't re-assert the default arrow. This flag lets the
+    /// move handler reset the cursor once on that transition (LYK — header stuck resize cursor).
+    resize_cursor_shown: Cell<bool>,
     /// Frame counter throttling tab-preview thumbnail capture (a glReadPixels is not free).
     thumb_tick: Cell<u32>,
     /// Frames of forced redraw remaining after a content-size change, so Servo's async reflow of
@@ -6318,7 +6358,7 @@ impl AppState {
                         ui.allocate_exact_size(egui::vec2(40.0, 24.0), egui::Sense::hover());
                     self.drag_rect.set(drag_handle);
                     {
-                        let menu_resp = icon_button(ui, true, "Settings", &pal, icon::menu);
+                        let menu_resp = icon_button(ui, true, "Settings", &pal, icon::gear);
                         if menu_resp.clicked() {
                             self.navigate_from_omnibox("gator://settings");
                         }
@@ -6380,9 +6420,8 @@ impl AppState {
                             }
                         }
                     }
-                    if icon_button(ui, true, "Customize appearance", &pal, icon::studio).clicked() {
-                        self.navigate_from_omnibox("gator://settings#appearance");
-                    }
+                    // (The former 2×2 "Customize appearance" button was a second settings entry-
+                    // point — the gear now covers it; appearance lives at gator://settings#appearance.)
                     // Add-ons (userscripts) puzzle icon: toggles the registry-driven popover. A
                     // count bubble shows how many enabled add-ons match the current tab's URL.
                     {
@@ -8499,8 +8538,16 @@ impl AppState {
                 }
             }
         }
+        // Dismiss on an outside click — but NOT the click on the toggle button itself. That click
+        // lands outside the popover Area, so clicked_elsewhere() fires for it too; without this
+        // guard the popover closed the same frame the button opened it (the "does nothing" bug).
         if r.response.clicked_elsewhere() {
-            self.show_addons.set(false);
+            let on_toggle = ctx
+                .pointer_interact_pos()
+                .is_some_and(|p| self.addon_badge_rect.get().contains(p));
+            if !on_toggle {
+                self.show_addons.set(false);
+            }
         }
     }
 
@@ -11070,6 +11117,52 @@ fn x11_gl_visual_id(display_handle: &winit::raw_window_handle::DisplayHandle) ->
     (vid > 0).then_some(vid as u32)
 }
 
+/// The window / taskbar icon, set on every window at creation. Desktop environments cache the
+/// launcher `.desktop` icon by name, so a new build (whose icon carries a fresh version badge)
+/// keeps showing a STALE variant in the dock / task bar / alt-tab. Setting the window's
+/// `_NET_WM_ICON` directly bypasses that cache entirely, so the running app always shows THIS
+/// build's icon. We prefer the packaged, build-badged PNG on disk (so the badge matches the
+/// running build); if none is found we fall back to the clean icon compiled into the binary.
+fn window_icon() -> Option<winit::window::Icon> {
+    fn decode(bytes: &[u8]) -> Option<winit::window::Icon> {
+        let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().ok()?;
+        let mut buf = vec![0u8; reader.output_buffer_size()?];
+        let info = reader.next_frame(&mut buf).ok()?;
+        buf.truncate(info.buffer_size());
+        let rgba = match info.color_type {
+            png::ColorType::Rgba => buf,
+            png::ColorType::Rgb => buf
+                .chunks_exact(3)
+                .flat_map(|p| [p[0], p[1], p[2], 255])
+                .collect(),
+            _ => return None,
+        };
+        winit::window::Icon::from_rgba(rgba, info.width, info.height).ok()
+    }
+    // The packaged, version-badged PNG on disk: AppImage ($APPDIR/navgator.png + its FHS copy)
+    // and .deb (/usr/share/icons/…). current_exe() resolves through the AppImage mount / install.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("../../navgator.png"));
+            candidates.push(dir.join("../share/icons/hicolor/256x256/apps/navgator.png"));
+        }
+    }
+    candidates.push(PathBuf::from("/usr/share/icons/hicolor/256x256/apps/navgator.png"));
+    for path in candidates {
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Some(icon) = decode(&bytes) {
+                return Some(icon);
+            }
+        }
+    }
+    // Fallback: the clean icon compiled in (dev builds / unpackaged runs — no version badge).
+    decode(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../packaging/navgator.png"
+    )))
+}
+
 fn open_window(
     event_loop: &ActiveEventLoop,
     browser: &Rc<BrowserState>,
@@ -11080,6 +11173,7 @@ fn open_window(
         .with_title("NavGator")
         .with_decorations(false)
         .with_transparent(true)
+        .with_window_icon(window_icon())
         .with_visible(false)
         .with_inner_size(LogicalSize::new(1280.0, 800.0));
     // Pin the window to surfman's GL config visual on X11 (see x11_gl_visual_id) so
@@ -11173,6 +11267,7 @@ fn open_window(
         console_filter: RefCell::new(String::new()),
         console_filter_focus: Cell::new(false),
         show_addons: Cell::new(false),
+        resize_cursor_shown: Cell::new(false),
         addon_badge_rect: Cell::new(egui::Rect::NOTHING),
         show_unlock: Cell::new(false),
         unlock_anchor: Cell::new(egui::Rect::NOTHING),
@@ -11599,15 +11694,27 @@ impl ApplicationHandler<WakeUp> for App {
         match event {
             WindowEvent::CursorMoved { position, .. } => {
                 match state.resize_direction_at(position.x, position.y) {
-                    Some(dir) => state.window.set_cursor(resize_cursor(dir)),
+                    Some(dir) => {
+                        state.window.set_cursor(resize_cursor(dir));
+                        state.resize_cursor_shown.set(true);
+                    }
                     // Over a page, keep showing the page's CSS cursor (swervo only re-emits it when
                     // the hovered element's cursor changes, so moving within one element must not
                     // reset it to the default arrow). Over the chrome, egui owns the cursor.
-                    None if !over_chrome => state.window.set_cursor(state.page_cursor.get()),
-                    // Over the chrome, let egui own the cursor: it sets the correct per-widget icon
-                    // each frame (a text I-beam over the omnibar, a pointer over buttons/dropdowns).
-                    // Forcing Default here raced egui and produced the wrong cursor.
-                    None => {}
+                    None if !over_chrome => {
+                        state.window.set_cursor(state.page_cursor.get());
+                        state.resize_cursor_shown.set(false);
+                    }
+                    // Over the chrome, egui owns the cursor — it sets the correct per-widget icon
+                    // each frame (a text I-beam over the omnibar, a pointer over buttons). But egui's
+                    // cursor cache is stale after our manual resize-cursor override, so it won't
+                    // re-assert the arrow over the blank header. Reset ONCE on leaving the edge
+                    // (not every move — that raced egui and flickered), then hand back to egui.
+                    None => {
+                        if state.resize_cursor_shown.replace(false) {
+                            state.window.set_cursor(CursorIcon::Default);
+                        }
+                    }
                 }
                 let foc = state.focused.get();
                 let off = if state.split.get() && foc == 1 { mid_dev } else { left_dev };

@@ -244,6 +244,21 @@ Description: NavGator - a fast, private web browser
  decodes via GStreamer, whose runtime plugin packages are pulled in as
  dependencies so playback works out of the box.
 EOF
+        # postinst: refresh the desktop icon + .desktop caches so the launcher shows THIS
+        # build's icon (each preview build stamps its version into the icon) instead of a
+        # stale cached one.
+        cat > "$DEBROOT/DEBIAN/postinst" <<'EOF'
+#!/bin/sh
+set -e
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 || true
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || true
+fi
+exit 0
+EOF
+        chmod 755 "$DEBROOT/DEBIAN/postinst"
         if dpkg-deb --root-owner-group --build "$DEBROOT" "$DIST/$DEB" >/dev/null; then
             echo "deb: $DEB"
             echo "     Depends: $DEPENDS"
