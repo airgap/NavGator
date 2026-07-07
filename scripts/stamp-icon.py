@@ -37,6 +37,7 @@ except Exception as e:  # pragma: no cover - exercised via package.sh degrade pa
 CANVAS = 1024
 RADIUS = 230  # ~22.5% of 1024, matches make-icon.sh
 ICONSET_SIZES = [16, 32, 128, 256, 512]  # each also emitted @2x
+LINUX_WIDTH_FRACTION = 0.75  # Linux png only: gator 25% smaller, bottom-centred
 BADGE_RGBA = (214, 40, 64, 255)          # dev crimson
 BADGE_OUTLINE = (255, 255, 255, 235)
 BADGE_TEXT = (255, 255, 255, 255)
@@ -60,17 +61,21 @@ def load_font(size):
     return ImageFont.load_default()
 
 
-def rounded_master(art_path):
+def rounded_master(art_path, width_fraction=1.0):
     """Build the white 1024 rounded-square master with the gator rising from the BOTTOM
-    edge (its design intent), with no padding — the same master scripts/make-icon.sh builds
-    (kept intentionally in sync).
+    edge (its design intent) — the same master scripts/make-icon.sh builds (kept in sync).
 
     The source art is a small (735x824) gator drawn on white with a lot of headroom above
     it and its feet already flush to the art's bottom edge. The old code thumbnail'd (which
     never upscales) and centred it, so the gator ended up inset with ~100px of padding on
-    every side. Instead: trim the white margins to the gator's true bounds, scale it to
-    fill the canvas WIDTH, and anchor it to the bottom edge — any height overflow is cropped
-    off the TOP (white headroom only), so the gator reaches the bottom with zero padding."""
+    every side. Instead: trim the white margins to the gator's true bounds, scale so its
+    width is `width_fraction` of the canvas, and bottom-center it — any height overflow is
+    cropped off the TOP (white headroom only).
+
+    width_fraction: 1.0 fills the width (feet reach the bottom, no side padding — used for
+    macOS/Windows). <1.0 shrinks the gator and horizontally centres it (bottom-centre); the
+    Linux icon uses 0.75 because desktop icon themes render the raw PNG smaller with their
+    own framing, so a full-bleed gator looks cramped there."""
     art = Image.open(art_path).convert("RGBA")
     # Trim white margins to the gator's true content box.
     bbox = ImageChops.difference(
@@ -78,12 +83,14 @@ def rounded_master(art_path):
     ).getbbox()
     if bbox:
         art = art.crop(bbox)
-    scale = CANVAS / art.width
-    gator = art.resize((CANVAS, round(art.height * scale)), Image.LANCZOS)
+    target_w = round(CANVAS * width_fraction)
+    scale = target_w / art.width
+    gator = art.resize((target_w, round(art.height * scale)), Image.LANCZOS)
     if gator.height > CANVAS:  # overflow is the headroom above the gator — crop it off the top
-        gator = gator.crop((0, gator.height - CANVAS, CANVAS, gator.height))
+        gator = gator.crop((0, gator.height - CANVAS, gator.width, gator.height))
     flat = Image.new("RGBA", (CANVAS, CANVAS), (255, 255, 255, 255))
-    flat.alpha_composite(gator, (0, CANVAS - gator.height))  # anchor to the bottom edge
+    x = (CANVAS - gator.width) // 2  # horizontally centred
+    flat.alpha_composite(gator, (x, CANVAS - gator.height))  # anchor to the bottom edge
     mask = Image.new("L", (CANVAS, CANVAS), 0)
     ImageDraw.Draw(mask).rounded_rectangle([0, 0, CANVAS - 1, CANVAS - 1], radius=RADIUS, fill=255)
     flat.putalpha(mask)
@@ -137,19 +144,22 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
-    master = rounded_master(args.art)
-    stamped = master.copy()
-    stamped.alpha_composite(badge_layer(args.label))
+    badge = badge_layer(args.label)
+    # macOS/Windows: full-bleed gator. Linux: 25% smaller + bottom-centred (LINUX_WIDTH_FRACTION).
+    stamped = rounded_master(args.art)
+    stamped.alpha_composite(badge)
+    stamped_linux = rounded_master(args.art, LINUX_WIDTH_FRACTION)
+    stamped_linux.alpha_composite(badge)
 
-    # iconset for iconutil -> .icns
+    # iconset for iconutil -> .icns (full-bleed)
     iconset = os.path.join(args.out_dir, "navgator.iconset")
     os.makedirs(iconset, exist_ok=True)
     for s in ICONSET_SIZES:
         stamped.resize((s, s), Image.LANCZOS).save(os.path.join(iconset, f"icon_{s}x{s}.png"))
         stamped.resize((s * 2, s * 2), Image.LANCZOS).save(os.path.join(iconset, f"icon_{s}x{s}@2x.png"))
 
-    # Linux 256 png + Windows ico
-    stamped.resize((256, 256), Image.LANCZOS).save(os.path.join(args.out_dir, "navgator.png"))
+    # Linux 256 png (smaller, bottom-centred) + Windows ico (full-bleed)
+    stamped_linux.resize((256, 256), Image.LANCZOS).save(os.path.join(args.out_dir, "navgator.png"))
     stamped.save(os.path.join(args.out_dir, "navgator.ico"),
                  sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
 

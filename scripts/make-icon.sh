@@ -44,8 +44,14 @@ for s in 16 32 128 256 512; do
 done
 iconutil -c icns "$SET" -o "$ROOT/packaging/navgator.icns"
 
-# Linux 256x256 PNG (matches hicolor/256x256/apps in scripts/package.sh)
-magick "$TMP/master.png" -resize 256x256 -define png:color-type=6 "$ROOT/packaging/navgator.png"
+# Linux 256x256 PNG (matches hicolor/256x256/apps in scripts/package.sh). Linux ONLY: the
+# gator is 25% smaller and bottom-centred (desktop icon themes render the raw PNG smaller
+# with their own framing, so a full-bleed gator looks cramped). Keep the 0.75 in sync with
+# scripts/stamp-icon.py LINUX_WIDTH_FRACTION. macOS/Windows keep the full-bleed master above.
+magick "$ART" -strip -fuzz 2% -trim +repage -resize 768x -background white -gravity south -extent 1024x1024 "$TMP/flat_linux.png"
+magick "$TMP/flat_linux.png" \( "$TMP/mask.png" -alpha extract \) \
+  -compose CopyOpacity -composite -define png:color-type=6 "$TMP/master_linux.png"
+magick "$TMP/master_linux.png" -resize 256x256 -define png:color-type=6 "$ROOT/packaging/navgator.png"
 
 # Windows multi-resolution .ico
 magick "$TMP/master.png" -define icon:auto-resize=16,32,48,64,128,256 "$ROOT/packaging/navgator.ico"
