@@ -166,6 +166,46 @@ sign_and_notarize_macos() {
 }
 # -----------------------------------------------------------------------------------------
 
+# --- Linux packaging helpers -------------------------------------------------------------
+# The GStreamer *codec plugins* are dlopen'd at runtime, so dpkg-shlibdeps (which only sees
+# LINKED libs) can't infer them — yet they are exactly what a bare AppImage wrongly assumed
+# already installed. Declare their packages explicitly on both the .deb Depends and (bundled)
+# in the AppImage.
+GST_PLUGIN_PKGS="gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, gstreamer1.0-nice"
+
+# Runtime Depends for the .deb: dpkg-shlibdeps maps the binary's linked libraries to their
+# packages (libgstreamer1.0-0, libgstreamer-plugins-base1.0-0, libglib2.0-0t64, …); we append
+# the dlopen'd plugin packages above. Falls back to a hand-listed core set if shlibdeps is absent.
+compute_deb_depends() {
+    local bin="$1" shlib="" tmpd
+    if command -v dpkg-shlibdeps >/dev/null; then
+        tmpd="$(mktemp -d)"; mkdir -p "$tmpd/debian"
+        printf 'Source: navgator\nPackage: navgator\nArchitecture: amd64\n' > "$tmpd/debian/control"
+        shlib="$( cd "$tmpd" && dpkg-shlibdeps -O --ignore-missing-info "$bin" 2>/dev/null | sed 's/^shlibs:Depends=//' )"
+        rm -rf "$tmpd"
+    fi
+    if [ -n "$shlib" ]; then
+        printf '%s, %s' "$shlib" "$GST_PLUGIN_PKGS"
+    else
+        printf 'libc6, libgstreamer1.0-0, libgstreamer-plugins-base1.0-0, libglib2.0-0t64, %s' "$GST_PLUGIN_PKGS"
+    fi
+}
+
+# appimagetool is not preinstalled on the build host; fetch the continuous build once into a
+# build cache. --appimage-extract-and-run avoids needing FUSE on the (headless) agent.
+ensure_appimagetool() {
+    if command -v appimagetool >/dev/null; then echo appimagetool; return 0; fi
+    local cache="${XDG_CACHE_HOME:-$HOME/.cache}/navgator-build" at
+    mkdir -p "$cache"; at="$cache/appimagetool-x86_64.AppImage"
+    if [ ! -x "$at" ]; then
+        curl -fsSL -o "$at" \
+          "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage" \
+          && chmod +x "$at" || { rm -f "$at"; return 1; }
+    fi
+    echo "$at"
+}
+# -----------------------------------------------------------------------------------------
+
 case "$OS" in
 Linux)
     # tarball
@@ -174,39 +214,86 @@ Linux)
     tar -C "$DIST" -czf "$DIST/navgator-$VERSION-linux-x86_64.tar.gz" "$(basename "$T")"
     rm -rf "$T"
 
-    # AppImage (optional; needs appimagetool OR linuxdeploy on PATH — degrades to a
-    # clean skip when neither is present, like the dmg/sccache steps elsewhere).
+    # .deb — declares the GStreamer runtime deps (via Depends) so `apt install ./navgator.deb`
+    # pulls the plugin packages a bare download can't assume are present. The binary is
+    # self-contained (gator:// pages, pdf.js and fonts are compiled in via include_str!/
+    # include_bytes!), so no resources dir is needed alongside it.
+    if command -v dpkg-deb >/dev/null; then
+        DEB="navgator-$VERSION-linux-x86_64.deb"
+        DEBROOT="$DIST/navgator-deb"; rm -rf "$DEBROOT"
+        mkdir -p "$DEBROOT/DEBIAN" "$DEBROOT/usr/bin" \
+                 "$DEBROOT/usr/share/applications" \
+                 "$DEBROOT/usr/share/icons/hicolor/256x256/apps"
+        cp "$BIN" "$DEBROOT/usr/bin/navgator"; chmod 755 "$DEBROOT/usr/bin/navgator"
+        cp packaging/navgator.desktop "$DEBROOT/usr/share/applications/navgator.desktop"
+        cp "$LINUX_PNG" "$DEBROOT/usr/share/icons/hicolor/256x256/apps/navgator.png" 2>/dev/null || true
+        DEPENDS="$(compute_deb_depends "$DEBROOT/usr/bin/navgator")"
+        ISIZE="$(du -ks "$DEBROOT/usr" | cut -f1)"
+        cat > "$DEBROOT/DEBIAN/control" <<EOF
+Package: navgator
+Version: $VERSION
+Architecture: amd64
+Maintainer: Lyku <apps@lyku.org>
+Installed-Size: $ISIZE
+Depends: $DEPENDS
+Section: web
+Priority: optional
+Homepage: https://lyku.org/apps/NavGator
+Description: NavGator - a fast, private web browser
+ A native chrome compositing the Servo engine. Media (<video>/<audio>)
+ decodes via GStreamer, whose runtime plugin packages are pulled in as
+ dependencies so playback works out of the box.
+EOF
+        if dpkg-deb --root-owner-group --build "$DEBROOT" "$DIST/$DEB" >/dev/null; then
+            echo "deb: $DEB"
+            echo "     Depends: $DEPENDS"
+        else
+            echo "dpkg-deb failed; skipping .deb (tarball still published)" >&2
+        fi
+        rm -rf "$DEBROOT"
+    else
+        echo "dpkg-deb not found; skipping .deb"
+    fi
+
+    # AppImage — SELF-CONTAINED: bundle GStreamer plugins + every non-host shared lib into
+    # usr/lib so it launches on machines with no gstreamer1.0-plugins-* installed (the
+    # reported "AppImage won't start" bug). Needs appimagetool (fetched if absent).
     APPIMAGE="navgator-$VERSION-linux-x86_64.AppImage"
-    if command -v appimagetool >/dev/null || command -v linuxdeploy >/dev/null; then
-        APPDIR="$DIST/navgator.AppDir"
-        rm -rf "$APPDIR"
-        mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+    ATOOL="$(ensure_appimagetool || true)"
+    if [ -n "$ATOOL" ]; then
+        APPDIR="$DIST/navgator.AppDir"; rm -rf "$APPDIR"
+        mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib" \
+                 "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/256x256/apps"
         cp "$BIN" "$APPDIR/usr/bin/navgator"; stage_resources "$APPDIR/usr/bin"
-        # AppImage spec wants the .desktop + icon at the AppDir root; keep the
-        # FHS copies too so the integrated/installed form is well-formed.
+        # AppImage spec wants the .desktop + icon at the AppDir root; keep the FHS copies too.
         cp packaging/navgator.desktop "$APPDIR/usr/share/applications/"
         cp "$LINUX_PNG" "$APPDIR/usr/share/icons/hicolor/256x256/apps/navgator.png" 2>/dev/null || true
         cp packaging/navgator.desktop "$APPDIR/"
         cp "$LINUX_PNG" "$APPDIR/navgator.png" 2>/dev/null || true
         cp "$LINUX_PNG" "$APPDIR/.DirIcon" 2>/dev/null || true
-        # Prefer the committed AppRun launcher (exec-forwards args, keeps resources
-        # resolvable via current_exe); fall back to a symlink if it is missing.
-        if [ -f packaging/AppRun ]; then
-            cp packaging/AppRun "$APPDIR/AppRun"; chmod +x "$APPDIR/AppRun"
+        cp packaging/AppRun "$APPDIR/AppRun"; chmod +x "$APPDIR/AppRun"
+        # Bundle GStreamer + non-host deps into usr/lib (AppRun points LD_LIBRARY_PATH +
+        # GST_PLUGIN_SYSTEM_PATH at it). GL/GPU/X11 driver libs stay on the host.
+        GST_PLUGINDIR="$(pkg-config --variable=pluginsdir gstreamer-1.0 2>/dev/null || true)"
+        [ -d "$GST_PLUGINDIR" ] || GST_PLUGINDIR="/usr/lib/x86_64-linux-gnu/gstreamer-1.0"
+        GST_SCANDIR="$(pkg-config --variable=pluginscannerdir gstreamer-1.0 2>/dev/null || true)"
+        GST_SCANNER="$GST_SCANDIR/gst-plugin-scanner"
+        [ -x "$GST_SCANNER" ] || GST_SCANNER="/usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner"
+        PLUGLISTS="$(ls -d "$HOME"/.cargo/git/checkouts/swervo-*/*/components/servo/gstreamer_plugin_lists 2>/dev/null | head -1)"
+        if [ -f scripts/linux-bundle-gst.py ]; then
+            python3 scripts/linux-bundle-gst.py --binary "$APPDIR/usr/bin/navgator" \
+                --lib-dir "$APPDIR/usr/lib" --gst-plugin-dir "$GST_PLUGINDIR" \
+                --scanner "$GST_SCANNER" --plugin-lists "${PLUGLISTS:-}" \
+                || echo "Linux: GStreamer bundling failed — the AppImage may need host GStreamer." >&2
         else
-            ln -sf usr/bin/navgator "$APPDIR/AppRun"
+            echo "Linux: scripts/linux-bundle-gst.py missing — AppImage NOT self-contained." >&2
         fi
-        if command -v appimagetool >/dev/null; then
-            ( cd "$DIST" && ARCH=x86_64 appimagetool "$APPDIR" "$APPIMAGE" ) \
-                || echo "appimagetool failed; skipping AppImage (tarball still published)" >&2
-        else
-            ( cd "$DIST" && linuxdeploy --appdir "$APPDIR" --output appimage \
-                && mv navgator*.AppImage "$APPIMAGE" 2>/dev/null || true )
-        fi
+        ( cd "$DIST" && APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 "$ATOOL" navgator.AppDir "$APPIMAGE" ) \
+            || echo "appimagetool failed; skipping AppImage (tarball + .deb still published)" >&2
         rm -rf "$APPDIR"
         [ -f "$DIST/$APPIMAGE" ] && chmod +x "$DIST/$APPIMAGE" || true
     else
-        echo "appimagetool/linuxdeploy not found; skipping AppImage"
+        echo "appimagetool unavailable (not installed, no network to fetch); skipping AppImage"
     fi
     ;;
 Darwin)

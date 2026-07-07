@@ -9,4 +9,27 @@
 # inside the mounted AppImage. We exec (not source/symlink) so $0 -> the real binary
 # and so any URL arguments are forwarded verbatim.
 HERE="$(dirname "$(readlink -f "$0")")"
+LIBDIR="$HERE/usr/lib"
+
+# Prefer bundled shared libraries (scripts/linux-bundle-gst.py copies every non-host lib
+# here) so the AppImage runs on machines with no gstreamer1.0-plugins-* installed. The
+# GL/GPU/X11 driver libs are deliberately NOT bundled and fall through to the host.
+export LD_LIBRARY_PATH="$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# Point GStreamer at the bundled plugins ONLY when they were actually bundled — otherwise
+# leave the host's system plugin path intact (a non-bundled fallback AppImage must still
+# find the host's plugins rather than an empty bundled dir).
+GSTDIR="$LIBDIR/gstreamer-1.0"
+if [ -d "$GSTDIR" ] && [ -n "$(ls -A "$GSTDIR" 2>/dev/null)" ]; then
+    export GST_PLUGIN_SYSTEM_PATH_1_0="$GSTDIR"
+    export GST_PLUGIN_SYSTEM_PATH="$GSTDIR"
+    [ -x "$GSTDIR/gst-plugin-scanner" ] && export GST_PLUGIN_SCANNER="$GSTDIR/gst-plugin-scanner"
+    # The AppImage mounts at a fresh path each run, so plugin paths change and the shared
+    # host registry would thrash; keep a navgator-private registry cache.
+    CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/navgator"
+    if mkdir -p "$CACHE" 2>/dev/null; then
+        export GST_REGISTRY_1_0="$CACHE/gst-registry-$(uname -m).bin"
+    fi
+fi
+
 exec "$HERE/usr/bin/navgator" "$@"
