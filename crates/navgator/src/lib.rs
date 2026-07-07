@@ -4099,6 +4099,77 @@ impl AppState {
     /// Render `gator://profiles` (LYK-1376): list the isolated identity profiles and open one in a
     /// new window (a fresh navgator process with its own cookies/history/vault). The current window's
     /// profile is marked; a form creates + opens a new one.
+    /// Serve a downloaded PDF's bytes for the gator://pdf viewer (LYK-1370). Guarded: only a real
+    /// `*.pdf` whose CANONICAL path is inside `~/Downloads` — a gator:// subresource must never
+    /// become an arbitrary-file-read primitive. Empty body on any failure.
+    fn serve_pdf_data(&self, url: &Url) -> Vec<u8> {
+        let Some(file) =
+            url.query_pairs().find(|(k, _)| k == "file").map(|(_, v)| v.into_owned())
+        else {
+            return Vec::new();
+        };
+        let path = PathBuf::from(&file);
+        let is_pdf = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("pdf"))
+            .unwrap_or(false);
+        let downloads = env::var_os("HOME").map(|h| PathBuf::from(h).join("Downloads"));
+        match (is_pdf, path.canonicalize(), downloads.and_then(|d| d.canonicalize().ok())) {
+            (true, Ok(cp), Some(cd)) if cp.starts_with(&cd) => std::fs::read(&cp).unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Render the `gator://pdf?file=<path>` viewer (LYK-1370): loads the bundled pdf.js, fetches the
+    /// file's bytes via `gator://pdf/data` (same scheme), and renders every page fit-to-width into a
+    /// scrollable column. Self-contained page (not themed) — its own dark reader chrome.
+    fn render_gator_pdf(&self, url: &Url) -> Vec<u8> {
+        let file = url
+            .query_pairs()
+            .find(|(k, _)| k == "file")
+            .map(|(_, v)| v.into_owned())
+            .unwrap_or_default();
+        let name = file.rsplit('/').next().unwrap_or("document.pdf").to_string();
+        let mut data_url = Url::parse("gator://pdf/data").expect("valid");
+        data_url.query_pairs_mut().append_pair("file", &file);
+        let html = format!(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{name} &middot; NavGator</title>\
+             <style>\
+             html,body{{margin:0;height:100%;background:#2b2d31;color:#e8eaed;font:14px system-ui,sans-serif}}\
+             .bar{{position:sticky;top:0;display:flex;align-items:center;gap:12px;padding:9px 16px;\
+             background:#1e1f22;border-bottom:1px solid #000;z-index:2}}\
+             .nm{{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}}\
+             .pg{{color:#9aa0a6;white-space:nowrap}} .bar a{{color:#5b8cff;text-decoration:none}}\
+             #pages{{display:flex;flex-direction:column;align-items:center;gap:16px;padding:16px}}\
+             #pages canvas{{max-width:100%;box-shadow:0 2px 12px rgba(0,0,0,.5);background:#fff}}\
+             #err{{padding:48px;text-align:center;color:#f5a524}}\
+             </style></head><body>\
+             <div class=\"bar\"><span class=\"nm\">{name}</span><span class=\"pg\" id=\"pg\"></span>\
+             <a href=\"gator://downloads\">Downloads</a></div>\
+             <div id=\"pages\"></div><div id=\"err\"></div>\
+             <script src=\"gator://pdf/lib.js\"></script>\
+             <script>\
+             pdfjsLib.GlobalWorkerOptions.workerSrc='gator://pdf/worker.js';\
+             (async function(){{try{{\
+             var pdf=await pdfjsLib.getDocument('{data_url}').promise;\
+             document.getElementById('pg').textContent=pdf.numPages+(pdf.numPages===1?' page':' pages');\
+             var wrap=document.getElementById('pages'),dpr=window.devicePixelRatio||1;\
+             for(var i=1;i<=pdf.numPages;i++){{\
+             var page=await pdf.getPage(i);var base=page.getViewport({{scale:1}});\
+             var scale=Math.min(1.6,(wrap.clientWidth-32)/base.width);\
+             var vp=page.getViewport({{scale:scale*dpr}});\
+             var c=document.createElement('canvas');c.width=vp.width;c.height=vp.height;\
+             c.style.width=(vp.width/dpr)+'px';wrap.appendChild(c);\
+             await page.render({{canvasContext:c.getContext('2d'),viewport:vp}}).promise;\
+             }}}}catch(e){{document.getElementById('err').textContent='Could not open this PDF: '+e;}}}})();\
+             </script></body></html>",
+            name = html_escape(&name),
+            data_url = data_url.as_str(),
+        );
+        html.into_bytes()
+    }
+
     /// Permanently remove a profile's directory (LYK-1376). Guarded: refuses the default profile and
     /// the currently-running one, and only ever touches a single sanitized segment under `profiles/`.
     fn delete_profile(&self, name: &str) {
@@ -4383,8 +4454,17 @@ impl AppState {
                     // A finished file gets Open / Show-folder actions (routed through the
                     // gator://downloads command links, applied via the system opener) — LYK-1408.
                     let acts = if d.done && d.success {
+                        // PDFs get an inline "View" (gator://pdf viewer, LYK-1370) alongside the
+                        // system Open / Show-folder actions.
+                        let view = if name.to_ascii_lowercase().ends_with(".pdf") {
+                            let mut u = Url::parse("gator://pdf").expect("valid");
+                            u.query_pairs_mut().append_pair("file", &d.path);
+                            format!("<a href=\"{}\">View</a>", html_escape(u.as_str()))
+                        } else {
+                            String::new()
+                        };
                         format!(
-                            "<div class=\"acts\"><a href=\"gator://downloads?open={idx}\">Open</a>\
+                            "<div class=\"acts\">{view}<a href=\"gator://downloads?open={idx}\">Open</a>\
                              <a href=\"gator://downloads?reveal={idx}\">Show folder</a></div>"
                         )
                     } else {
@@ -9706,6 +9786,23 @@ impl WebViewDelegate for AppState {
                 ))
                 .to_vec(),
             },
+            // PDF viewer (LYK-1370): pdf.js + its worker + the per-file data + the viewer page.
+            // gator://pdf?file=<path> is the viewer; gator://pdf/data?file=<path> streams the file's
+            // bytes (guarded to ~/Downloads/*.pdf) so pdf.js fetches same-scheme.
+            "pdf" => match url.path() {
+                "/lib.js" => include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/assets/pdfjs/pdf.min.js"
+                ))
+                .to_vec(),
+                "/worker.js" => include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/assets/pdfjs/pdf.worker.min.js"
+                ))
+                .to_vec(),
+                "/data" => self.serve_pdf_data(&url),
+                _ => self.render_gator_pdf(&url),
+            },
             // Cached favicon for the new-tab tiles (gator://favicon/<host>). A miss returns an
             // empty body, so the tile's <img onerror> drops it and the letter avatar shows (#14).
             "favicon" => favicon_cache_path(url.path().trim_start_matches('/'))
@@ -9732,6 +9829,11 @@ impl WebViewDelegate for AppState {
                 match url.host_str() {
                     Some("font") => "font/ttf",
                     Some("favicon") => "image/png",
+                    Some("pdf") => match url.path() {
+                        "/lib.js" | "/worker.js" => "application/javascript; charset=utf-8",
+                        "/data" => "application/pdf",
+                        _ => "text/html; charset=utf-8",
+                    },
                     _ => "text/html; charset=utf-8",
                 }
             }),
