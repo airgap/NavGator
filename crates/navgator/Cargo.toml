@@ -48,6 +48,13 @@ url = "2.5"
 # Servo does TLS through rustls; a crypto provider is installed at startup.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 
+# X11-only: query surfman's GL config's native X visual so the window is created with the SAME
+# visual, or strict EGL drivers (NVIDIA) fail eglCreateWindowSurface -> surfman panics on launch.
+[target.'cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))'.dependencies]
+khronos-egl = { version = "6", features = ["dynamic"] }
+libloading = "0.8"
+raw-window-handle = "0.6"
+
 # Native chrome: egui drawn over the page (same versions servoshell uses, so the lock
 # resolves cleanly against the engine's glow/winit/raw-window-handle).
 egui = "0.34.3"

@@ -11030,21 +11030,67 @@ impl WebViewDelegate for AppState {
 /// Create a brand-new OS window with its own render contexts, egui, and tab set (opening
 /// `urls`, or the welcome page if empty). One `Servo` (in `browser`) drives every window — this
 /// just registers another rendering context with it when the window's first webview is built.
+/// On X11, query the native X visual of the EGL config surfman's GL context will select
+/// (RGB888 + ALPHA8), so `open_window` can create the winit window with that EXACT visual.
+///
+/// surfman applies the context's config to the window surface via `eglCreateWindowSurface`,
+/// which strict drivers (NVIDIA) reject with `EGL_NO_SURFACE` unless the window's visual equals
+/// the config's `EGL_NATIVE_VISUAL_ID` — and this X server exposes several 32-bit visuals, so
+/// winit's own `with_transparent` visual and surfman's config visual don't necessarily agree
+/// (works on lenient Mesa/Xvfb, panics on NVIDIA). Returns None off X11 / on any query failure,
+/// where callers fall back to winit's default visual selection.
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+fn x11_gl_visual_id(display_handle: &winit::raw_window_handle::DisplayHandle) -> Option<u32> {
+    use khronos_egl as egl;
+    use raw_window_handle::RawDisplayHandle;
+
+    let RawDisplayHandle::Xlib(xlib) = display_handle.as_raw() else {
+        return None; // Wayland / other — not affected by this X visual matching.
+    };
+    let display_ptr = xlib.display?.as_ptr();
+    // SAFETY: loads libEGL and calls eglGetDisplay on the winit-owned X Display pointer.
+    let lib = unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required() }.ok()?;
+    let egl_display = unsafe { lib.get_display(display_ptr) }?;
+    lib.initialize(egl_display).ok()?;
+    // Match surfman's config (base/egl/context.rs): 8-bit RGB + 8-bit alpha, window-renderable.
+    // Depth/stencil don't affect the native visual, so they're omitted.
+    let attribs = [
+        egl::RED_SIZE, 8,
+        egl::GREEN_SIZE, 8,
+        egl::BLUE_SIZE, 8,
+        egl::ALPHA_SIZE, 8,
+        egl::SURFACE_TYPE, egl::WINDOW_BIT,
+        egl::RENDERABLE_TYPE, egl::OPENGL_BIT,
+        egl::NONE,
+    ];
+    let config = lib.choose_first_config(egl_display, &attribs).ok()??;
+    let vid = lib
+        .get_config_attrib(egl_display, config, egl::NATIVE_VISUAL_ID)
+        .ok()?;
+    (vid > 0).then_some(vid as u32)
+}
+
 fn open_window(
     event_loop: &ActiveEventLoop,
     browser: &Rc<BrowserState>,
     urls: Vec<Url>,
 ) -> (WindowId, Rc<AppState>) {
     let display_handle = event_loop.display_handle().expect("no display handle");
+    let mut window_attributes = Window::default_attributes()
+        .with_title("NavGator")
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_visible(false)
+        .with_inner_size(LogicalSize::new(1280.0, 800.0));
+    // Pin the window to surfman's GL config visual on X11 (see x11_gl_visual_id) so
+    // eglCreateWindowSurface doesn't fail on strict drivers like NVIDIA.
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+    if let Some(visual_id) = x11_gl_visual_id(&display_handle) {
+        use winit::platform::x11::WindowAttributesExtX11;
+        window_attributes = window_attributes.with_x11_visual(visual_id);
+    }
     let window = event_loop
-        .create_window(
-            Window::default_attributes()
-                .with_title("NavGator")
-                .with_decorations(false)
-                .with_transparent(true)
-                .with_visible(false)
-                .with_inner_size(LogicalSize::new(1280.0, 800.0)),
-        )
+        .create_window(window_attributes)
         .expect("failed to create window");
 
     // First window only: if the user hasn't explicitly chosen a theme base, follow the OS
