@@ -39,20 +39,30 @@ FALLBACK_PLUGINS = [
     "gstid3tag", "gstproxy", "gstvideoparsersbad", "gstwebrtc", "gstlibav",
 ]
 
-# Libraries that MUST come from the host, not the bundle: glibc (matches the kernel), the
-# GL/GPU driver stack + libdrm/gbm/vulkan (must match the installed GPU driver), and the
-# X11/xcb/wayland client libs (must match the running display server). Bundling any of
-# these is the classic "AppImage works here, black screen / GLXBadContext there" failure.
-# Matched by basename prefix (before the first ".so"). Mirrors the pkg2appimage excludelist,
-# trimmed to the families that actually matter for a GPU-compositing browser.
+# Libraries that MUST come from the host, not the bundle. Bundling any of these is the
+# classic "AppImage works on the build box, crashes elsewhere" failure — most sharply as
+# surfman's `assert_ne!(egl_surface, EGL_NO_SURFACE)` panic: the host's libEGL dlopen's the
+# host GPU driver (Mesa DRI / NVIDIA) INTO our process, and that driver then resolves its own
+# libstdc++/libexpat/… against OUR bundle via LD_LIBRARY_PATH + the global symbol scope. If a
+# bundled copy is older than the driver was built for, surface creation silently returns
+# EGL_NO_SURFACE. So we must never bundle anything the GL/GPU/X driver stack itself touches.
+# Matched by basename prefix (before the first ".so"). Mirrors the pkg2appimage excludelist.
 EXCLUDE_PREFIXES = (
-    # glibc / loader
+    # glibc / loader / low-level runtime — match the kernel
     "ld-linux", "libc", "libm", "libdl", "libpthread", "librt", "libresolv",
     "libutil", "libnsl", "libnss_", "libBrokenLocale", "libanl", "libmvec",
-    "libthread_db", "libpcprofile",
-    # GL / GPU driver stack
+    "libthread_db", "libpcprofile", "libcrypt",
+    # C/C++ runtime — the GPU driver loaded into our process uses the host's; a bundled
+    # libstdc++/libgcc that predates the driver breaks eglCreate*Surface.
+    "libstdc++", "libgcc_s",
+    # GL / GPU driver stack itself
     "libGL", "libEGL", "libGLX", "libGLdispatch", "libOpenGL", "libGLU", "libGLESv",
-    "libglapi", "libgbm", "libdrm", "libvulkan",
+    "libglapi", "libgbm", "libdrm", "libvulkan", "libglvnd",
+    # Libraries the Mesa/GPU driver pulls in — bundling a mismatched copy fails surface
+    # creation, so leave them to the host (all are universally present + ABI-stable).
+    "libexpat", "libz", "libzstd", "liblzma", "libffi", "libelf", "libLLVM",
+    "libtinfo", "libncurses", "libedit", "libpciaccess", "libsensors", "libnuma",
+    "libxml2", "libxcb-glx", "libxcb-dri", "libxcb-present", "libxcb-sync",
     # X11 / display server — match the host
     "libX11", "libxcb", "libXext", "libXrender", "libXi", "libXrandr", "libXfixes",
     "libXcursor", "libXinerama", "libXdamage", "libXcomposite", "libXtst", "libXss",
