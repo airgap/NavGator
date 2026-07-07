@@ -1049,7 +1049,9 @@ fn settings_path() -> Option<PathBuf> {
 
 fn load_settings() -> Settings {
     let mut s = Settings::default();
-    if let Some(text) = settings_path().and_then(|p| std::fs::read_to_string(p).ok()) {
+    let path = settings_path();
+    let existed = path.as_ref().map(|p| p.exists()).unwrap_or(false);
+    if let Some(text) = path.and_then(|p| std::fs::read_to_string(p).ok()) {
         for line in text.lines() {
             if let Some((k, v)) = line.split_once('=') {
                 match k.trim() {
@@ -1128,6 +1130,15 @@ fn load_settings() -> Settings {
                     _ => {}
                 }
             }
+        }
+    }
+    // Per-profile auto-accent (LYK-1376): a brand-new non-default profile (no settings file yet)
+    // gets a distinct accent derived from its name, so identities are visually separable. Only when
+    // untouched — once the file exists, the persisted accent (default or the user's later choice) wins.
+    if !existed {
+        let prof = active_profile();
+        if prof != "default" {
+            s.theme.accent = profile_accent(&prof);
         }
     }
     sync_legacy_theme(&mut s);
@@ -1568,6 +1579,19 @@ fn favicon_hue(s: &str) -> f32 {
         h = (h ^ b as u32).wrapping_mul(16777619);
     }
     (h % 360) as f32
+}
+
+/// A distinct, deterministic chrome accent for a named profile (LYK-1376): derived from the name so
+/// each identity looks different at a glance. Picks from the colourful accents only (never the
+/// White/Dark monochrome ones). Seeded onto a fresh non-default profile; the user can override it.
+fn profile_accent(name: &str) -> theme::Accent {
+    let colourful: Vec<theme::Accent> = theme::Accent::ALL
+        .iter()
+        .copied()
+        .filter(|a| *a != theme::Accent::White && *a != theme::Accent::Dark)
+        .collect();
+    let idx = (favicon_hue(name) as usize) % colourful.len().max(1);
+    colourful[idx]
 }
 
 fn load_profile() -> Profile {
