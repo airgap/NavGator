@@ -34,6 +34,9 @@ use egui_glow::{CallbackFn, EguiGlow};
 // Re-exported by egui-winit only when its `accesskit` feature is on (which we enable): the chrome
 // accessibility transport (LYK-1378).
 use egui_winit::accesskit_winit;
+// The single `accesskit` in the tree (re-exported by egui) — same crate/version Servo's
+// WebViewDelegate uses, so the page `TreeUpdate` type matches (LYK-1378).
+use egui::accesskit;
 use euclid::Scale;
 use euclid::default::{Point2D, Rect, Size2D};
 // Everything from the engine comes through navgator-engine, the only crate that touches
@@ -2032,6 +2035,10 @@ fn navgator_preferences() -> Preferences {
     p.layout_columns_enabled = true; // CSS multi-column (`column-count`/`column-width`)
     p.layout_variable_fonts_enabled = true; // variable fonts (weight/width axes)
     p.layout_writing_mode_enabled = true; // `writing-mode: vertical-*` (CJK + vertical layouts)
+    // Accessibility tree (LYK-1378): gate for the layout-built AccessKit tree of page content.
+    // Off by default (it costs a tree walk per reflow); we opt in and expose it to the OS a11y
+    // layer via the chrome's AccessKit adapter (see WebViewDelegate::notify_accessibility_tree_update).
+    p.accessibility_enabled = true;
     // (Font parity handled in the engine: swervo resolves uninstalled named families via
     // fontconfig like Chrome — Arial->Liberation, Verdana->Noto, sans-serif->DejaVu — so no pref
     // override is needed. See airgap/swervo font_list font_family_substitute.)
@@ -3803,6 +3810,10 @@ struct AppState {
     window_context: Rc<WindowRenderingContext>,
     content_context: Rc<OffscreenRenderingContext>,
     egui: RefCell<EguiGlow>,
+    /// Page-content accessibility tree updates from Servo (`notify_accessibility_tree_update`),
+    /// queued off the UI frame and drained into the chrome's AccessKit adapter each `update()`
+    /// so a screen reader sees page content grafted under the chrome tree (LYK-1378).
+    pending_accesskit_updates: RefCell<Vec<accesskit::TreeUpdate>>,
     /// Lazily-built GL program that erases the four window corners to transparent (rounded window).
     /// `Some(None)` after a failed build so we don't retry every frame.
     corner_mask: RefCell<Option<Option<CornerMaskGl>>>,
@@ -5548,6 +5559,33 @@ impl AppState {
         })
     }
 
+    /// For each pane's active webview, create a chrome AccessKit host node whose subtree IS the
+    /// page's accessibility tree (referenced by its `TreeId`). egui includes this node in the
+    /// chrome tree; the page tree itself is fed to the same adapter in [`Self::update`] so the AT
+    /// resolves the graft (LYK-1378).
+    fn build_a11y_graft_nodes(&self, ctx: &egui::Context) {
+        for pane in [&self.pane0, &self.pane1] {
+            let tabs = pane.tabs.borrow();
+            let Some(tab) = tabs.get(pane.active.get()) else {
+                continue;
+            };
+            if let Some(tree_id) = tab.webview.accesskit_tree_id() {
+                let host = egui::Id::new(("navgator_page_a11y", tab.webview.id()));
+                ctx.accesskit_node_builder(host, |node| node.set_tree_id(tree_id));
+            }
+        }
+    }
+
+    /// Activate/deactivate Servo's page-content accessibility tree for every tab's webview. Called
+    /// when an assistive technology attaches to / detaches from the window (LYK-1378).
+    fn set_content_accessibility_active(&self, active: bool) {
+        for pane in [&self.pane0, &self.pane1] {
+            for tab in pane.tabs.borrow().iter() {
+                tab.webview.set_accessibility_active(active);
+            }
+        }
+    }
+
     // ── egui frame build + paint ───────────────────────────────────────────────
     fn update(&self) {
         let _ = self.content_context.make_current();
@@ -5741,7 +5779,18 @@ impl AppState {
             } else {
                 self.render_pane(ctx, 0, avail, scale);
             }
+            // Graft each pane's page accessibility tree under a chrome host node, so a screen
+            // reader can descend from the chrome into page content (LYK-1378).
+            self.build_a11y_graft_nodes(ctx);
         });
+        // Flush queued page a11y tree updates (from notify_accessibility_tree_update) into the
+        // chrome's AccessKit adapter — the adapter now owns both the chrome tree and, grafted
+        // under the host nodes above, the page trees (LYK-1378).
+        if let Some(adapter) = egui.egui_winit.accesskit.as_mut() {
+            for tree_update in self.pending_accesskit_updates.borrow_mut().drain(..) {
+                adapter.update_if_active(|| tree_update);
+            }
+        }
         if egui.egui_ctx.has_requested_repaint() {
             self.window.request_redraw();
         }
@@ -10125,6 +10174,20 @@ impl WebViewDelegate for AppState {
         self.window.request_redraw();
     }
 
+    /// Servo produced a new accessibility-tree update for a page. Queue it off the frame; it's
+    /// drained into the chrome's AccessKit adapter in `update()`, grafted under the page's host
+    /// node (LYK-1378).
+    fn notify_accessibility_tree_update(
+        &self,
+        _webview: WebView,
+        tree_update: accesskit::TreeUpdate,
+    ) {
+        self.pending_accesskit_updates
+            .borrow_mut()
+            .push(tree_update);
+        self.window.request_redraw();
+    }
+
     /// The page has finished processing an input event we forwarded. For overridable (tier-2)
     /// keyboard shortcuts, this is the verdict: run our shortcut only if the page did NOT consume
     /// the key — i.e. it neither called `preventDefault` nor let Servo's own `<input>` handler eat
@@ -11335,6 +11398,7 @@ fn open_window(
         window_context,
         content_context: content_context.clone(),
         egui: RefCell::new(egui),
+        pending_accesskit_updates: RefCell::new(Vec::new()),
         corner_mask: RefCell::new(None),
         toolbar_height: Cell::new(0.0),
         content_left: Cell::new(0.0),
@@ -11652,11 +11716,17 @@ impl ApplicationHandler<WakeUp> for App {
             if let WakeUp::AccessKit(evt) = event {
                 if let Some(state) = windows.get(&evt.window_id).cloned() {
                     match evt.window_event {
-                        // egui emits the tree in its next frame's platform output.
+                        // An assistive tech attached: turn on egui's tree generation and Servo's
+                        // page-content tree. egui emits its tree in the next frame's output.
                         accesskit_winit::WindowEvent::InitialTreeRequested => {
+                            state.egui.borrow().egui_ctx.enable_accesskit();
+                            state.set_content_accessibility_active(true);
                             state.window.request_redraw();
                         }
                         accesskit_winit::WindowEvent::ActionRequested(request) => {
+                            // Actions on the chrome tree (TreeId::ROOT) are handled by egui;
+                            // page-targeted actions would forward to Servo (a follow-up, matching
+                            // servoshell's current TODO) — feeding them to egui is a harmless no-op.
                             state
                                 .egui
                                 .borrow_mut()
@@ -11664,7 +11734,11 @@ impl ApplicationHandler<WakeUp> for App {
                                 .on_accesskit_action_request(request);
                             state.window.request_redraw();
                         }
-                        accesskit_winit::WindowEvent::AccessibilityDeactivated => {},
+                        // The assistive tech detached: stop generating trees.
+                        accesskit_winit::WindowEvent::AccessibilityDeactivated => {
+                            state.egui.borrow().egui_ctx.disable_accesskit();
+                            state.set_content_accessibility_active(false);
+                        },
                     }
                 }
             }
