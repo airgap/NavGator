@@ -27,6 +27,9 @@ pub(crate) enum PaletteAction {
     ToggleSiteDark,
     ToggleSiteAdblock,
     ReaderMode,
+    NewWorkspace,
+    NextWorkspace,
+    MoveTabToNextWorkspace,
 }
 
 /// The full command catalog: (label, right-aligned mono hint, action).
@@ -62,6 +65,21 @@ pub(crate) fn palette_catalog() -> Vec<(String, &'static str, PaletteAction)> {
             "Reader mode".to_string(),
             "Reading",
             PaletteAction::ReaderMode,
+        ),
+        (
+            "New workspace".to_string(),
+            "Spaces",
+            PaletteAction::NewWorkspace,
+        ),
+        (
+            "Next workspace".to_string(),
+            "⇧⌘E",
+            PaletteAction::NextWorkspace,
+        ),
+        (
+            "Move tab to next workspace".to_string(),
+            "Spaces",
+            PaletteAction::MoveTabToNextWorkspace,
         ),
         (
             "Toggle vertical tabs".to_string(),
