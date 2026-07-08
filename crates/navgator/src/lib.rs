@@ -618,6 +618,9 @@ struct Settings {
     /// True once the user has completed (or skipped) the first-run onboarding screen. Until then,
     /// launch opens `gator://onboarding` instead of the welcome page.
     onboarded: bool,
+    /// UI language override (a shipped locale tag like `fr` / `en-GB`); empty = follow the OS
+    /// locale detected at startup (LYK i18n).
+    locale: String,
 }
 
 /// The offered update-check cadences (key, label). `daily` is the default.
@@ -651,6 +654,7 @@ impl Default for Settings {
             theme_base_explicit: false,
             update_freq: "daily".to_string(),
             onboarded: false,
+            locale: String::new(),
         }
     }
 }
@@ -1229,10 +1233,16 @@ fn load_settings() -> Settings {
                         s.update_freq = v.trim().to_string()
                     }
                     "onboarded" => s.onboarded = v.trim() == "true",
+                    "locale" => s.locale = v.trim().to_string(),
                     _ => {}
                 }
             }
         }
+    }
+    // Apply a saved UI-language override (unless NAVGATOR_LOCALE forces one for this run). This
+    // runs after init_from_system, so precedence is: env > saved setting > OS locale.
+    if !s.locale.is_empty() && std::env::var_os("NAVGATOR_LOCALE").is_none() {
+        i18n::set_locale(&s.locale);
     }
     // Per-profile auto-accent (LYK-1376): a brand-new non-default profile (no settings file yet)
     // gets a distinct accent derived from its name, so identities are visually separable. Only when
@@ -1255,7 +1265,7 @@ fn save_settings(s: &Settings) {
         let _ = std::fs::write(
             &path,
             format!(
-                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nremember_passphrase={}\nblock_ads={}\nforce_dark={}\nwallpaper={}\nth_base={}\nth_accent={}\nth_density={}\nth_font={}\nth_tabpos={}\nth_wallpaper={}\nth_tabfit={}\nth_radius={}\nth_glass={}\nth_tabmaxw={}\nth_base_explicit={}\nmod_clock={}\nmod_search={}\nmod_sites={}\nmod_notes={}\nmod_feed={}\nupdate_freq={}\nonboarded={}\n",
+                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nremember_passphrase={}\nblock_ads={}\nforce_dark={}\nwallpaper={}\nth_base={}\nth_accent={}\nth_density={}\nth_font={}\nth_tabpos={}\nth_wallpaper={}\nth_tabfit={}\nth_radius={}\nth_glass={}\nth_tabmaxw={}\nth_base_explicit={}\nmod_clock={}\nmod_search={}\nmod_sites={}\nmod_notes={}\nmod_feed={}\nupdate_freq={}\nonboarded={}\nlocale={}\n",
                 s.search,
                 s.accent,
                 s.dark,
@@ -1285,6 +1295,7 @@ fn save_settings(s: &Settings) {
                 s.modules.feed,
                 s.update_freq,
                 s.onboarded,
+                s.locale,
             ),
         );
     }
@@ -2122,6 +2133,7 @@ enum SettingsApply {
     ThemeSet(String, String),
     /// Update-check cadence change (`never`/`hourly`/`daily`) from the settings page (LYK-1495).
     UpdateFreq(String),
+    Locale(String),
     Action(String),
 }
 
@@ -5000,6 +5012,19 @@ impl AppState {
                         changed = true;
                     }
                 }
+                SettingsApply::Locale(v) => {
+                    // A shipped tag switches + persists the UI language; the sentinel "auto" clears
+                    // the override back to OS detection.
+                    if v == "auto" {
+                        s.locale.clear();
+                        i18n::init_from_system();
+                        changed = true;
+                    } else if i18n::LOCALES.iter().any(|(tag, _, _)| *tag == v) {
+                        i18n::set_locale(&v);
+                        s.locale = v;
+                        changed = true;
+                    }
+                }
                 SettingsApply::BlockAds(b) => {
                     s.block_ads = b;
                     changed = true;
@@ -5152,6 +5177,24 @@ impl AppState {
                     if *k == s.update_freq { " on" } else { "" },
                     k,
                     html_escape(label),
+                )
+            })
+            .collect();
+        // Language picker: "Automatic" (follow OS) + each shipped locale shown by its endonym.
+        let active_locale = i18n::current_locale();
+        let language_pills: String = std::iter::once(("auto", "Automatic"))
+            .chain(i18n::LOCALES.iter().map(|(tag, endonym, _)| (*tag, *endonym)))
+            .map(|(tag, name)| {
+                let on = if tag == "auto" {
+                    s.locale.is_empty()
+                } else {
+                    !s.locale.is_empty() && tag == active_locale
+                };
+                format!(
+                    "<a class=\"pill{}\" href=\"gator://settings?locale={}#language\">{}</a>",
+                    if on { " on" } else { "" },
+                    tag,
+                    html_escape(name),
                 )
             })
             .collect();
@@ -5317,6 +5360,7 @@ impl AppState {
             .replace("__ADS_BLOCKED__", &blocked.to_string())
             .replace("__UPDATE_STATUS__", &update_status)
             .replace("__UPDATE_PILLS__", &update_pills)
+            .replace("__LANGUAGE_PILLS__", &language_pills)
             .replace("__CURRENT_VERSION__", &build_version())
             .replace("__SYNC_BOOKMARKS__", &sync_bookmarks)
             .replace("__SYNC_HISTORY__", &sync_history)
@@ -5710,7 +5754,7 @@ impl AppState {
                                     pal.muted,
                                 );
                                 ui.label(egui::RichText::new(pmsg.as_str()));
-                                if icon_button(ui, true, "Dismiss", &pal, icon::close).clicked() {
+                                if icon_button(ui, true, &tr!("find-dismiss"), &pal, icon::close).clicked() {
                                     *self.browser.password_msg.borrow_mut() = None;
                                 }
                             });
@@ -5733,7 +5777,7 @@ impl AppState {
                                 let mut q = self.find_query.borrow_mut();
                                 let resp = ui.add(
                                     egui::TextEdit::singleline(&mut *q)
-                                        .hint_text("Find in page")
+                                        .hint_text(tr!("find-hint"))
                                         .desired_width(200.0)
                                         .id(egui::Id::new("find_input")),
                                 );
@@ -5753,13 +5797,13 @@ impl AppState {
                                 ));
                                 // Flat vector icons — the UI font has no glyph for ▲/▼/✕, so
                                 // `ui.button("▲")` painted a .notdef box (see no-emoji rule).
-                                if icon_button(ui, true, "Previous match", &pal, icon::up).clicked() {
+                                if icon_button(ui, true, &tr!("find-prev"), &pal, icon::up).clicked() {
                                     self.find_step(-1);
                                 }
-                                if icon_button(ui, true, "Next match", &pal, icon::down).clicked() {
+                                if icon_button(ui, true, &tr!("find-next"), &pal, icon::down).clicked() {
                                     self.find_step(1);
                                 }
-                                if icon_button(ui, true, "Close", &pal, icon::close).clicked() {
+                                if icon_button(ui, true, &tr!("action-close"), &pal, icon::close).clicked() {
                                     self.find_close();
                                 }
                             });
@@ -5980,7 +6024,7 @@ impl AppState {
             .fixed_pos(egui::pos2(right_rect.right() - 30.0, right_rect.top() + 6.0))
             .show(ctx, |ui| {
                 // Flat vector × — the UI font renders a "✕" glyph as a .notdef box.
-                if icon_button(ui, true, "Close split", &pal, icon::close).clicked() {
+                if icon_button(ui, true, &tr!("tab-close-split"), &pal, icon::close).clicked() {
                     self.exit_split();
                 }
             });
@@ -6014,7 +6058,7 @@ impl AppState {
         self.pane1.tabs.borrow_mut().push(Tab {
             webview,
             url: seed.to_string(),
-            title: "New tab".to_string(),
+            title: tr!("tab-new"),
             can_back: false,
             can_forward: false,
             zoom: 1.0,
@@ -6068,7 +6112,7 @@ impl AppState {
             self.pane1.tabs.borrow_mut().push(Tab {
                 webview,
                 url: url.to_string(),
-                title: "New tab".to_string(),
+                title: tr!("tab-new"),
                 can_back: false,
                 can_forward: false,
                 zoom: 1.0,
@@ -6407,7 +6451,7 @@ impl AppState {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let pal = self.browser.settings.borrow().theme.palette();
-                    if icon_button(ui, true, "Close", &pal, icon::close).clicked() {
+                    if icon_button(ui, true, &tr!("action-close"), &pal, icon::close).clicked() {
                         // Close THIS window (quits the app only if it's the last one).
                         self.wants_close.set(true);
                         self.window.request_redraw();
@@ -6459,7 +6503,7 @@ impl AppState {
                                 .fill(pal.accent)
                                 .min_size(egui::vec2(0.0, 22.0)),
                             )
-                            .on_hover_text("Current profile — click to switch");
+                            .on_hover_text(tr!("toolbar-profile"));
                         if resp.clicked() {
                             self.navigate_from_omnibox("gator://profiles");
                         }
@@ -6486,7 +6530,7 @@ impl AppState {
                                     .fill(pal.accent)
                                     .min_size(egui::vec2(0.0, 22.0)),
                                 )
-                                .on_hover_text("Workspace — manage / switch (Ctrl+Shift+E cycles)");
+                                .on_hover_text(tr!("toolbar-workspace"));
                             if resp.clicked() {
                                 self.navigate_from_omnibox("gator://spaces");
                             }
@@ -6542,7 +6586,7 @@ impl AppState {
                                 .frame(false)
                                 .min_size(egui::vec2(40.0, 24.0)),
                         );
-                        if z.on_hover_text("Reset zoom (Ctrl+0)").clicked() {
+                        if z.on_hover_text(tr!("toolbar-reset-zoom")).clicked() {
                             self.zoom_reset();
                         }
                     }
@@ -7216,7 +7260,7 @@ impl AppState {
         let mut menu_act = 0u8;
         let mut group_act: Option<TabAction> = None;
         tab.context_menu(|ui| {
-            if ui.button("New tab").clicked() {
+            if ui.button(tr!("tab-new")).clicked() {
                 menu_act = 1;
             }
             if ui
@@ -7225,10 +7269,10 @@ impl AppState {
             {
                 menu_act = 4;
             }
-            if ui.button("Close tab").clicked() {
+            if ui.button(tr!("tab-close")).clicked() {
                 menu_act = 2;
             }
-            if ui.button("Close other tabs").clicked() {
+            if ui.button(tr!("tab-close-others")).clicked() {
                 menu_act = 3;
             }
             if ui
@@ -7237,14 +7281,14 @@ impl AppState {
             {
                 menu_act = 5;
             }
-            if ui.button("Move tab to new window").clicked() {
+            if ui.button(tr!("tab-move-new-window")).clicked() {
                 menu_act = 6;
             }
             // Tab groups (LYK-1374). A pinned tab can't be grouped.
             if !pinned {
                 ui.separator();
                 let cur_group = self.focused_pane().tabs.borrow().get(i).and_then(|t| t.group);
-                if ui.button("Add to new group").clicked() {
+                if ui.button(tr!("tab-add-group")).clicked() {
                     group_act = Some(TabAction::NewGroup(i));
                 }
                 for (g, name) in self
@@ -7259,7 +7303,7 @@ impl AppState {
                         group_act = Some(TabAction::AddToGroup(i, g));
                     }
                 }
-                if cur_group.is_some() && ui.button("Remove from group").clicked() {
+                if cur_group.is_some() && ui.button(tr!("tab-remove-group")).clicked() {
                     group_act = Some(TabAction::RemoveFromGroup(i));
                 }
             }
@@ -7479,7 +7523,7 @@ impl AppState {
                                     egui::vec2(tab_h, tab_h),
                                     egui::Sense::click(),
                                 );
-                                let resp = resp.on_hover_text("New tab (Ctrl+T)");
+                                let resp = resp.on_hover_text(tr!("tab-new-tip"));
                                 resp.widget_info(|| {
                                     egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "New tab")
                                 });
@@ -7538,7 +7582,7 @@ impl AppState {
             .default_width(200.0)
             .show(ctx, |ui| {
                 if ui
-                    .add(egui::Button::new("+ New tab").frame(false))
+                    .add(egui::Button::new(tr!("tab-new-plus")).frame(false))
                     .clicked()
                 {
                     pending = Some(TabAction::NewTab);
@@ -7736,7 +7780,7 @@ impl AppState {
                         }
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            if ui.button("OK").clicked() {
+                            if ui.button(tr!("action-ok")).clicked() {
                                 if let Some(h) = handle.take() {
                                     match h {
                                         SimpleDialog::Prompt(mut p) => {
@@ -7748,7 +7792,7 @@ impl AppState {
                                 }
                                 keep = false;
                             }
-                            if *kind != SimpleKind::Alert && ui.button("Cancel").clicked() {
+                            if *kind != SimpleKind::Alert && ui.button(tr!("action-cancel")).clicked() {
                                 if let Some(h) = handle.take() {
                                     h.dismiss();
                                 }
@@ -7773,22 +7817,22 @@ impl AppState {
                         ui.label(message.as_str());
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
-                            ui.label("Username");
+                            ui.label(tr!("field-username"));
                             ui.text_edit_singleline(user);
                         });
                         ui.horizontal(|ui| {
-                            ui.label("Password");
+                            ui.label(tr!("field-password"));
                             ui.add(egui::TextEdit::singleline(pass).password(true));
                         });
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            if ui.button("OK").clicked() {
+                            if ui.button(tr!("action-ok")).clicked() {
                                 if let Some(h) = handle.take() {
                                     h.authenticate(user.clone(), pass.clone());
                                 }
                                 keep = false;
                             }
-                            if ui.button("Cancel").clicked() {
+                            if ui.button(tr!("action-cancel")).clicked() {
                                 handle.take();
                                 keep = false;
                             }
@@ -7822,7 +7866,7 @@ impl AppState {
                             }
                         });
                         ui.add_space(6.0);
-                        if ui.button("Cancel").clicked() {
+                        if ui.button(tr!("action-cancel")).clicked() {
                             handle.take();
                             keep = false;
                         }
@@ -7837,12 +7881,12 @@ impl AppState {
                     .anchor(center, egui::vec2(0.0, 0.0))
                     .show(ctx, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label("Hex");
+                            ui.label(tr!("color-hex"));
                             ui.text_edit_singleline(hex);
                         });
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            if ui.button("OK").clicked() {
+                            if ui.button(tr!("action-ok")).clicked() {
                                 if let Some(mut p) = handle.take() {
                                     if let Some(rgb) = parse_hex_color(hex) {
                                         p.select(Some(rgb));
@@ -7851,7 +7895,7 @@ impl AppState {
                                 }
                                 keep = false;
                             }
-                            if ui.button("Cancel").clicked() {
+                            if ui.button(tr!("action-cancel")).clicked() {
                                 handle.take();
                                 keep = false;
                             }
@@ -7920,27 +7964,27 @@ impl AppState {
                         ui.label(message.as_str());
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            if ui.button("Allow once").clicked() {
+                            if ui.button(tr!("perm-allow-once")).clicked() {
                                 if let Some(r) = handle.take() {
                                     r.allow();
                                 }
                                 keep = false;
                             }
-                            if ui.button("Allow always").clicked() {
+                            if ui.button(tr!("perm-allow-always")).clicked() {
                                 if let Some(r) = handle.take() {
                                     r.allow();
                                 }
                                 grant = Some(true);
                                 keep = false;
                             }
-                            if ui.button("Block always").clicked() {
+                            if ui.button(tr!("perm-block-always")).clicked() {
                                 if let Some(r) = handle.take() {
                                     r.deny();
                                 }
                                 grant = Some(false);
                                 keep = false;
                             }
-                            if ui.button("Deny").clicked() {
+                            if ui.button(tr!("action-deny")).clicked() {
                                 if let Some(r) = handle.take() {
                                     r.deny();
                                 }
@@ -7975,13 +8019,13 @@ impl AppState {
                             egui::RichText::new(format!("{name}  v{version}")).strong(),
                         );
                         ui.add_space(6.0);
-                        ui.label("Runs on:");
+                        ui.label(tr!("userscripts-runs-on"));
                         for s in sites_human.iter() {
                             ui.label(egui::RichText::new(format!("  • {s}")).monospace());
                         }
                         if !perms_human.is_empty() {
                             ui.add_space(4.0);
-                            ui.label("Capabilities:");
+                            ui.label(tr!("userscripts-caps"));
                             for p in perms_human.iter() {
                                 ui.label(format!("  • {p}"));
                             }
@@ -7995,11 +8039,11 @@ impl AppState {
                         );
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            if ui.button("Enable").clicked() {
+                            if ui.button(tr!("action-enable")).clicked() {
                                 self.set_addon_consent(addon_id, true);
                                 keep = false;
                             }
-                            if ui.button("Cancel").clicked() {
+                            if ui.button(tr!("action-cancel")).clicked() {
                                 keep = false;
                             }
                         });
@@ -8015,19 +8059,19 @@ impl AppState {
                         egui::Frame::popup(ui.style()).show(ui, |ui| {
                             ui.set_min_width(150.0);
                             let (cb, cf) = self.active_nav();
-                            if ui.add_enabled(cb, egui::Button::new("Back").frame(false)).clicked() {
+                            if ui.add_enabled(cb, egui::Button::new(tr!("toolbar-back")).frame(false)).clicked() {
                                 if let Some(t) = self.active_tab() {
                                     t.go_back(1);
                                 }
                                 keep = false;
                             }
-                            if ui.add_enabled(cf, egui::Button::new("Forward").frame(false)).clicked() {
+                            if ui.add_enabled(cf, egui::Button::new(tr!("toolbar-forward")).frame(false)).clicked() {
                                 if let Some(t) = self.active_tab() {
                                     t.go_forward(1);
                                 }
                                 keep = false;
                             }
-                            if ui.add(egui::Button::new("Reload").frame(false)).clicked() {
+                            if ui.add(egui::Button::new(tr!("toolbar-reload")).frame(false)).clicked() {
                                 if let Some(t) = self.active_tab() {
                                     t.reload();
                                 }
@@ -8554,10 +8598,10 @@ impl AppState {
                     .inner_margin(egui::Margin::same(10))
                     .show(ui, |ui| {
                         ui.set_min_width(240.0);
-                        ui.label(egui::RichText::new("Unlock vault").strong().color(pal.text));
+                        ui.label(egui::RichText::new(tr!("vault-unlock")).strong().color(pal.text));
                         ui.add_space(2.0);
                         ui.label(
-                            egui::RichText::new("Encrypts your saved logins + autofill profile.")
+                            egui::RichText::new(tr!("vault-encrypt-note"))
                                 .small()
                                 .color(pal.muted),
                         );
@@ -8567,7 +8611,7 @@ impl AppState {
                             let resp = ui.add(
                                 egui::TextEdit::singleline(&mut *pass)
                                     .password(true)
-                                    .hint_text("Passphrase")
+                                    .hint_text(tr!("vault-passphrase"))
                                     .desired_width(220.0),
                             );
                             // Keep the field focused while empty so the overlay is typeable the
@@ -8579,10 +8623,10 @@ impl AppState {
                         };
                         ui.add_space(7.0);
                         ui.horizontal(|ui| {
-                            if ui.button("Unlock").clicked() || entered {
+                            if ui.button(tr!("action-unlock")).clicked() || entered {
                                 do_unlock = true;
                             }
-                            if ui.button("Cancel").clicked() {
+                            if ui.button(tr!("action-cancel")).clicked() {
                                 self.show_unlock.set(false);
                             }
                         });
@@ -8638,11 +8682,11 @@ impl AppState {
                     .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {
                         ui.set_min_width(240.0);
-                        ui.label(egui::RichText::new("Userscripts").strong().color(pal.text));
+                        ui.label(egui::RichText::new(tr!("userscripts-title")).strong().color(pal.text));
                         ui.add_space(4.0);
                         if rows.is_empty() {
                             ui.label(
-                                egui::RichText::new("No userscripts installed.")
+                                egui::RichText::new(tr!("userscripts-empty"))
                                     .small()
                                     .color(pal.muted),
                             );
@@ -8675,7 +8719,7 @@ impl AppState {
                         ui.add_space(6.0);
                         ui.separator();
                         if ui
-                            .add(egui::Button::new("Manage add-ons…").frame(false))
+                            .add(egui::Button::new(tr!("userscripts-manage")).frame(false))
                             .clicked()
                         {
                             open_manager = true;
@@ -8826,7 +8870,7 @@ impl AppState {
             tabs.push(Tab {
                 webview,
                 url: String::new(),
-                title: "New tab".to_string(),
+                title: tr!("tab-new"),
                 can_back: false,
                 can_forward: false,
                 zoom: 1.0,
@@ -10642,6 +10686,7 @@ impl WebViewDelegate for AppState {
                         "sync_history" => SettingsApply::SyncHistory(v == "on"),
                         "sync_passwords" => SettingsApply::SyncPasswords(v == "on"),
                         "update_freq" => SettingsApply::UpdateFreq(v.into_owned()),
+                        "locale" => SettingsApply::Locale(v.into_owned()),
                         "action" => SettingsApply::Action(v.into_owned()),
                         "base" | "accentk" | "density" | "font" | "tabpos" | "tabfit"
                         | "wallpaper" | "preset" | "radius" | "glass" | "tabmaxw" | "module" => {
@@ -10797,7 +10842,7 @@ impl WebViewDelegate for AppState {
 
     fn notify_page_title_changed(&self, webview: WebView, title: Option<String>) {
         if let Some((p, i)) = self.locate_tab(&webview) {
-            let title = title.unwrap_or_else(|| "New tab".to_string());
+            let title = title.unwrap_or_else(|| tr!("tab-new"));
             if p == self.focused.get() {
                 self.ipc_emit(&format!("title {i} {title}"));
             }
@@ -12603,26 +12648,26 @@ impl AppState {
                 ui.set_width(screen.width());
                 frame.show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Console").strong().color(pal.text));
+                        ui.label(egui::RichText::new(tr!("console-title")).strong().color(pal.text));
                         let count = self.console_log.borrow().len();
                         ui.label(egui::RichText::new(format!("{count}")).small().weak());
                         ui.add_space(8.0);
-                        ui.label(egui::RichText::new("filter").small().weak());
+                        ui.label(egui::RichText::new(tr!("console-filter")).small().weak());
                         let mut filter = self.console_filter.borrow_mut();
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut *filter)
                                 .desired_width(180.0)
-                                .hint_text("level or text"),
+                                .hint_text(tr!("console-filter-hint")),
                         );
                         if self.console_filter_focus.take() {
                             resp.request_focus();
                         }
                         drop(filter);
-                        if ui.button("Clear").clicked() {
+                        if ui.button(tr!("action-clear")).clicked() {
                             self.console_log.borrow_mut().clear();
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if icon_button(ui, true, "Close", &pal, icon::close).clicked() {
+                            if icon_button(ui, true, &tr!("action-close"), &pal, icon::close).clicked() {
                                 self.show_console.set(false);
                             }
                         });

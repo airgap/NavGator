@@ -34,148 +34,148 @@ pub(crate) enum PaletteAction {
 }
 
 /// The full command catalog: (label, right-aligned mono hint, action).
-pub(crate) fn palette_catalog() -> Vec<(String, &'static str, PaletteAction)> {
+pub(crate) fn palette_catalog() -> Vec<(String, String, PaletteAction)> {
     vec![
-        ("New tab".to_string(), "⌘T", PaletteAction::NewTab),
+        (tr!("tab-new"), "⌘T".to_string(), PaletteAction::NewTab),
         (
-            "Show blocked requests (gator://why)".to_string(),
-            "Privacy",
+            tr!("palette-cmd-blocked"),
+            tr!("palette-cat-privacy"),
             PaletteAction::OpenWhy,
         ),
         (
-            "Export my data (gator://export)".to_string(),
-            "Data",
+            tr!("palette-cmd-export"),
+            tr!("palette-cat-data"),
             PaletteAction::OpenExport,
         ),
         (
-            "Toggle force-dark mode".to_string(),
-            "Appearance",
+            tr!("palette-cmd-force-dark"),
+            tr!("palette-cat-appearance"),
             PaletteAction::ToggleForceDark,
         ),
         (
-            "This site: toggle dark mode".to_string(),
-            "Loadout",
+            tr!("palette-cmd-site-dark"),
+            tr!("palette-cat-loadout"),
             PaletteAction::ToggleSiteDark,
         ),
         (
-            "This site: toggle ad-blocking".to_string(),
-            "Loadout",
+            tr!("palette-cmd-site-adblock"),
+            tr!("palette-cat-loadout"),
             PaletteAction::ToggleSiteAdblock,
         ),
         (
-            "Reader mode".to_string(),
-            "Reading",
+            tr!("palette-cmd-reader"),
+            tr!("palette-cat-reading"),
             PaletteAction::ReaderMode,
         ),
         (
-            "New workspace".to_string(),
-            "Spaces",
+            tr!("palette-cmd-new-workspace"),
+            tr!("palette-cat-spaces"),
             PaletteAction::NewWorkspace,
         ),
         (
-            "Next workspace".to_string(),
-            "⇧⌘E",
+            tr!("palette-cmd-next-workspace"),
+            "⇧⌘E".to_string(),
             PaletteAction::NextWorkspace,
         ),
         (
-            "Move tab to next workspace".to_string(),
-            "Spaces",
+            tr!("palette-cmd-move-workspace"),
+            tr!("palette-cat-spaces"),
             PaletteAction::MoveTabToNextWorkspace,
         ),
         (
-            "Manage workspaces".to_string(),
-            "Spaces",
+            tr!("palette-cmd-manage-workspaces"),
+            tr!("palette-cat-spaces"),
             PaletteAction::ManageWorkspaces,
         ),
         (
-            "Toggle vertical tabs".to_string(),
-            "Layout",
+            tr!("palette-cmd-vertical-tabs"),
+            tr!("palette-cat-layout"),
             PaletteAction::ToggleVerticalTabs,
         ),
         (
-            "Shrink tabs to title width".to_string(),
-            "Tabs",
+            tr!("palette-cmd-shrink-tabs"),
+            tr!("palette-cat-tabs"),
             PaletteAction::ShrinkTabs,
         ),
         (
-            "Customize appearance".to_string(),
-            "Settings",
+            tr!("palette-cmd-customize"),
+            tr!("palette-cat-settings"),
             PaletteAction::ToggleStudio,
         ),
         (
-            "Density: Compact".to_string(),
-            "",
+            tr!("palette-cmd-density-compact"),
+            String::new(),
             PaletteAction::Density(Density::Compact),
         ),
         (
-            "Density: Cozy".to_string(),
-            "",
+            tr!("palette-cmd-density-cozy"),
+            String::new(),
             PaletteAction::Density(Density::Cozy),
         ),
         (
-            "Accent: Violet".to_string(),
-            "",
+            tr!("palette-cmd-accent-violet"),
+            String::new(),
             PaletteAction::SetAccent(Accent::Violet),
         ),
         (
-            "Accent: Cyan".to_string(),
-            "",
+            tr!("palette-cmd-accent-cyan"),
+            String::new(),
             PaletteAction::SetAccent(Accent::Cyan),
         ),
         (
             // NOTE: label "Green" maps to Accent::Lime
-            "Accent: Green".to_string(),
-            "",
+            tr!("palette-cmd-accent-green"),
+            String::new(),
             PaletteAction::SetAccent(Accent::Lime),
         ),
         (
-            "Accent: Magenta".to_string(),
-            "",
+            tr!("palette-cmd-accent-magenta"),
+            String::new(),
             PaletteAction::SetAccent(Accent::Magenta),
         ),
         (
-            "Wallpaper: Aurora".to_string(),
-            "",
+            tr!("palette-cmd-wp-aurora"),
+            String::new(),
             PaletteAction::SetWallpaper(Wallpaper::Aurora),
         ),
         (
-            "Wallpaper: Grid".to_string(),
-            "",
+            tr!("palette-cmd-wp-grid"),
+            String::new(),
             PaletteAction::SetWallpaper(Wallpaper::Grid),
         ),
         (
-            "Wallpaper: Mesh".to_string(),
-            "",
+            tr!("palette-cmd-wp-mesh"),
+            String::new(),
             PaletteAction::SetWallpaper(Wallpaper::Mesh),
         ),
         (
-            "Apply preset: Aurora".to_string(),
-            "",
+            tr!("palette-cmd-preset-aurora"),
+            String::new(),
             PaletteAction::ApplyPreset(Preset::Aurora),
         ),
         (
-            "Apply preset: Terminal".to_string(),
-            "",
+            tr!("palette-cmd-preset-terminal"),
+            String::new(),
             PaletteAction::ApplyPreset(Preset::Terminal),
         ),
         (
-            "Apply preset: Halo".to_string(),
-            "",
+            tr!("palette-cmd-preset-halo"),
+            String::new(),
             PaletteAction::ApplyPreset(Preset::Halo),
         ),
         (
-            "Apply preset: Noir".to_string(),
-            "",
+            tr!("palette-cmd-preset-noir"),
+            String::new(),
             PaletteAction::ApplyPreset(Preset::Noir),
         ),
         (
             "Toggle Notes widget".to_string(),
-            "",
+            String::new(),
             PaletteAction::ToggleNotes,
         ),
         (
             "Toggle Reading list widget".to_string(),
-            "",
+            String::new(),
             PaletteAction::ToggleFeed,
         ),
     ]
@@ -186,7 +186,7 @@ pub(crate) fn palette_catalog() -> Vec<(String, &'static str, PaletteAction)> {
 pub(crate) fn draw_palette_dropdown(
     ui: &mut Ui,
     anchor: Rect,
-    items: &[(String, &'static str, PaletteAction)],
+    items: &[(String, String, PaletteAction)],
     pal: &Palette,
 ) -> Option<PaletteAction> {
     let mut clicked = None;
@@ -214,7 +214,7 @@ pub(crate) fn draw_palette_dropdown(
                     if items.is_empty() {
                         ui.vertical_centered(|ui| {
                             ui.label(
-                                egui::RichText::new("No commands match")
+                                egui::RichText::new(tr!("palette-empty"))
                                     .color(pal.muted)
                                     .size(13.0),
                             );
