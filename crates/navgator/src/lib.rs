@@ -4184,13 +4184,11 @@ impl AppState {
                         .collect();
                     out.push_str(&format!(
                         "<div class=\"row\"><div class=\"tk\"><span class=\"name\">{}</span>\
-                         <span class=\"stat\">{} site{} &middot; {} block{}</span></div>\
+                         <span class=\"stat\">{} &middot; {}</span></div>\
                          <div class=\"sites\">{}</div></div>",
                         html_escape(tracker),
-                        nsites,
-                        if *nsites == 1 { "" } else { "s" },
-                        total,
-                        if *total == 1 { "" } else { "s" },
+                        tr!("exposure-sites", count = *nsites as i64),
+                        tr!("exposure-blocks", count = *total as i64),
                         chips,
                     ));
                 }
@@ -4264,13 +4262,11 @@ impl AppState {
                         .collect();
                     out.push_str(&format!(
                         "<div class=\"row\"><div class=\"tk\"><span class=\"name\">&rarr; {}</span>\
-                         <span class=\"stat\">reached from {} site{} &middot; {} hop{}</span></div>\
+                         <span class=\"stat\">{} &middot; {}</span></div>\
                          <div class=\"sites\">{}</div></div>",
                         html_escape(to),
-                        nfrom,
-                        if *nfrom == 1 { "" } else { "s" },
-                        total,
-                        if *total == 1 { "" } else { "s" },
+                        tr!("trail-reached-sites", count = *nfrom as i64),
+                        tr!("trail-hops", count = *total as i64),
                         chips,
                     ));
                 }
@@ -4357,9 +4353,9 @@ impl AppState {
                      <input type=\"hidden\" name=\"rename\" value=\"{i}\">\
                      <input name=\"name\" value=\"{name}\" autocomplete=\"off\" spellcheck=\"false\">\
                      </form>\
-                     <span class=\"ct\">{ct} tab{plural}</span>{badge}{del}</div>",
+                     <span class=\"ct\">{tabs}</span>{badge}{del}</div>",
                     name = html_escape(&w.name),
-                    plural = if ct == 1 { "" } else { "s" },
+                    tabs = tr!("spaces-tab-count", count = ct as i64),
                 )
             })
             .collect();
@@ -4520,13 +4516,15 @@ impl AppState {
         // Two-step delete: ?delete=<name> shows this confirm; the button then adds &confirm=1.
         let confirm_html = match confirm_delete {
             Some(name) if name != current && name != "default" && names.iter().any(|n| n == name) => {
+                let esc = html_escape(name);
                 format!(
-                    "<div class=\"confirm\"><p>Delete profile <b>{0}</b>? This permanently erases its \
-                     cookies, saved logins, history, autofill and settings — it can't be undone.</p>\
+                    "<div class=\"confirm\"><p>{msg}</p>\
                      <div class=\"cbtns\">\
-                     <a class=\"danger\" href=\"gator://profiles?delete={0}&amp;confirm=1\">Delete permanently</a>\
-                     <a class=\"cancel\" href=\"gator://profiles\">Cancel</a></div></div>",
-                    html_escape(name)
+                     <a class=\"danger\" href=\"gator://profiles?delete={esc}&amp;confirm=1\">{del}</a>\
+                     <a class=\"cancel\" href=\"gator://profiles\">{cancel}</a></div></div>",
+                    msg = tr!("profiles-delete-confirm", name = esc.clone()),
+                    del = tr!("profiles-delete-btn"),
+                    cancel = tr!("action-cancel"),
                 )
             }
             _ => String::new(),
@@ -4646,7 +4644,7 @@ impl AppState {
                 .collect()
         };
         let title = tr!("why-title");
-        let sub = tr!("why-sub");
+        let sub = tr!("why-sub", count = total as i64);
         let link_exposure = tr!("why-link-exposure");
         let html = format!(
             "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
@@ -4664,9 +4662,8 @@ impl AppState {
              font:12px ui-monospace,monospace;word-break:break-all}}li{{margin:3px 0}}\
              .empty{{color:var(--muted)}}</style></head><body>\
              <h1>{title}</h1>\
-             <p class=\"sub\">{} {sub} \
-             <a href=\"gator://exposure\">{link_exposure} &rarr;</a></p>{}</body></html>",
-            total, body
+             <p class=\"sub\">{sub} \
+             <a href=\"gator://exposure\">{link_exposure} &rarr;</a></p>{body}</body></html>",
         );
         self.themed(html)
     }
@@ -4829,37 +4826,45 @@ impl AppState {
         } else {
             let store = self.browser.autofill_store.borrow();
             let p = store.profile();
-            let field = |name: &str, label: &str, val: &str, ph: &str| {
+            // Field labels are keyed `autofill-field-<name>` (with `_`→`-`); example placeholders
+            // stay as illustrative sample data.
+            let field = |name: &str, val: &str, ph: &str| {
+                let label = i18n::tr(&format!("autofill-field-{}", name.replace('_', "-")));
                 format!(
                     "<label class=\"fld\"><span>{}</span>\
                      <input name=\"{}\" value=\"{}\" placeholder=\"{}\" autocomplete=\"off\" spellcheck=\"false\"></label>",
-                    html_escape(label),
+                    html_escape(&label),
                     name,
                     html_escape(val),
                     html_escape(ph),
                 )
             };
+            let h_contact = tr!("autofill-h-contact");
+            let h_address = tr!("autofill-h-address");
+            let h_payment = tr!("autofill-h-payment");
+            let cvc_hint = tr!("autofill-cvc-hint");
+            let save = tr!("autofill-save");
             format!(
                 "<form method=\"get\" action=\"gator://autofill\">\
-                 <h2>Contact</h2><div class=\"grid\">{}{}{}{}</div>\
-                 <h2>Address</h2><div class=\"grid\">{}{}{}{}{}{}</div>\
-                 <h2>Payment card <span class=\"hint\">— the security code (CVC) is never stored</span></h2>\
+                 <h2>{h_contact}</h2><div class=\"grid\">{}{}{}{}</div>\
+                 <h2>{h_address}</h2><div class=\"grid\">{}{}{}{}{}{}</div>\
+                 <h2>{h_payment} <span class=\"hint\">{cvc_hint}</span></h2>\
                  <div class=\"grid\">{}{}{}{}</div>\
-                 <div class=\"acts\"><button type=\"submit\">Save profile</button></div></form>",
-                field("full_name", "Full name", &p.full_name, "Jane Doe"),
-                field("email", "Email", &p.email, "jane@example.com"),
-                field("phone", "Phone", &p.phone, "+1 555 0100"),
-                field("organization", "Organization", &p.organization, ""),
-                field("address1", "Street address", &p.address1, "123 Main St"),
-                field("address2", "Address line 2", &p.address2, "Apt 4"),
-                field("city", "City", &p.city, "Springfield"),
-                field("region", "State / Region", &p.region, "CA"),
-                field("postal_code", "Postal code", &p.postal_code, "94016"),
-                field("country", "Country", &p.country, "United States"),
-                field("cc_name", "Cardholder name", &p.cc_name, "JANE DOE"),
-                field("cc_number", "Card number", &p.cc_number, "4111 1111 1111 1111"),
-                field("cc_exp_month", "Exp month (MM)", &p.cc_exp_month, "08"),
-                field("cc_exp_year", "Exp year (YYYY)", &p.cc_exp_year, "2029"),
+                 <div class=\"acts\"><button type=\"submit\">{save}</button></div></form>",
+                field("full_name", &p.full_name, "Jane Doe"),
+                field("email", &p.email, "jane@example.com"),
+                field("phone", &p.phone, "+1 555 0100"),
+                field("organization", &p.organization, ""),
+                field("address1", &p.address1, "123 Main St"),
+                field("address2", &p.address2, "Apt 4"),
+                field("city", &p.city, "Springfield"),
+                field("region", &p.region, "CA"),
+                field("postal_code", &p.postal_code, "94016"),
+                field("country", &p.country, "United States"),
+                field("cc_name", &p.cc_name, "JANE DOE"),
+                field("cc_number", &p.cc_number, "4111 1111 1111 1111"),
+                field("cc_exp_month", &p.cc_exp_month, "08"),
+                field("cc_exp_year", &p.cc_exp_year, "2029"),
             )
         };
         let accent = self.browser.settings.borrow().accent.clone();
@@ -5417,7 +5422,10 @@ impl AppState {
             .replace("__ENGINE_PILLS__", &engine_pills)
             .replace("__SEARCH_VALUE__", &html_escape(&s.search))
             .replace("__ADS_TOGGLE__", &ads_toggle)
-            .replace("__ADS_BLOCKED__", &blocked.to_string())
+            .replace(
+                "__ADS_BLOCKED_MSG__",
+                &tr!("settings-privacy-ads-blocked", count = blocked as i64),
+            )
             .replace("__UPDATE_STATUS__", &update_status)
             .replace("__UPDATE_PILLS__", &update_pills)
             .replace("__LANGUAGE_PILLS__", &language_pills)

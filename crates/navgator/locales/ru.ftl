@@ -164,7 +164,7 @@ settings-nav-appearance = Внешний вид
 settings-nav-language = Язык
 settings-nav-search = Поиск
 settings-nav-newtab = Новая вкладка
-settings-nav-privacy = Приватность &amp; безопасность
+settings-nav-privacy = Приватность и безопасность
 settings-nav-sync = Синхронизация
 settings-nav-passwords = Пароли
 settings-nav-about = О браузере
@@ -193,15 +193,14 @@ settings-search-save = Сохранить
 settings-newtab-title = Новая вкладка
 settings-newtab-sub = Какие модули показывать на странице новой вкладки.
 settings-newtab-modules = Модули
-settings-privacy-title = Приватность &amp; безопасность
+settings-privacy-title = Приватность и безопасность
 settings-privacy-sub = блокирует рекламу и трекеры по умолчанию.
 settings-privacy-content-blocking = Блокировка контента
-settings-privacy-block-ads = Блокировать рекламу &amp; трекеры
-settings-privacy-ads-blocked = запросов рекламы/трекеров заблокировано за этот сеанс.
+settings-privacy-block-ads = Блокировать рекламу и трекеры
 settings-privacy-software-updates = Обновления ПО
 settings-privacy-update-version = Текущая версия
 settings-privacy-update-desc = проверяет наличие новой версии в фоновом режиме &mdash; никогда не загружает и не устанавливает её самостоятельно.
-settings-privacy-update-link = О браузере &amp; статус обновления
+settings-privacy-update-link = О браузере и статус обновления
 settings-sync-title = Синхронизация
 settings-sync-sub = Синхронизация Lyku (ранний доступ). Ваш API-ключ хранится локально.
 settings-sync-collections = Коллекции
@@ -217,7 +216,7 @@ settings-passwords-title = Пароли
 settings-passwords-open-manager = Открыть менеджер паролей
 settings-about-title = О браузере
 settings-about-sub = Нативный браузер с интерфейсом egui поверх движка Servo.
-settings-about-shortcuts-btn = О браузере &amp; сочетания клавиш
+settings-about-shortcuts-btn = О браузере и сочетания клавиш
 settings-about-make-default-a = Сделать
 settings-about-make-default-b = браузером по умолчанию
 welcome-search-placeholder = Искать в интернете, во вкладках или введите команду&hellip;
@@ -246,7 +245,7 @@ spaces-heading = пространства
 spaces-sub = Рабочие пространства группируют вкладки и подкрашивают весь браузер. Измените название прямо здесь (Enter — сохранить), переключитесь или удалите. Ctrl+Shift+E переключает по кругу.
 spaces-new = Новое пространство
 spaces-placeholder = напр. Работа, Исследования
-spaces-create = Создать &amp; переключиться
+spaces-create = Создать и переключиться
 spaces-link-welcome = добро пожаловать
 pdf-downloads = Загрузки
 pdf-cannot-open = Не удалось открыть этот PDF:
@@ -255,33 +254,32 @@ profiles-heading = профили
 profiles-sub = Каждый профиль — это отдельная личность: свои файлы cookie, история, сохранённые входы, автозаполнение и выделения. Открытие профиля запускает новое окно.
 profiles-new = Новый профиль
 profiles-placeholder = напр. работа, личный
-profiles-create = Создать &amp; открыть
+profiles-create = Создать и открыть
 profiles-current = текущий:
 profiles-link-welcome = добро пожаловать
 why-title = Отчёт о блокировке
-why-sub = запрос(ов) заблокировал блокировщик рекламы и трекеров на просматриваемой вами странице, сгруппировано по хостам. Вычислено на устройстве; ничего не покинуло машину.
 why-link-exposure = Смотреть карту трекеров за весь сеанс
 why-empty = <p class="empty">На этой странице ничего не заблокировано.</p>
 export-title = Экспорт ваших данных
 export-lead = Ваши данные принадлежат вам. Скачайте переносимую, удобочитаемую копию — без аккаунта, без привязки.
 export-bookmarks = закладок
 export-history = записей истории
-export-settings = настройки интерфейса &amp; тема
+export-settings = настройки интерфейса и тема
 export-download = Скачать всё (.json)
 export-note = Пока не включено: сохранённые пароли (в зашифрованном хранилище — планируется отдельный экспорт в зашифрованный архив) и заметки/список для чтения на новой вкладке (хранятся в собственном localStorage страницы).
 autofill-title = Автозаполнение
 autofill-heading = автозаполнение
 autofill-sub-1 = Одна сохранённая личность, зашифрованная вашим хранилищем. Нажмите
-autofill-sub-2 = на любой странице, чтобы заполнить поля адреса &amp; карты.
+autofill-sub-2 = на любой странице, чтобы заполнить поля адреса и карты.
 autofill-link-welcome = добро пожаловать
-autofill-locked = <div class="note">Ваш профиль автозаполнения защищён хранилищем. Разблокируйте его в разделе <a href="gator://settings#privacy">Настройки → Конфиденциальность &amp; безопасность</a> (та же парольная фраза, что и для сохранённых паролей), затем перезагрузите эту страницу.</div>
+autofill-locked = <div class="note">Ваш профиль автозаполнения защищён хранилищем. Разблокируйте его в разделе <a href="gator://settings#privacy">Настройки → Конфиденциальность и безопасность</a> (та же парольная фраза, что и для сохранённых паролей), затем перезагрузите эту страницу.</div>
 onboarding-title = Добро пожаловать в NavGator
 onboarding-heading = Добро пожаловать в
 onboarding-sub = Браузер, ставящий конфиденциальность на первое место. Два быстрых выбора — и всё готово; всё можно изменить позже в настройках.
 onboarding-search = Поисковая система
 onboarding-updates = Проверять обновления
 onboarding-privacy = Конфиденциальность
-onboarding-block-ads = Блокировать рекламу &amp; трекеры
+onboarding-block-ads = Блокировать рекламу и трекеры
 onboarding-recommended = (рекомендуется)
 onboarding-get-started = Начать
 onboarding-skip = Пропустить пока
@@ -291,3 +289,75 @@ onboarding-fine = NavGator только проверяет наличие бол
 update-freq-never = Никогда
 update-freq-hourly = Каждый час
 update-freq-daily = Каждый день
+
+## Plurals + autofill + profile-confirm
+settings-privacy-ads-blocked =
+    { $count ->
+        [one] { $count } запрос рекламы/трекеров заблокирован за эту сессию.
+        [few] { $count } запроса рекламы/трекеров заблокировано за эту сессию.
+        [many] { $count } запросов рекламы/трекеров заблокировано за эту сессию.
+       *[other] { $count } запроса рекламы/трекеров заблокировано за эту сессию.
+    }
+why-sub =
+    { $count ->
+        [one] { $count } запрос, который блокировщик рекламы/трекеров остановил на просматриваемой вами странице, сгруппирован по хостам. Вычислено на устройстве; ничего не покинуло машину.
+        [few] { $count } запроса, которые блокировщик рекламы/трекеров остановил на просматриваемой вами странице, сгруппированы по хостам. Вычислено на устройстве; ничего не покинуло машину.
+        [many] { $count } запросов, которые блокировщик рекламы/трекеров остановил на просматриваемой вами странице, сгруппированы по хостам. Вычислено на устройстве; ничего не покинуло машину.
+       *[other] { $count } запроса, которые блокировщик рекламы/трекеров остановил на просматриваемой вами странице, сгруппированы по хостам. Вычислено на устройстве; ничего не покинуло машину.
+    }
+exposure-sites =
+    { $count ->
+        [one] { $count } сайт
+        [few] { $count } сайта
+        [many] { $count } сайтов
+       *[other] { $count } сайта
+    }
+exposure-blocks =
+    { $count ->
+        [one] { $count } блокировка
+        [few] { $count } блокировки
+        [many] { $count } блокировок
+       *[other] { $count } блокировки
+    }
+trail-reached-sites =
+    { $count ->
+        [one] достигнуто с { $count } сайта
+        [few] достигнуто с { $count } сайтов
+        [many] достигнуто с { $count } сайтов
+       *[other] достигнуто с { $count } сайта
+    }
+trail-hops =
+    { $count ->
+        [one] { $count } переход
+        [few] { $count } перехода
+        [many] { $count } переходов
+       *[other] { $count } перехода
+    }
+spaces-tab-count =
+    { $count ->
+        [one] { $count } вкладка
+        [few] { $count } вкладки
+        [many] { $count } вкладок
+       *[other] { $count } вкладки
+    }
+profiles-delete-confirm = Удалить профиль <b>{ $name }</b>? Это безвозвратно удалит его файлы cookie, сохранённые логины, историю, данные автозаполнения и настройки — отменить это будет нельзя.
+profiles-delete-btn = Удалить навсегда
+autofill-field-full-name = Полное имя
+autofill-field-email = Эл. почта
+autofill-field-phone = Телефон
+autofill-field-organization = Организация
+autofill-field-address1 = Адрес
+autofill-field-address2 = Адрес, строка 2
+autofill-field-city = Город
+autofill-field-region = Штат / регион
+autofill-field-postal-code = Почтовый индекс
+autofill-field-country = Страна
+autofill-field-cc-name = Имя владельца карты
+autofill-field-cc-number = Номер карты
+autofill-field-cc-exp-month = Месяц окончания (MM)
+autofill-field-cc-exp-year = Год окончания (YYYY)
+autofill-h-contact = Контакт
+autofill-h-address = Адрес
+autofill-h-payment = Платёжная карта
+autofill-cvc-hint = — код безопасности (CVC) никогда не сохраняется
+autofill-save = Сохранить профиль

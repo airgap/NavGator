@@ -164,7 +164,7 @@ settings-nav-appearance = Apparence
 settings-nav-language = Langue
 settings-nav-search = Recherche
 settings-nav-newtab = Nouvel onglet
-settings-nav-privacy = Confidentialité &amp; sécurité
+settings-nav-privacy = Confidentialité et sécurité
 settings-nav-sync = Synchronisation
 settings-nav-passwords = Mots de passe
 settings-nav-about = À propos
@@ -193,15 +193,14 @@ settings-search-save = Enregistrer
 settings-newtab-title = Nouvel onglet
 settings-newtab-sub = Les modules affichés sur la page du nouvel onglet.
 settings-newtab-modules = Modules
-settings-privacy-title = Confidentialité &amp; sécurité
+settings-privacy-title = Confidentialité et sécurité
 settings-privacy-sub = bloque les publicités et les traqueurs par défaut.
 settings-privacy-content-blocking = Blocage de contenu
-settings-privacy-block-ads = Bloquer les publicités &amp; les traqueurs
-settings-privacy-ads-blocked = requête(s) de publicité/traqueur bloquée(s) durant cette session.
+settings-privacy-block-ads = Bloquer les publicités et les traqueurs
 settings-privacy-software-updates = Mises à jour logicielles
 settings-privacy-update-version = Version actuelle
 settings-privacy-update-desc = recherche une nouvelle version en arrière-plan &mdash; il ne télécharge ni n'installe jamais rien de lui-même.
-settings-privacy-update-link = À propos &amp; état des mises à jour
+settings-privacy-update-link = À propos et état des mises à jour
 settings-sync-title = Synchronisation
 settings-sync-sub = Synchronisation Lyku (accès anticipé). Votre clé API est stockée localement.
 settings-sync-collections = Collections
@@ -217,7 +216,7 @@ settings-passwords-title = Mots de passe
 settings-passwords-open-manager = Ouvrir le gestionnaire de mots de passe
 settings-about-title = À propos
 settings-about-sub = Un navigateur natif avec une interface egui par-dessus un moteur Servo.
-settings-about-shortcuts-btn = À propos &amp; raccourcis
+settings-about-shortcuts-btn = À propos et raccourcis
 settings-about-make-default-a = Définir
 settings-about-make-default-b = comme navigateur par défaut
 welcome-search-placeholder = Recherchez sur le Web, dans vos onglets, ou saisissez une commande&hellip;
@@ -246,7 +245,7 @@ spaces-heading = espaces
 spaces-sub = Les espaces de travail regroupent les onglets et teintent tout le navigateur. Modifiez un nom sur place (Entrée pour enregistrer), changez d'espace ou supprimez-en un. Ctrl+Shift+E fait défiler.
 spaces-new = Nouvel espace
 spaces-placeholder = ex. Travail, Recherche
-spaces-create = Créer &amp; basculer
+spaces-create = Créer et basculer
 spaces-link-welcome = bienvenue
 pdf-downloads = Téléchargements
 pdf-cannot-open = Impossible d'ouvrir ce PDF :
@@ -255,33 +254,32 @@ profiles-heading = profils
 profiles-sub = Chaque profil est une identité distincte — ses propres cookies, historique, identifiants enregistrés, saisie automatique et surlignages. En ouvrir un lance une nouvelle fenêtre.
 profiles-new = Nouveau profil
 profiles-placeholder = ex. travail, personnel
-profiles-create = Créer &amp; ouvrir
+profiles-create = Créer et ouvrir
 profiles-current = actuel :
 profiles-link-welcome = bienvenue
 why-title = Reçu de blocage
-why-sub = requête(s) que le bloqueur de pubs/traqueurs a arrêtée(s) sur la page que vous consultiez, regroupée(s) par hôte. Calculé sur l'appareil ; rien n'a quitté la machine.
 why-link-exposure = Voir la carte des traqueurs de toute la session
 why-empty = <p class="empty">Rien n'a été bloqué sur cette page.</p>
 export-title = Exporter vos données
 export-lead = Vos données vous appartiennent. Téléchargez-en une copie portable et lisible — sans compte, sans enfermement.
 export-bookmarks = favoris
 export-history = entrées d'historique
-export-settings = paramètres du navigateur &amp; thème
+export-settings = paramètres du navigateur et thème
 export-download = Tout télécharger (.json)
 export-note = Pas encore inclus : les mots de passe enregistrés (dans le coffre chiffré — un export séparé sous forme d'archive chiffrée est prévu) et les notes/liste de lecture du nouvel onglet (stockées dans le localStorage propre à la page).
 autofill-title = Saisie automatique
 autofill-heading = saisie automatique
 autofill-sub-1 = Une seule identité enregistrée, chiffrée avec votre coffre. Appuyez sur
-autofill-sub-2 = sur n'importe quelle page pour remplir ses champs d'adresse &amp; de carte.
+autofill-sub-2 = sur n'importe quelle page pour remplir ses champs d'adresse et de carte.
 autofill-link-welcome = bienvenue
-autofill-locked = <div class="note">Votre profil de saisie automatique est protégé par votre coffre. Déverrouillez-le dans <a href="gator://settings#privacy">Paramètres → Confidentialité &amp; sécurité</a> (la même phrase secrète que pour les mots de passe enregistrés), puis rechargez cette page.</div>
+autofill-locked = <div class="note">Votre profil de saisie automatique est protégé par votre coffre. Déverrouillez-le dans <a href="gator://settings#privacy">Paramètres → Confidentialité et sécurité</a> (la même phrase secrète que pour les mots de passe enregistrés), puis rechargez cette page.</div>
 onboarding-title = Bienvenue dans NavGator
 onboarding-heading = Bienvenue dans
 onboarding-sub = Un navigateur qui privilégie la confidentialité. Deux choix rapides et le tour est joué — tout reste modifiable ensuite dans les Paramètres.
 onboarding-search = Moteur de recherche
 onboarding-updates = Rechercher des mises à jour
 onboarding-privacy = Confidentialité
-onboarding-block-ads = Bloquer les pubs &amp; les traqueurs
+onboarding-block-ads = Bloquer les pubs et les traqueurs
 onboarding-recommended = (recommandé)
 onboarding-get-started = Commencer
 onboarding-skip = Ignorer pour l'instant
@@ -291,3 +289,61 @@ onboarding-fine = NavGator vérifie uniquement si une version plus récente exis
 update-freq-never = Jamais
 update-freq-hourly = Toutes les heures
 update-freq-daily = Chaque jour
+
+## Plurals + autofill + profile-confirm
+settings-privacy-ads-blocked =
+    { $count ->
+        [one] { $count } requête publicitaire/traceur bloquée cette session.
+       *[other] { $count } requêtes publicitaires/traceurs bloquées cette session.
+    }
+why-sub =
+    { $count ->
+        [one] { $count } requête que le bloqueur de publicités/traceurs a stoppée sur la page que vous consultiez, regroupée par hôte. Calculé sur l'appareil ; rien n'a quitté la machine.
+       *[other] { $count } requêtes que le bloqueur de publicités/traceurs a stoppées sur la page que vous consultiez, regroupées par hôte. Calculé sur l'appareil ; rien n'a quitté la machine.
+    }
+exposure-sites =
+    { $count ->
+        [one] { $count } site
+       *[other] { $count } sites
+    }
+exposure-blocks =
+    { $count ->
+        [one] { $count } blocage
+       *[other] { $count } blocages
+    }
+trail-reached-sites =
+    { $count ->
+        [one] atteint depuis { $count } site
+       *[other] atteint depuis { $count } sites
+    }
+trail-hops =
+    { $count ->
+        [one] { $count } saut
+       *[other] { $count } sauts
+    }
+spaces-tab-count =
+    { $count ->
+        [one] { $count } onglet
+       *[other] { $count } onglets
+    }
+profiles-delete-confirm = Supprimer le profil <b>{ $name }</b> ? Cela efface définitivement ses cookies, identifiants enregistrés, historique, saisie automatique et paramètres — c'est irréversible.
+profiles-delete-btn = Supprimer définitivement
+autofill-field-full-name = Nom complet
+autofill-field-email = Adresse e-mail
+autofill-field-phone = Téléphone
+autofill-field-organization = Organisation
+autofill-field-address1 = Adresse
+autofill-field-address2 = Complément d'adresse
+autofill-field-city = Ville
+autofill-field-region = État / Région
+autofill-field-postal-code = Code postal
+autofill-field-country = Pays
+autofill-field-cc-name = Nom du titulaire
+autofill-field-cc-number = Numéro de carte
+autofill-field-cc-exp-month = Mois d'expiration (MM)
+autofill-field-cc-exp-year = Année d'expiration (YYYY)
+autofill-h-contact = Contact
+autofill-h-address = Adresse
+autofill-h-payment = Carte de paiement
+autofill-cvc-hint = — le code de sécurité (CVC) n'est jamais conservé
+autofill-save = Enregistrer le profil

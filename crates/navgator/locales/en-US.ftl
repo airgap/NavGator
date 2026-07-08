@@ -200,7 +200,11 @@ settings-privacy-title = Privacy &amp; security
 settings-privacy-sub = blocks ads and trackers by default.
 settings-privacy-content-blocking = Content blocking
 settings-privacy-block-ads = Block ads &amp; trackers
-settings-privacy-ads-blocked = ad/tracker request(s) blocked this session.
+settings-privacy-ads-blocked =
+    { $count ->
+        [one] { $count } ad/tracker request blocked this session.
+       *[other] { $count } ad/tracker requests blocked this session.
+    }
 settings-privacy-software-updates = Software updates
 settings-privacy-update-version = Currently on version
 settings-privacy-update-desc = checks for a newer release in the background &mdash; it never downloads or installs on its own.
@@ -262,7 +266,11 @@ profiles-create = Create &amp; open
 profiles-current = current:
 profiles-link-welcome = welcome
 why-title = Block receipt
-why-sub = request(s) the ad/tracker blocker stopped on the page you were viewing, grouped by host. Computed on-device; nothing left the machine.
+why-sub =
+    { $count ->
+        [one] { $count } request the ad/tracker blocker stopped on the page you were viewing, grouped by host. Computed on-device; nothing left the machine.
+       *[other] { $count } requests the ad/tracker blocker stopped on the page you were viewing, grouped by host. Computed on-device; nothing left the machine.
+    }
 why-link-exposure = See the session-wide tracker map
 why-empty = <p class="empty">Nothing was blocked on that page.</p>
 export-title = Export your data
@@ -294,3 +302,55 @@ onboarding-fine = NavGator only checks whether a newer version exists — it nev
 update-freq-never = Never
 update-freq-hourly = Hourly
 update-freq-daily = Daily
+
+## Plural stats (gator pages)
+exposure-sites =
+    { $count ->
+        [one] { $count } site
+       *[other] { $count } sites
+    }
+exposure-blocks =
+    { $count ->
+        [one] { $count } block
+       *[other] { $count } blocks
+    }
+trail-reached-sites =
+    { $count ->
+        [one] reached from { $count } site
+       *[other] reached from { $count } sites
+    }
+trail-hops =
+    { $count ->
+        [one] { $count } hop
+       *[other] { $count } hops
+    }
+spaces-tab-count =
+    { $count ->
+        [one] { $count } tab
+       *[other] { $count } tabs
+    }
+
+## Profiles (delete confirmation)
+profiles-delete-confirm = Delete profile <b>{ $name }</b>? This permanently erases its cookies, saved logins, history, autofill and settings — it can't be undone.
+profiles-delete-btn = Delete permanently
+
+## Autofill form
+autofill-field-full-name = Full name
+autofill-field-email = Email
+autofill-field-phone = Phone
+autofill-field-organization = Organization
+autofill-field-address1 = Street address
+autofill-field-address2 = Address line 2
+autofill-field-city = City
+autofill-field-region = State / Region
+autofill-field-postal-code = Postal code
+autofill-field-country = Country
+autofill-field-cc-name = Cardholder name
+autofill-field-cc-number = Card number
+autofill-field-cc-exp-month = Exp month (MM)
+autofill-field-cc-exp-year = Exp year (YYYY)
+autofill-h-contact = Contact
+autofill-h-address = Address
+autofill-h-payment = Payment card
+autofill-cvc-hint = — the security code (CVC) is never stored
+autofill-save = Save profile

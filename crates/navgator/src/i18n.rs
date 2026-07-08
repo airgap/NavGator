@@ -165,11 +165,50 @@ mod tests {
         assert_eq!(tr("toolbar-settings"), "设置");
         set_locale("en-GB");
         assert_eq!(tr("toolbar-minimize"), "Minimise");
+        // Catalog plural blocks must parse + select correctly per locale (else these fall back to
+        // en-US). Russian: count 2 = "few", count 5 = "many".
+        let count = |n: i64| {
+            let mut a = FluentArgs::new();
+            a.set("count", n);
+            a
+        };
+        set_locale("ru");
+        assert_eq!(tr_args("exposure-sites", &count(2)), "2 сайта");
+        assert_eq!(tr_args("exposure-sites", &count(5)), "5 сайтов");
+        set_locale("en-US");
+        assert_eq!(tr_args("exposure-sites", &count(1)), "1 site");
+        assert_eq!(tr_args("exposure-sites", &count(3)), "3 sites");
         // A missing key falls back to en-US, then to the key itself.
         set_locale("es");
         assert_eq!(tr("no-such-key-exists"), "no-such-key-exists");
         set_locale("en-US");
         assert_eq!(tr("toolbar-back"), "Back");
+    }
+
+    #[test]
+    fn fluent_plurals_select_by_locale() {
+        // Verify CLDR plural-category selection works per locale (en = one/other; ru = one/few/many).
+        fn pick(tag: &str, ftl: &str, n: i64) -> String {
+            let res = FluentResource::try_new(ftl.to_string()).unwrap();
+            let mut bundle = FluentBundle::new(vec![tag.parse().unwrap()]);
+            bundle.set_use_isolating(false);
+            bundle.add_resource(res).unwrap();
+            let msg = bundle.get_message("m").unwrap();
+            let mut args = FluentArgs::new();
+            args.set("n", n);
+            let mut errors = Vec::new();
+            bundle
+                .format_pattern(msg.value().unwrap(), Some(&args), &mut errors)
+                .into_owned()
+        }
+        let en = "m =\n    { $n ->\n        [one] one\n       *[other] other\n    }";
+        assert_eq!(pick("en", en, 1), "one");
+        assert_eq!(pick("en", en, 5), "other");
+        let ru = "m =\n    { $n ->\n        [one] one\n        [few] few\n        [many] many\n       *[other] other\n    }";
+        assert_eq!(pick("ru", ru, 1), "one");
+        assert_eq!(pick("ru", ru, 2), "few");
+        assert_eq!(pick("ru", ru, 5), "many");
+        assert_eq!(pick("ru", ru, 21), "one");
     }
 
     #[test]
