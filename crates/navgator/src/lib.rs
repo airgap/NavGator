@@ -63,6 +63,19 @@ use navgator_engine::http::{
 };
 use navgator_protocol::IpcCommand;
 
+/// Localized-string lookup: `tr!("key")`, or `tr!("key", name = value)` for interpolation.
+/// Resolves against the active locale's Fluent catalog with an en-US fallback (see [`i18n`]).
+#[macro_export]
+macro_rules! tr {
+    ($key:expr $(,)?) => { $crate::i18n::tr($key) };
+    ($key:expr, $($name:ident = $val:expr),+ $(,)?) => {{
+        let mut args = ::fluent::FluentArgs::new();
+        $( args.set(stringify!($name), $val); )+
+        $crate::i18n::tr_args($key, &args)
+    }};
+}
+
+mod i18n;
 mod sync;
 mod password;
 mod autofill;
@@ -151,6 +164,9 @@ pub fn desktop_main() -> Result<(), Box<dyn Error>> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");
+
+    // Activate the closest shipped locale to the OS setting (overridable in gator://settings).
+    i18n::init_from_system();
 
     let event_loop = EventLoop::with_user_event().build()?;
 
@@ -6373,17 +6389,17 @@ impl AppState {
                 ui.set_min_height(omni_h);
                 let navpal = self.browser.settings.borrow().theme.palette();
                 let (cb, cf) = self.active_nav();
-                if icon_button(ui, cb, "Back", &navpal, icon::back).clicked() {
+                if icon_button(ui, cb, &tr!("toolbar-back"), &navpal, icon::back).clicked() {
                     if let Some(t) = self.active_tab() {
                         t.go_back(1);
                     }
                 }
-                if icon_button(ui, cf, "Forward", &navpal, icon::forward).clicked() {
+                if icon_button(ui, cf, &tr!("toolbar-forward"), &navpal, icon::forward).clicked() {
                     if let Some(t) = self.active_tab() {
                         t.go_forward(1);
                     }
                 }
-                if icon_button(ui, true, "Reload", &navpal, icon::reload).clicked() {
+                if icon_button(ui, true, &tr!("toolbar-reload"), &navpal, icon::reload).clicked() {
                     if let Some(t) = self.active_tab() {
                         t.reload();
                     }
@@ -6397,14 +6413,15 @@ impl AppState {
                         self.window.request_redraw();
                     }
                     let maxed = self.window.is_maximized();
-                    if icon_button(ui, true, if maxed { "Restore" } else { "Maximize" }, &pal, |p, r, c| {
+                    let max_tip = if maxed { tr!("toolbar-restore") } else { tr!("toolbar-maximize") };
+                    if icon_button(ui, true, &max_tip, &pal, |p, r, c| {
                         icon::maximize(p, r, c, maxed)
                     })
                     .clicked()
                     {
                         self.window.set_maximized(!maxed);
                     }
-                    if icon_button(ui, true, "Minimize", &pal, icon::minimize).clicked() {
+                    if icon_button(ui, true, &tr!("toolbar-minimize"), &pal, icon::minimize).clicked() {
                         self.window.set_minimized(true);
                     }
                     // The ONLY draggable region: a reserved handle just left of the window controls
@@ -6413,7 +6430,7 @@ impl AppState {
                         ui.allocate_exact_size(egui::vec2(40.0, 24.0), egui::Sense::hover());
                     self.drag_rect.set(drag_handle);
                     {
-                        let menu_resp = icon_button(ui, true, "Settings", &pal, icon::gear);
+                        let menu_resp = icon_button(ui, true, &tr!("toolbar-settings"), &pal, icon::gear);
                         if menu_resp.clicked() {
                             self.navigate_from_omnibox("gator://settings");
                         }
@@ -6484,7 +6501,7 @@ impl AppState {
                             let cur = self.location.borrow().clone();
                             self.browser.addons.borrow().enabled_matching(&cur).len()
                         };
-                        let r = icon_button(ui, true, "Userscripts / add-ons", &pal, icon::addons);
+                        let r = icon_button(ui, true, &tr!("toolbar-userscripts"), &pal, icon::addons);
                         self.addon_badge_rect.set(r.rect);
                         if active_count > 0 {
                             let p = ui.painter();
@@ -6503,13 +6520,13 @@ impl AppState {
                         }
                     }
                     if self.browser.password_store.borrow().is_unlocked() {
-                        if icon_button(ui, true, "Save this page's login", &pal, icon::key).clicked() {
+                        if icon_button(ui, true, &tr!("toolbar-save-login"), &pal, icon::key).clicked() {
                             self.save_login_active();
                         }
                     } else {
                         // Locked: a key button opens the passphrase overlay (unlocks the vault for
                         // saved logins + autofill, LYK-1371).
-                        let resp = icon_button(ui, false, "Unlock vault (passwords + autofill)", &pal, icon::key);
+                        let resp = icon_button(ui, false, &tr!("toolbar-unlock-vault"), &pal, icon::key);
                         self.unlock_anchor.set(resp.rect);
                         if resp.clicked() {
                             self.show_unlock.set(!self.show_unlock.get());
@@ -6627,7 +6644,7 @@ impl AppState {
                                             .id(id)
                                             .frame(egui::Frame::NONE)
                                             .vertical_align(egui::Align::Center)
-                                            .hint_text("Search, enter URL, or type  >  for commands"),
+                                            .hint_text(tr!("omnibox-hint")),
                                     )
                                 },
                             )

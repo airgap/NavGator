@@ -89,6 +89,13 @@ adblock = { version = "0.12", default-features = false, features = ["embedded-do
 # engine's image stack), so tiles render from a local cache instead of a live network fetch.
 png = "0.18"
 
+# Localization (i18n): Fluent catalogs per locale + system-locale detection. Fluent is the
+# browser-standard (Firefox/Servo) message format — handles plurals/interpolation and is
+# extensible to more locales (LYK i18n).
+fluent = "0.16"
+unic-langid = { version = "0.9", features = ["macros"] }
+sys-locale = "0.3"
+
 # OS keyring (Linux Secret Service) for remembering the sync passphrase. Optional at
 # runtime — all calls degrade to manual unlock if no secret-service is available.
 # Pure-rust crypto (no system OpenSSL dep); zbus is already in the cache transitively.
