@@ -230,3 +230,63 @@ welcome-note-add-placeholder = Add a note, press Enter&hellip;
 welcome-reading-list-heading = Reading list
 welcome-read-add-placeholder = Add a link or note, press Enter&hellip;
 
+
+## gator:// pages (inline)
+exposure-title = Exposure
+exposure-heading = exposure
+exposure-sub = Trackers blocked this session, ranked by how many sites they tried to follow you across. Nothing leaves your machine.
+exposure-empty = <div class="note">No trackers blocked yet this session. Browse a few sites and come back — this page maps which trackers tried to follow you across them.</div>
+exposure-link-trail = how you got here
+exposure-link-why = this page's receipt
+exposure-link-welcome = welcome
+trail-title = Trail
+trail-heading = trail
+trail-sub = How you got here: cross-site navigations this session, grouped by destination. Nothing leaves your machine.
+trail-empty = <div class="note">No cross-site navigations yet this session. Follow some links across different sites and come back — this traces how you arrived at each one.</div>
+trail-link-exposure = tracker map
+trail-link-welcome = welcome
+spaces-title = Spaces
+spaces-heading = spaces
+spaces-sub = Workspaces group tabs and tint the whole browser. Edit a name inline (Enter to save), switch, or delete. Ctrl+Shift+E cycles.
+spaces-new = New space
+spaces-placeholder = e.g. Work, Research
+spaces-create = Create &amp; switch
+spaces-link-welcome = welcome
+pdf-downloads = Downloads
+pdf-cannot-open = Could not open this PDF:
+profiles-title = Profiles
+profiles-heading = profiles
+profiles-sub = Each profile is a separate identity — its own cookies, history, saved logins, autofill and highlights. Opening one launches a new window.
+profiles-new = New profile
+profiles-placeholder = e.g. work, personal
+profiles-create = Create &amp; open
+profiles-current = current:
+profiles-link-welcome = welcome
+why-title = Block receipt
+why-sub = request(s) the ad/tracker blocker stopped on the page you were viewing, grouped by host. Computed on-device; nothing left the machine.
+why-link-exposure = See the session-wide tracker map
+why-empty = <p class="empty">Nothing was blocked on that page.</p>
+export-title = Export your data
+export-lead = Your data is yours. Download a portable, human-readable copy — no account, no lock-in.
+export-bookmarks = bookmarks
+export-history = history entries
+export-settings = chrome settings &amp; theme
+export-download = Download everything (.json)
+export-note = Not yet included: saved passwords (in the encrypted vault — a separate encrypted-archive export is planned) and the new-tab notes/reading-list (stored in the page's own localStorage).
+autofill-title = Autofill
+autofill-heading = autofill
+autofill-sub-1 = One saved identity, encrypted with your vault. Press
+autofill-sub-2 = on any page to fill its address &amp; card fields.
+autofill-link-welcome = welcome
+autofill-locked = <div class="note">Your autofill profile is protected by your vault. Unlock it in <a href="gator://settings#privacy">Settings → Privacy &amp; security</a> (the same passphrase as saved passwords), then reload this page.</div>
+onboarding-title = Welcome to NavGator
+onboarding-heading = Welcome to
+onboarding-sub = A privacy-first browser. Two quick choices and you're set — everything's changeable later in Settings.
+onboarding-search = Search engine
+onboarding-updates = Check for updates
+onboarding-privacy = Privacy
+onboarding-block-ads = Block ads &amp; trackers
+onboarding-recommended = (recommended)
+onboarding-get-started = Get started
+onboarding-skip = Skip for now
+onboarding-fine = NavGator only checks whether a newer version exists — it never downloads or installs updates on its own.

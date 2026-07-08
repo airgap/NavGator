@@ -226,3 +226,63 @@ welcome-notes-heading = Notes
 welcome-note-add-placeholder = Ajoutez une note, appuyez sur Entrée&hellip;
 welcome-reading-list-heading = Liste de lecture
 welcome-read-add-placeholder = Ajoutez un lien ou une note, appuyez sur Entrée&hellip;
+
+## gator:// pages (inline)
+exposure-title = Exposition
+exposure-heading = exposition
+exposure-sub = Traqueurs bloqués pendant cette session, classés selon le nombre de sites sur lesquels ils ont tenté de vous suivre. Rien ne quitte votre machine.
+exposure-empty = <div class="note">Aucun traqueur bloqué pour l'instant durant cette session. Parcourez quelques sites puis revenez — cette page recense les traqueurs qui ont tenté de vous suivre d'un site à l'autre.</div>
+exposure-link-trail = comment vous êtes arrivé ici
+exposure-link-why = le reçu de cette page
+exposure-link-welcome = bienvenue
+trail-title = Parcours
+trail-heading = parcours
+trail-sub = Comment vous êtes arrivé ici : navigations inter-sites de cette session, regroupées par destination. Rien ne quitte votre machine.
+trail-empty = <div class="note">Aucune navigation inter-sites pour l'instant durant cette session. Suivez quelques liens vers différents sites puis revenez — ceci retrace la manière dont vous êtes parvenu à chacun d'eux.</div>
+trail-link-exposure = carte des traqueurs
+trail-link-welcome = bienvenue
+spaces-title = Espaces
+spaces-heading = espaces
+spaces-sub = Les espaces de travail regroupent les onglets et teintent tout le navigateur. Modifiez un nom sur place (Entrée pour enregistrer), changez d'espace ou supprimez-en un. Ctrl+Shift+E fait défiler.
+spaces-new = Nouvel espace
+spaces-placeholder = ex. Travail, Recherche
+spaces-create = Créer &amp; basculer
+spaces-link-welcome = bienvenue
+pdf-downloads = Téléchargements
+pdf-cannot-open = Impossible d'ouvrir ce PDF :
+profiles-title = Profils
+profiles-heading = profils
+profiles-sub = Chaque profil est une identité distincte — ses propres cookies, historique, identifiants enregistrés, saisie automatique et surlignages. En ouvrir un lance une nouvelle fenêtre.
+profiles-new = Nouveau profil
+profiles-placeholder = ex. travail, personnel
+profiles-create = Créer &amp; ouvrir
+profiles-current = actuel :
+profiles-link-welcome = bienvenue
+why-title = Reçu de blocage
+why-sub = requête(s) que le bloqueur de pubs/traqueurs a arrêtée(s) sur la page que vous consultiez, regroupée(s) par hôte. Calculé sur l'appareil ; rien n'a quitté la machine.
+why-link-exposure = Voir la carte des traqueurs de toute la session
+why-empty = <p class="empty">Rien n'a été bloqué sur cette page.</p>
+export-title = Exporter vos données
+export-lead = Vos données vous appartiennent. Téléchargez-en une copie portable et lisible — sans compte, sans enfermement.
+export-bookmarks = favoris
+export-history = entrées d'historique
+export-settings = paramètres du navigateur &amp; thème
+export-download = Tout télécharger (.json)
+export-note = Pas encore inclus : les mots de passe enregistrés (dans le coffre chiffré — un export séparé sous forme d'archive chiffrée est prévu) et les notes/liste de lecture du nouvel onglet (stockées dans le localStorage propre à la page).
+autofill-title = Saisie automatique
+autofill-heading = saisie automatique
+autofill-sub-1 = Une seule identité enregistrée, chiffrée avec votre coffre. Appuyez sur
+autofill-sub-2 = sur n'importe quelle page pour remplir ses champs d'adresse &amp; de carte.
+autofill-link-welcome = bienvenue
+autofill-locked = <div class="note">Votre profil de saisie automatique est protégé par votre coffre. Déverrouillez-le dans <a href="gator://settings#privacy">Paramètres → Confidentialité &amp; sécurité</a> (la même phrase secrète que pour les mots de passe enregistrés), puis rechargez cette page.</div>
+onboarding-title = Bienvenue dans NavGator
+onboarding-heading = Bienvenue dans
+onboarding-sub = Un navigateur qui privilégie la confidentialité. Deux choix rapides et le tour est joué — tout reste modifiable ensuite dans les Paramètres.
+onboarding-search = Moteur de recherche
+onboarding-updates = Rechercher des mises à jour
+onboarding-privacy = Confidentialité
+onboarding-block-ads = Bloquer les pubs &amp; les traqueurs
+onboarding-recommended = (recommandé)
+onboarding-get-started = Commencer
+onboarding-skip = Ignorer pour l'instant
+onboarding-fine = NavGator vérifie uniquement si une version plus récente existe — il ne télécharge ni n'installe jamais de mises à jour de lui-même.

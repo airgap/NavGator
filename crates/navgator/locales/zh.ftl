@@ -226,3 +226,63 @@ welcome-notes-heading = 笔记
 welcome-note-add-placeholder = 添加笔记，按 Enter&hellip;
 welcome-reading-list-heading = 阅读列表
 welcome-read-add-placeholder = 添加链接或笔记，按 Enter&hellip;
+
+## gator:// pages (inline)
+exposure-title = 曝光
+exposure-heading = 曝光
+exposure-sub = 本次会话中被拦截的追踪器，按它们试图在多少个网站上跨站追踪你来排序。任何数据都不会离开你的设备。
+exposure-empty = <div class="note">本次会话尚未拦截任何追踪器。浏览几个网站后再回来——本页会标出哪些追踪器试图跨站追踪你。</div>
+exposure-link-trail = 你是怎么来到这里的
+exposure-link-why = 本页的拦截记录
+exposure-link-welcome = 欢迎
+trail-title = 足迹
+trail-heading = 足迹
+trail-sub = 你是怎么来到这里的：本次会话中的跨站导航，按目标站点分组。任何数据都不会离开你的设备。
+trail-empty = <div class="note">本次会话尚无跨站导航。在不同网站间点几个链接后再回来——本页会追溯你是如何到达每个站点的。</div>
+trail-link-exposure = 追踪器地图
+trail-link-welcome = 欢迎
+spaces-title = 空间
+spaces-heading = 空间
+spaces-sub = 工作空间用来分组标签页并为整个浏览器着色。可就地编辑名称（按 Enter 保存）、切换或删除。Ctrl+Shift+E 可循环切换。
+spaces-new = 新建空间
+spaces-placeholder = 例如：工作、研究
+spaces-create = 创建 &amp; 切换
+spaces-link-welcome = 欢迎
+pdf-downloads = 下载
+pdf-cannot-open = 无法打开此 PDF：
+profiles-title = 配置文件
+profiles-heading = 配置文件
+profiles-sub = 每个配置文件都是一个独立身份——拥有各自的 Cookie、历史记录、已保存的登录信息、自动填充和高亮内容。打开一个会启动一个新窗口。
+profiles-new = 新建配置文件
+profiles-placeholder = 例如：工作、个人
+profiles-create = 创建 &amp; 打开
+profiles-current = 当前：
+profiles-link-welcome = 欢迎
+why-title = 拦截记录
+why-sub = 个请求被广告/追踪器拦截器在你正浏览的页面上拦截，按主机分组。在设备本地计算；任何数据都不会离开你的设备。
+why-link-exposure = 查看整个会话的追踪器地图
+why-empty = <p class="empty">该页面上没有拦截任何内容。</p>
+export-title = 导出你的数据
+export-lead = 你的数据属于你。下载一份可移植、人类可读的副本——无需账户，也不会被锁定。
+export-bookmarks = 个书签
+export-history = 条历史记录
+export-settings = 浏览器设置 &amp; 主题
+export-download = 下载全部（.json）
+export-note = 暂未包含：已保存的密码（存放在加密保险库中——计划另行提供加密归档导出）以及新标签页的笔记/阅读列表（存储在页面自身的 localStorage 中）。
+autofill-title = 自动填充
+autofill-heading = 自动填充
+autofill-sub-1 = 一份已保存的身份信息，用你的保险库加密。在任意页面上按
+autofill-sub-2 = 即可填充其地址 &amp; 银行卡字段。
+autofill-link-welcome = 欢迎
+autofill-locked = <div class="note">你的自动填充配置受保险库保护。请在 <a href="gator://settings#privacy">设置 → 隐私 &amp; 安全</a> 中解锁（与已保存密码使用相同的口令），然后重新加载本页。</div>
+onboarding-title = 欢迎使用 NavGator
+onboarding-heading = 欢迎使用
+onboarding-sub = 一款隐私优先的浏览器。做两个快速选择即可完成设置——之后都可以在设置中更改。
+onboarding-search = 搜索引擎
+onboarding-updates = 检查更新
+onboarding-privacy = 隐私
+onboarding-block-ads = 拦截广告 &amp; 追踪器
+onboarding-recommended = （推荐）
+onboarding-get-started = 开始使用
+onboarding-skip = 暂时跳过
+onboarding-fine = NavGator 只会检查是否存在更新版本——绝不会自行下载或安装更新。

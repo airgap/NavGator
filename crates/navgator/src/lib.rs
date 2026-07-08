@@ -4001,8 +4001,11 @@ impl AppState {
         for (k, v) in vars {
             html = html.replace(k, &v);
         }
-        // Resolve `{{i18n-key}}` tokens in the page prose to the active locale (LYK i18n).
-        localize_html(&html).into_bytes()
+        // Resolve `{{i18n-key}}` tokens in the page prose to the active locale, and stamp the
+        // document language so `<html lang>` matches (screen readers / hyphenation) (LYK i18n).
+        localize_html(&html)
+            .replacen("lang=\"en\"", &format!("lang=\"{}\"", i18n::current_locale()), 1)
+            .into_bytes()
     }
 
     fn render_gator_welcome(&self) -> Vec<u8> {
@@ -4157,9 +4160,7 @@ impl AppState {
         let body = {
             let prov = self.browser.tracker_provenance.borrow();
             if prov.is_empty() {
-                "<div class=\"note\">No trackers blocked yet this session. Browse a few sites and \
-                 come back — this page maps which trackers tried to follow you across them.</div>"
-                    .to_string()
+                tr!("exposure-empty")
             } else {
                 let mut rows: Vec<(&String, usize, u32, Vec<(&String, u32)>)> = prov
                     .iter()
@@ -4196,8 +4197,14 @@ impl AppState {
                 format!("<div class=\"list\">{out}</div>")
             }
         };
+        let title = tr!("exposure-title");
+        let heading = tr!("exposure-heading");
+        let sub = tr!("exposure-sub");
+        let link_trail = tr!("exposure-link-trail");
+        let link_why = tr!("exposure-link-why");
+        let link_welcome = tr!("exposure-link-welcome");
         let html = format!(
-            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Exposure &middot; NavGator</title>\
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{title} &middot; NavGator</title>\
              <style>\
              body{{font:15px/1.5 var(--font,system-ui),sans-serif;color:var(--fg);background:var(--bg);\
              margin:0;padding:40px 24px;display:flex;justify-content:center}}\
@@ -4215,13 +4222,12 @@ impl AppState {
              .note{{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:24px;color:var(--muted)}}\
              a{{color:{accent}}} footer{{margin-top:38px;color:var(--muted);font-size:12px}}\
              </style></head><body><div class=\"wrap\">\
-             <h1>Nav<span class=\"g\">Gator</span> exposure</h1>\
-             <p class=\"sub\">Trackers blocked this session, ranked by how many sites they tried to \
-             follow you across. Nothing leaves your machine.</p>\
+             <h1>Nav<span class=\"g\">Gator</span> {heading}</h1>\
+             <p class=\"sub\">{sub}</p>\
              {body}\
-             <footer>gator://exposure &middot; <a href=\"gator://trail\">how you got here</a> &middot; \
-             <a href=\"gator://why\">this page's receipt</a> &middot; \
-             <a href=\"gator://welcome\">welcome</a></footer>\
+             <footer>gator://exposure &middot; <a href=\"gator://trail\">{link_trail}</a> &middot; \
+             <a href=\"gator://why\">{link_why}</a> &middot; \
+             <a href=\"gator://welcome\">{link_welcome}</a></footer>\
              </div></body></html>"
         );
         self.themed(html)
@@ -4235,9 +4241,7 @@ impl AppState {
         let body = {
             let graph = self.browser.nav_graph.borrow();
             if graph.is_empty() {
-                "<div class=\"note\">No cross-site navigations yet this session. Follow some links \
-                 across different sites and come back — this traces how you arrived at each one.</div>"
-                    .to_string()
+                tr!("trail-empty")
             } else {
                 let mut rows: Vec<(&String, usize, u32, Vec<(&String, u32)>)> = graph
                     .iter()
@@ -4273,8 +4277,13 @@ impl AppState {
                 format!("<div class=\"list\">{out}</div>")
             }
         };
+        let title = tr!("trail-title");
+        let heading = tr!("trail-heading");
+        let sub = tr!("trail-sub");
+        let link_exposure = tr!("trail-link-exposure");
+        let link_welcome = tr!("trail-link-welcome");
         let html = format!(
-            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Trail &middot; NavGator</title>\
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{title} &middot; NavGator</title>\
              <style>\
              body{{font:15px/1.5 var(--font,system-ui),sans-serif;color:var(--fg);background:var(--bg);\
              margin:0;padding:40px 24px;display:flex;justify-content:center}}\
@@ -4292,12 +4301,11 @@ impl AppState {
              .note{{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:24px;color:var(--muted)}}\
              a{{color:{accent}}} footer{{margin-top:38px;color:var(--muted);font-size:12px}}\
              </style></head><body><div class=\"wrap\">\
-             <h1>Nav<span class=\"g\">Gator</span> trail</h1>\
-             <p class=\"sub\">How you got here: cross-site navigations this session, grouped by \
-             destination. Nothing leaves your machine.</p>\
+             <h1>Nav<span class=\"g\">Gator</span> {heading}</h1>\
+             <p class=\"sub\">{sub}</p>\
              {body}\
-             <footer>gator://trail &middot; <a href=\"gator://exposure\">tracker map</a> &middot; \
-             <a href=\"gator://welcome\">welcome</a></footer>\
+             <footer>gator://trail &middot; <a href=\"gator://exposure\">{link_exposure}</a> &middot; \
+             <a href=\"gator://welcome\">{link_welcome}</a></footer>\
              </div></body></html>"
         );
         self.themed(html)
@@ -4355,8 +4363,15 @@ impl AppState {
                 )
             })
             .collect();
+        let title = tr!("spaces-title");
+        let heading = tr!("spaces-heading");
+        let sub = tr!("spaces-sub");
+        let newspace = tr!("spaces-new");
+        let placeholder = tr!("spaces-placeholder");
+        let create = tr!("spaces-create");
+        let link_welcome = tr!("spaces-link-welcome");
         let html = format!(
-            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Spaces &middot; NavGator</title>\
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{title} &middot; NavGator</title>\
              <style>\
              body{{font:15px/1.5 var(--font,system-ui),sans-serif;color:var(--fg);background:var(--bg);\
              margin:0;padding:40px 24px;display:flex;justify-content:center}}\
@@ -4380,15 +4395,14 @@ impl AppState {
              .new button{{font:600 14px system-ui;padding:9px 16px;border-radius:9px;border:none;background:{accent};color:#0b0b0b;cursor:pointer}}\
              a{{color:{accent}}} footer{{margin-top:30px;color:var(--muted);font-size:12px}}\
              </style></head><body><div class=\"wrap\">\
-             <h1>Nav<span class=\"g\">Gator</span> spaces</h1>\
-             <p class=\"sub\">Workspaces group tabs and tint the whole browser. Edit a name inline \
-             (Enter to save), switch, or delete. Ctrl+Shift+E cycles.</p>\
+             <h1>Nav<span class=\"g\">Gator</span> {heading}</h1>\
+             <p class=\"sub\">{sub}</p>\
              <div class=\"list\">{rows}</div>\
-             <h2>New space</h2>\
+             <h2>{newspace}</h2>\
              <form class=\"new\" method=\"get\" action=\"gator://spaces\">\
-             <input name=\"new\" placeholder=\"e.g. Work, Research\" autocomplete=\"off\" spellcheck=\"false\">\
-             <button type=\"submit\">Create &amp; switch</button></form>\
-             <footer>gator://spaces &middot; <a href=\"gator://welcome\">welcome</a></footer>\
+             <input name=\"new\" placeholder=\"{placeholder}\" autocomplete=\"off\" spellcheck=\"false\">\
+             <button type=\"submit\">{create}</button></form>\
+             <footer>gator://spaces &middot; <a href=\"gator://welcome\">{link_welcome}</a></footer>\
              </div></body></html>"
         );
         self.themed(html)
@@ -4431,6 +4445,8 @@ impl AppState {
         let name = file.rsplit('/').next().unwrap_or("document.pdf").to_string();
         let mut data_url = Url::parse("gator://pdf/data").expect("valid");
         data_url.query_pairs_mut().append_pair("file", &file);
+        let downloads = tr!("pdf-downloads");
+        let cannot_open = tr!("pdf-cannot-open");
         let html = format!(
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{name} &middot; NavGator</title>\
              <style>\
@@ -4444,7 +4460,7 @@ impl AppState {
              #err{{padding:48px;text-align:center;color:#f5a524}}\
              </style></head><body>\
              <div class=\"bar\"><span class=\"nm\">{name}</span><span class=\"pg\" id=\"pg\"></span>\
-             <a href=\"gator://downloads\">Downloads</a></div>\
+             <a href=\"gator://downloads\">{downloads}</a></div>\
              <div id=\"pages\"></div><div id=\"err\"></div>\
              <script src=\"gator://pdf/lib.js\"></script>\
              <script>\
@@ -4460,7 +4476,7 @@ impl AppState {
              var c=document.createElement('canvas');c.width=vp.width;c.height=vp.height;\
              c.style.width=(vp.width/dpr)+'px';wrap.appendChild(c);\
              await page.render({{canvasContext:c.getContext('2d'),viewport:vp}}).promise;\
-             }}}}catch(e){{document.getElementById('err').textContent='Could not open this PDF: '+e;}}}})();\
+             }}}}catch(e){{document.getElementById('err').textContent='{cannot_open} '+e;}}}})();\
              </script></body></html>",
             name = html_escape(&name),
             data_url = data_url.as_str(),
@@ -4544,8 +4560,16 @@ impl AppState {
                 )
             })
             .collect();
+        let title = tr!("profiles-title");
+        let heading = tr!("profiles-heading");
+        let sub = tr!("profiles-sub");
+        let newprofile = tr!("profiles-new");
+        let placeholder = tr!("profiles-placeholder");
+        let create = tr!("profiles-create");
+        let current_label = tr!("profiles-current");
+        let link_welcome = tr!("profiles-link-welcome");
         let html = format!(
-            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Profiles &middot; NavGator</title>\
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{title} &middot; NavGator</title>\
              <style>\
              body{{font:15px/1.5 var(--font,system-ui),sans-serif;color:var(--fg);background:var(--bg);\
              margin:0;padding:40px 24px;display:flex;justify-content:center}}\
@@ -4572,17 +4596,16 @@ impl AppState {
              button{{font:600 14px system-ui;padding:9px 16px;border-radius:9px;border:none;background:{accent};color:#0b0b0b;cursor:pointer}}\
              a{{color:{accent}}} footer{{margin-top:34px;color:var(--muted);font-size:12px}}\
              </style></head><body><div class=\"wrap\">\
-             <h1>Nav<span class=\"g\">Gator</span> profiles</h1>\
-             <p class=\"sub\">Each profile is a separate identity — its own cookies, history, saved \
-             logins, autofill and highlights. Opening one launches a new window.</p>\
+             <h1>Nav<span class=\"g\">Gator</span> {heading}</h1>\
+             <p class=\"sub\">{sub}</p>\
              {confirm_html}\
              <div class=\"list\">{rows}</div>\
-             <h2>New profile</h2>\
+             <h2>{newprofile}</h2>\
              <form method=\"get\" action=\"gator://profiles\">\
-             <input name=\"new\" placeholder=\"e.g. work, personal\" autocomplete=\"off\" spellcheck=\"false\">\
-             <button type=\"submit\">Create &amp; open</button></form>\
-             <footer>gator://profiles &middot; current: <strong>{cur}</strong> &middot; \
-             <a href=\"gator://welcome\">welcome</a></footer>\
+             <input name=\"new\" placeholder=\"{placeholder}\" autocomplete=\"off\" spellcheck=\"false\">\
+             <button type=\"submit\">{create}</button></form>\
+             <footer>gator://profiles &middot; {current_label} <strong>{cur}</strong> &middot; \
+             <a href=\"gator://welcome\">{link_welcome}</a></footer>\
              </div></body></html>",
             cur = html_escape(&current),
         );
@@ -4605,7 +4628,7 @@ impl AppState {
             by_host.entry(host).or_default().push(u);
         }
         let body = if total == 0 {
-            "<p class=\"empty\">Nothing was blocked on that page.</p>".to_string()
+            tr!("why-empty")
         } else {
             by_host
                 .iter()
@@ -4622,9 +4645,12 @@ impl AppState {
                 })
                 .collect()
         };
+        let title = tr!("why-title");
+        let sub = tr!("why-sub");
+        let link_exposure = tr!("why-link-exposure");
         let html = format!(
             "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-             <title>Block receipt</title><style>\
+             <title>{title}</title><style>\
              :root{{--accent:__ACCENT__;--bg:__BG__;--panel:__PANEL__;--line:__LINE__;--fg:__FG__;--muted:__MUTED__;}}\
              *{{box-sizing:border-box}}body{{background:var(--bg);color:var(--fg);\
              font:15px/1.5 system-ui,-apple-system,sans-serif;max-width:760px;margin:0 auto;padding:8vh 24px}}\
@@ -4637,10 +4663,9 @@ impl AppState {
              ul{{margin:10px 0 0;padding-left:18px;color:var(--muted);\
              font:12px ui-monospace,monospace;word-break:break-all}}li{{margin:3px 0}}\
              .empty{{color:var(--muted)}}</style></head><body>\
-             <h1>Block receipt</h1>\
-             <p class=\"sub\">{} request(s) the ad/tracker blocker stopped on the page you were \
-             viewing, grouped by host. Computed on-device; nothing left the machine. \
-             <a href=\"gator://exposure\">See the session-wide tracker map &rarr;</a></p>{}</body></html>",
+             <h1>{title}</h1>\
+             <p class=\"sub\">{} {sub} \
+             <a href=\"gator://exposure\">{link_exposure} &rarr;</a></p>{}</body></html>",
             total, body
         );
         self.themed(html)
@@ -4652,8 +4677,15 @@ impl AppState {
             let p = self.browser.profile.borrow();
             (p.bookmarks.len(), p.history.len())
         };
+        let title = tr!("export-title");
+        let lead = tr!("export-lead");
+        let bookmarks = tr!("export-bookmarks");
+        let history = tr!("export-history");
+        let settings = tr!("export-settings");
+        let download = tr!("export-download");
+        let note = tr!("export-note");
         let html = format!(
-            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Export your data</title>\
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>{title}</title>\
              <style>:root{{--accent:__ACCENT__;--bg:__BG__;--panel:__PANEL__;--line:__LINE__;--fg:__FG__;--muted:__MUTED__;}}\
              *{{box-sizing:border-box}}body{{background:var(--bg);color:var(--fg);\
              font:15px/1.6 system-ui,-apple-system,sans-serif;max-width:640px;margin:0 auto;padding:9vh 24px}}\
@@ -4663,14 +4695,12 @@ impl AppState {
              ul{{color:var(--muted);font-size:14px;line-height:1.8}}\
              .note{{margin-top:26px;font-size:13px;color:var(--muted);border-top:1px solid var(--line);padding-top:16px}}\
              </style></head><body>\
-             <h1>Export your data</h1>\
-             <p>Your data is yours. Download a portable, human-readable copy — no account, no lock-in.</p>\
-             <ul><li><span class=\"fg\">{nb}</span> bookmarks</li><li><span class=\"fg\">{nh}</span> history entries</li>\
-             <li>chrome settings &amp; theme</li></ul>\
-             <a class=\"btn\" href=\"gator://export?get=all\">Download everything (.json)</a>\
-             <p class=\"note\">Not yet included: saved passwords (in the encrypted vault — a separate \
-             encrypted-archive export is planned) and the new-tab notes/reading-list (stored in the \
-             page's own localStorage).</p></body></html>"
+             <h1>{title}</h1>\
+             <p>{lead}</p>\
+             <ul><li><span class=\"fg\">{nb}</span> {bookmarks}</li><li><span class=\"fg\">{nh}</span> {history}</li>\
+             <li>{settings}</li></ul>\
+             <a class=\"btn\" href=\"gator://export?get=all\">{download}</a>\
+             <p class=\"note\">{note}</p></body></html>"
         );
         self.themed(html)
     }
@@ -4795,10 +4825,7 @@ impl AppState {
     fn render_gator_autofill(&self) -> Vec<u8> {
         let unlocked = self.browser.autofill_store.borrow().is_unlocked();
         let inner = if !unlocked {
-            "<div class=\"note\">Your autofill profile is protected by your vault. \
-             Unlock it in <a href=\"gator://settings#privacy\">Settings → Privacy &amp; security</a> \
-             (the same passphrase as saved passwords), then reload this page.</div>"
-                .to_string()
+            tr!("autofill-locked")
         } else {
             let store = self.browser.autofill_store.borrow();
             let p = store.profile();
@@ -4836,8 +4863,13 @@ impl AppState {
             )
         };
         let accent = self.browser.settings.borrow().accent.clone();
+        let title = tr!("autofill-title");
+        let heading = tr!("autofill-heading");
+        let sub1 = tr!("autofill-sub-1");
+        let sub2 = tr!("autofill-sub-2");
+        let link_welcome = tr!("autofill-link-welcome");
         let html = format!(
-            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Autofill · NavGator</title>\
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{title} · NavGator</title>\
              <style>\
              body{{font:15px/1.5 var(--font,system-ui),sans-serif;color:var(--fg);\
              background:var(--bg);margin:0;padding:40px 24px;display:flex;justify-content:center}}\
@@ -4858,11 +4890,11 @@ impl AppState {
              padding:24px;color:var(--muted)}} a{{color:{accent}}}\
              footer{{margin-top:38px;color:var(--muted);font-size:12px}}\
              </style></head><body><div class=\"wrap\">\
-             <h1>Nav<span class=\"g\">Gator</span> autofill</h1>\
-             <p class=\"sub\">One saved identity, encrypted with your vault. Press \
-             <strong>Ctrl+Shift+A</strong> on any page to fill its address &amp; card fields.</p>\
+             <h1>Nav<span class=\"g\">Gator</span> {heading}</h1>\
+             <p class=\"sub\">{sub1} \
+             <strong>Ctrl+Shift+A</strong> {sub2}</p>\
              {inner}\
-             <footer>gator://autofill &middot; <a href=\"gator://welcome\">welcome</a></footer>\
+             <footer>gator://autofill &middot; <a href=\"gator://welcome\">{link_welcome}</a></footer>\
              </div></body></html>"
         );
         self.themed(html)
@@ -5482,8 +5514,19 @@ impl AppState {
             })
             .collect();
         let ads_checked = if cur_ads { " checked" } else { "" };
+        let title = tr!("onboarding-title");
+        let heading = tr!("onboarding-heading");
+        let sub = tr!("onboarding-sub");
+        let search = tr!("onboarding-search");
+        let updates = tr!("onboarding-updates");
+        let privacy = tr!("onboarding-privacy");
+        let block_ads = tr!("onboarding-block-ads");
+        let recommended = tr!("onboarding-recommended");
+        let get_started = tr!("onboarding-get-started");
+        let skip = tr!("onboarding-skip");
+        let fine = tr!("onboarding-fine");
         let html = format!(
-            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Welcome to NavGator</title>\
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{title}</title>\
              <style>\
              body{{font:15px/1.5 var(--font,system-ui),sans-serif;color:var(--fg);background:var(--bg);\
              margin:0;padding:8vh 24px 40px;display:flex;justify-content:center}}\
@@ -5504,21 +5547,19 @@ impl AppState {
              .skip{{color:var(--muted);text-decoration:none;font-size:14px}} .skip:hover{{color:var(--fg)}}\
              .fine{{color:var(--muted);font-size:12px;margin-top:22px}}\
              </style></head><body><div class=\"wrap\">\
-             <h1>Welcome to Nav<span class=\"g\">Gator</span></h1>\
-             <p class=\"sub\">A privacy-first browser. Two quick choices and you're set — \
-             everything's changeable later in Settings.</p>\
+             <h1>{heading} Nav<span class=\"g\">Gator</span></h1>\
+             <p class=\"sub\">{sub}</p>\
              <form method=\"get\" action=\"gator://onboarding\">\
              <input type=\"hidden\" name=\"done\" value=\"1\">\
-             <div class=\"card\"><h2>Search engine</h2><div class=\"opts\">{engines}</div></div>\
-             <div class=\"card\"><h2>Check for updates</h2><div class=\"opts\">{freqs}</div></div>\
-             <div class=\"card\"><h2>Privacy</h2><div class=\"opts\">\
+             <div class=\"card\"><h2>{search}</h2><div class=\"opts\">{engines}</div></div>\
+             <div class=\"card\"><h2>{updates}</h2><div class=\"opts\">{freqs}</div></div>\
+             <div class=\"card\"><h2>{privacy}</h2><div class=\"opts\">\
              <label class=\"opt\"><input type=\"checkbox\" name=\"block_ads\" value=\"on\"{ads_checked}>\
-             <span>Block ads &amp; trackers <b>(recommended)</b></span></label></div></div>\
-             <div class=\"actions\"><button type=\"submit\">Get started &rarr;</button>\
-             <a class=\"skip\" href=\"gator://onboarding?skip=1\">Skip for now</a></div>\
+             <span>{block_ads} <b>{recommended}</b></span></label></div></div>\
+             <div class=\"actions\"><button type=\"submit\">{get_started} &rarr;</button>\
+             <a class=\"skip\" href=\"gator://onboarding?skip=1\">{skip}</a></div>\
              </form>\
-             <p class=\"fine\">NavGator only checks whether a newer version exists — it never \
-             downloads or installs updates on its own.</p>\
+             <p class=\"fine\">{fine}</p>\
              </div></body></html>"
         );
         self.themed(html)

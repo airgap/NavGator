@@ -228,3 +228,63 @@ welcome-notes-heading = Notas
 welcome-note-add-placeholder = Añade una nota, presiona Enter&hellip;
 welcome-reading-list-heading = Lista de lectura
 welcome-read-add-placeholder = Añade un enlace o nota, presiona Enter&hellip;
+
+## gator:// pages (inline)
+exposure-title = Exposición
+exposure-heading = exposición
+exposure-sub = Rastreadores bloqueados en esta sesión, ordenados según cuántos sitios intentaron usar para seguirte. Nada sale de tu equipo.
+exposure-empty = <div class="note">Aún no se ha bloqueado ningún rastreador en esta sesión. Navega por algunos sitios y vuelve — esta página muestra qué rastreadores intentaron seguirte a través de ellos.</div>
+exposure-link-trail = cómo llegaste aquí
+exposure-link-why = el comprobante de esta página
+exposure-link-welcome = bienvenida
+trail-title = Rastro
+trail-heading = rastro
+trail-sub = Cómo llegaste aquí: navegaciones entre sitios de esta sesión, agrupadas por destino. Nada sale de tu equipo.
+trail-empty = <div class="note">Aún no hay navegaciones entre sitios en esta sesión. Sigue algunos enlaces entre distintos sitios y vuelve — esto rastrea cómo llegaste a cada uno.</div>
+trail-link-exposure = mapa de rastreadores
+trail-link-welcome = bienvenida
+spaces-title = Espacios
+spaces-heading = espacios
+spaces-sub = Los espacios de trabajo agrupan pestañas y tiñen todo el navegador. Edita un nombre en línea (Enter para guardar), cambia o elimina. Ctrl+Shift+E alterna entre ellos.
+spaces-new = Nuevo espacio
+spaces-placeholder = p. ej. Trabajo, Investigación
+spaces-create = Crear &amp; cambiar
+spaces-link-welcome = bienvenida
+pdf-downloads = Descargas
+pdf-cannot-open = No se pudo abrir este PDF:
+profiles-title = Perfiles
+profiles-heading = perfiles
+profiles-sub = Cada perfil es una identidad independiente — sus propias cookies, historial, inicios de sesión guardados, autocompletado y destacados. Al abrir uno se lanza una nueva ventana.
+profiles-new = Nuevo perfil
+profiles-placeholder = p. ej. trabajo, personal
+profiles-create = Crear &amp; abrir
+profiles-current = actual:
+profiles-link-welcome = bienvenida
+why-title = Comprobante de bloqueo
+why-sub = solicitud(es) que el bloqueador de anuncios/rastreadores detuvo en la página que estabas viendo, agrupadas por host. Calculado en el dispositivo; nada salió del equipo.
+why-link-exposure = Ver el mapa de rastreadores de toda la sesión
+why-empty = <p class="empty">No se bloqueó nada en esa página.</p>
+export-title = Exporta tus datos
+export-lead = Tus datos son tuyos. Descarga una copia portátil y legible — sin cuenta, sin ataduras.
+export-bookmarks = marcadores
+export-history = entradas del historial
+export-settings = ajustes del navegador &amp; tema
+export-download = Descargar todo (.json)
+export-note = Aún no se incluye: las contraseñas guardadas (en el baúl cifrado — se planea una exportación separada de archivo cifrado) y las notas/lista de lectura de la nueva pestaña (almacenadas en el propio localStorage de la página).
+autofill-title = Autocompletado
+autofill-heading = autocompletado
+autofill-sub-1 = Una identidad guardada, cifrada con tu baúl. Pulsa
+autofill-sub-2 = en cualquier página para rellenar sus campos de dirección &amp; tarjeta.
+autofill-link-welcome = bienvenida
+autofill-locked = <div class="note">Tu perfil de autocompletado está protegido por tu baúl. Desbloquéalo en <a href="gator://settings#privacy">Ajustes → Privacidad &amp; seguridad</a> (la misma frase de contraseña que las contraseñas guardadas), luego recarga esta página.</div>
+onboarding-title = Te damos la bienvenida a NavGator
+onboarding-heading = Te damos la bienvenida a
+onboarding-sub = Un navegador que prioriza la privacidad. Dos decisiones rápidas y listo — todo se puede cambiar más tarde en Ajustes.
+onboarding-search = Motor de búsqueda
+onboarding-updates = Buscar actualizaciones
+onboarding-privacy = Privacidad
+onboarding-block-ads = Bloquear anuncios &amp; rastreadores
+onboarding-recommended = (recomendado)
+onboarding-get-started = Comenzar
+onboarding-skip = Omitir por ahora
+onboarding-fine = NavGator solo comprueba si existe una versión más reciente — nunca descarga ni instala actualizaciones por sí solo.
