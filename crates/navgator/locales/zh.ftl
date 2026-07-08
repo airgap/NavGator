@@ -286,3 +286,8 @@ onboarding-recommended = （推荐）
 onboarding-get-started = 开始使用
 onboarding-skip = 暂时跳过
 onboarding-fine = NavGator 只会检查是否存在更新版本——绝不会自行下载或安装更新。
+
+## Update frequency
+update-freq-never = 从不
+update-freq-hourly = 每小时
+update-freq-daily = 每天

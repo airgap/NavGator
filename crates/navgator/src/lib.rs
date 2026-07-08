@@ -5231,12 +5231,12 @@ impl AppState {
         };
         let update_pills: String = UPDATE_FREQS
             .iter()
-            .map(|(k, label)| {
+            .map(|(k, _label)| {
                 format!(
                     "<a class=\"pill{}\" href=\"gator://settings?update_freq={}#privacy\">{}</a>",
                     if *k == s.update_freq { " on" } else { "" },
                     k,
-                    html_escape(label),
+                    html_escape(&i18n::tr(&format!("update-freq-{k}"))),
                 )
             })
             .collect();
@@ -5503,13 +5503,13 @@ impl AppState {
             .collect();
         let freqs: String = UPDATE_FREQS
             .iter()
-            .map(|(k, label)| {
+            .map(|(k, _label)| {
                 format!(
                     "<label class=\"opt\"><input type=\"radio\" name=\"update_freq\" value=\"{}\"{}>\
                      <span>{}</span></label>",
                     k,
                     if *k == cur_freq { " checked" } else { "" },
-                    html_escape(label),
+                    html_escape(&i18n::tr(&format!("update-freq-{k}"))),
                 )
             })
             .collect();

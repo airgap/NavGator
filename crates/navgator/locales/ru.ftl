@@ -286,3 +286,8 @@ onboarding-recommended = (рекомендуется)
 onboarding-get-started = Начать
 onboarding-skip = Пропустить пока
 onboarding-fine = NavGator только проверяет наличие более новой версии — он никогда не скачивает и не устанавливает обновления самостоятельно.
+
+## Update frequency
+update-freq-never = Никогда
+update-freq-hourly = Каждый час
+update-freq-daily = Каждый день

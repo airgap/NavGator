@@ -290,3 +290,8 @@ onboarding-recommended = (recommended)
 onboarding-get-started = Get started
 onboarding-skip = Skip for now
 onboarding-fine = NavGator only checks whether a newer version exists — it never downloads or installs updates on its own.
+
+## Update frequency
+update-freq-never = Never
+update-freq-hourly = Hourly
+update-freq-daily = Daily
