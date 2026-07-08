@@ -7476,6 +7476,7 @@ name = "servo-constellation-traits"
 version = "0.4.0"
 source = "git+https://github.com/airgap/swervo?rev=b8b55c1133dca08b5775b46d0c719dfcf301a430#b8b55c1133dca08b5775b46d0c719dfcf301a430"
 dependencies = [
+ "accesskit",
  "base64",
  "content-security-policy",
  "encoding_rs",
@@ -7798,6 +7799,7 @@ name = "servo-layout-api"
 version = "0.4.0"
 source = "git+https://github.com/airgap/swervo?rev=b8b55c1133dca08b5775b46d0c719dfcf301a430#b8b55c1133dca08b5775b46d0c719dfcf301a430"
 dependencies = [
+ "accesskit",
  "app_units",
  "atomic_refcell",
  "bitflags 2.13.0",
@@ -8336,6 +8338,7 @@ name = "servo-script"
 version = "0.4.0"
 source = "git+https://github.com/airgap/swervo?rev=b8b55c1133dca08b5775b46d0c719dfcf301a430#b8b55c1133dca08b5775b46d0c719dfcf301a430"
 dependencies = [
+ "accesskit",
  "aes 0.9.1",
  "aes-gcm",
  "aes-kw",

@@ -11724,14 +11724,20 @@ impl ApplicationHandler<WakeUp> for App {
                             state.window.request_redraw();
                         }
                         accesskit_winit::WindowEvent::ActionRequested(request) => {
-                            // Actions on the chrome tree (TreeId::ROOT) are handled by egui;
-                            // page-targeted actions would forward to Servo (a follow-up, matching
-                            // servoshell's current TODO) — feeding them to egui is a harmless no-op.
-                            state
-                                .egui
-                                .borrow_mut()
-                                .egui_winit
-                                .on_accesskit_action_request(request);
+                            // The chrome tree is TreeId::ROOT (egui handles those actions); any
+                            // other target tree is a grafted page tree, so forward the action to
+                            // the active webview's engine to be dispatched to the DOM (#4344).
+                            if request.target_tree != accesskit::TreeId::ROOT {
+                                if let Some(webview) = state.active_tab() {
+                                    webview.handle_accesskit_action(request);
+                                }
+                            } else {
+                                state
+                                    .egui
+                                    .borrow_mut()
+                                    .egui_winit
+                                    .on_accesskit_action_request(request);
+                            }
                             state.window.request_redraw();
                         }
                         // The assistive tech detached: stop generating trees.
