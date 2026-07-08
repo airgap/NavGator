@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Settings · NavGator</title>
+<title>{{settings-title}} · NavGator</title>
 <style>
   :root { --accent: __ACCENT__; --bg:__BG__; --panel:__PANEL__; --line:__LINE__; --fg:__FG__; --muted:__MUTED__; }
   * { box-sizing:border-box; }
@@ -102,123 +102,123 @@
 </head>
 <body>
   <nav class="rail">
-    <div class="brand"><span class="dot"></span>Settings</div>
+    <div class="brand"><span class="dot"></span>{{settings-brand}}</div>
     <div class="nav" id="nav">
-      <a data-s="appearance">Appearance</a>
-      <a data-s="language">Language</a>
-      <a data-s="search">Search</a>
-      <a data-s="newtab">New tab</a>
-      <a data-s="privacy">Privacy &amp; security</a>
-      <a data-s="sync">Sync</a>
-      <a data-s="passwords">Passwords</a>
-      <a data-s="about">About</a>
+      <a data-s="appearance">{{settings-nav-appearance}}</a>
+      <a data-s="language">{{settings-nav-language}}</a>
+      <a data-s="search">{{settings-nav-search}}</a>
+      <a data-s="newtab">{{settings-nav-newtab}}</a>
+      <a data-s="privacy">{{settings-nav-privacy}}</a>
+      <a data-s="sync">{{settings-nav-sync}}</a>
+      <a data-s="passwords">{{settings-nav-passwords}}</a>
+      <a data-s="about">{{settings-nav-about}}</a>
     </div>
   </nav>
 
   <main class="detail">
     <!-- APPEARANCE -->
     <section id="appearance">
-      <h1>Appearance</h1>
-      <p class="sub">Theme the entire browser. Changes apply live.</p>
+      <h1>{{settings-appearance-title}}</h1>
+      <p class="sub">{{settings-appearance-sub}}</p>
 
-      <div class="grp"><h2>Presets</h2><div class="presets">__PRESET_CARDS__</div></div>
-      <div class="grp"><h2>Accent</h2><div class="swrow">__ACCENT_SWATCHES__</div></div>
-      <div class="grp"><h2>Surface</h2><div class="srfrow">__BASE_PILLS__</div></div>
-      <div class="grp"><h2>Typography</h2><div class="row">__FONT_PILLS__</div></div>
-      <div class="grp"><h2>Density</h2><div class="row">__DENSITY_PILLS__</div></div>
+      <div class="grp"><h2>{{settings-appearance-presets}}</h2><div class="presets">__PRESET_CARDS__</div></div>
+      <div class="grp"><h2>{{settings-appearance-accent}}</h2><div class="swrow">__ACCENT_SWATCHES__</div></div>
+      <div class="grp"><h2>{{settings-appearance-surface}}</h2><div class="srfrow">__BASE_PILLS__</div></div>
+      <div class="grp"><h2>{{settings-appearance-typography}}</h2><div class="row">__FONT_PILLS__</div></div>
+      <div class="grp"><h2>{{settings-appearance-density}}</h2><div class="row">__DENSITY_PILLS__</div></div>
       <div class="grp">
-        <h2>Corner radius</h2><div class="row">__RADIUS_PILLS__</div>
+        <h2>{{settings-appearance-corner-radius}}</h2><div class="row">__RADIUS_PILLS__</div>
       </div>
       <div class="grp">
-        <h2>Glass blur</h2><div class="row">__GLASS_PILLS__</div>
+        <h2>{{settings-appearance-glass-blur}}</h2><div class="row">__GLASS_PILLS__</div>
       </div>
       <div class="grp">
-        <h2>Tabs</h2>
+        <h2>{{settings-appearance-tabs}}</h2>
         <div class="row" style="margin-bottom:10px">__TABPOS_PILLS__</div>
         <div class="row" style="margin-bottom:10px">__TABFIT_PILLS__</div>
-        <p class="note" style="margin-top:4px">Max tab width</p>
+        <p class="note" style="margin-top:4px">{{settings-appearance-max-tab-width}}</p>
         <div class="row">__TABMAXW_PILLS__</div>
       </div>
-      <div class="grp"><h2>New-tab wallpaper</h2><div class="row">__WALLPAPER_PILLS__</div></div>
+      <div class="grp"><h2>{{settings-appearance-wallpaper}}</h2><div class="row">__WALLPAPER_PILLS__</div></div>
     </section>
 
     <!-- LANGUAGE -->
     <section id="language">
-      <h1>Language</h1>
-      <p class="sub">The interface language for menus, toolbars, and dialogs. “Automatic” follows your system locale.</p>
-      <div class="grp"><h2>Display language</h2><div class="row">__LANGUAGE_PILLS__</div></div>
+      <h1>{{settings-language-title}}</h1>
+      <p class="sub">{{settings-language-sub}}</p>
+      <div class="grp"><h2>{{settings-language-display}}</h2><div class="row">__LANGUAGE_PILLS__</div></div>
     </section>
 
     <!-- SEARCH -->
     <section id="search">
-      <h1>Search</h1>
-      <p class="sub">The default engine for the address bar and the new-tab search box.</p>
-      <div class="grp"><h2>Search engine</h2><div class="row">__ENGINE_PILLS__</div></div>
-      <div class="grp"><h2>Custom search URL</h2>
-        <p class="note">Use <code>%s</code> where the query goes.</p>
+      <h1>{{settings-search-title}}</h1>
+      <p class="sub">{{settings-search-sub}}</p>
+      <div class="grp"><h2>{{settings-search-engine}}</h2><div class="row">__ENGINE_PILLS__</div></div>
+      <div class="grp"><h2>{{settings-search-custom-url}}</h2>
+        <p class="note">{{settings-search-url-a}} <code>%s</code> {{settings-search-url-b}}</p>
         <form class="field" id="searchForm">
           <input type="text" id="searchInput" value="__SEARCH_VALUE__" placeholder="https://example.com/?q=%s">
-          <button class="btn" type="submit">Save</button>
+          <button class="btn" type="submit">{{settings-search-save}}</button>
         </form>
       </div>
     </section>
 
     <!-- NEW TAB -->
     <section id="newtab">
-      <h1>New tab</h1>
-      <p class="sub">Which modules show on the new-tab page.</p>
-      <div class="grp"><h2>Modules</h2>__MODULE_TOGGLES__</div>
+      <h1>{{settings-newtab-title}}</h1>
+      <p class="sub">{{settings-newtab-sub}}</p>
+      <div class="grp"><h2>{{settings-newtab-modules}}</h2>__MODULE_TOGGLES__</div>
     </section>
 
     <!-- PRIVACY -->
     <section id="privacy">
-      <h1>Privacy &amp; security</h1>
-      <p class="sub">NavGator blocks ads and trackers by default.</p>
-      <div class="grp"><h2>Content blocking</h2>
-        <div class="trow"><span>Block ads &amp; trackers</span>__ADS_TOGGLE__</div>
-        <p class="note" style="margin-top:12px">__ADS_BLOCKED__ ad/tracker request(s) blocked this session.</p>
+      <h1>{{settings-privacy-title}}</h1>
+      <p class="sub">NavGator {{settings-privacy-sub}}</p>
+      <div class="grp"><h2>{{settings-privacy-content-blocking}}</h2>
+        <div class="trow"><span>{{settings-privacy-block-ads}}</span>__ADS_TOGGLE__</div>
+        <p class="note" style="margin-top:12px">__ADS_BLOCKED__ {{settings-privacy-ads-blocked}}</p>
       </div>
-      <div class="grp"><h2>Software updates</h2>
+      <div class="grp"><h2>{{settings-privacy-software-updates}}</h2>
         __UPDATE_STATUS__
         <div class="row">__UPDATE_PILLS__</div>
-        <p class="note" style="margin-top:12px">Currently on version __CURRENT_VERSION__. NavGator checks for a newer release in the background &mdash; it never downloads or installs on its own. <a href="gator://about">About &amp; update status</a></p>
+        <p class="note" style="margin-top:12px">{{settings-privacy-update-version}} __CURRENT_VERSION__. NavGator {{settings-privacy-update-desc}} <a href="gator://about">{{settings-privacy-update-link}}</a></p>
       </div>
     </section>
 
     <!-- SYNC -->
     <section id="sync">
-      <h1>Sync</h1>
-      <p class="sub">Lyku sync (early access). Your API key is stored locally.</p>
-      <div class="grp"><h2>Collections</h2>
-        <div class="trow"><span>Bookmarks</span>__SYNC_BOOKMARKS__</div>
-        <div class="trow"><span>History</span>__SYNC_HISTORY__</div>
-        <div class="trow"><span>Passwords</span>__SYNC_PASSWORDS__</div>
+      <h1>{{settings-sync-title}}</h1>
+      <p class="sub">{{settings-sync-sub}}</p>
+      <div class="grp"><h2>{{settings-sync-collections}}</h2>
+        <div class="trow"><span>{{settings-sync-bookmarks}}</span>__SYNC_BOOKMARKS__</div>
+        <div class="trow"><span>{{settings-sync-history}}</span>__SYNC_HISTORY__</div>
+        <div class="trow"><span>{{settings-sync-passwords}}</span>__SYNC_PASSWORDS__</div>
       </div>
-      <div class="grp"><h2>Status</h2>
-        <p class="stat">API key: __KEY_STATUS__</p>
+      <div class="grp"><h2>{{settings-sync-status-heading}}</h2>
+        <p class="stat">{{settings-sync-api-key}}: __KEY_STATUS__</p>
         <p class="stat">__SYNC_STATUS__</p>
-        <p style="margin-top:10px"><a class="btn" href="gator://settings?action=sync#sync">Sync now</a></p>
+        <p style="margin-top:10px"><a class="btn" href="gator://settings?action=sync#sync">{{settings-sync-now}}</a></p>
       </div>
-      <div class="grp"><h2>Import</h2>
+      <div class="grp"><h2>{{settings-sync-import}}</h2>
         <p class="stat">__IMPORT_MSG__</p>
-        <p style="margin-top:6px"><a class="btn" href="gator://settings?action=import#sync">Import from another browser</a></p>
+        <p style="margin-top:6px"><a class="btn" href="gator://settings?action=import#sync">{{settings-sync-import-btn}}</a></p>
       </div>
     </section>
 
     <!-- PASSWORDS -->
     <section id="passwords">
-      <h1>Passwords</h1>
+      <h1>{{settings-passwords-title}}</h1>
       <p class="sub">__PW_STATE__</p>
-      <div class="grp"><p><a class="btn" href="gator://passwords">Open the password manager</a></p></div>
+      <div class="grp"><p><a class="btn" href="gator://passwords">{{settings-passwords-open-manager}}</a></p></div>
     </section>
 
     <!-- ABOUT -->
     <section id="about">
-      <h1>About NavGator</h1>
-      <p class="sub">A native browser with an egui chrome over a Servo engine.</p>
+      <h1>{{settings-about-title}} NavGator</h1>
+      <p class="sub">{{settings-about-sub}}</p>
       <div class="grp">
-        <p><a class="btn" href="gator://about">About &amp; shortcuts</a></p>
-        <p style="margin-top:10px"><a class="btn" href="gator://settings?action=default#about">Make NavGator the default browser</a></p>
+        <p><a class="btn" href="gator://about">{{settings-about-shortcuts-btn}}</a></p>
+        <p style="margin-top:10px"><a class="btn" href="gator://settings?action=default#about">{{settings-about-make-default-a}} NavGator {{settings-about-make-default-b}}</a></p>
       </div>
     </section>
   </main>

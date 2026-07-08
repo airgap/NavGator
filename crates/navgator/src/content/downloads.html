@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Downloads · NavGator</title>
+<title>{{downloads-title}} · NavGator</title>
 <style>
   :root { --accent: __ACCENT__; --bg:__BG__; --panel:__PANEL__; --line:__LINE__; --fg:__FG__; --muted:__MUTED__; }
   * { box-sizing:border-box; }
@@ -44,10 +44,10 @@
 </head>
 <body>
   <div class="head">
-    <h1>Nav<span class="g">Gator</span> downloads</h1>
-    <p class="sub">Files are saved to your <strong>~/Downloads</strong> folder.</p>
+    <h1>Nav<span class="g">Gator</span> {{downloads-heading}}</h1>
+    <p class="sub">{{downloads-saved-to-your}} <strong>~/Downloads</strong> {{downloads-folder}}</p>
   </div>
   __ROWS__
-  <footer>gator://downloads &middot; <a href="gator://welcome">welcome</a></footer>
+  <footer>gator://downloads &middot; <a href="gator://welcome">{{downloads-welcome-link}}</a></footer>
 </body>
 </html>

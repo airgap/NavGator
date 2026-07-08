@@ -114,25 +114,25 @@
     <form class="search __SEARCH_HIDE__" id="searchForm">
       <span class="dot"></span>
       <input class="ph" id="searchInput" type="text" autocomplete="off" spellcheck="false"
-             placeholder="Search the web, your tabs, or type a command&hellip;">
+             placeholder="{{welcome-search-placeholder}}">
       <span class="kbd">__KBD__</span>
     </form>
 
     <section class="__SITES_HIDE__">
-      <div class="label">Top sites</div>
+      <div class="label">{{welcome-top-sites}}</div>
       <div class="grid">__TOPSITES__</div>
     </section>
 
     <div class="cards">
       <div class="card __NOTES_HIDE__">
-        <h2>Notes</h2>
+        <h2>{{welcome-notes-heading}}</h2>
         <div id="notes"></div>
-        <input id="note-add" class="add" placeholder="Add a note, press Enter&hellip;" autocomplete="off" spellcheck="false">
+        <input id="note-add" class="add" placeholder="{{welcome-note-add-placeholder}}" autocomplete="off" spellcheck="false">
       </div>
       <div class="card __FEED_HIDE__">
-        <h2>Reading list</h2>
+        <h2>{{welcome-reading-list-heading}}</h2>
         <div id="reading"></div>
-        <input id="read-add" class="add" placeholder="Add a link or note, press Enter&hellip;" autocomplete="off" spellcheck="false">
+        <input id="read-add" class="add" placeholder="{{welcome-read-add-placeholder}}" autocomplete="off" spellcheck="false">
       </div>
     </div>
   </div>

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tab crashed</title>
+<title>{{crash-title}}</title>
 <style>
   :root { --accent: __ACCENT__; --bg:__BG__; --panel:__PANEL__; --line:__LINE__; --fg:__FG__; --muted:__MUTED__; }
   * { box-sizing:border-box; }
@@ -43,14 +43,14 @@
 <body>
   <div class="card">
     <p class="glyph">⚠</p>
-    <h1>This tab crashed</h1>
-    <p class="lead">The page renderer stopped responding. Your other tabs are unaffected.</p>
+    <h1>{{crash-heading}}</h1>
+    <p class="lead">{{crash-lead}}</p>
     <span class="url">__CRASH_URL__</span>
     <div class="actions">
-      <a class="btn" href="__CRASH_HREF__">Reload page</a>
+      <a class="btn" href="__CRASH_HREF__">{{crash-reload}}</a>
     </div>
     <details>
-      <summary>Details</summary>
+      <summary>{{crash-details}}</summary>
       <pre class="reason">__CRASH_REASON__</pre>
     </details>
   </div>

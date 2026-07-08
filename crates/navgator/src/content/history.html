@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>History · NavGator</title>
+<title>{{history-title}} · NavGator</title>
 <style>
   :root { --accent: __ACCENT__; --bg:__BG__; --panel:__PANEL__; --line:__LINE__; --fg:__FG__; --muted:__MUTED__; }
   * { box-sizing:border-box; }
@@ -36,10 +36,10 @@
 </head>
 <body>
   <div class="head">
-    <h1>Nav<span class="g">Gator</span> history</h1>
-    <p class="sub">Recent pages, newest first · stored locally on this device.</p>
+    <h1>Nav<span class="g">Gator</span> {{history-heading}}</h1>
+    <p class="sub">{{history-sub}}</p>
   </div>
   __ROWS__
-  <footer>gator://history · <a href="gator://welcome">welcome</a> · <a href="gator://about">about</a></footer>
+  <footer>gator://history · <a href="gator://welcome">{{history-welcome-link}}</a> · <a href="gator://about">{{history-about-link}}</a></footer>
 </body>
 </html>

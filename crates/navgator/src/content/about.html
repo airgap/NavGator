@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>About NavGator</title>
+<title>{{about-title}} NavGator</title>
 <style>
   :root { --accent: __ACCENT__; --bg:__BG__; --panel:__PANEL__; --line:__LINE__; --fg:__FG__; --muted:__MUTED__; }
   * { box-sizing:border-box; }
@@ -46,24 +46,24 @@
 </head>
 <body>
   <h1 class="brand">Nav<span class="g">Gator</span></h1>
-  <p class="ver">Version __VERSION__</p>
-  <p class="blurb">A privacy-first browser with a native chrome composited over the Servo engine. Fast. Private. Yours.</p>
+  <p class="ver">{{about-version}} __VERSION__</p>
+  <p class="blurb">{{about-blurb}}</p>
   __UPDATE__
   <div class="card">
-    <h2>Keyboard shortcuts</h2>
+    <h2>{{about-shortcuts-heading}}</h2>
     <ul class="keys">
-      <li><span class="d">New tab</span><kbd>Ctrl + T</kbd></li>
-      <li><span class="d">Reopen closed tab</span><kbd>Ctrl + Shift + T</kbd></li>
-      <li><span class="d">Close tab</span><kbd>Ctrl + W</kbd></li>
-      <li><span class="d">Focus address bar</span><kbd>Ctrl + L</kbd></li>
-      <li><span class="d">Reload page</span><kbd>Ctrl + R</kbd></li>
-      <li><span class="d">Bookmark this page</span><kbd>Ctrl + D</kbd></li>
-      <li><span class="d">Find in page</span><kbd>Ctrl + F</kbd></li>
-      <li><span class="d">History</span><kbd>Ctrl + H</kbd></li>
-      <li><span class="d">Zoom in / out / reset</span><kbd>Ctrl + + / − / 0</kbd></li>
-      <li><span class="d">Jump to tab 1–8 / last</span><kbd>Ctrl + 1–8 / 9</kbd></li>
-      <li><span class="d">Next / previous tab</span><kbd>Ctrl + (Shift) + Tab</kbd></li>
-      <li><span class="d">Close menu / find · exit fullscreen</span><kbd>Esc</kbd></li>
+      <li><span class="d">{{about-new-tab}}</span><kbd>Ctrl + T</kbd></li>
+      <li><span class="d">{{about-reopen-closed-tab}}</span><kbd>Ctrl + Shift + T</kbd></li>
+      <li><span class="d">{{about-close-tab}}</span><kbd>Ctrl + W</kbd></li>
+      <li><span class="d">{{about-focus-address-bar}}</span><kbd>Ctrl + L</kbd></li>
+      <li><span class="d">{{about-reload-page}}</span><kbd>Ctrl + R</kbd></li>
+      <li><span class="d">{{about-bookmark-page}}</span><kbd>Ctrl + D</kbd></li>
+      <li><span class="d">{{about-find-in-page}}</span><kbd>Ctrl + F</kbd></li>
+      <li><span class="d">{{about-history}}</span><kbd>Ctrl + H</kbd></li>
+      <li><span class="d">{{about-zoom}}</span><kbd>Ctrl + + / − / 0</kbd></li>
+      <li><span class="d">{{about-jump-to-tab}}</span><kbd>Ctrl + 1–8 / 9</kbd></li>
+      <li><span class="d">{{about-next-prev-tab}}</span><kbd>Ctrl + (Shift) + Tab</kbd></li>
+      <li><span class="d">{{about-close-menu}}</span><kbd>Esc</kbd></li>
     </ul>
   </div>
   <div class="nav">

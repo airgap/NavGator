@@ -2106,6 +2106,33 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// Resolve `{{i18n-key}}` tokens in a gator:// page's HTML to the active locale's strings (keys are
+/// kebab-case: lowercase, digits, hyphens). An unknown key resolves to the key itself, so a missing
+/// translation shows up in the page. A `{{` not followed by a valid key + `}}` is left verbatim.
+fn localize_html(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        if let Some(end) = after.find("}}") {
+            let key = &after[..end];
+            if !key.is_empty() &&
+                key.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            {
+                out.push_str(&i18n::tr(key));
+                rest = &after[end + 2..];
+                continue;
+            }
+        }
+        out.push_str("{{");
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Escape text for safe interpolation into HTML (the gator://welcome template).
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -3974,7 +4001,8 @@ impl AppState {
         for (k, v) in vars {
             html = html.replace(k, &v);
         }
-        html.into_bytes()
+        // Resolve `{{i18n-key}}` tokens in the page prose to the active locale (LYK i18n).
+        localize_html(&html).into_bytes()
     }
 
     fn render_gator_welcome(&self) -> Vec<u8> {
