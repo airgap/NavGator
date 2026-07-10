@@ -57,4 +57,6 @@ $zip = Join-Path $Dist "$name.zip"
 Remove-Item $zip -ErrorAction SilentlyContinue
 Compress-Archive -Path (Join-Path $root '*') -DestinationPath $zip -Force
 $sizeMb = [math]::Round((Get-Item $zip).Length / 1MB, 1)
+# Drop the staging dir so only the .zip is stashed/published (not ~400 loose files).
+Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
 Write-Host ("Windows package: {0} ({1} MB)" -f $zip, $sizeMb)
