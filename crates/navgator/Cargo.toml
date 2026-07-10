@@ -48,13 +48,6 @@ url = "2.5"
 # Servo does TLS through rustls; a crypto provider is installed at startup.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 
-# X11-only: query surfman's GL config's native X visual so the window is created with the SAME
-# visual, or strict EGL drivers (NVIDIA) fail eglCreateWindowSurface -> surfman panics on launch.
-[target.'cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))'.dependencies]
-khronos-egl = { version = "6", features = ["dynamic"] }
-libloading = "0.8"
-raw-window-handle = "0.6"
-
 # Native chrome: egui drawn over the page (same versions servoshell uses, so the lock
 # resolves cleanly against the engine's glow/winit/raw-window-handle).
 egui = "0.34.3"
@@ -96,10 +89,24 @@ fluent = "0.16"
 unic-langid = { version = "0.9", features = ["macros"] }
 sys-locale = "0.3"
 
-# OS keyring (Linux Secret Service) for remembering the sync passphrase. Optional at
-# runtime — all calls degrade to manual unlock if no secret-service is available.
-# Pure-rust crypto (no system OpenSSL dep); zbus is already in the cache transitively.
+# X11-only: query surfman's GL config's native X visual so the window is created with the SAME
+# visual, or strict EGL drivers (NVIDIA) fail eglCreateWindowSurface -> surfman panics on launch.
+# Plus the OS keyring for the sync passphrase — the Secret Service backend is Linux-only (macOS
+# and Windows use their native keychains below). keyring_store is called unconditionally, so
+# every desktop target needs a backend.
+[target.'cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))'.dependencies]
+khronos-egl = { version = "6", features = ["dynamic"] }
+libloading = "0.8"
+raw-window-handle = "0.6"
 keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+
+# macOS Keychain backend for the sync passphrase.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["apple-native"] }
+
+# Windows Credential Manager backend for the sync passphrase.
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
 
 # Android entry point: winit drives the NativeActivity via android-activity (Android only).
 [target.'cfg(target_os = "android")'.dependencies]
