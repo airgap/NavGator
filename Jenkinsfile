@@ -212,16 +212,18 @@ pipeline {
                         // token). Wrapped UNSTABLE so a packaging hiccup isn't a gate failure.
                         steps {
                             catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
-                                if (isUnix()) {
-                                    sh '''
-                                        set -a; [ -f .ci-env ] && . ./.ci-env; set +a
-                                        bash scripts/package.sh
-                                    '''
-                                } else {
-                                    // package.sh produces the Linux/macOS bundles (.deb / AppImage / .app);
-                                    // a Windows installer isn't wired up yet, so skip cleanly instead of
-                                    // erroring on a missing `sh`. The Build + Test gates above still run.
-                                    echo 'Windows packaging not yet implemented — skipping (build + test validated on this runner).'
+                                script {
+                                    if (isUnix()) {
+                                        sh '''
+                                            set -a; [ -f .ci-env ] && . ./.ci-env; set +a
+                                            bash scripts/package.sh
+                                        '''
+                                    } else {
+                                        // package.sh produces the Linux/macOS bundles (.deb / AppImage / .app);
+                                        // a Windows installer isn't wired up yet, so skip cleanly instead of
+                                        // erroring on a missing `sh`. The Build + Test gates above still run.
+                                        echo 'Windows packaging not yet implemented — skipping (build + test validated on this runner).'
+                                    }
                                 }
                             }
                             stash name: "dist-${env.PLATFORM}", includes: 'dist/**', allowEmpty: true
