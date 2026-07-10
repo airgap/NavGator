@@ -304,7 +304,7 @@ pipeline {
             steps {
                 checkout scm
                 script {
-                    ['dist-linux', 'dist-macos', 'dist-android'].each { s ->
+                    ['dist-linux', 'dist-macos', 'dist-windows', 'dist-android'].each { s ->
                         try { unstash s } catch (err) { echo "no stash ${s} (platform may have failed)" }
                     }
                 }
