@@ -175,7 +175,14 @@ pipeline {
                                             touch .dav1d-static-done
                                         '''
                                     } else {
-                                        bat 'cargo build --release --locked --workspace'
+                                        // Windows: no system dav1d / pkg-config, so build it static-from-source
+                                        // like Linux (SYSTEM_DEPS_DAV1D_BUILD_INTERNAL); needs meson+ninja+nasm
+                                        // on the agent. Bust any pkg-config-mode dav1d-sys cache once per workspace.
+                                        bat '''
+                                            set SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always
+                                            if not exist .dav1d-static-done cargo clean -p dav1d-sys
+                                            cargo build --release --locked --workspace && echo done> .dav1d-static-done
+                                        '''
                                     }
                                 }
                                 // Linux is the gate; macOS/Windows are non-blocking until green.
