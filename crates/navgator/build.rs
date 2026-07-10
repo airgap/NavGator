@@ -24,6 +24,30 @@ fn main() {
     if let Some(logs_head) = git_path("logs/HEAD") {
         println!("cargo:rerun-if-changed={logs_head}");
     }
+
+    // Embed the app icon into the Windows .exe so it shows in Explorer / the taskbar (macOS/Linux
+    // carry the icon in their bundles instead). Best-effort: a missing rc toolchain is a warning,
+    // not a build failure.
+    #[cfg(windows)]
+    embed_windows_icon();
+}
+
+/// Compile `packaging/navgator.ico` into the Windows binary's resources (winresource uses the SDK
+/// `rc.exe` or `llvm-rc`, both present on the CI agent).
+#[cfg(windows)]
+fn embed_windows_icon() {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    let ico = std::path::Path::new(&manifest).join("../../packaging/navgator.ico");
+    if !ico.exists() {
+        println!("cargo:warning=packaging/navgator.ico not found; the .exe will have no icon");
+        return;
+    }
+    println!("cargo:rerun-if-changed={}", ico.display());
+    let mut res = winresource::WindowsResource::new();
+    res.set_icon(&ico.to_string_lossy());
+    if let Err(e) = res.compile() {
+        println!("cargo:warning=embedding the Windows icon failed: {e}");
+    }
 }
 
 /// `git rev-list --count HEAD`, trimmed; None if git is unavailable or this isn't a repo.

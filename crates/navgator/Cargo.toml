@@ -108,6 +108,11 @@ keyring = { version = "3", default-features = false, features = ["apple-native"]
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["windows-native"] }
 
+# Embed packaging/navgator.ico (+ version info) into the .exe via build.rs. winresource is the
+# maintained fork of winres.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 # Android entry point: winit drives the NativeActivity via android-activity (Android only).
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }
