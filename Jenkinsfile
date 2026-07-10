@@ -59,9 +59,9 @@ pipeline {
         stage('Build & Test') {
             matrix {
                 axes {
-                    // 'windows' temporarily disabled (windows-strix offline) — re-add it
-                    // here when the runner is online; the windows build branches remain below.
-                    axis { name 'PLATFORM'; values 'linux', 'macos' }
+                    // windows is back online as `windows-neptune` (a Windows Server 2022 KVM VM on
+                    // /neptune, label `windows`); the windows build branches below run on it.
+                    axis { name 'PLATFORM'; values 'linux', 'macos', 'windows' }
                 }
                 // macOS builds on every push again: sccache + warm ~/.cargo make the repeat
                 // engine build fast, and the per-push stall that once justified nightly-only is
