@@ -178,8 +178,15 @@ pipeline {
                                         // Windows: no system dav1d / pkg-config, so build it static-from-source
                                         // like Linux (SYSTEM_DEPS_DAV1D_BUILD_INTERNAL); needs meson+ninja+nasm
                                         // on the agent. Bust any pkg-config-mode dav1d-sys cache once per workspace.
+                                        // GStreamer (Servo's media stack) provides glib/gstreamer .pc files; use its
+                                        // windows-aware pkg-config (pkgconfiglite mis-splits C:\ drive paths on ':').
+                                        // Its bundled dav1d.pc (1.4.1) is renamed .disabled during provisioning so the
+                                        // source-built dav1d 1.5.0 wins. Toolchain (LLVM/meson/ninja/nasm/gstreamer) +
+                                        // long-path support are pre-provisioned on the agent.
                                         bat '''
                                             set SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always
+                                            set PKG_CONFIG=C:\\Program Files\\GStreamer\\1.0\\msvc_x86_64\\bin\\pkg-config.exe
+                                            set PKG_CONFIG_PATH=C:\\Program Files\\GStreamer\\1.0\\msvc_x86_64\\lib\\pkgconfig
                                             if not exist .dav1d-static-done cargo clean -p dav1d-sys
                                             cargo build --release --locked --workspace && echo done> .dav1d-static-done
                                         '''

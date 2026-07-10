@@ -20,7 +20,13 @@ use std::cell::{Cell, RefCell};
 use std::env;
 use std::error::Error;
 use std::io::{BufRead, BufReader, Write as _};
+// The IPC control socket (external tooling drives/observes the browser) is a Unix domain socket.
+// Windows has no Unix sockets, so alias the client stream to a Write-capable stub there and make
+// start_ipc a no-op (below) — the single-instance/control IPC is unix-only for now.
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(not(unix))]
+use std::net::TcpStream as UnixStream;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
@@ -12461,7 +12467,13 @@ impl EventLoopWaker for Waker {
     }
 }
 
+/// Windows has no Unix domain sockets; the IPC control socket is unavailable there for now, so this
+/// is a no-op (the `NAVGATOR_IPC` env var is simply ignored).
+#[cfg(not(unix))]
+fn start_ipc(_path: String, _proxy: EventLoopProxy<WakeUp>, _clients: Arc<Mutex<Vec<UnixStream>>>) {}
+
 /// Bind the IPC control socket and accept connections on a background thread.
+#[cfg(unix)]
 fn start_ipc(path: String, proxy: EventLoopProxy<WakeUp>, clients: Arc<Mutex<Vec<UnixStream>>>) {
     let _ = std::fs::remove_file(&path);
     let listener = match UnixListener::bind(&path) {
