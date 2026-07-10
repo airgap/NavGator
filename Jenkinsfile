@@ -233,10 +233,10 @@ pipeline {
                                             bash scripts/package.sh
                                         '''
                                     } else {
-                                        // package.sh produces the Linux/macOS bundles (.deb / AppImage / .app);
-                                        // a Windows installer isn't wired up yet, so skip cleanly instead of
-                                        // erroring on a missing `sh`. The Build + Test gates above still run.
-                                        echo 'Windows packaging not yet implemented — skipping (build + test validated on this runner).'
+                                        // Windows: portable .zip (navgator.exe + resources + bundled GStreamer
+                                        // runtime + launcher). No signed installer yet; an .msi via cargo-wix
+                                        // is a follow-up. package.sh (bash) only does the Linux/macOS bundles.
+                                        bat 'powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\package-windows.ps1'
                                     }
                                 }
                             }
