@@ -88,8 +88,10 @@ pub struct RefreshedTokens {
 
 /// Local data + config handed to the background sync thread. Plain owned data only (`Send`).
 pub struct SyncSnapshot {
-    /// Platform key (`lyku.org` | `lyku.co`) — selects the API base URL and OAuth endpoints.
+    /// Platform key (`lyku.org` | `lyku.co`) — selects the API base URL, endpoints, and paths.
     pub platform: String,
+    /// Workspace slug for multi-tenant platforms (lyku.co), sent as `x-tenant`; `None` otherwise.
+    pub tenant: Option<String>,
     pub auth: SyncAuth,
     pub sync_bookmarks: bool,
     pub sync_history: bool,
@@ -154,12 +156,15 @@ fn err_str(e: ureq::Error) -> String {
     }
 }
 
-fn push(base: &str, bearer: &str, items: Vec<WireItem>) -> Result<usize, String> {
+fn push(url: &str, bearer: &str, tenant: Option<&str>, items: Vec<WireItem>) -> Result<usize, String> {
     if items.is_empty() {
         return Ok(0);
     }
-    let resp: PushResp = ureq::post(&format!("{base}/sync-push"))
-        .set("Authorization", &format!("Bearer {bearer}"))
+    let mut req = ureq::post(url).set("Authorization", &format!("Bearer {bearer}"));
+    if let Some(t) = tenant {
+        req = req.set("x-tenant", t);
+    }
+    let resp: PushResp = req
         .send_json(PushReq { items })
         .map_err(err_str)?
         .into_json()
@@ -167,9 +172,18 @@ fn push(base: &str, bearer: &str, items: Vec<WireItem>) -> Result<usize, String>
     Ok(resp.accepted as usize)
 }
 
-fn pull(base: &str, bearer: &str, collection: &str, since: i64) -> Result<Vec<WireItemIn>, String> {
-    let resp: PullResp = ureq::post(&format!("{base}/sync-pull"))
-        .set("Authorization", &format!("Bearer {bearer}"))
+fn pull(
+    url: &str,
+    bearer: &str,
+    tenant: Option<&str>,
+    collection: &str,
+    since: i64,
+) -> Result<Vec<WireItemIn>, String> {
+    let mut req = ureq::post(url).set("Authorization", &format!("Bearer {bearer}"));
+    if let Some(t) = tenant {
+        req = req.set("x-tenant", t);
+    }
+    let resp: PullResp = req
         .send_json(PullReq {
             collections: vec![collection.to_string()],
             since,
@@ -204,7 +218,10 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
         refreshed: None,
     };
 
-    let base = oauth::platform(&snap.platform).api_base.to_string();
+    let plat = oauth::platform(&snap.platform);
+    let push_url = format!("{}{}", plat.api_base, plat.sync_push_path);
+    let pull_url = format!("{}{}", plat.api_base, plat.sync_pull_path);
+    let tenant = snap.tenant.clone();
 
     // Resolve the Bearer credential. OAuth access tokens are refreshed first when within 60s of
     // expiry; the rotated tokens ride back in `out.refreshed` so they persist even if a later
@@ -226,6 +243,14 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
             expires_at,
         } => {
             if now_ms() >= *expires_at - 60_000 {
+                // No refresh token (e.g. lyku.co's long-lived apiToken) → the user must reconnect.
+                if refresh_token.is_empty() {
+                    return SyncOutcome {
+                        ok: false,
+                        message: "Session expired — reconnect your account.".into(),
+                        ..out
+                    };
+                }
                 match oauth::refresh(&snap.platform, refresh_token) {
                     Ok(t) => {
                         let bearer = t.access_token.clone();
@@ -266,7 +291,7 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
                 updated: *updated,
             })
             .collect();
-        match push(&base, &bearer, items) {
+        match push(&push_url, &bearer, tenant.as_deref(), items) {
             Ok(n) => out.pushed += n,
             Err(e) => {
                 return SyncOutcome {
@@ -276,7 +301,7 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
                 };
             }
         }
-        match pull(&base, &bearer, "bookmarks", snap.cursor_bookmarks) {
+        match pull(&pull_url, &bearer, tenant.as_deref(), "bookmarks", snap.cursor_bookmarks) {
             Ok(items) => {
                 for it in items {
                     if it.updated > out.cursor_bookmarks {
@@ -326,7 +351,7 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
                 updated: *updated,
             })
             .collect();
-        match push(&base, &bearer, items) {
+        match push(&push_url, &bearer, tenant.as_deref(), items) {
             Ok(n) => out.pushed += n,
             Err(e) => {
                 return SyncOutcome {
@@ -336,7 +361,7 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
                 };
             }
         }
-        match pull(&base, &bearer, "history", snap.cursor_history) {
+        match pull(&pull_url, &bearer, tenant.as_deref(), "history", snap.cursor_history) {
             Ok(items) => {
                 for it in items {
                     if it.updated > out.cursor_history {
@@ -375,7 +400,7 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
                 updated: *updated,
             })
             .collect();
-        match push(&base, &bearer, items) {
+        match push(&push_url, &bearer, tenant.as_deref(), items) {
             Ok(n) => out.pushed += n,
             Err(e) => {
                 return SyncOutcome {
@@ -385,7 +410,7 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
                 };
             }
         }
-        match pull(&base, &bearer, "passwords", snap.cursor_passwords) {
+        match pull(&pull_url, &bearer, tenant.as_deref(), "passwords", snap.cursor_passwords) {
             Ok(items) => {
                 for it in items {
                     if it.updated > out.cursor_passwords {

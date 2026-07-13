@@ -611,9 +611,12 @@ struct Settings {
     sync_platform: String,
     sync_account_id: String,
     sync_account_name: String,
+    /// Workspace slug for multi-tenant platforms (lyku.co), sent as `x-tenant`; empty otherwise.
+    sync_workspace: String,
     sync_access_token: String,
     sync_refresh_token: String,
-    /// ms-epoch access-token expiry (0 = none). The refresh token outlives it (server: 90d).
+    /// ms-epoch access-token expiry (0 = none). lyku.org refresh outlives it (90d); lyku.co has
+    /// no refresh token, so the 90d access token itself is the ceiling before a reconnect.
     sync_token_expiry: i64,
     /// Remember the sync passphrase in the OS keyring (Secret Service) for auto-unlock.
     remember_passphrase: bool,
@@ -667,6 +670,7 @@ impl Default for Settings {
             sync_platform: "lyku.org".to_string(),
             sync_account_id: String::new(),
             sync_account_name: String::new(),
+            sync_workspace: String::new(),
             sync_access_token: String::new(),
             sync_refresh_token: String::new(),
             sync_token_expiry: 0,
@@ -1197,6 +1201,7 @@ fn load_settings() -> Settings {
                     "sync_platform" => s.sync_platform = v.trim().to_string(),
                     "sync_account_id" => s.sync_account_id = v.trim().to_string(),
                     "sync_account_name" => s.sync_account_name = v.trim().to_string(),
+                    "sync_workspace" => s.sync_workspace = v.trim().to_string(),
                     "sync_access_token" => s.sync_access_token = v.trim().to_string(),
                     "sync_refresh_token" => s.sync_refresh_token = v.trim().to_string(),
                     "sync_token_expiry" => {
@@ -1298,7 +1303,7 @@ fn save_settings(s: &Settings) {
         let _ = std::fs::write(
             &path,
             format!(
-                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nsync_platform={}\nsync_account_id={}\nsync_account_name={}\nsync_access_token={}\nsync_refresh_token={}\nsync_token_expiry={}\nremember_passphrase={}\nblock_ads={}\nforce_dark={}\nwallpaper={}\nth_base={}\nth_accent={}\nth_density={}\nth_font={}\nth_tabpos={}\nth_wallpaper={}\nth_tabfit={}\nth_radius={}\nth_glass={}\nth_tabmaxw={}\nth_base_explicit={}\nmod_clock={}\nmod_search={}\nmod_sites={}\nmod_notes={}\nmod_feed={}\nupdate_freq={}\nonboarded={}\nlocale={}\n",
+                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nsync_platform={}\nsync_account_id={}\nsync_account_name={}\nsync_workspace={}\nsync_access_token={}\nsync_refresh_token={}\nsync_token_expiry={}\nremember_passphrase={}\nblock_ads={}\nforce_dark={}\nwallpaper={}\nth_base={}\nth_accent={}\nth_density={}\nth_font={}\nth_tabpos={}\nth_wallpaper={}\nth_tabfit={}\nth_radius={}\nth_glass={}\nth_tabmaxw={}\nth_base_explicit={}\nmod_clock={}\nmod_search={}\nmod_sites={}\nmod_notes={}\nmod_feed={}\nupdate_freq={}\nonboarded={}\nlocale={}\n",
                 s.search,
                 s.accent,
                 s.dark,
@@ -1309,6 +1314,7 @@ fn save_settings(s: &Settings) {
                 s.sync_platform,
                 s.sync_account_id,
                 s.sync_account_name,
+                s.sync_workspace,
                 s.sync_access_token,
                 s.sync_refresh_token,
                 s.sync_token_expiry,
@@ -5230,6 +5236,7 @@ impl AppState {
                 SettingsApply::Disconnect => {
                     s.sync_account_id.clear();
                     s.sync_account_name.clear();
+                    s.sync_workspace.clear();
                     s.sync_access_token.clear();
                     s.sync_refresh_token.clear();
                     s.sync_token_expiry = 0;
@@ -5348,7 +5355,7 @@ impl AppState {
                 }
             })
             .collect();
-        let sync_account = if !s.sync_refresh_token.is_empty() {
+        let sync_account = if !s.sync_access_token.is_empty() {
             let label = oauth::platform(&s.sync_platform).label;
             let name = if s.sync_account_name.is_empty() {
                 "your account".to_string()
@@ -9541,10 +9548,11 @@ impl AppState {
         if self.browser.syncing.get() {
             return;
         }
-        let (platform, auth, sync_bookmarks, sync_history, sync_passwords) = {
+        let (platform, tenant, auth, sync_bookmarks, sync_history, sync_passwords) = {
             let s = self.browser.settings.borrow();
-            // OAuth binding wins over the legacy pasted key; neither ⇒ not connected.
-            let auth = if !s.sync_refresh_token.is_empty() {
+            // OAuth binding wins over the legacy pasted key; neither ⇒ not connected. The presence
+            // of an access token marks "connected" (lyku.co issues no refresh token).
+            let auth = if !s.sync_access_token.is_empty() {
                 Some(sync::SyncAuth::OAuth {
                     access_token: s.sync_access_token.clone(),
                     refresh_token: s.sync_refresh_token.clone(),
@@ -9560,8 +9568,14 @@ impl AppState {
             } else {
                 s.sync_platform.clone()
             };
+            let tenant = if s.sync_workspace.is_empty() {
+                None
+            } else {
+                Some(s.sync_workspace.clone())
+            };
             (
                 platform,
+                tenant,
                 auth,
                 s.sync_bookmarks,
                 s.sync_history,
@@ -9601,6 +9615,7 @@ impl AppState {
             };
             sync::SyncSnapshot {
                 platform,
+                tenant,
                 auth,
                 sync_bookmarks,
                 sync_history,
@@ -9722,25 +9737,27 @@ impl AppState {
     /// and reports back via `WakeUp::OAuthDone`. NavGator being a browser makes the RFC-8252
     /// loopback flow seamless — the sign-in just opens as another tab.
     fn start_connect(&self, platform_key: String) {
-        match oauth::begin(&platform_key) {
+        let plat = oauth::platform(&platform_key);
+        if !plat.available {
+            *self.browser.sync_status.borrow_mut() =
+                format!("{} sync isn't available yet.", plat.label);
+            return;
+        }
+        *self.browser.sync_status.borrow_mut() = format!("Opening {} sign-in…", plat.label);
+        let proxy = self.browser.event_proxy.clone();
+        // begin() may make a network call (dynamic client registration on lyku.co), so run the
+        // whole flow off the UI thread. The tab-open is marshalled back via WakeUp::OpenAuthTab
+        // (new_tab touches browser state and must run on the UI thread).
+        std::thread::spawn(move || match oauth::begin(&platform_key) {
             Ok((auth_url, pending)) => {
-                *self.browser.sync_status.borrow_mut() = format!(
-                    "Opening {} sign-in…",
-                    oauth::platform(&platform_key).label
-                );
-                if let Ok(u) = Url::parse(&auth_url) {
-                    self.new_tab(u);
-                }
-                let proxy = self.browser.event_proxy.clone();
-                std::thread::spawn(move || {
-                    let res = oauth::complete(pending);
-                    let _ = proxy.send_event(WakeUp::OAuthDone(res));
-                });
+                let _ = proxy.send_event(WakeUp::OpenAuthTab(auth_url));
+                let res = oauth::complete(pending);
+                let _ = proxy.send_event(WakeUp::OAuthDone(res));
             }
             Err(e) => {
-                *self.browser.sync_status.borrow_mut() = e;
+                let _ = proxy.send_event(WakeUp::OAuthDone(Err(e)));
             }
-        }
+        });
         self.window.request_redraw();
     }
 
@@ -9759,6 +9776,7 @@ impl AppState {
                     s.sync_platform = r.platform.clone();
                     s.sync_account_id = r.account_id;
                     s.sync_account_name = r.account_name;
+                    s.sync_workspace = r.workspace.unwrap_or_default();
                     s.sync_access_token = r.tokens.access_token;
                     s.sync_refresh_token = r.tokens.refresh_token;
                     s.sync_token_expiry = r.tokens.expires_at;
@@ -12085,6 +12103,11 @@ impl ApplicationHandler<WakeUp> for App {
                 WakeUp::Ipc(cmd) => state.handle_ipc(cmd),
                 WakeUp::SyncDone(outcome) => state.apply_sync(outcome),
                 WakeUp::OAuthDone(res) => state.apply_oauth(res),
+                WakeUp::OpenAuthTab(url) => {
+                    if let Ok(u) = Url::parse(&url) {
+                        state.new_tab(u);
+                    }
+                }
                 WakeUp::CosmeticReady => state.flush_cosmetic(),
                 WakeUp::GmFetchDone { id, ok, json } => state.resolve_gm_fetch(id, ok, json),
                 WakeUp::UpdateAvailable {
@@ -12624,6 +12647,8 @@ enum WakeUp {
     SyncDone(sync::SyncOutcome),
     /// An OAuth connect flow finished; bind the account (or report failure) on the UI thread.
     OAuthDone(Result<oauth::ConnectResult, String>),
+    /// Open the OAuth authorize URL in a new tab (marshalled from the connect thread).
+    OpenAuthTab(String),
     /// Cosmetic-filter CSS is ready to inject (deferred out of the JS-eval callback).
     CosmeticReady,
     /// An off-thread GM_xmlhttpRequest (net.fetch) finished; resolve it on the UI thread (LYK-1257).
