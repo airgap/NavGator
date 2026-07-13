@@ -208,6 +208,7 @@ settings-sync-bookmarks = Favoris
 settings-sync-history = Historique
 settings-sync-passwords = Mots de passe
 settings-sync-status-heading = État
+settings-sync-account = Compte
 settings-sync-api-key = Clé API
 settings-sync-now = Synchroniser maintenant
 settings-sync-import = Importer

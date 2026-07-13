@@ -211,6 +211,7 @@ settings-sync-bookmarks = Bookmarks
 settings-sync-history = History
 settings-sync-passwords = Passwords
 settings-sync-status-heading = Status
+settings-sync-account = Account
 settings-sync-api-key = API key
 settings-sync-now = Sync now
 settings-sync-import = Import

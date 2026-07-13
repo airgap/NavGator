@@ -83,6 +83,7 @@ macro_rules! tr {
 
 mod i18n;
 mod sync;
+mod oauth;
 mod password;
 mod autofill;
 mod highlights;
@@ -602,6 +603,18 @@ struct Settings {
     sync_bookmarks: bool,
     sync_history: bool,
     sync_passwords: bool,
+    /// Per-profile Lyku account binding (OAuth). `sync_platform` selects the platform
+    /// (`lyku.org` | `lyku.co`); the tokens + account identity come from an OAuth connect. A
+    /// non-empty `sync_refresh_token` means "connected via OAuth" and takes precedence over the
+    /// legacy `sync_api_key`. Stored in the per-profile settings.conf (isolated per profile),
+    /// mirroring how `sync_api_key` is already persisted.
+    sync_platform: String,
+    sync_account_id: String,
+    sync_account_name: String,
+    sync_access_token: String,
+    sync_refresh_token: String,
+    /// ms-epoch access-token expiry (0 = none). The refresh token outlives it (server: 90d).
+    sync_token_expiry: i64,
     /// Remember the sync passphrase in the OS keyring (Secret Service) for auto-unlock.
     remember_passphrase: bool,
     /// Block ads + trackers (adblock-rust). On by default — it's the pitch.
@@ -651,6 +664,12 @@ impl Default for Settings {
             sync_bookmarks: false,
             sync_history: false,
             sync_passwords: false,
+            sync_platform: "lyku.org".to_string(),
+            sync_account_id: String::new(),
+            sync_account_name: String::new(),
+            sync_access_token: String::new(),
+            sync_refresh_token: String::new(),
+            sync_token_expiry: 0,
             remember_passphrase: false,
             block_ads: true,
             force_dark: false,
@@ -1175,6 +1194,14 @@ fn load_settings() -> Settings {
                     "sync_bookmarks" => s.sync_bookmarks = v.trim() == "true",
                     "sync_history" => s.sync_history = v.trim() == "true",
                     "sync_passwords" => s.sync_passwords = v.trim() == "true",
+                    "sync_platform" => s.sync_platform = v.trim().to_string(),
+                    "sync_account_id" => s.sync_account_id = v.trim().to_string(),
+                    "sync_account_name" => s.sync_account_name = v.trim().to_string(),
+                    "sync_access_token" => s.sync_access_token = v.trim().to_string(),
+                    "sync_refresh_token" => s.sync_refresh_token = v.trim().to_string(),
+                    "sync_token_expiry" => {
+                        s.sync_token_expiry = v.trim().parse().unwrap_or(0)
+                    }
                     "remember_passphrase" => s.remember_passphrase = v.trim() == "true",
                     "block_ads" => s.block_ads = v.trim() == "true",
                     "force_dark" => s.force_dark = v.trim() == "true",
@@ -1271,7 +1298,7 @@ fn save_settings(s: &Settings) {
         let _ = std::fs::write(
             &path,
             format!(
-                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nremember_passphrase={}\nblock_ads={}\nforce_dark={}\nwallpaper={}\nth_base={}\nth_accent={}\nth_density={}\nth_font={}\nth_tabpos={}\nth_wallpaper={}\nth_tabfit={}\nth_radius={}\nth_glass={}\nth_tabmaxw={}\nth_base_explicit={}\nmod_clock={}\nmod_search={}\nmod_sites={}\nmod_notes={}\nmod_feed={}\nupdate_freq={}\nonboarded={}\nlocale={}\n",
+                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nsync_platform={}\nsync_account_id={}\nsync_account_name={}\nsync_access_token={}\nsync_refresh_token={}\nsync_token_expiry={}\nremember_passphrase={}\nblock_ads={}\nforce_dark={}\nwallpaper={}\nth_base={}\nth_accent={}\nth_density={}\nth_font={}\nth_tabpos={}\nth_wallpaper={}\nth_tabfit={}\nth_radius={}\nth_glass={}\nth_tabmaxw={}\nth_base_explicit={}\nmod_clock={}\nmod_search={}\nmod_sites={}\nmod_notes={}\nmod_feed={}\nupdate_freq={}\nonboarded={}\nlocale={}\n",
                 s.search,
                 s.accent,
                 s.dark,
@@ -1279,6 +1306,12 @@ fn save_settings(s: &Settings) {
                 s.sync_bookmarks,
                 s.sync_history,
                 s.sync_passwords,
+                s.sync_platform,
+                s.sync_account_id,
+                s.sync_account_name,
+                s.sync_access_token,
+                s.sync_refresh_token,
+                s.sync_token_expiry,
                 s.remember_passphrase,
                 s.block_ads,
                 s.force_dark,
@@ -2167,6 +2200,10 @@ enum SettingsApply {
     /// Update-check cadence change (`never`/`hourly`/`daily`) from the settings page (LYK-1495).
     UpdateFreq(String),
     Locale(String),
+    /// Start an OAuth connect for a platform key (`lyku.org` | `lyku.co`) to bind this profile.
+    Connect(String),
+    /// Unbind the current sync account (clears OAuth tokens + account identity).
+    Disconnect,
     Action(String),
 }
 
@@ -5181,6 +5218,23 @@ impl AppState {
                         changed = true;
                     }
                 }
+                SettingsApply::Connect(platform_key) => {
+                    // Remember the chosen platform, then defer the OAuth flow until the settings
+                    // borrow is dropped (it needs &self to open a tab + spawn the listener).
+                    if !platform_key.is_empty() {
+                        s.sync_platform = platform_key.clone();
+                        changed = true;
+                    }
+                    action = Some(format!("connect:{platform_key}"));
+                }
+                SettingsApply::Disconnect => {
+                    s.sync_account_id.clear();
+                    s.sync_account_name.clear();
+                    s.sync_access_token.clear();
+                    s.sync_refresh_token.clear();
+                    s.sync_token_expiry = 0;
+                    changed = true;
+                }
                 SettingsApply::Action(a) => action = Some(a),
             }
             if changed {
@@ -5191,6 +5245,9 @@ impl AppState {
             Some("sync") => self.start_sync(),
             Some("import") => self.import_browser_data(),
             Some("default") => self.make_default_browser(),
+            Some(a) if a.starts_with("connect:") => {
+                self.start_connect(a["connect:".len()..].to_string())
+            }
             _ => {}
         }
         // Re-advertise the page colour-scheme to open tabs in case the dark/theme setting changed.
@@ -5272,10 +5329,48 @@ impl AppState {
         let sync_bookmarks = toggle_link("sync_bookmarks", s.sync_bookmarks, "sync");
         let sync_history = toggle_link("sync_history", s.sync_history, "sync");
         let sync_passwords = toggle_link("sync_passwords", s.sync_passwords, "sync");
-        let key_status = if s.sync_api_key.is_empty() {
-            "Not set"
+        // Account binding: connected via OAuth ⇒ show who + a Disconnect; legacy key ⇒ note it +
+        // still offer Connect; otherwise a Connect button per platform (lyku.co disabled for now).
+        let connect_buttons: String = oauth::PLATFORMS
+            .iter()
+            .map(|p| {
+                if p.available {
+                    format!(
+                        "<a class=\"btn\" href=\"gator://settings?connect={}#sync\">Connect {}</a> ",
+                        p.key,
+                        html_escape(p.label)
+                    )
+                } else {
+                    format!(
+                        "<span class=\"btn\" style=\"opacity:.45;pointer-events:none\">{} (coming soon)</span> ",
+                        html_escape(p.label)
+                    )
+                }
+            })
+            .collect();
+        let sync_account = if !s.sync_refresh_token.is_empty() {
+            let label = oauth::platform(&s.sync_platform).label;
+            let name = if s.sync_account_name.is_empty() {
+                "your account".to_string()
+            } else {
+                html_escape(&s.sync_account_name)
+            };
+            format!(
+                "<p class=\"stat\">Connected as <b>{}</b> on {}.</p>\
+                 <p style=\"margin-top:6px\"><a class=\"btn\" href=\"gator://settings?disconnect=1#sync\">Disconnect</a></p>",
+                name,
+                html_escape(label)
+            )
+        } else if !s.sync_api_key.trim().is_empty() {
+            format!(
+                "<p class=\"stat\">Authenticated with a Lyku API key. Connect an account to use OAuth:</p>\
+                 <p style=\"margin-top:6px\">{connect_buttons}</p>"
+            )
         } else {
-            "Set (hidden)"
+            format!(
+                "<p class=\"stat\">Sign in to sync this profile across devices:</p>\
+                 <p style=\"margin-top:6px\">{connect_buttons}</p>"
+            )
         };
         let blocked = self.browser.adblock_blocked.get();
         let import_msg = self.browser.import_msg.borrow().clone().unwrap_or_default();
@@ -5439,7 +5534,7 @@ impl AppState {
             .replace("__SYNC_BOOKMARKS__", &sync_bookmarks)
             .replace("__SYNC_HISTORY__", &sync_history)
             .replace("__SYNC_PASSWORDS__", &sync_passwords)
-            .replace("__KEY_STATUS__", key_status)
+            .replace("__SYNC_ACCOUNT__", &sync_account)
             .replace("__IMPORT_MSG__", &html_escape(&import_msg))
             .replace("__SYNC_STATUS__", &html_escape(&sync_status))
             .replace("__PW_STATE__", &html_escape(&pw_state));
@@ -9446,19 +9541,38 @@ impl AppState {
         if self.browser.syncing.get() {
             return;
         }
-        let (api_key, sync_bookmarks, sync_history, sync_passwords) = {
+        let (platform, auth, sync_bookmarks, sync_history, sync_passwords) = {
             let s = self.browser.settings.borrow();
+            // OAuth binding wins over the legacy pasted key; neither ⇒ not connected.
+            let auth = if !s.sync_refresh_token.is_empty() {
+                Some(sync::SyncAuth::OAuth {
+                    access_token: s.sync_access_token.clone(),
+                    refresh_token: s.sync_refresh_token.clone(),
+                    expires_at: s.sync_token_expiry,
+                })
+            } else if !s.sync_api_key.trim().is_empty() {
+                Some(sync::SyncAuth::ApiKey(s.sync_api_key.clone()))
+            } else {
+                None
+            };
+            let platform = if s.sync_platform.is_empty() {
+                "lyku.org".to_string()
+            } else {
+                s.sync_platform.clone()
+            };
             (
-                s.sync_api_key.clone(),
+                platform,
+                auth,
                 s.sync_bookmarks,
                 s.sync_history,
                 s.sync_passwords,
             )
         };
-        if api_key.trim().is_empty() {
-            *self.browser.sync_status.borrow_mut() = "Set a Lyku API key first.".into();
+        let Some(auth) = auth else {
+            *self.browser.sync_status.borrow_mut() =
+                "Connect a Lyku account (or set an API key) first.".into();
             return;
-        }
+        };
         if !sync_bookmarks && !sync_history && !sync_passwords {
             *self.browser.sync_status.borrow_mut() = "Enable a collection to sync first.".into();
             return;
@@ -9486,7 +9600,8 @@ impl AppState {
                 Vec::new()
             };
             sync::SyncSnapshot {
-                api_key,
+                platform,
+                auth,
                 sync_bookmarks,
                 sync_history,
                 sync_passwords,
@@ -9519,6 +9634,15 @@ impl AppState {
     /// `updated`; deletes are not propagated in early access.
     fn apply_sync(&self, outcome: sync::SyncOutcome) {
         self.browser.syncing.set(false);
+        // Persist OAuth tokens the sync thread rotated (access token refreshed mid-run), even if
+        // the sync itself failed afterwards — the fresh access token is still worth keeping.
+        if let Some(rt) = &outcome.refreshed {
+            let mut s = self.browser.settings.borrow_mut();
+            s.sync_access_token = rt.access_token.clone();
+            s.sync_refresh_token = rt.refresh_token.clone();
+            s.sync_token_expiry = rt.expires_at;
+            save_settings(&s);
+        }
         *self.browser.sync_status.borrow_mut() = outcome.message.clone();
         if outcome.ok {
             {
@@ -9589,6 +9713,63 @@ impl AppState {
                 outcome.cursor_history,
                 outcome.cursor_passwords,
             );
+        }
+        self.window.request_redraw();
+    }
+
+    /// Begin binding this profile to a Lyku account: open the platform's OAuth sign-in in a new
+    /// tab and start a background loopback listener that captures the redirect, exchanges the code,
+    /// and reports back via `WakeUp::OAuthDone`. NavGator being a browser makes the RFC-8252
+    /// loopback flow seamless — the sign-in just opens as another tab.
+    fn start_connect(&self, platform_key: String) {
+        match oauth::begin(&platform_key) {
+            Ok((auth_url, pending)) => {
+                *self.browser.sync_status.borrow_mut() = format!(
+                    "Opening {} sign-in…",
+                    oauth::platform(&platform_key).label
+                );
+                if let Ok(u) = Url::parse(&auth_url) {
+                    self.new_tab(u);
+                }
+                let proxy = self.browser.event_proxy.clone();
+                std::thread::spawn(move || {
+                    let res = oauth::complete(pending);
+                    let _ = proxy.send_event(WakeUp::OAuthDone(res));
+                });
+            }
+            Err(e) => {
+                *self.browser.sync_status.borrow_mut() = e;
+            }
+        }
+        self.window.request_redraw();
+    }
+
+    /// A finished OAuth connect (UI thread): persist the tokens + bound account, or report failure.
+    fn apply_oauth(&self, res: Result<oauth::ConnectResult, String>) {
+        match res {
+            Ok(r) => {
+                let label = oauth::platform(&r.platform).label;
+                let name = if r.account_name.is_empty() {
+                    "your account".to_string()
+                } else {
+                    r.account_name.clone()
+                };
+                {
+                    let mut s = self.browser.settings.borrow_mut();
+                    s.sync_platform = r.platform.clone();
+                    s.sync_account_id = r.account_id;
+                    s.sync_account_name = r.account_name;
+                    s.sync_access_token = r.tokens.access_token;
+                    s.sync_refresh_token = r.tokens.refresh_token;
+                    s.sync_token_expiry = r.tokens.expires_at;
+                    save_settings(&s);
+                }
+                *self.browser.sync_status.borrow_mut() =
+                    format!("Connected as {name} on {label}.");
+            }
+            Err(e) => {
+                *self.browser.sync_status.borrow_mut() = format!("Connect failed: {e}");
+            }
         }
         self.window.request_redraw();
     }
@@ -10770,6 +10951,8 @@ impl WebViewDelegate for AppState {
                         "sync_passwords" => SettingsApply::SyncPasswords(v == "on"),
                         "update_freq" => SettingsApply::UpdateFreq(v.into_owned()),
                         "locale" => SettingsApply::Locale(v.into_owned()),
+                        "connect" => SettingsApply::Connect(v.into_owned()),
+                        "disconnect" => SettingsApply::Disconnect,
                         "action" => SettingsApply::Action(v.into_owned()),
                         "base" | "accentk" | "density" | "font" | "tabpos" | "tabfit"
                         | "wallpaper" | "preset" | "radius" | "glass" | "tabmaxw" | "module" => {
@@ -11901,6 +12084,7 @@ impl ApplicationHandler<WakeUp> for App {
             match event {
                 WakeUp::Ipc(cmd) => state.handle_ipc(cmd),
                 WakeUp::SyncDone(outcome) => state.apply_sync(outcome),
+                WakeUp::OAuthDone(res) => state.apply_oauth(res),
                 WakeUp::CosmeticReady => state.flush_cosmetic(),
                 WakeUp::GmFetchDone { id, ok, json } => state.resolve_gm_fetch(id, ok, json),
                 WakeUp::UpdateAvailable {
@@ -12438,6 +12622,8 @@ enum WakeUp {
     Exit,
     /// A background Lyku sync finished; apply the result on the UI thread.
     SyncDone(sync::SyncOutcome),
+    /// An OAuth connect flow finished; bind the account (or report failure) on the UI thread.
+    OAuthDone(Result<oauth::ConnectResult, String>),
     /// Cosmetic-filter CSS is ready to inject (deferred out of the JS-eval callback).
     CosmeticReady,
     /// An off-thread GM_xmlhttpRequest (net.fetch) finished; resolve it on the UI thread (LYK-1257).

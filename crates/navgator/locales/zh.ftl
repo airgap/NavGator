@@ -208,6 +208,7 @@ settings-sync-bookmarks = 书签
 settings-sync-history = 历史记录
 settings-sync-passwords = 密码
 settings-sync-status-heading = 状态
+settings-sync-account = 账户
 settings-sync-api-key = API 密钥
 settings-sync-now = 立即同步
 settings-sync-import = 导入

@@ -1,17 +1,20 @@
 //! NavGator ↔ Lyku sync (early access).
 //!
-//! Pushes/pulls bookmarks + history to `api.lyku.org` over HTTPS+JSON, authenticated with a
-//! Lyku API key (`lyk_` bearer). Bookmark/history payloads are plaintext JSON; the `passwords`
-//! collection (E2EE) lands once a password store exists. The network runs on a background
-//! thread, so `run_sync` takes a plain `Send` snapshot (no NavGator/egui types) and returns a
-//! `SyncOutcome` the UI thread merges into the `Profile`. Conflicts resolve last-write-wins by
-//! each item's `updated` (ms): items are pushed with their *stored* mtime, so re-pushing an
-//! unchanged item is idempotent and never clobbers another device's newer edit. Deletes don't
-//! propagate yet (no local tombstones) — an early-access limitation.
+//! Pushes/pulls bookmarks + history to a Lyku platform (`api.lyku.org` consumer, `api.lyku.co`
+//! business) over HTTPS+JSON. Auth is either a legacy `lyk_` API key or an OAuth access token
+//! (`lyt_`) obtained by binding the profile to an account ([`crate::oauth`]); a profile syncs to
+//! exactly one account/platform. Bookmark/history payloads are plaintext JSON; `passwords` are
+//! E2EE (encrypted on the UI thread — only ciphertext reaches this module). The network runs on a
+//! background thread, so `run_sync` takes a plain `Send` snapshot (no NavGator/egui types) and
+//! returns a `SyncOutcome` the UI thread merges into the `Profile`. Conflicts resolve
+//! last-write-wins by each item's `updated` (ms): items are pushed with their *stored* mtime, so
+//! re-pushing an unchanged item is idempotent and never clobbers another device's newer edit.
+//! When an OAuth access token is expired/near-expiry the sync thread refreshes it first and hands
+//! the rotated tokens back in the outcome for the UI thread to persist. Deletes don't propagate
+//! yet (no local tombstones) — an early-access limitation.
 
+use crate::oauth;
 use serde::{Deserialize, Serialize};
-
-const API: &str = "https://api.lyku.org";
 
 #[derive(Serialize)]
 struct WireItem {
@@ -61,9 +64,33 @@ struct HistoryPayload {
     visits: u32,
 }
 
+/// How the sync thread authenticates to the platform.
+pub enum SyncAuth {
+    /// Legacy `lyk_` API key pasted into settings.conf.
+    ApiKey(String),
+    /// OAuth credentials from binding the profile to an account. The thread refreshes the access
+    /// token if it's expired/near-expiry before syncing.
+    OAuth {
+        access_token: String,
+        refresh_token: String,
+        /// ms-epoch access-token deadline.
+        expires_at: i64,
+    },
+}
+
+/// OAuth tokens the sync thread rotated mid-run; the UI thread persists these into settings.conf.
+#[derive(Debug)]
+pub struct RefreshedTokens {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: i64,
+}
+
 /// Local data + config handed to the background sync thread. Plain owned data only (`Send`).
 pub struct SyncSnapshot {
-    pub api_key: String,
+    /// Platform key (`lyku.org` | `lyku.co`) — selects the API base URL and OAuth endpoints.
+    pub platform: String,
+    pub auth: SyncAuth,
     pub sync_bookmarks: bool,
     pub sync_history: bool,
     pub bookmarks: Vec<(String, String, i64)>, // (url, title, updated)
@@ -113,6 +140,8 @@ pub struct SyncOutcome {
     pub cursor_bookmarks: i64,
     pub cursor_history: i64,
     pub cursor_passwords: i64,
+    /// Present iff the sync thread refreshed OAuth tokens; the UI thread must persist them.
+    pub refreshed: Option<RefreshedTokens>,
 }
 
 fn err_str(e: ureq::Error) -> String {
@@ -125,12 +154,12 @@ fn err_str(e: ureq::Error) -> String {
     }
 }
 
-fn push(api_key: &str, items: Vec<WireItem>) -> Result<usize, String> {
+fn push(base: &str, bearer: &str, items: Vec<WireItem>) -> Result<usize, String> {
     if items.is_empty() {
         return Ok(0);
     }
-    let resp: PushResp = ureq::post(&format!("{API}/sync-push"))
-        .set("Authorization", &format!("Bearer {api_key}"))
+    let resp: PushResp = ureq::post(&format!("{base}/sync-push"))
+        .set("Authorization", &format!("Bearer {bearer}"))
         .send_json(PushReq { items })
         .map_err(err_str)?
         .into_json()
@@ -138,9 +167,9 @@ fn push(api_key: &str, items: Vec<WireItem>) -> Result<usize, String> {
     Ok(resp.accepted as usize)
 }
 
-fn pull(api_key: &str, collection: &str, since: i64) -> Result<Vec<WireItemIn>, String> {
-    let resp: PullResp = ureq::post(&format!("{API}/sync-pull"))
-        .set("Authorization", &format!("Bearer {api_key}"))
+fn pull(base: &str, bearer: &str, collection: &str, since: i64) -> Result<Vec<WireItemIn>, String> {
+    let resp: PullResp = ureq::post(&format!("{base}/sync-pull"))
+        .set("Authorization", &format!("Bearer {bearer}"))
         .send_json(PullReq {
             collections: vec![collection.to_string()],
             since,
@@ -150,6 +179,13 @@ fn pull(api_key: &str, collection: &str, since: i64) -> Result<Vec<WireItemIn>, 
         .into_json()
         .map_err(|e| e.to_string())?;
     Ok(resp.items)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Run a full push+pull for the opted-in collections. Never panics; failures come back as
@@ -165,14 +201,54 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
         cursor_bookmarks: snap.cursor_bookmarks,
         cursor_history: snap.cursor_history,
         cursor_passwords: snap.cursor_passwords,
+        refreshed: None,
     };
-    if snap.api_key.trim().is_empty() {
-        return SyncOutcome {
-            ok: false,
-            message: "No Lyku API key set (paste one in Settings).".into(),
-            ..out
-        };
-    }
+
+    let base = oauth::platform(&snap.platform).api_base.to_string();
+
+    // Resolve the Bearer credential. OAuth access tokens are refreshed first when within 60s of
+    // expiry; the rotated tokens ride back in `out.refreshed` so they persist even if a later
+    // push/pull fails (an early return still carries them via `..out`).
+    let bearer: String = match &snap.auth {
+        SyncAuth::ApiKey(k) => {
+            if k.trim().is_empty() {
+                return SyncOutcome {
+                    ok: false,
+                    message: "No Lyku account connected (connect one in Settings).".into(),
+                    ..out
+                };
+            }
+            k.clone()
+        }
+        SyncAuth::OAuth {
+            access_token,
+            refresh_token,
+            expires_at,
+        } => {
+            if now_ms() >= *expires_at - 60_000 {
+                match oauth::refresh(&snap.platform, refresh_token) {
+                    Ok(t) => {
+                        let bearer = t.access_token.clone();
+                        out.refreshed = Some(RefreshedTokens {
+                            access_token: t.access_token,
+                            refresh_token: t.refresh_token,
+                            expires_at: t.expires_at,
+                        });
+                        bearer
+                    }
+                    Err(e) => {
+                        return SyncOutcome {
+                            ok: false,
+                            message: format!("Session expired — reconnect your account. ({e})"),
+                            ..out
+                        };
+                    }
+                }
+            } else {
+                access_token.clone()
+            }
+        }
+    };
 
     if snap.sync_bookmarks {
         let items = snap
@@ -190,7 +266,7 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
                 updated: *updated,
             })
             .collect();
-        match push(&snap.api_key, items) {
+        match push(&base, &bearer, items) {
             Ok(n) => out.pushed += n,
             Err(e) => {
                 return SyncOutcome {
@@ -200,7 +276,7 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
                 };
             }
         }
-        match pull(&snap.api_key, "bookmarks", snap.cursor_bookmarks) {
+        match pull(&base, &bearer, "bookmarks", snap.cursor_bookmarks) {
             Ok(items) => {
                 for it in items {
                     if it.updated > out.cursor_bookmarks {
@@ -250,7 +326,7 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
                 updated: *updated,
             })
             .collect();
-        match push(&snap.api_key, items) {
+        match push(&base, &bearer, items) {
             Ok(n) => out.pushed += n,
             Err(e) => {
                 return SyncOutcome {
@@ -260,7 +336,7 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
                 };
             }
         }
-        match pull(&snap.api_key, "history", snap.cursor_history) {
+        match pull(&base, &bearer, "history", snap.cursor_history) {
             Ok(items) => {
                 for it in items {
                     if it.updated > out.cursor_history {
@@ -299,7 +375,7 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
                 updated: *updated,
             })
             .collect();
-        match push(&snap.api_key, items) {
+        match push(&base, &bearer, items) {
             Ok(n) => out.pushed += n,
             Err(e) => {
                 return SyncOutcome {
@@ -309,7 +385,7 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
                 };
             }
         }
-        match pull(&snap.api_key, "passwords", snap.cursor_passwords) {
+        match pull(&base, &bearer, "passwords", snap.cursor_passwords) {
             Ok(items) => {
                 for it in items {
                     if it.updated > out.cursor_passwords {

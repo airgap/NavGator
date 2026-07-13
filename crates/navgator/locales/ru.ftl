@@ -208,6 +208,7 @@ settings-sync-bookmarks = Закладки
 settings-sync-history = История
 settings-sync-passwords = Пароли
 settings-sync-status-heading = Статус
+settings-sync-account = Учётная запись
 settings-sync-api-key = API-ключ
 settings-sync-now = Синхронизировать сейчас
 settings-sync-import = Импорт
