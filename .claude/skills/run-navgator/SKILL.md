@@ -156,6 +156,15 @@ or a colour/pixel assertion for a non-shape case (see `forms_accent`).
   background pixel (OCR-free). Catches regressions in the swervo IndexedDB index feature (backend
   index population + index reads, `IDBIndex` methods, `IDBCursor.continue()`). Before it, index
   queries threw "not a function" (broke YouTube).
+- `resize-reflow.sh` — window-resize reflow: shrinks the window and asserts a `position:fixed;
+  right:0;bottom:0` marker tracks the NEW content-area corner (stale layout leaves it at the old,
+  cropped-away corner). Catches the class of bug where the framebuffer resizes but layout never
+  hears about the new viewport (pages stuck at the old size, white L after maximize, reloads laying
+  out stale). First instance: `render_pane` resized the pane's `OffscreenRenderingContext` directly
+  BEFORE `WebView::resize`, so the engine painter's resize path early-returned on "context already
+  at target size" and never pushed the new rect to layout — `WebView::resize` must be the ONLY
+  resize entry point for a pane with tabs. Nothing else in the suite resizes the window, which is
+  how that shipped unseen for weeks.
 
 ## Record/replay real pages (deterministic fixtures)
 

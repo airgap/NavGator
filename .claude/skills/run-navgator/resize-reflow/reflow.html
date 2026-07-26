@@ -1,0 +1,9 @@
+<!doctype html>
+<!-- Fixture for resize-reflow.sh: the green layer covers the layout viewport, and the red
+     marker hugs its bottom-right corner. If a window resize reflows layout, the red square
+     tracks the new content-area corner; if layout is stale, red stays at the OLD corner
+     (cropped away on shrink). Pure colors so the gate can threshold loosely. -->
+<body style="margin:0">
+  <div style="position:fixed; inset:0; background:#00c800"></div>
+  <div style="position:fixed; right:0; bottom:0; width:24px; height:24px; background:#e00000"></div>
+</body>

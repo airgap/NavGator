@@ -6058,10 +6058,19 @@ impl AppState {
         let h = (rect.height() * scale).round().max(1.0) as u32;
         if (w, h) != self.pane(pane).content_px.get() {
             self.pane(pane).content_px.set((w, h));
-            self.pane(pane).context.resize(PhysicalSize::new(w, h));
-            for t in self.pane(pane).tabs.borrow().iter() {
+            // Resize via the WebView, NOT the context: the engine's painter skips its whole
+            // resize path (webview rects, document view, layout reflow) when the context is
+            // already at the target size — so pre-resizing the context here left every page
+            // laid out at the old viewport forever (stale layout + white L after any window
+            // resize). WebView::resize resizes the shared context and every sibling webview.
+            let tabs = self.pane(pane).tabs.borrow();
+            if let Some(t) = tabs.first() {
                 t.webview.resize(PhysicalSize::new(w, h));
+            } else {
+                // Empty pane: no webview shares this context, so size the blit source directly.
+                self.pane(pane).context.resize(PhysicalSize::new(w, h));
             }
+            drop(tabs);
             // Servo reflows the new size ASYNCHRONOUSLY, and notify_new_frame_ready only fires when
             // its event loop is pumped — after a resize nothing reliably pumps it, so the stale
             // (old-size) frame stays on screen until the user interacts. Keep redrawing for a short
