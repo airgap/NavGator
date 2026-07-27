@@ -5648,6 +5648,20 @@ impl AppState {
         let get_started = tr!("onboarding-get-started");
         let skip = tr!("onboarding-skip");
         let fine = tr!("onboarding-fine");
+        // Form submission to a custom scheme is aborted by the HTML spec (only http(s)/
+        // file/data are form-submittable), so "Get started" must build the gator:// GET
+        // URL itself and navigate — top-level navigation DOES reach the interceptor
+        // (same mechanism as the Skip link). See the gator:// GET-only constraint.
+        let onboard_js = "document.querySelector('form').addEventListener('submit',function(ev){\
+            ev.preventDefault();\
+            var parts=['done=1'];\
+            var els=this.querySelectorAll('input');\
+            for(var i=0;i<els.length;i++){var el=els[i];\
+              if(el.name==='done')continue;\
+              if((el.type==='radio'||el.type==='checkbox')&&!el.checked)continue;\
+              parts.push(encodeURIComponent(el.name)+'='+encodeURIComponent(el.value));}\
+            location.href='gator://onboarding?'+parts.join('&');\
+        });";
         let html = format!(
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{title}</title>\
              <style>\
@@ -5683,7 +5697,7 @@ impl AppState {
              <a class=\"skip\" href=\"gator://onboarding?skip=1\">{skip}</a></div>\
              </form>\
              <p class=\"fine\">{fine}</p>\
-             </div></body></html>"
+             </div><script>{onboard_js}</script></body></html>"
         );
         self.themed(html)
     }
