@@ -2081,6 +2081,14 @@ fn navgator_preferences() -> Preferences {
     // denied). (Excluded: webvtt — vttcue::GetCueAsHTML is a `todo!()` panic; sharedworker/
     // abort_controller/resize_observer/mutation_observer/crypto_subtle are already default-on.)
     p.dom_cookiestore_enabled = true;
+    // Native <foreignObject> layout (LYK-136 stage 3 phase 1): real boxes for the HTML
+    // content on top of the svg raster — live + hit-testable. OFF by default: the native
+    // layer doesn't apply the svg mask yet (phase 2, WR image-mask compositing), so masked
+    // avatars would paint square. Opt in with NAVGATOR_NATIVE_FO=1 to develop against it;
+    // the stage-1/2 serializer lowering remains the default visual path.
+    if std::env::var_os("NAVGATOR_NATIVE_FO").is_some_and(|v| v == "1") {
+        p.dom_svg_foreignobject_native = true;
+    }
     // Cache API (window.caches / Cache / CacheStorage) — storage-thread-backed, SQLite
     // persistence in the profile dir (LYK-1365 Phase 1).
     p.dom_cache_api_enabled = true;
