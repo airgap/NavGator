@@ -38,7 +38,22 @@ Gotchas encoded in the code: SVG attribute names are case-sensitive
 - `background-image`-based avatars inside foreignObject (no `<img>` to
   source pixels from)
 
-## Stage 3 design: native foreignObject (not started)
+## Stage 3: native foreignObject — SHIPPED (phases 1+2, swervo 4e84111)
+
+Phase 1: the replaced `<svg>` reuses the UA-widget slot to lay out foreignObject HTML
+content as real boxes (live, hit-testable, a11y); display forced via presentation
+hints (camelCase SVG type selectors don't match through UA stylesheets). Phase 2: the
+serializer synthesizes a standalone mask document per masked foreignObject, injected
+as CSS `mask-image` via a hint; two author-facing CSS-masking fixes carry it —
+`mask-image` now establishes a stacking context with its image-mask clip on the WR
+stacking-context surface (masks clip DESCENDANTS, not just own decorations), and
+`traverse_replaced_content` defers SC-establishing children to the SC tree (was
+double-painting: unmasked square under masked circle, diagnosed with a 50%-alpha
+probe). `dom_svg_foreignobject_native` defaults ON in NavGator (NAVGATOR_NATIVE_FO=0
+reverts to raster lowering). The `svg_foreignobject` reftest runs native-vs-raster at
+SSIM 0.9975 — two independent pipelines, same pixels.
+
+## Original stage-3 design sketch (as built, for reference)
 
 Goal: arbitrary HTML inside `<foreignObject>` with real hit-testing and a11y —
 the one thing serializer lowering can never do (resvg cannot lay out HTML).
