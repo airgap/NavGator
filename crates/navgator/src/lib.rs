@@ -3663,6 +3663,10 @@ struct PaneGroup {
     context: Rc<OffscreenRenderingContext>,
     /// This pane's content area device-px size, to skip redundant resizes.
     content_px: Cell<(u32, u32)>,
+    /// When the engine was last resized to `content_px` — the throttle clock that keeps
+    /// interactive drags (a new size every frame) from triggering a full engine resize
+    /// (surface realloc + relayout) per frame.
+    last_engine_resize: Cell<Option<std::time::Instant>>,
     /// This pane's tabs and the active index within them.
     tabs: RefCell<Vec<Tab>>,
     active: Cell<usize>,
@@ -3677,6 +3681,7 @@ impl PaneGroup {
         Self {
             context,
             content_px: Cell::new((0, 0)),
+            last_engine_resize: Cell::new(None),
             tabs: RefCell::new(Vec::new()),
             active: Cell::new(0),
             drag_tab: Cell::new(None),
@@ -6078,20 +6083,35 @@ impl AppState {
         let w = (rect.width() * scale).round().max(1.0) as u32;
         let h = (rect.height() * scale).round().max(1.0) as u32;
         if (w, h) != self.pane(pane).content_px.get() {
-            self.pane(pane).content_px.set((w, h));
-            // Resize via the WebView, NOT the context: the engine's painter skips its whole
-            // resize path (webview rects, document view, layout reflow) when the context is
-            // already at the target size — so pre-resizing the context here left every page
-            // laid out at the old viewport forever (stale layout + white L after any window
-            // resize). WebView::resize resizes the shared context and every sibling webview.
-            let tabs = self.pane(pane).tabs.borrow();
-            if let Some(t) = tabs.first() {
-                t.webview.resize(PhysicalSize::new(w, h));
-            } else {
-                // Empty pane: no webview shares this context, so size the blit source directly.
-                self.pane(pane).context.resize(PhysicalSize::new(w, h));
+            // An engine resize is a GL surface realloc plus a full relayout — far too heavy to
+            // run at drag rate, where a new size arrives every frame. Throttle to one engine
+            // resize per interval; between them the previous frame blits stretched into the new
+            // rect, and the settle loop below is re-armed every pending frame, so the redraw
+            // loop stays alive until the trailing-edge resize lands regardless of frame rate.
+            const ENGINE_RESIZE_THROTTLE: std::time::Duration = std::time::Duration::from_millis(100);
+            let now = std::time::Instant::now();
+            let due = self
+                .pane(pane)
+                .last_engine_resize
+                .get()
+                .is_none_or(|last| now.duration_since(last) >= ENGINE_RESIZE_THROTTLE);
+            if due {
+                self.pane(pane).content_px.set((w, h));
+                self.pane(pane).last_engine_resize.set(Some(now));
+                // Resize via the WebView, NOT the context: the engine's painter skips its whole
+                // resize path (webview rects, document view, layout reflow) when the context is
+                // already at the target size — so pre-resizing the context here left every page
+                // laid out at the old viewport forever (stale layout + white L after any window
+                // resize). WebView::resize resizes the shared context and every sibling webview.
+                let tabs = self.pane(pane).tabs.borrow();
+                if let Some(t) = tabs.first() {
+                    t.webview.resize(PhysicalSize::new(w, h));
+                } else {
+                    // Empty pane: no webview shares this context, so size the blit source directly.
+                    self.pane(pane).context.resize(PhysicalSize::new(w, h));
+                }
+                drop(tabs);
             }
-            drop(tabs);
             // Servo reflows the new size ASYNCHRONOUSLY, and notify_new_frame_ready only fires when
             // its event loop is pumped — after a resize nothing reliably pumps it, so the stale
             // (old-size) frame stays on screen until the user interacts. Keep redrawing for a short

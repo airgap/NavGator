@@ -38,7 +38,7 @@ ssim() { ffmpeg -i "$1" -i "$2" -lavfi ssim -f null - 2>&1 | grep -oE 'All:[0-9.
 # --- self-reftests: <name> renders <name>.test.html, compared to <name>.ref.html ---
 # svg_xref_mask + svg_foreignobject need the LYK-136 serializer passes (cross-doc ref
 # inlining + foreignObject lowering) — red on an engine pin older than that merge.
-for t in mask_circle mask_chevron scheme_light clip_text grid_cols light_dark svg_xref_mask svg_foreignobject svg_image_href; do
+for t in mask_circle mask_chevron scheme_light clip_text grid_cols light_dark svg_xref_mask svg_foreignobject svg_image_href svg_fo_use_mask; do
   render "${t}_t" "${t}.test.html"
   render "${t}_r" "${t}.ref.html"
   s=$(ssim "/tmp/reg_${t}_t_c.png" "/tmp/reg_${t}_r_c.png")
