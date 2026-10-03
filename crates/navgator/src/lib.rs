@@ -49,7 +49,7 @@ use euclid::default::{Point2D, Rect, Size2D};
 // the Servo fork (ROADMAP §R2; docs/FORK.md). IPC wire types come from navgator-protocol.
 use navgator_engine::{
     AuthenticationRequest, ColorPicker, ConsoleLogLevel, CreateNewWebViewRequest, Cursor, DeviceIntRect,
-    DeviceIntSize, DevicePoint, EmbedderControl,
+    DeviceIntSize, DevicePoint, EmbedderControl, ScreenGeometry,
     EmbedderControlId, EventLoopWaker, FilePicker, FilterPattern, Image, InputEvent, InputEventId,
     InputEventResult, JSValue, Key,
     KeyState, KeyboardEvent, LoadStatus, MediaSessionEvent, MediaSessionPlaybackState, Modifiers,
@@ -2078,9 +2078,12 @@ fn navgator_preferences() -> Preferences {
     // Enablement audit (LYK-1383): default-OFF stock prefs whose swervo impls are complete +
     // additive. `cookiestore.rs` is a full 746-line Get/Set/Delete impl over the cookie jar;
     // `wakelock.rs` is a spec-compliant Screen Wake Lock (permission-gated, rejects cleanly when
-    // denied). (Excluded: webvtt — vttcue::GetCueAsHTML is a `todo!()` panic; sharedworker/
-    // abort_controller/resize_observer/mutation_observer/crypto_subtle are already default-on.)
+    // denied). (sharedworker/abort_controller/resize_observer/mutation_observer/crypto_subtle
+    // are already default-on.)
     p.dom_cookiestore_enabled = true;
+    // WebVTT (VTTCue, TextTrack): Reddit's player subclasses `window.VTTCue` at load, and its
+    // post pages fail ("Request failed", no comments) when the class is missing.
+    p.dom_webvtt_enabled = true;
     // Native <foreignObject> layout (LYK-136 stage 3): real boxes for the HTML content —
     // live, hit-testable, in the a11y tree — composited through the svg mask via the
     // WR image-mask stacking context (phase 2). ON by default; NAVGATOR_NATIVE_FO=0
@@ -2113,7 +2116,9 @@ fn navgator_preferences() -> Preferences {
     p.layout_container_queries_enabled = true; // `@container` (ubiquitous on modern responsive sites)
     p.layout_columns_enabled = true; // CSS multi-column (`column-count`/`column-width`)
     p.layout_variable_fonts_enabled = true; // variable fonts (weight/width axes)
-    p.layout_writing_mode_enabled = true; // `writing-mode: vertical-*` (CJK + vertical layouts)
+    // Not `layout_writing_mode_enabled`: layout still asserts that writing modes never mix
+    // (flow/mod.rs, positioned.rs), so a vertical block panicked the whole browser. Ignoring
+    // `writing-mode` lays such text out horizontally instead.
     // Accessibility tree (LYK-1378): gate for the layout-built AccessKit tree of page content.
     // Off by default (it costs a tree walk per reflow); we opt in and expose it to the OS a11y
     // layer via the chrome's AccessKit adapter (see WebViewDelegate::notify_accessibility_tree_update).
@@ -10565,6 +10570,30 @@ impl AppState {
 impl WebViewDelegate for AppState {
     fn notify_new_frame_ready(&self, _webview: WebView) {
         self.window.request_redraw();
+    }
+
+    /// `window.screen`, `outerWidth`, `screenX` and friends. Without this they all read 0, and
+    /// sites sizing popups or picking a layout from `screen.width` broke.
+    fn screen_geometry(&self, _webview: WebView) -> Option<ScreenGeometry> {
+        let monitor = self.window.current_monitor()?;
+        let screen = monitor.size();
+        let screen = DeviceIntSize::new(screen.width as i32, screen.height as i32);
+        // Wayland doesn't reveal window positions to clients; browsers report 0 there.
+        let position = match self.window.outer_position() {
+            Ok(position) => position,
+            Err(_) => winit::dpi::PhysicalPosition::new(0, 0),
+        };
+        let outer = self.window.outer_size();
+        Some(ScreenGeometry {
+            size: screen,
+            // winit has no work-area query; the whole screen is what Chrome reports on X11
+            // without a panel-aware window manager.
+            available_size: screen,
+            window_rect: DeviceIntRect::from_origin_and_size(
+                euclid::point2(position.x, position.y),
+                DeviceIntSize::new(outer.width as i32, outer.height as i32),
+            ),
+        })
     }
 
     /// Servo produced a new accessibility-tree update for a page. Queue it off the frame; it's

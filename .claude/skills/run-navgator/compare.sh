@@ -11,7 +11,7 @@
 set -uo pipefail
 name="${1:?usage: compare.sh <name> <url>}"
 url="${2:?usage: compare.sh <name> <url>}"
-OUT=/tmp/navgator-compare; mkdir -p "$OUT"
+OUT="${NAVG_COMPARE_OUT:-/tmp/navgator-compare}"; mkdir -p "$OUT"
 DRV="$(cd "$(dirname "$0")" && pwd)/driver.sh"
 TOP="$("$DRV" chrome-top)" || exit 1   # chrome height to crop off swervo's screenshot
 W=1280; VH=$((800 - TOP))              # navgator's content viewport in its 1280x800 window
