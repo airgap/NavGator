@@ -16,7 +16,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DRV="$HERE/driver.sh"
 OUT=/tmp/svg-aspect; mkdir -p "$OUT"
-PORT="${SA_PORT:-8995}"; W=1280; H=800; TOP=93
+PORT="${SA_PORT:-8995}"; W=1280; H=800
+TOP="$("$DRV" chrome-top)" || exit 1
 TOL="${SA_ASPECT_TOL:-0.18}"
 # name:x:y:w:h — page-content rects (add TOP for the swervo capture's chrome offset). The first
 # three boxes are 24x60 (tall, cross stretched); D is the 60x60 square control.

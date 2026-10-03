@@ -16,10 +16,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 DRV="$HERE/driver.sh"
 OUT=/tmp/kbd-shortcuts; mkdir -p "$OUT"
 PORT="${KS_PORT:-8993}"
-# Field crop in display coords (1280x800 capture): the textarea is page (20,40)+600x120; the page
-# renders below ~78px of chrome, so display ~ (22,120) .. (620,236).
-CROP="${KS_CROP:-590:108:24:122}"   # w:h:x:y
-CLICK_X="${KS_CLICK_X:-320}"; CLICK_Y="${KS_CLICK_Y:-178}"
+# Field crop in display coords (1280x800 capture): the textarea is page (20,40)+600x120, inset by
+# 4px to stay inside its border, and the page renders below the measured chrome height.
+TOP="$("$DRV" chrome-top)" || exit 1
+CROP="${KS_CROP:-590:108:24:$((TOP + 46))}"   # w:h:x:y
+CLICK_X="${KS_CLICK_X:-320}"; CLICK_Y="${KS_CLICK_Y:-$((TOP + 100))}"
 
 ( cd "$HERE/kbd-shortcuts" && setsid python3 -m http.server "$PORT" >/dev/null 2>&1 </dev/null & ); sleep 1
 "$DRV" stop >/dev/null 2>&1

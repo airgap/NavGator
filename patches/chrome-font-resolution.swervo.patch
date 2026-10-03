@@ -1,0 +1,209 @@
+diff --git a/components/fonts/platform/freetype/font.rs b/components/fonts/platform/freetype/font.rs
+index 7a3041e75e4..a4bc88e86d1 100644
+--- a/components/fonts/platform/freetype/font.rs
++++ b/components/fonts/platform/freetype/font.rs
+@@ -350,6 +350,15 @@ impl PlatformFontMethods for PlatformFont {
+             }
+         }
+ 
++        // Chrome (Skia's `SimpleFontData::PlatformInit`) rounds ascent, descent and line gap to
++        // whole pixels individually, and `line-height: normal` and baselines follow from those.
++        // Unrounded, every normal-height line drifted a fraction of a pixel from Chrome's
++        // (13.33px Liberation Sans: 15.33px lines here, 15px there), compounding down a page.
++        let line_gap = line_height - max_ascent - max_descent;
++        max_ascent = max_ascent.round();
++        max_descent = max_descent.round();
++        line_height = max_ascent + max_descent + line_gap.round();
++
+         // 'leading' is supposed to be the vertical distance between two baselines,
+         // reflected by the height attribute in freetype. On OS X (w/ CTFont),
+         // leading represents the distance between the bottom of a line descent to
+diff --git a/components/fonts/platform/freetype/font_list.rs b/components/fonts/platform/freetype/font_list.rs
+index 4d1416fb49c..d12517d221b 100644
+--- a/components/fonts/platform/freetype/font_list.rs
++++ b/components/fonts/platform/freetype/font_list.rs
+@@ -223,6 +223,17 @@ pub fn fallback_font_families(options: FallbackFontSelectionOptions) -> Vec<&'st
+ pub(crate) fn default_system_generic_font_family(
+     generic: GenericFontFamily,
+ ) -> LowercaseFontFamilyName {
++    // Chrome's default fonts on Linux, resolved like any named family. Fontconfig's own generic
++    // choice (often Noto) only applies when neither they nor a metric-compatible stand-in exist.
++    let chrome_default_family = match generic {
++        GenericFontFamily::None | GenericFontFamily::Serif => Some("Times New Roman"),
++        GenericFontFamily::SansSerif => Some("Arial"),
++        _ => None,
++    };
++    if let Some(family) = chrome_default_family.and_then(font_family_substitute) {
++        return family.into();
++    }
++
+     let generic_string = match generic {
+         GenericFontFamily::None | GenericFontFamily::Serif => c"serif",
+         GenericFontFamily::SansSerif => c"sans-serif",
+@@ -275,42 +286,110 @@ pub(crate) fn default_system_generic_font_family(
+     .into()
+ }
+ 
+-/// Resolve a requested font family *name* through fontconfig's configuration substitution + match —
+-/// i.e. its aliases (Arial → Liberation Sans, Verdana → Noto Sans, Helvetica → Nimbus Sans, Times New
+-/// Roman → Liberation Serif, …). This is what Chrome does on Linux for families that are not installed
+-/// under their requested name; swervo otherwise only ran fontconfig for *generic* families and dropped
+-/// named misses to the generic fallback, so e.g. Arial and Verdana both collapsed to the same font.
+-/// Returns the matched family name (always an installed font), or None on failure.
++/// Families that Skia (and so Chrome) accepts in place of one another when fontconfig substitutes
++/// one for another: they share metrics, so a page laid out against one lays out the same with any.
++/// The Latin and office groups of Skia's `kFontEquivMap`; its CJK groups are not mirrored.
++const METRIC_COMPATIBLE_FAMILIES: &[&[&str]] = &[
++    &["Arial", "Arimo", "Liberation Sans"],
++    &["Times New Roman", "Tinos", "Liberation Serif"],
++    &["Courier New", "Cousine", "Liberation Mono"],
++    &["Symbol", "Symbol Neu"],
++    &["Cambria", "Caladea"],
++    &["Calibri", "Carlito"],
++];
++
++fn is_metric_compatible(requested: &str, matched: &str) -> bool {
++    METRIC_COMPATIBLE_FAMILIES.iter().any(|group| {
++        group.iter().any(|family| family.eq_ignore_ascii_case(requested)) &&
++            group.iter().any(|family| family.eq_ignore_ascii_case(matched))
++    })
++}
++
++/// Blink's `AlternateFamilyName`: the name Chrome retries when a family can't be found. It is
++/// why Helvetica renders as Arial's stand-in (fontconfig itself picks Nimbus Sans, which Skia
++/// rejects).
++fn alternate_family_name(name: &str) -> Option<&'static str> {
++    [
++        ("Arial", "Helvetica"),
++        ("Courier", "Courier New"),
++        ("Times", "Times New Roman"),
++    ]
++    .iter()
++    .find_map(|(first, second)| {
++        if first.eq_ignore_ascii_case(name) {
++            Some(*second)
++        } else if second.eq_ignore_ascii_case(name) {
++            Some(*first)
++        } else {
++            None
++        }
++    })
++}
++
++unsafe fn pattern_family(pattern: *mut FcPattern, index: c_int) -> Option<String> {
++    let mut family: *mut FcChar8 = ptr::null_mut();
++    let result = unsafe {
++        FcPatternGetString(
++            pattern,
++            FC_FAMILY.as_ptr() as *mut c_char,
++            index,
++            &mut family,
++        )
++    };
++    if result != FcResultMatch {
++        return None;
++    }
++    unsafe { CStr::from_ptr(family as *const c_char) }
++        .to_str()
++        .ok()
++        .map(str::to_owned)
++}
++
++/// Resolve a font family *name* that isn't installed under that name the way Chrome does on
++/// Linux (Skia's `SkFontConfigInterfaceDirect::matchFamilyName`): run fontconfig's substitution
++/// and match, but accept the result only if it is the family fontconfig's configuration rewrote
++/// the name to, the requested family itself, or a metric-compatible stand-in. Anything else is a
++/// best-effort guess Chrome rejects so the page's next family applies: Verdana does not become
++/// Noto Sans; `font-family: Verdana, sans-serif` falls through to sans-serif. Retries Blink's
++/// alternate name (Helvetica -> Arial). Returns an installed family name, or None.
+ pub(crate) fn font_family_substitute(name: &str) -> Option<String> {
+-    let cname = std::ffi::CString::new(name).ok()?;
++    acceptable_fontconfig_substitute(name)
++        .or_else(|| alternate_family_name(name).and_then(acceptable_fontconfig_substitute))
++}
++
++fn acceptable_fontconfig_substitute(name: &str) -> Option<String> {
++    let cname = CString::new(name).ok()?;
+     unsafe {
+         let pattern = FcNameParse(cname.as_ptr() as *mut FcChar8);
+         if pattern.is_null() {
+             return None;
+         }
+         FcConfigSubstitute(ptr::null_mut(), pattern, FcMatchPattern);
++        let post_config_family = pattern_family(pattern, 0);
+         FcDefaultSubstitute(pattern);
+ 
+         let mut result = 0;
+-        let family_match = FcFontMatch(ptr::null_mut(), pattern, &mut result);
+-        let mut matched = None;
+-        if !family_match.is_null() {
+-            let mut match_string: *mut FcChar8 = ptr::null_mut();
+-            FcPatternGetString(
+-                family_match,
+-                FC_FAMILY.as_ptr() as *mut c_char,
+-                0,
+-                &mut match_string,
+-            );
+-            if !match_string.is_null() {
+-                if let Ok(s) = CStr::from_ptr(match_string as *const c_char).to_str() {
+-                    matched = Some(s.to_owned());
+-                }
+-            }
+-            FcPatternDestroy(family_match);
+-        }
++        let font_match = FcFontMatch(ptr::null_mut(), pattern, &mut result);
+         FcPatternDestroy(pattern);
+-        matched
++        if font_match.is_null() {
++            return None;
++        }
++        let acceptable = (0..)
++            .map_while(|index| pattern_family(font_match, index))
++            .any(|matched| {
++                post_config_family
++                    .as_deref()
++                    .is_some_and(|post_config| post_config.eq_ignore_ascii_case(&matched)) ||
++                    matched.eq_ignore_ascii_case(name) ||
++                    is_metric_compatible(name, &matched)
++            });
++        let family = if acceptable {
++            pattern_family(font_match, 0)
++        } else {
++            None
++        };
++        FcPatternDestroy(font_match);
++        family
+     }
+ }
+ 
+diff --git a/components/fonts/system_font_service.rs b/components/fonts/system_font_service.rs
+index d6f1a71de4e..f8d2280554e 100644
+--- a/components/fonts/system_font_service.rs
++++ b/components/fonts/system_font_service.rs
+@@ -32,9 +32,10 @@ use crate::platform::font_list::{
+ };
+ 
+ /// Resolve a *named* font family that isn't installed under that name, via the platform's font
+-/// configuration. On Linux/freetype this is fontconfig's alias substitution (Arial -> Liberation
+-/// Sans, Verdana -> Noto Sans, …, matching Chrome); on macOS/Windows the requested families are
+-/// installed and native matching already handles them, so this is a no-op.
++/// configuration. On Linux/freetype this is fontconfig's substitution, filtered the way Chrome
++/// filters it (Arial -> Liberation Sans is accepted, Verdana -> Noto Sans is not); on
++/// macOS/Windows the requested families are installed and native matching already handles them,
++/// so this is a no-op.
+ #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+ fn platform_family_substitute(name: &str) -> Option<String> {
+     crate::platform::font_list::font_family_substitute(name)
+@@ -254,9 +255,9 @@ impl SystemFontService {
+         // look up canonical name
+         let mut family_name = self.family_name_for_single_font_family(family);
+         // If a *named* family is not installed under that name, resolve it through the platform's
+-        // font configuration (fontconfig on Linux: Arial -> Liberation Sans, Verdana -> Noto Sans,
+-        // Helvetica -> Nimbus Sans, …) instead of dropping to the generic fallback — matching what
+-        // Chrome does. Generics are already resolved by `family_name_for_single_font_family`.
++        // font configuration (fontconfig on Linux: Arial -> Liberation Sans, Helvetica -> Liberation
++        // Sans) where Chrome would; a rejected substitute leaves the family unmatched so the page's
++        // next family applies. Generics are already resolved by `family_name_for_single_font_family`.
+         if matches!(family, SingleFontFamily::FamilyName(_)) &&
+             !self.local_families.families.contains_key(&family_name)
+         {

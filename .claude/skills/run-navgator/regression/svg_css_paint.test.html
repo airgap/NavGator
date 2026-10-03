@@ -1,0 +1,37 @@
+<!doctype html><body style="margin:0;background:#202124">
+<!-- Inline-svg paint from the page's CSS: inline <svg> is rasterized from a standalone
+     serialization, so the serializer must carry computed paint properties into it. Without
+     that every icon here paints black (invisible on this background). -->
+<style>
+  .row { display: flex; gap: 24px; padding: 40px; }
+  .octicon { fill: currentColor; }
+  .c4 path { fill: #3ad16b; }
+  .c5 { fill: #c86bff; }
+  .c9 g path { fill: #ff5fa2; }
+  .lottie path { fill: #f2f2f2; }
+</style>
+<div class="row">
+  <!-- 1: fill="currentColor" attribute, colour inherited from an HTML ancestor (YouTube) -->
+  <span style="color:#ff4a4a"><svg width="80" height="80" viewBox="0 0 24 24" fill="currentColor"><rect x="2" y="2" width="20" height="20"/></svg></span>
+  <!-- 2: fill from a stylesheet class on the svg (GitHub octicons) -->
+  <span style="color:#44aaff"><svg class="octicon" width="80" height="80" viewBox="0 0 24 24"><path d="M2 2h20v20H2z"/></svg></span>
+  <!-- 3: stroke icon whose fill="none" presentation attribute must survive (Lucide/Feather) -->
+  <span style="color:#ffd23a"><svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="9"/></svg></span>
+  <!-- 4: a rule targeting the svg's child -->
+  <svg class="c4" width="80" height="80" viewBox="0 0 24 24"><path d="M2 2h20v20H2z"/></svg>
+  <!-- 5: a rule on the svg beats its fill presentation attribute -->
+  <svg class="c5" fill="red" width="80" height="80" viewBox="0 0 24 24"><path d="M2 2h20v20H2z"/></svg>
+</div>
+<div class="row">
+  <!-- 6: var() in a presentation attribute (Discord: fill="var(--interactive-icon-default)") -->
+  <svg style="--ic:#ff9f1a" width="80" height="80" viewBox="0 0 24 24"><path fill="var(--ic)" d="M2 2h20v20H2z"/></svg>
+  <!-- 7: var() fallback when the custom property is missing -->
+  <svg width="80" height="80" viewBox="0 0 24 24"><path fill="var(--missing, #1ad1ff)" d="M2 2h20v20H2z"/></svg>
+  <!-- 8: a colour the rasterizer can't parse as written (color-mix, oklab, ...) via currentColor -->
+  <span style="color:color-mix(in srgb, #ff0000 50%, #0000ff)"><svg width="80" height="80" viewBox="0 0 24 24" fill="currentColor"><path d="M2 2h20v20H2z"/></svg></span>
+  <!-- 9: a rule reaching a path nested inside groups -->
+  <svg class="c9" width="80" height="80" viewBox="0 0 24 24"><g><g><path d="M2 2h20v20H2z"/></g></g></svg>
+  <!-- 10: a page rule recolouring a Lottie-style baked fill deep in the tree (Discord's gear) -->
+  <svg class="lottie" width="80" height="80" viewBox="0 0 24 24"><g><g><g><path fill="rgb(88,101,242)" d="M2 2h20v20H2z"/></g></g></g></svg>
+</div>
+</body>

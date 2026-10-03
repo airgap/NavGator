@@ -1,0 +1,92 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>document.all gate</title>
+<style>
+  body { margin: 0; font: 14px monospace; background: #888; }
+  #log { padding: 8px; white-space: pre; }
+</style>
+</head>
+<body>
+<div id="log"></div>
+<div id="target"></div>
+<img name="dup" alt=""><input name="dup">
+<div name="divname"></div>
+<form name="theform"></form>
+<span id="01"></span>
+<script>
+const results = [];
+function check(label, fn) {
+  let ok = false, err = "";
+  try { ok = fn() === true; } catch (e) { err = " threw " + e; }
+  results.push((ok ? "PASS " : "FAIL ") + label + err);
+}
+const all = document.all;
+// [[IsHTMLDDA]]: https://tc39.es/ecma262/#sec-IsHTMLDDA-internal-slot
+check("typeof is undefined", () => typeof document.all === "undefined");
+check("falsy", () => !document.all);
+check("== null and == undefined", () => document.all == null && document.all == undefined);
+check("!== undefined and !== null", () => document.all !== undefined && document.all !== null);
+check("polymer-resin pattern passes undefined through",
+  () => (function (c) { return c || c === document.all ? "sanitized" : c; })(undefined) === undefined);
+check("polymer-resin pattern still catches document.all",
+  () => (function (c) { return c || c === document.all ? "sanitized" : c; })(document.all) === "sanitized");
+// The JIT must not keep a "nothing emulates undefined" assumption once document.all exists.
+check("JIT-warmed === undefined", () => {
+  function isUndef(v) { return v === undefined; }
+  for (let i = 0; i < 20000; i++) isUndef(i % 2 ? undefined : {});
+  return isUndef(document.all) === false && isUndef(undefined) === true;
+});
+check("JIT-warmed == null", () => {
+  function isNullish(v) { return v == null; }
+  for (let i = 0; i < 20000; i++) isNullish(i % 2 ? null : {});
+  return isNullish(document.all) === true && isNullish({}) === false;
+});
+check("JIT-warmed truthiness", () => {
+  function truthy(v) { return v ? 1 : 0; }
+  let sum = 0;
+  for (let i = 0; i < 20000; i++) sum += truthy({});
+  return sum === 20000 && truthy(document.all) === 0;
+});
+// The collection itself: https://html.spec.whatwg.org/multipage/#htmlallcollection
+check("[SameObject]", () => document.all === all);
+check("class string", () => Object.prototype.toString.call(all) === "[object HTMLAllCollection]");
+check("length matches getElementsByTagName('*')",
+  () => all.length === document.getElementsByTagName("*").length && all.length > 5);
+check("indexed getter", () => all[0] === document.documentElement && all[1] === document.head);
+check("item(index)", () => all.item(0) === document.documentElement);
+check("item('0') is an index", () => all.item("0") === document.documentElement);
+check("'01' is a name, not an index", () => all.item("01") === document.getElementById("01"));
+check("out-of-range index", () => all[100000] === undefined && all.item(100000) === null);
+check("named by id", () => all.target === document.getElementById("target"));
+check("namedItem by id", () => all.namedItem("target") === document.getElementById("target"));
+check("named by name on all-named element", () => all.theform === document.forms[0]);
+check("name on non-all-named element is ignored", () => all.namedItem("divname") === null);
+check("several matches give an HTMLCollection", () => {
+  const c = all.namedItem("dup");
+  return c instanceof HTMLCollection && c.length === 2 && c[0].localName === "img" && c[1].localName === "input";
+});
+check("missing name", () => all.namedItem("nope") === null && all.nope === undefined);
+check("empty name", () => all.namedItem("") === null);
+check("named props are unenumerable", () => !Object.keys(all).includes("target"));
+check("item() and item(undefined) are null", () => all.item() === null && all.item(undefined) === null);
+// [[Call]]: https://html.spec.whatwg.org/multipage/#HTMLAllCollection-call
+check("callable: all(0)", () => document.all(0) === document.documentElement);
+check("callable: all('target')", () => document.all("target") === document.getElementById("target"));
+check("callable: all() is null", () => document.all() === null);
+check("callable: all('dup') is a collection", () => document.all("dup").length === 2);
+check("live", () => {
+  const before = all.length;
+  const e = document.createElement("p"); e.id = "late"; document.body.appendChild(e);
+  const ok = all.length === before + 1 && all.late === e;
+  e.remove();
+  return ok && all.length === before;
+});
+
+const failed = results.filter(r => r.startsWith("FAIL"));
+document.getElementById("log").textContent = results.join("\n");
+document.body.style.background = failed.length ? "#c00" : "#0a0";
+</script>
+</body>
+</html>

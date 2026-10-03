@@ -1,0 +1,152 @@
+diff --git a/style/properties/longhands.toml b/style/properties/longhands.toml
+index 65b4491c0..7063fc975 100644
+--- a/style/properties/longhands.toml
++++ b/style/properties/longhands.toml
+@@ -544,7 +544,7 @@ servo_restyle_damage = "repaint"
+ type = "FillRule"
+ initial = "Default::default()"
+ struct = "inherited_svg"
+-engine = "gecko"
++servo_restyle_damage = "repaint"
+ animation_type = "discrete"
+ spec = "https://svgwg.org/svg2-draft/masking.html#ClipRuleProperty"
+ affects = "paint"
+@@ -764,7 +764,7 @@ affects = "layout"
+ type = "SVGPaint"
+ initial = "crate::values::computed::SVGPaint::BLACK"
+ struct = "inherited_svg"
+-engine = "gecko"
++servo_restyle_damage = "repaint"
+ boxed = true
+ spec = "https://svgwg.org/svg2-draft/painting.html#SpecifyingFillPaint"
+ affects = "paint"
+@@ -773,7 +773,7 @@ affects = "paint"
+ type = "SVGOpacity"
+ initial = "Default::default()"
+ struct = "inherited_svg"
+-engine = "gecko"
++servo_restyle_damage = "repaint"
+ spec = "https://svgwg.org/svg2-draft/painting.html#FillOpacity"
+ affects = "paint"
+ 
+@@ -781,7 +781,7 @@ affects = "paint"
+ type = "FillRule"
+ initial = "Default::default()"
+ struct = "inherited_svg"
+-engine = "gecko"
++servo_restyle_damage = "repaint"
+ animation_type = "discrete"
+ spec = "https://svgwg.org/svg2-draft/painting.html#FillRuleProperty"
+ affects = "paint"
+@@ -1646,7 +1646,7 @@ affects = "layout"
+ type = "SVGPaintOrder"
+ initial = "computed::SVGPaintOrder::normal()"
+ struct = "inherited_svg"
+-engine = "gecko"
++servo_restyle_damage = "repaint"
+ animation_type = "discrete"
+ spec = "https://svgwg.org/svg2-draft/painting.html#PaintOrder"
+ affects = "paint"
+@@ -1939,7 +1939,7 @@ affects = "layout"
+ type = "Color"
+ initial = "computed::Color::BLACK"
+ struct = "svg"
+-engine = "gecko"
++servo_restyle_damage = "repaint"
+ spec = "https://svgwg.org/svg2-draft/pservers.html#StopColorProperties"
+ affects = "paint"
+ 
+@@ -1947,7 +1947,7 @@ affects = "paint"
+ type = "Opacity"
+ initial = "1.0"
+ struct = "svg"
+-engine = "gecko"
++servo_restyle_damage = "repaint"
+ spec = "https://svgwg.org/svg2-draft/pservers.html#StopOpacityProperty"
+ affects = "paint"
+ 
+@@ -1955,7 +1955,7 @@ affects = "paint"
+ type = "SVGPaint"
+ initial = "Default::default()"
+ struct = "inherited_svg"
+-engine = "gecko"
++servo_restyle_damage = "repaint"
+ boxed = true
+ spec = "https://svgwg.org/svg2-draft/painting.html#SpecifyingStrokePaint"
+ affects = "paint"
+@@ -1964,7 +1964,7 @@ affects = "paint"
+ type = "SVGStrokeDashArray"
+ initial = "Default::default()"
+ struct = "inherited_svg"
+-engine = "gecko"
++servo_restyle_damage = "repaint"
+ spec = "https://svgwg.org/svg2-draft/painting.html#StrokeDashing"
+ affects = "paint"
+ 
+@@ -1972,7 +1972,7 @@ affects = "paint"
+ type = "SVGLength"
+ initial = "computed::SVGLength::zero()"
+ struct = "inherited_svg"
+-engine = "gecko"
++servo_restyle_damage = "repaint"
+ spec = "https://svgwg.org/svg2-draft/painting.html#StrokeDashing"
+ affects = "paint"
+ 
+@@ -1980,7 +1980,7 @@ affects = "paint"
+ type = "NonNegativeNumber"
+ initial = "From::from(4.0)"
+ struct = "inherited_svg"
+-engine = "gecko"
++servo_restyle_damage = "repaint"
+ spec = "https://svgwg.org/svg2-draft/painting.html#StrokeMiterlimitProperty"
+ affects = "layout"
+ 
+@@ -1988,7 +1988,7 @@ affects = "layout"
+ type = "SVGOpacity"
+ initial = "Default::default()"
+ struct = "inherited_svg"
+-engine = "gecko"
++servo_restyle_damage = "repaint"
+ spec = "https://svgwg.org/svg2-draft/painting.html#StrokeOpacity"
+ affects = "paint"
+ 
+@@ -1996,7 +1996,7 @@ affects = "paint"
+ type = "SVGWidth"
+ initial = "computed::SVGWidth::one()"
+ struct = "inherited_svg"
+-engine = "gecko"
++servo_restyle_damage = "repaint"
+ spec = "https://svgwg.org/svg2-draft/painting.html#StrokeWidth"
+ affects = "layout"
+ 
+@@ -3882,7 +3882,7 @@ keyword = { values = ["auto", "optimizespeed", "crispedges", "geometricprecision
+ 
+ [stroke-linecap]
+ struct = "inherited_svg"
+-engine = "gecko"
++servo_restyle_damage = "repaint"
+ spec = "https://svgwg.org/svg2-draft/painting.html#StrokeLinecapProperty"
+ animation_type = "discrete"
+ affects = "layout"
+@@ -3890,7 +3890,7 @@ keyword = { values = ["butt", "round", "square"] }
+ 
+ [stroke-linejoin]
+ struct = "inherited_svg"
+-engine = "gecko"
++servo_restyle_damage = "repaint"
+ spec = "https://svgwg.org/svg2-draft/painting.html#StrokeLinejoinProperty"
+ animation_type = "discrete"
+ affects = "layout"
+diff --git a/style/properties/properties.mako.rs b/style/properties/properties.mako.rs
+index c675e47c8..03053a32f 100644
+--- a/style/properties/properties.mako.rs
++++ b/style/properties/properties.mako.rs
+@@ -2829,7 +2829,7 @@ macro_rules! longhand_properties_idents {
+ #[cfg(feature = "gecko")]
+ size_of_test!(ComputedValues, 248);
+ #[cfg(feature = "servo")]
+-size_of_test!(ComputedValues, 224);
++size_of_test!(ComputedValues, 232);
+ 
+ // FFI relies on this.
+ size_of_test!(Option<Arc<ComputedValues>>, 8);

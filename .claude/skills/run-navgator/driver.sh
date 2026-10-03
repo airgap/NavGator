@@ -24,7 +24,7 @@ set -uo pipefail
 
 DISP="${NAVG_DISPLAY:-:99}"
 W=1280; H=800
-BIN="./target/debug/navgator"
+BIN="${NAVG_BIN:-./target/debug/navgator}"
 STATE="/tmp/navgator-run"
 mkdir -p "$STATE"
 
@@ -65,6 +65,8 @@ case "$cmd" in
 
   shot)
     out="${1:-$STATE/shot.png}"
+    # A failed capture must not leave the previous run's image for the caller to measure.
+    rm -f "$out"
     # -draw_mouse 0: do NOT capture the X cursor. Xvfb's default cursor is an X shape that sits at
     # screen-center on launch — without this it shows up as a bogus "✕ glitch" mid-page (see #41).
     ffmpeg -y -draw_mouse 0 -f x11grab -video_size "${W}x${H}" -i "${DISP}.0" -frames:v 1 "$out" >/dev/null 2>&1 \
@@ -85,6 +87,36 @@ case "$cmd" in
   type)    focus; DISPLAY="$DISP" xdotool type --delay 25 "$*" ;;
   click)   focus; DISPLAY="$DISP" xdotool mousemove "$1" "$2" click 1 ;;
 
+  chrome-top)
+    # Height of NavGator's own chrome (toolbar + tab strip) in a screenshot = the y where page
+    # content starts. Gates crop/offset by it. Measured, not hardcoded: every chrome redesign moved
+    # it (93 -> 78 -> 68) and stale constants silently made position-based gates read the wrong
+    # pixels (svg-aspect "failed" for weeks on correct rendering). Cached per binary build.
+    key="$(stat -c '%n %Y' "$BIN")"
+    cache="$STATE/chrome_top"
+    if [ -f "$cache" ] && [ "$(head -1 "$cache")" = "$key" ]; then tail -1 "$cache"; exit 0; fi
+    "$0" stop >/dev/null 2>&1
+    "$0" start 'data:text/html,<body style="margin:0;background:%2300ff00">' >/dev/null || exit 1
+    sleep 3
+    "$0" shot "$STATE/chrome_top.png" >/dev/null || exit 1
+    "$0" stop >/dev/null 2>&1
+    top="$(python3 - "$STATE/chrome_top.png" <<'PY'
+import sys
+from PIL import Image
+img = Image.open(sys.argv[1]).convert("RGB"); W, H = img.size
+# Right edge of the window, clear of the tab strip's tabs and the toolbar's controls.
+x = int(W * 0.9)
+for y in range(H):
+    r, g, b = img.getpixel((x, y))
+    if g > 200 and r < 60 and b < 60:
+        print(y); sys.exit(0)
+sys.exit("chrome-top: page colour never appeared")
+PY
+)" || exit 1
+    printf '%s\n%s\n' "$key" "$top" > "$cache"
+    echo "$top"
+    ;;
+
   stop)
     # Kill ONLY our recorded PIDs (+ their children). Never pkill -f 'navgator' — that matches
     # the user's AppImages on :0 AND this very shell (whose args contain the string -> exit 144).
@@ -95,7 +127,7 @@ case "$cmd" in
     ;;
 
   *)
-    echo "usage: driver.sh {build|start [url]|shot [file]|nav <url>|palette|key <k>|type <text>|click <x> <y>|stop}"
+    echo "usage: driver.sh {build|start [url]|shot [file]|nav <url>|palette|key <k>|type <text>|click <x> <y>|chrome-top|stop}"
     exit 1
     ;;
 esac

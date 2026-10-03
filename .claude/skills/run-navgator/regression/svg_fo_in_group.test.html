@@ -1,0 +1,13 @@
+<!doctype html><body style="margin:0;background:#202124">
+<!-- A foreignObject nested in svg containers still lays out (the native-foreignObject widget
+     looks through <g>/<a>), and svg <title>/<desc> text never lays out as HTML. -->
+<svg width="160" height="120" style="margin:40px" viewBox="0 0 160 120">
+  <title>tooltip text that must not render</title>
+  <desc>description text that must not render</desc>
+  <g><a href="#"><g>
+    <foreignObject x="20" y="20" width="80" height="80">
+      <div style="width:80px;height:80px;background:#3ad16b"></div>
+    </foreignObject>
+  </g></a></g>
+</svg>
+</body>
