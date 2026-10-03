@@ -1,0 +1,27 @@
+From 759cfb769e142c986e921e663f30c20b16adfe0d Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sat, 3 Oct 2026 05:12:22 -0400
+Subject: [PATCH] servo: -webkit-text-fill-color
+
+Servo's layout fills glyphs with it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ style/properties/longhands.toml | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/style/properties/longhands.toml b/style/properties/longhands.toml
+index 6f0ca6e55..e88d5f079 100644
+--- a/style/properties/longhands.toml
++++ b/style/properties/longhands.toml
+@@ -2500,7 +2500,6 @@ affects = "layout"
+ type = "Color"
+ initial = "computed_value::T::currentcolor()"
+ struct = "inherited_text"
+-engine = "gecko"
+ ignored_when_colors_disabled = true
+ spec = "https://compat.spec.whatwg.org/#the-webkit-text-fill-color"
+ affects = "paint"
+-- 
+2.43.0
+

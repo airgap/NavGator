@@ -1,0 +1,11 @@
+<!doctype html><meta charset=utf-8><style>body{margin:20px;background:#fff}
+.w{container-type:inline-size;margin-bottom:10px}.b{height:40px;background:#c33}
+@container (min-width:300px){.b{background:#2a6}}
+.u{container:card/inline-size;width:400px}.u div{width:50cqw;height:30px;background:#36c}
+@container card (max-width:500px){.u div{height:60px}}
+.f{display:flex;gap:10px}.f .c{container-type:inline-size;background:#999;height:20px}
+</style>
+<div class=w style="width:400px"><div class=b></div></div>
+<div class=w style="width:200px"><div class=b style="--x:1"></div></div>
+<div class=u><div></div></div>
+<div class=f><div class=c>xxxxxxxx</div><div style="width:50px;height:20px;background:#555"></div></div>

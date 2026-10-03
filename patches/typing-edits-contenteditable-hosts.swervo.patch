@@ -1,0 +1,301 @@
+From 5f88ae09fa701a66f06ff9ffb9ee45fb45c9dff7 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sat, 3 Oct 2026 05:47:20 -0400
+Subject: [PATCH] script: typing edits contenteditable hosts
+
+Keys typed into an editing host did nothing: no text, no beforeinput or
+input. Characters, Enter and Backspace now run insertText (new, a
+simplified version of the spec algorithm), insertParagraph and delete,
+with a cancelable beforeinput and an input carrying the input type and
+data (Input Events order). execCommand('insertText') works too. Editors
+on Discord, X, Gmail and Notion type into contenteditable.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../dom/document/document_event_handler.rs    | 30 ++++++
+ .../script/dom/execcommand/basecommand.rs     |  2 +
+ .../dom/execcommand/commands/inserttext.rs    | 99 +++++++++++++++++++
+ .../script/dom/execcommand/commands/mod.rs    |  1 +
+ .../script/dom/execcommand/execcommands.rs    | 69 +++++++++++++
+ 5 files changed, 201 insertions(+)
+ create mode 100644 components/script/dom/execcommand/commands/inserttext.rs
+
+diff --git a/components/script/dom/document/document_event_handler.rs b/components/script/dom/document/document_event_handler.rs
+index e35be91758f..68374355ffc 100644
+--- a/components/script/dom/document/document_event_handler.rs
++++ b/components/script/dom/document/document_event_handler.rs
+@@ -48,6 +48,7 @@ use style::Atom;
+ use style_traits::CSSPixel;
+ use webrender_api::ExternalScrollId;
+ 
++use crate::dom::execcommand::basecommand::CommandName;
+ #[cfg(feature = "gamepad")]
+ use crate::dom::bindings::codegen::Bindings::PermissionStatusBinding::PermissionName;
+ use crate::dom::bindings::inheritance::{ElementTypeId, HTMLElementTypeId, NodeTypeId};
+@@ -1572,6 +1573,19 @@ impl DocumentEventHandler {
+             flags = event.flags();
+         }
+ 
++        // Keys typed into an editing host (contenteditable) edit it. Text controls edit
++        // themselves in their keydown handling.
++        if keyboard_event.event.state == KeyState::Down &&
++            !keyboard_event.event.is_composing &&
++            !flags.contains(EventFlags::Canceled) &&
++            target
++                .downcast::<Node>()
++                .is_some_and(|node| node.editing_host_of().is_some()) &&
++            let Some((command, data)) = typing_command(&keyboard_event.event)
++        {
++            self.window.Document().edit_by_typing(cx, command, data);
++        }
++
+         flags.into()
+     }
+ 
+@@ -3058,3 +3072,19 @@ fn clipboard_action_for_shortcut(
+         _ => None,
+     }
+ }
++
++/// The editing command a key performs in an editing host, with the text it inserts.
++fn typing_command(event: &keyboard_types::KeyboardEvent) -> Option<(CommandName, Option<DOMString>)> {
++    if event
++        .modifiers
++        .intersects(keyboard_types::Modifiers::CONTROL | keyboard_types::Modifiers::META)
++    {
++        return None;
++    }
++    Some(match &event.key {
++        Key::Character(text) => (CommandName::InsertText, Some(DOMString::from(text.as_str()))),
++        Key::Named(NamedKey::Enter) => (CommandName::InsertParagraph, None),
++        Key::Named(NamedKey::Backspace) => (CommandName::Delete, None),
++        _ => return None,
++    })
++}
+diff --git a/components/script/dom/execcommand/basecommand.rs b/components/script/dom/execcommand/basecommand.rs
+index 1a3349a2b35..11a660f9d96 100644
+--- a/components/script/dom/execcommand/basecommand.rs
++++ b/components/script/dom/execcommand/basecommand.rs
+@@ -30,6 +30,7 @@ use crate::dom::execcommand::commands::fontsize::{
+ use crate::dom::execcommand::commands::forecolor::execute_forecolor_command;
+ use crate::dom::execcommand::commands::hilitecolor::execute_hilitecolor_command;
+ use crate::dom::execcommand::commands::insertparagraph::execute_insert_paragraph_command;
++use crate::dom::execcommand::commands::inserttext::execute_insert_text_command;
+ use crate::dom::execcommand::commands::italic::execute_italic_command;
+ use crate::dom::execcommand::commands::removeformat::execute_removeformat_command;
+ use crate::dom::execcommand::commands::strikethrough::execute_strikethrough_command;
+@@ -703,6 +704,7 @@ impl CommandName {
+             CommandName::InsertParagraph => {
+                 execute_insert_paragraph_command(cx, document, selection)
+             },
++            CommandName::InsertText => execute_insert_text_command(cx, document, selection, value),
+             CommandName::Italic => execute_italic_command(cx, document, selection),
+             CommandName::RemoveFormat => execute_removeformat_command(cx, document, selection),
+             CommandName::Strikethrough => execute_strikethrough_command(cx, document, selection),
+diff --git a/components/script/dom/execcommand/commands/inserttext.rs b/components/script/dom/execcommand/commands/inserttext.rs
+new file mode 100644
+index 00000000000..cf67c04ae63
+--- /dev/null
++++ b/components/script/dom/execcommand/commands/inserttext.rs
+@@ -0,0 +1,99 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++use js::context::JSContext;
++use script_bindings::inheritance::Castable;
++
++use crate::dom::bindings::codegen::Bindings::CharacterDataBinding::CharacterDataMethods;
++use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
++use crate::dom::bindings::root::DomRoot;
++use crate::dom::bindings::str::DOMString;
++use crate::dom::characterdata::CharacterData;
++use crate::dom::document::Document;
++use crate::dom::node::Node;
++use crate::dom::selection::Selection;
++use crate::dom::text::Text;
++
++/// <https://w3c.github.io/editing/docs/execCommand/#the-inserttext-command>, inserting the whole
++/// value at once and without the autolinking and override steps: typed text goes into the text
++/// node at the caret (or a new one), and the caret moves after it.
++pub(crate) fn execute_insert_text_command(
++    cx: &mut JSContext,
++    document: &Document,
++    selection: &Selection,
++    value: DOMString,
++) -> bool {
++    // Step 1. If the active range is not collapsed, delete the selection.
++    let active_range = selection
++        .active_range()
++        .expect("Must always have an active range");
++    if !active_range.collapsed() {
++        selection.delete_the_selection(
++            cx,
++            document,
++            Default::default(),
++            Default::default(),
++            Default::default(),
++        );
++    }
++
++    // Step 3. If value is the empty string, return false.
++    if value.is_empty() {
++        return false;
++    }
++    let inserted_length = value.str().encode_utf16().count() as u32;
++
++    let active_range = selection
++        .active_range()
++        .expect("Must always have an active range");
++    let node = active_range.start_container();
++    let offset = active_range.start_offset();
++
++    // Step 8. If node is a Text node, insert the value into it at offset.
++    let (text_node, end_offset) = if node.is::<Text>() {
++        let character_data = node.downcast::<CharacterData>().unwrap();
++        if character_data.InsertData(cx, offset, value).is_err() {
++            return false;
++        }
++        (node, offset + inserted_length)
++    } else {
++        // Step 9. Otherwise a new Text node holding the value goes at (node, offset), or the
++        // value is appended to a Text node right before it.
++        let previous = offset
++            .checked_sub(1)
++            .and_then(|index| node.children().nth(index as usize))
++            .filter(|child| child.is::<Text>());
++        match previous {
++            Some(previous) => {
++                let character_data = previous.downcast::<CharacterData>().unwrap();
++                let previous_length = character_data.Length();
++                if character_data
++                    .InsertData(cx, previous_length, value)
++                    .is_err()
++                {
++                    return false;
++                }
++                (previous, previous_length + inserted_length)
++            },
++            None => {
++                let text = Text::new(cx, value, document);
++                let text_node = DomRoot::upcast::<Node>(text);
++                let reference = node.children().nth(offset as usize);
++                if node
++                    .InsertBefore(cx, &text_node, reference.as_deref())
++                    .is_err()
++                {
++                    return false;
++                }
++                (text_node, inserted_length)
++            },
++        }
++    };
++
++    // Step 10. Canonicalize whitespace around the insertion, so a typed space at the end of a
++    // line stays visible (it becomes a no-break space).
++    text_node.canonicalize_whitespace(cx, end_offset, true);
++    selection.collapse_current_range(&text_node, end_offset);
++    true
++}
+diff --git a/components/script/dom/execcommand/commands/mod.rs b/components/script/dom/execcommand/commands/mod.rs
+index 22bbfa2ed7a..456fba047ff 100644
+--- a/components/script/dom/execcommand/commands/mod.rs
++++ b/components/script/dom/execcommand/commands/mod.rs
+@@ -12,6 +12,7 @@ pub(crate) mod fontsize;
+ pub(crate) mod forecolor;
+ pub(crate) mod hilitecolor;
+ pub(crate) mod insertparagraph;
++pub(crate) mod inserttext;
+ pub(crate) mod italic;
+ pub(crate) mod removeformat;
+ pub(crate) mod strikethrough;
+diff --git a/components/script/dom/execcommand/execcommands.rs b/components/script/dom/execcommand/execcommands.rs
+index 5a941a48d8d..84c919a2be8 100644
+--- a/components/script/dom/execcommand/execcommands.rs
++++ b/components/script/dom/execcommand/execcommands.rs
+@@ -65,6 +65,74 @@ fn mapped_value_of_command(command: CommandName) -> DOMString {
+     .into()
+ }
+ 
++impl Document {
++    /// Edits an editing host for a key press, with the event order of
++    /// <https://w3c.github.io/input-events/#event-order-during-typing>: a cancelable
++    /// `beforeinput` carrying the input type and typed `data`, the edit, then `input`. Returns
++    /// whether the key was handled (also when the page canceled `beforeinput`).
++    pub(crate) fn edit_by_typing(
++        &self,
++        cx: &mut JSContext,
++        command: CommandName,
++        data: Option<DOMString>,
++    ) -> bool {
++        let window = self.window();
++        let Some(selection) = self.selection_if_command_is_enabled(cx, command) else {
++            return false;
++        };
++        let Some(editing_host) = selection
++            .active_range()
++            .expect("Must always have an active range")
++            .CommonAncestorContainer()
++            .editing_host_of()
++        else {
++            return false;
++        };
++        let input_type = mapped_value_of_command(command);
++        let before_input = InputEvent::new(
++            cx,
++            window,
++            None,
++            atom!("beforeinput"),
++            true,
++            true,
++            Some(window),
++            0,
++            data.clone(),
++            false,
++            input_type.clone(),
++        );
++        let before_input = before_input.upcast::<Event>();
++        before_input.set_trusted(true);
++        if !before_input.fire(cx, editing_host.upcast()) {
++            return true;
++        }
++        let Some(selection) = self.selection_if_command_is_enabled(cx, command) else {
++            return true;
++        };
++        if !command.execute(cx, self, &selection, data.clone().unwrap_or_default()) {
++            return true;
++        }
++        let input = InputEvent::new(
++            cx,
++            window,
++            None,
++            atom!("input"),
++            true,
++            false,
++            Some(window),
++            0,
++            data,
++            false,
++            input_type,
++        );
++        let input = input.upcast::<Event>();
++        input.set_trusted(true);
++        input.fire(cx, editing_host.upcast());
++        true
++    }
++}
++
+ impl Node {
+     fn is_in_plaintext_only_state(&self) -> bool {
+         self.downcast::<HTMLElement>()
+@@ -126,6 +194,7 @@ impl Document {
+             "forecolor" => CommandName::ForeColor,
+             "hilitecolor" => CommandName::HiliteColor,
+             "insertparagraph" => CommandName::InsertParagraph,
++            "inserttext" => CommandName::InsertText,
+             "italic" => CommandName::Italic,
+             "removeformat" => CommandName::RemoveFormat,
+             "strikethrough" => CommandName::Strikethrough,
+-- 
+2.43.0
+

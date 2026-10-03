@@ -63,8 +63,9 @@ PY
 # svg_fo_in_group needs the native-foreignObject widget to look through svg containers.
 # list_numbers needs list ordinals and CSS counters (every marker read 0 before);
 # aspect_ratio needs aspect-ratio on non-replaced boxes; has_selector needs :has() parsing and
-# its invalidation on DOM/state changes; line_clamp needs -webkit-box + -webkit-line-clamp.
-for t in mask_circle mask_chevron scheme_light clip_text grid_cols light_dark svg_xref_mask svg_foreignobject svg_image_href svg_fo_use_mask svg_css_paint svg_paint_restyle svg_fo_in_group list_numbers aspect_ratio has_selector line_clamp; do
+# its invalidation on DOM/state changes; line_clamp needs -webkit-box + -webkit-line-clamp;
+# container_query needs @container, cq units and the relayout after containers are sized.
+for t in mask_circle mask_chevron scheme_light clip_text grid_cols light_dark svg_xref_mask svg_foreignobject svg_image_href svg_fo_use_mask svg_css_paint svg_paint_restyle svg_fo_in_group list_numbers aspect_ratio has_selector line_clamp container_query; do
   render "${t}_t" "${t}.test.html"
   render "${t}_r" "${t}.ref.html"
   s=$(ssim "/tmp/reg_${t}_t_c.png" "/tmp/reg_${t}_r_c.png")
