@@ -6,15 +6,20 @@
   .row { display: flex; gap: 24px; padding: 40px; }
   .icon { fill: #888888; }
   .icon.on { fill: #44aaff; }
+  .shape { fill: #888888; }
+  .shape.on { fill: #ff9f1a; }
 </style>
 <div class="row">
   <span id="host" style="color:#ff4a4a"><svg width="80" height="80" viewBox="0 0 24 24" fill="currentColor"><rect x="2" y="2" width="20" height="20"/></svg></span>
   <svg id="toggled" class="icon" width="80" height="80" viewBox="0 0 24 24"><path d="M2 2h20v20H2z"/></svg>
+  <!-- only a nested shape restyles; the svg root's own paint is unchanged -->
+  <svg width="80" height="80" viewBox="0 0 24 24"><g><path id="shape" class="shape" d="M2 2h20v20H2z"/></g></svg>
 </div>
 <script>
   setTimeout(() => {
     document.getElementById("host").style.color = "#44ff88";
     document.getElementById("toggled").classList.add("on");
+    document.getElementById("shape").classList.add("on");
   }, 2000);
 </script>
 </body>

@@ -76,6 +76,12 @@ check("callable: all(0)", () => document.all(0) === document.documentElement);
 check("callable: all('target')", () => document.all("target") === document.getElementById("target"));
 check("callable: all() is null", () => document.all() === null);
 check("callable: all('dup') is a collection", () => document.all("dup").length === 2);
+check("callable: ignores a replaced prototype item()", () => {
+  const original = HTMLAllCollection.prototype.item;
+  HTMLAllCollection.prototype.item = () => "hijacked";
+  try { return document.all(0) === document.documentElement; }
+  finally { HTMLAllCollection.prototype.item = original; }
+});
 check("live", () => {
   const before = all.length;
   const e = document.createElement("p"); e.id = "late"; document.body.appendChild(e);

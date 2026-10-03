@@ -162,9 +162,9 @@ a copy of a real profile (dark mode), `scheme_light` fails — delete `/tmp/navg
   on paste via field ink count. Catches the regression where NavGator forwarded page keys with no
   modifiers so Ctrl+A/C/X/V typed literal letters. Needs `ctrl`/`shift` on the forwarded
   `KeyboardEvent.modifiers`.
-- `document-all.sh` — `document.all` (HTMLAllCollection): 31 JS checks painting GREEN/RED — falsy /
+- `document-all.sh` — `document.all` (HTMLAllCollection): 32 JS checks painting GREEN/RED — falsy /
   `typeof "undefined"` / `== null` but `!== undefined` (incl. after JIT warm-up), polymer-resin's exact
-  `c || c === document.all` test, indexed/named/callable lookups, liveness. All 31 also pass in Chrome
+  `c || c === document.all` test, indexed/named/callable lookups, liveness. All 32 also pass in Chrome
   (`google-chrome --headless=new --dump-dom` on the fixture). Before HTMLAllCollection, `document.all`
   was plain `undefined` and YouTube hid its search results.
 - `idb-index.sh` — IndexedDB index support (LYK-1310): a JS-driven gate that creates a store with a
