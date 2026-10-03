@@ -1,0 +1,1246 @@
+From dd7f82ceb6e24458ef7acb9ef5d66f3485d9dee6 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sat, 3 Oct 2026 03:58:16 -0400
+Subject: [PATCH] media: MSE playback with one GStreamer stream per
+ SourceBuffer
+
+YouTube appends audio and video to separate SourceBuffers, each with its
+own initialization segment. Pushing both into one byte stream made a
+single matroskademux see two incompatible headers, so video stayed black.
+ServoMseSrc exposes one appsrc per SourceBuffer as a sometimes-pad, so
+urisourcebin demuxes each stream on its own. SourceBuffer.buffered now
+comes from parsing WebM and fMP4 segment timestamps.
+
+update_media_state paused a playing element on every state update; it now
+pauses only when the element stops being potentially playing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/media/backends/gstreamer/lib.rs    |   1 +
+ .../media/backends/gstreamer/mse_source.rs    | 170 +++++++
+ components/media/backends/gstreamer/player.rs |  92 +++-
+ components/media/backends/ohos/lib.rs         |   2 +-
+ components/media/player/lib.rs                |  20 +
+ .../script/dom/html/htmlmediaelement.rs       |  29 +-
+ .../script/dom/media/mediasegmentparser.rs    | 458 ++++++++++++++++++
+ components/script/dom/media/mediasource.rs    |  21 +-
+ components/script/dom/media/mod.rs            |   1 +
+ components/script/dom/media/sourcebuffer.rs   |  66 +--
+ .../script/dom/media/sourcebufferlist.rs      |  33 ++
+ 11 files changed, 839 insertions(+), 54 deletions(-)
+ create mode 100644 components/media/backends/gstreamer/mse_source.rs
+ create mode 100644 components/script/dom/media/mediasegmentparser.rs
+
+diff --git a/components/media/backends/gstreamer/lib.rs b/components/media/backends/gstreamer/lib.rs
+index e687b4cd9c2..bddb5d26300 100644
+--- a/components/media/backends/gstreamer/lib.rs
++++ b/components/media/backends/gstreamer/lib.rs
+@@ -11,6 +11,7 @@ mod device_monitor;
+ pub mod media_capture;
+ pub mod media_stream;
+ mod media_stream_source;
++mod mse_source;
+ pub mod player;
+ mod registry_scanner;
+ mod render;
+diff --git a/components/media/backends/gstreamer/mse_source.rs b/components/media/backends/gstreamer/mse_source.rs
+new file mode 100644
+index 00000000000..13eff546702
+--- /dev/null
++++ b/components/media/backends/gstreamer/mse_source.rs
+@@ -0,0 +1,170 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! The playback source for Media Source Extensions: one output pad per `SourceBuffer`.
++//!
++//! Sites like YouTube append audio and video to separate SourceBuffers, each its own
++//! container stream with its own initialization segment. Feeding them into one byte stream
++//! (as `ServoSrc` does) makes a single demuxer see two incompatible headers. Here each
++//! SourceBuffer gets its own `appsrc` exposed as a "sometimes" pad, so `urisourcebin` typefinds
++//! and demuxes every stream separately and `decodebin3` decodes them side by side.
++
++use std::sync::Mutex;
++
++use glib::subclass::prelude::*;
++use gstreamer::prelude::*;
++use gstreamer::subclass::prelude::*;
++use url::Url;
++
++mod imp {
++    use std::sync::LazyLock;
++
++    use super::*;
++
++    #[derive(Default)]
++    pub struct ServoMseSrc {
++        pub(super) streams: Mutex<Vec<gstreamer_app::AppSrc>>,
++    }
++
++    #[glib::object_subclass]
++    impl ObjectSubclass for ServoMseSrc {
++        const NAME: &'static str = "ServoMseSrc";
++        type Type = super::ServoMseSrc;
++        type ParentType = gstreamer::Bin;
++        type Interfaces = (gstreamer::URIHandler,);
++    }
++
++    impl ObjectImpl for ServoMseSrc {
++        fn constructed(&self) {
++            self.parent_constructed();
++            self.obj()
++                .set_element_flags(gstreamer::ElementFlags::SOURCE);
++        }
++    }
++
++    impl GstObjectImpl for ServoMseSrc {}
++
++    impl ElementImpl for ServoMseSrc {
++        fn metadata() -> Option<&'static gstreamer::subclass::ElementMetadata> {
++            static ELEMENT_METADATA: LazyLock<gstreamer::subclass::ElementMetadata> =
++                LazyLock::new(|| {
++                    gstreamer::subclass::ElementMetadata::new(
++                        "Servo Media Source Extensions source",
++                        "Source/Audio/Video",
++                        "One stream per MSE SourceBuffer",
++                        "Servo developers",
++                    )
++                });
++            Some(&*ELEMENT_METADATA)
++        }
++
++        fn pad_templates() -> &'static [gstreamer::PadTemplate] {
++            // "Sometimes" pads: `urisourcebin` then treats the source as dynamic and handles
++            // each pad as it is added, rather than only the pads present at setup.
++            static PAD_TEMPLATES: LazyLock<Vec<gstreamer::PadTemplate>> = LazyLock::new(|| {
++                vec![
++                    gstreamer::PadTemplate::new(
++                        "src_%u",
++                        gstreamer::PadDirection::Src,
++                        gstreamer::PadPresence::Sometimes,
++                        &gstreamer::Caps::new_any(),
++                    )
++                    .unwrap(),
++                ]
++            });
++            PAD_TEMPLATES.as_ref()
++        }
++    }
++
++    impl BinImpl for ServoMseSrc {}
++
++    impl URIHandlerImpl for ServoMseSrc {
++        const URI_TYPE: gstreamer::URIType = gstreamer::URIType::Src;
++
++        fn protocols() -> &'static [&'static str] {
++            &["servomse"]
++        }
++
++        fn uri(&self) -> Option<String> {
++            Some("servomse://".to_string())
++        }
++
++        fn set_uri(&self, uri: &str) -> Result<(), glib::Error> {
++            if let Ok(uri) = Url::parse(uri) &&
++                uri.scheme() == "servomse"
++            {
++                return Ok(());
++            }
++            Err(glib::Error::new(
++                gstreamer::URIError::BadUri,
++                format!("Invalid URI '{uri:?}'").as_str(),
++            ))
++        }
++    }
++}
++
++glib::wrapper! {
++    pub struct ServoMseSrc(ObjectSubclass<imp::ServoMseSrc>)
++        @extends gstreamer::Bin, gstreamer::Element, gstreamer::Object, @implements gstreamer::URIHandler;
++}
++
++unsafe impl Send for ServoMseSrc {}
++unsafe impl Sync for ServoMseSrc {}
++
++impl ServoMseSrc {
++    /// Add the stream for a new SourceBuffer, returning its index.
++    pub fn add_stream(&self) -> Result<usize, glib::BoolError> {
++        let appsrc = gstreamer::ElementFactory::make("appsrc")
++            .build()?
++            .downcast::<gstreamer_app::AppSrc>()
++            .expect("appsrc is an AppSrc");
++        appsrc.set_format(gstreamer::Format::Bytes);
++        appsrc.set_stream_type(gstreamer_app::AppStreamType::Stream);
++        // A page appends ahead of playback at its own pace; never drop or block its data.
++        appsrc.set_max_bytes(0);
++        appsrc.set_block(false);
++
++        let mut streams = self.imp().streams.lock().unwrap();
++        let index = streams.len();
++        self.add(&appsrc)?;
++        appsrc.sync_state_with_parent()?;
++        let template = self
++            .pad_template("src_%u")
++            .expect("ServoMseSrc declares src_%u");
++        let pad = gstreamer::GhostPad::builder_from_template(&template)
++            .name(format!("src_{index}"))
++            .build();
++        pad.set_target(appsrc.static_pad("src").as_ref())?;
++        pad.set_active(true)?;
++        self.add_pad(&pad)?;
++        streams.push(appsrc);
++        Ok(index)
++    }
++
++    pub fn push(
++        &self,
++        stream: usize,
++        data: Vec<u8>,
++    ) -> Result<gstreamer::FlowSuccess, gstreamer::FlowError> {
++        let streams = self.imp().streams.lock().unwrap();
++        streams[stream].push_buffer(gstreamer::Buffer::from_mut_slice(data))
++    }
++
++    /// `MediaSource.endOfStream()`: every stream has received all its data.
++    pub fn end_of_stream(&self) -> Result<(), gstreamer::FlowError> {
++        for stream in self.imp().streams.lock().unwrap().iter() {
++            stream.end_of_stream()?;
++        }
++        Ok(())
++    }
++}
++
++pub fn register_servo_mse_src() -> Result<(), glib::BoolError> {
++    gstreamer::Element::register(
++        None,
++        "servomsesrc",
++        gstreamer::Rank::NONE,
++        ServoMseSrc::static_type(),
++    )
++}
+diff --git a/components/media/backends/gstreamer/player.rs b/components/media/backends/gstreamer/player.rs
+index 3c0de43f082..7d176349102 100644
+--- a/components/media/backends/gstreamer/player.rs
++++ b/components/media/backends/gstreamer/player.rs
+@@ -31,6 +31,7 @@ use servo_media_traits::{BackendMsg, ClientContextId, MediaInstance};
+ use super::BACKEND_BASE_TIME;
+ use crate::media_stream::GStreamerMediaStream;
+ use crate::media_stream_source::{ServoMediaStreamSrc, register_servo_media_stream_src};
++use crate::mse_source::{ServoMseSrc, register_servo_mse_src};
+ use crate::render::GStreamerRender;
+ use crate::source::{ServoSrc, register_servo_src};
+ 
+@@ -120,6 +121,7 @@ impl AsRef<[f32]> for GStreamerAudioChunk {
+ enum PlayerSource {
+     Seekable(ServoSrc),
+     Stream(ServoMediaStreamSrc),
++    MediaSource(ServoMseSrc),
+ }
+ 
+ struct PlayerInner {
+@@ -244,16 +246,13 @@ impl PlayerInner {
+ 
+     pub fn end_of_stream(&mut self) -> Result<(), PlayerError> {
+         match self.source {
+-            Some(ref mut source) => {
+-                if let PlayerSource::Seekable(source) = source {
+-                    source
+-                        .push_end_of_stream()
+-                        .map(|_| ())
+-                        .map_err(|_| PlayerError::EOSFailed)
+-                } else {
+-                    Ok(())
+-                }
+-            },
++            Some(PlayerSource::Seekable(ref source)) => source
++                .push_end_of_stream()
++                .map(|_| ())
++                .map_err(|_| PlayerError::EOSFailed),
++            Some(PlayerSource::MediaSource(ref source)) => source
++                .end_of_stream()
++                .map_err(|_| PlayerError::EOSFailed),
+             _ => Ok(()),
+         }
+     }
+@@ -303,6 +302,31 @@ impl PlayerInner {
+         Err(PlayerError::BufferPushFailed)
+     }
+ 
++    pub fn add_source_buffer(&mut self) -> Result<usize, PlayerError> {
++        let Some(PlayerSource::MediaSource(ref source)) = self.source else {
++            return Err(PlayerError::Backend(
++                "MSE SourceBuffers need a StreamType::MediaSource player".to_owned(),
++            ));
++        };
++        source
++            .add_stream()
++            .map_err(|error| PlayerError::Backend(error.to_string()))
++    }
++
++    pub fn push_source_buffer_data(
++        &mut self,
++        source_buffer: usize,
++        data: Vec<u8>,
++    ) -> Result<(), PlayerError> {
++        let Some(PlayerSource::MediaSource(ref source)) = self.source else {
++            return Err(PlayerError::BufferPushFailed);
++        };
++        source
++            .push(source_buffer, data)
++            .map(|_| ())
++            .map_err(|_| PlayerError::BufferPushFailed)
++    }
++
+     pub fn set_src(&mut self, source: PlayerSource) {
+         self.source = Some(source);
+     }
+@@ -560,11 +584,15 @@ impl GStreamerPlayer {
+             });
+         }
+ 
++        let is_media_source = self.stream_type == StreamType::MediaSource;
+         // FIXME(#282): The progressive downloading breaks playback on Windows and Android.
+-        if !cfg!(any(target_os = "windows", target_os = "android")) {
++        if is_media_source || !cfg!(any(target_os = "windows", target_os = "android")) {
+             // Set player to perform progressive downloading. This will make the
+             // player store the downloaded media in a local temporary file for
+             // faster playback of already-downloaded chunks.
++            // MSE data is already in memory and arrives at the page's pace instead: no
++            // download buffering, and no byte-level buffering either. An open-ended appsrc never
++            // reads as fully buffered, so GstPlay would pause on each dip and stay paused.
+             let flags = pipeline.property_value("flags");
+             let flags_class = match glib::FlagsClass::with_type(flags.type_()) {
+                 Some(flags) => flags,
+@@ -582,7 +610,14 @@ impl GStreamerPlayer {
+                     ));
+                 },
+             };
+-            let Some(flags) = flags_class.set_by_nick("download").build() else {
++            let flags_class = if is_media_source {
++                flags_class
++                    .unset_by_nick("download")
++                    .unset_by_nick("buffering")
++            } else {
++                flags_class.set_by_nick("download")
++            };
++            let Some(flags) = flags_class.build() else {
+                 return Err(PlayerError::Backend(
+                     "FlagsClass creation failed".to_owned(),
+                 ));
+@@ -676,6 +711,12 @@ impl GStreamerPlayer {
+                 })?;
+                 "servosrc://".to_value()
+             },
++            StreamType::MediaSource => {
++                register_servo_mse_src().map_err(|error| {
++                    PlayerError::Backend(format!("servomsesrc registration error: {error:?}"))
++                })?;
++                "servomse://".to_value()
++            },
+         };
+         player.set_property("uri", &uri);
+ 
+@@ -960,6 +1001,18 @@ impl GStreamerPlayer {
+                         });
+                         PlayerSource::Stream(media_stream_src)
+                     },
++                    StreamType::MediaSource => {
++                        let mse_src = source
++                            .dynamic_cast::<ServoMseSrc>()
++                            .expect("Source element is expected to be a ServoMseSrc!");
++                        // No data flows until the page creates SourceBuffers and appends to
++                        // them, which needs this setup to have returned.
++                        let sender_clone = sender.clone();
++                        is_ready_clone.call_once(|| {
++                            let _ = notify!(sender_clone, Ok(()));
++                        });
++                        PlayerSource::MediaSource(mse_src)
++                    },
+                 };
+ 
+                 inner.set_src(source);
+@@ -1050,6 +1103,21 @@ impl Player for GStreamerPlayer {
+     inner_player_proxy!(set_audio_track, stream_index, i32, enabled, bool);
+     inner_player_proxy!(set_video_track, stream_index, i32, enabled, bool);
+ 
++    fn add_source_buffer(&self) -> Result<usize, PlayerError> {
++        self.setup()?;
++        let inner = self.inner.borrow();
++        let mut inner = inner.as_ref().unwrap().lock().unwrap();
++        inner.add_source_buffer()
++    }
++
++    inner_player_proxy!(
++        push_source_buffer_data,
++        source_buffer,
++        usize,
++        data,
++        Vec<u8>
++    );
++
+     fn render_use_gl(&self) -> bool {
+         self.render.lock().unwrap().is_gl()
+     }
+diff --git a/components/media/backends/ohos/lib.rs b/components/media/backends/ohos/lib.rs
+index 431c8001f6b..34ace29166c 100644
+--- a/components/media/backends/ohos/lib.rs
++++ b/components/media/backends/ohos/lib.rs
+@@ -113,7 +113,7 @@ impl Backend for OhosBackend {
+             StreamType::Stream => {
+                 todo!("Stream Type currently not supported!")
+             },
+-            StreamType::Seekable => (),
++            StreamType::Seekable | StreamType::MediaSource => (),
+         }
+ 
+         if let Some(_audio_renderer) = audio_renderer {
+diff --git a/components/media/player/lib.rs b/components/media/player/lib.rs
+index b553bb61c3b..07a634129d5 100644
+--- a/components/media/player/lib.rs
++++ b/components/media/player/lib.rs
+@@ -100,6 +100,9 @@ pub enum StreamType {
+     Stream,
+     /// The stream is seekable.
+     Seekable,
++    /// Media Source Extensions: each `SourceBuffer` is fed as its own stream through
++    /// [`Player::add_source_buffer`] and [`Player::push_source_buffer_data`].
++    MediaSource,
+ }
+ 
+ pub trait Player: Send + MediaInstance {
+@@ -120,6 +123,23 @@ pub trait Player: Send + MediaInstance {
+     fn playback_rate(&self) -> f64;
+     fn push_data(&self, data: Vec<u8>) -> Result<(), PlayerError>;
+     fn end_of_stream(&self) -> Result<(), PlayerError>;
++    /// Add the input stream for a new MSE `SourceBuffer`, returning its index. Requires a
++    /// player constructed with `StreamType::MediaSource`.
++    fn add_source_buffer(&self) -> Result<usize, PlayerError> {
++        Err(PlayerError::Backend(
++            "this media backend has no MSE SourceBuffer support".to_owned(),
++        ))
++    }
++    /// Append bytes to the stream of the `SourceBuffer` at `source_buffer`.
++    fn push_source_buffer_data(
++        &self,
++        _source_buffer: usize,
++        _data: Vec<u8>,
++    ) -> Result<(), PlayerError> {
++        Err(PlayerError::Backend(
++            "this media backend has no MSE SourceBuffer support".to_owned(),
++        ))
++    }
+     /// Get the list of time ranges in seconds that have been buffered.
+     fn buffered(&self) -> Vec<Range<f64>>;
+     /// Set the stream to be played by the player.
+diff --git a/components/script/dom/html/htmlmediaelement.rs b/components/script/dom/html/htmlmediaelement.rs
+index 29ec189ee22..95cd963c32d 100644
+--- a/components/script/dom/html/htmlmediaelement.rs
++++ b/components/script/dom/html/htmlmediaelement.rs
+@@ -554,6 +554,8 @@ pub(crate) struct HTMLMediaElement {
+     #[ignore_malloc_size_of = "servo_media"]
+     #[no_trace]
+     player: DomRefCell<Option<Arc<Mutex<dyn Player>>>>,
++    /// The MediaSource this element plays, when its resource is an MSE object URL.
++    media_source: MutNullableDom<MediaSource>,
+     #[conditional_malloc_size_of]
+     #[no_trace]
+     video_renderer: Arc<Mutex<MediaFrameRenderer>>,
+@@ -672,6 +674,7 @@ impl HTMLMediaElement {
+             pending_play_promises: Default::default(),
+             in_flight_play_promises_queue: Default::default(),
+             player: Default::default(),
++            media_source: Default::default(),
+             video_renderer: Arc::new(Mutex::new(MediaFrameRenderer::new(
+                 document.webview_id(),
+                 document.window().paint_api().clone(),
+@@ -723,7 +726,8 @@ impl HTMLMediaElement {
+             .as_ref()
+             .is_some_and(|player| !player.lock().unwrap().paused());
+ 
+-        if self.is_potentially_playing() && !is_playing {
++        let is_potentially_playing = self.is_potentially_playing();
++        if is_potentially_playing && !is_playing {
+             if let Some(ref player) = *self.player.borrow() {
+                 let player = player.lock().unwrap();
+ 
+@@ -737,7 +741,8 @@ impl HTMLMediaElement {
+                     error!("Could not play media: {error:?}");
+                 }
+             }
+-        } else if is_playing &&
++        } else if !is_potentially_playing &&
++            is_playing &&
+             let Some(ref player) = *self.player.borrow() &&
+             let Err(error) = player.lock().unwrap().pause()
+         {
+@@ -1531,14 +1536,8 @@ impl HTMLMediaElement {
+     /// will feed it via `push_data`.
+     fn attach_media_source(&self, media_source: &MediaSource) {
+         media_source.set_media_element(self);
++        self.media_source.set(Some(media_source));
+         self.network_state.set(NetworkState::Loading);
+-        // MSE feeds an append-only forward byte stream via `appendBuffer` → `push_data`; there is
+-        // no fetchable resource to seek. Mark the player non-seekable so the demuxer forward-
+-        // demuxes instead of emitting `SeekData` (which routes to `fetch_request` and stalls MSE
+-        // playback at readyState HAVE_CURRENT_DATA on multi-segment appends).
+-        if let Some(player) = self.get_player() {
+-            let _ = player.lock().unwrap().set_seekable(false);
+-        }
+         let media_source = Trusted::new(media_source);
+         self.owner_global()
+             .task_manager()
+@@ -2170,8 +2169,12 @@ impl HTMLMediaElement {
+                     return Err(());
+                 }
+             },
++            Resource::Url(ref url) if self.global().get_media_source(url.as_str()).is_some() => {
++                StreamType::MediaSource
++            },
+             _ => StreamType::Seekable,
+         };
++        self.media_source.set(None);
+ 
+         let window = self.owner_window();
+ 
+@@ -3381,7 +3384,13 @@ impl HTMLMediaElementMethods<crate::DomTypeHolder> for HTMLMediaElement {
+     /// <https://html.spec.whatwg.org/multipage/#dom-media-buffered>
+     fn Buffered(&self, cx: &mut JSContext) -> DomRoot<TimeRanges> {
+         let mut buffered = TimeRangesContainer::default();
+-        if let Some(ref player) = *self.player.borrow() {
++        if let Some(media_source) = self.media_source.get() {
++            for (start, end) in media_source.buffered() {
++                buffered
++                    .add(start, end)
++                    .expect("SourceBuffer range intersections are valid and disjoint");
++            }
++        } else if let Some(ref player) = *self.player.borrow() {
+             let ranges = player.lock().unwrap().buffered();
+             for range in ranges {
+                 let _ = buffered.add(range.start, range.end);
+diff --git a/components/script/dom/media/mediasegmentparser.rs b/components/script/dom/media/mediasegmentparser.rs
+new file mode 100644
+index 00000000000..8acefacbb25
+--- /dev/null
++++ b/components/script/dom/media/mediasegmentparser.rs
+@@ -0,0 +1,458 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! The time ranges held by an MSE `SourceBuffer`, read from the media segments appended to it.
++//!
++//! The playback pipeline only sees opaque bytes per SourceBuffer, and its buffering query can't
++//! say which presentation times a given SourceBuffer holds. MSE players (YouTube's) decide what
++//! to fetch next from `SourceBuffer.buffered` as soon as `updateend` fires, so the ranges are
++//! derived synchronously from the container while appending: WebM cluster and block timecodes,
++//! fragmented-MP4 `tfdt` decode times plus `trun` sample durations.
++
++/// Ranges closer than this are one range: frame-duration estimates and audio/video frame
++/// boundaries leave hairline gaps between consecutive segments.
++const COALESCE_SECONDS: f64 = 0.1;
++
++#[derive(Default)]
++pub(crate) struct MediaSegmentParser {
++    /// Bytes of an element or box header (or small payload) not yet complete.
++    pending: Vec<u8>,
++    /// Payload bytes still to discard before the next header (frame data, `mdat`).
++    skip: u64,
++    format: Option<Format>,
++    /// Sorted, disjoint `[start, end)` presentation-time ranges in seconds.
++    ranges: Vec<(f64, f64)>,
++}
++
++enum Format {
++    WebM(WebMState),
++    Mp4(Mp4State),
++}
++
++struct WebMState {
++    timecode_scale_ns: u64,
++    cluster_timecode: u64,
++    default_duration_ns: Option<u64>,
++    /// Start of the most recent block, used to estimate frame durations when the stream
++    /// declares none.
++    previous_block_ns: Option<u64>,
++    estimated_frame_ns: u64,
++}
++
++impl Default for WebMState {
++    fn default() -> Self {
++        WebMState {
++            // The Matroska default TimecodeScale: millisecond timecodes.
++            timecode_scale_ns: 1_000_000,
++            cluster_timecode: 0,
++            default_duration_ns: None,
++            previous_block_ns: None,
++            // A conservative frame length until two blocks give a real one.
++            estimated_frame_ns: 20_000_000,
++        }
++    }
++}
++
++struct Mp4State {
++    timescale: u32,
++    trex_default_duration: u32,
++    tfhd_default_duration: Option<u32>,
++    /// Decode time of the next sample in the current track fragment.
++    next_decode_time: u64,
++}
++
++impl Default for Mp4State {
++    fn default() -> Self {
++        Mp4State {
++            timescale: 1000,
++            trex_default_duration: 0,
++            tfhd_default_duration: None,
++            next_decode_time: 0,
++        }
++    }
++}
++
++// EBML element ids, with their length-marker bits kept as Matroska writes them.
++const EBML_SEGMENT: u64 = 0x1853_8067;
++const EBML_CLUSTER: u64 = 0x1F43_B675;
++const EBML_INFO: u64 = 0x1549_A966;
++const EBML_TRACKS: u64 = 0x1654_AE6B;
++const EBML_TRACK_ENTRY: u64 = 0xAE;
++const EBML_BLOCK_GROUP: u64 = 0xA0;
++const EBML_TIMECODE_SCALE: u64 = 0x2A_D7B1;
++const EBML_CLUSTER_TIMECODE: u64 = 0xE7;
++const EBML_DEFAULT_DURATION: u64 = 0x23_E383;
++const EBML_SIMPLE_BLOCK: u64 = 0xA3;
++const EBML_BLOCK: u64 = 0xA1;
++
++impl MediaSegmentParser {
++    pub(crate) fn ranges(&self) -> &[(f64, f64)] {
++        &self.ranges
++    }
++
++    /// Parse appended bytes; `timestamp_offset` is the SourceBuffer's `timestampOffset`.
++    pub(crate) fn append(&mut self, bytes: &[u8], timestamp_offset: f64) {
++        let mut bytes = bytes;
++        if self.skip > 0 {
++            let skipped = self.skip.min(bytes.len() as u64);
++            self.skip -= skipped;
++            bytes = &bytes[skipped as usize..];
++        }
++        if bytes.is_empty() {
++            return;
++        }
++        self.pending.extend_from_slice(bytes);
++        if self.format.is_none() {
++            self.format = detect_format(&self.pending);
++        }
++        let consumed = match self.format {
++            Some(Format::WebM(_)) => self.parse_webm(timestamp_offset),
++            Some(Format::Mp4(_)) => self.parse_mp4(timestamp_offset),
++            // Too few bytes to tell yet.
++            None => 0,
++        };
++        self.pending.drain(..consumed);
++    }
++
++    /// `abort()` and the like: drop any partially received element.
++    pub(crate) fn reset_partial(&mut self) {
++        self.pending.clear();
++        self.skip = 0;
++    }
++
++    /// `remove(start, end)`.
++    pub(crate) fn remove(&mut self, start: f64, end: f64) {
++        let mut kept = Vec::with_capacity(self.ranges.len() + 1);
++        for &(range_start, range_end) in &self.ranges {
++            if range_end <= start || range_start >= end {
++                kept.push((range_start, range_end));
++                continue;
++            }
++            if range_start < start {
++                kept.push((range_start, start));
++            }
++            if range_end > end {
++                kept.push((end, range_end));
++            }
++        }
++        self.ranges = kept;
++    }
++
++    fn add_range(&mut self, start: f64, end: f64) {
++        let (mut start, mut end) = (start, end);
++        let mut merged = Vec::with_capacity(self.ranges.len() + 1);
++        for &(range_start, range_end) in &self.ranges {
++            if range_end + COALESCE_SECONDS < start || end + COALESCE_SECONDS < range_start {
++                merged.push((range_start, range_end));
++            } else {
++                start = start.min(range_start);
++                end = end.max(range_end);
++            }
++        }
++        merged.push((start, end));
++        merged.sort_by(|a, b| a.0.total_cmp(&b.0));
++        self.ranges = merged;
++    }
++
++    /// Returns how many bytes of `pending` were consumed.
++    fn parse_webm(&mut self, timestamp_offset: f64) -> usize {
++        let mut position = 0;
++        loop {
++            let data = &self.pending[position..];
++            let Some((id, id_length)) = read_ebml_id(data) else {
++                return position;
++            };
++            let Some((size, size_length)) = read_ebml_size(&data[id_length..]) else {
++                return position;
++            };
++            let header = id_length + size_length;
++            match id {
++                // Masters whose children matter: step inside instead of over them.
++                EBML_SEGMENT | EBML_CLUSTER | EBML_INFO | EBML_TRACKS | EBML_TRACK_ENTRY |
++                EBML_BLOCK_GROUP => position += header,
++                EBML_TIMECODE_SCALE | EBML_CLUSTER_TIMECODE | EBML_DEFAULT_DURATION => {
++                    let size = size.unwrap_or(0) as usize;
++                    if data.len() < header + size {
++                        return position;
++                    }
++                    let value = read_uint(&data[header..header + size]);
++                    let Some(Format::WebM(ref mut state)) = self.format else {
++                        unreachable!("parse_webm runs for WebM streams");
++                    };
++                    match id {
++                        EBML_TIMECODE_SCALE => state.timecode_scale_ns = value.max(1),
++                        EBML_CLUSTER_TIMECODE => state.cluster_timecode = value,
++                        _ => state.default_duration_ns = Some(value),
++                    }
++                    position += header + size;
++                },
++                EBML_SIMPLE_BLOCK | EBML_BLOCK => {
++                    let Some(size) = size else {
++                        return position;
++                    };
++                    // Track number (a vint), then a signed 16-bit timecode relative to the
++                    // cluster. The frame data after it is not needed.
++                    let payload = &data[header..];
++                    let Some((_, track_length)) = read_ebml_size(payload) else {
++                        return position;
++                    };
++                    if payload.len() < track_length + 2 {
++                        return position;
++                    }
++                    let relative =
++                        i16::from_be_bytes([payload[track_length], payload[track_length + 1]]);
++                    let available = (data.len() - header) as u64;
++                    self.webm_block(relative, timestamp_offset);
++                    if available >= size {
++                        position += header + size as usize;
++                    } else {
++                        self.skip = size - available;
++                        return self.pending.len();
++                    }
++                },
++                _ => {
++                    // Anything else (EBML header, SeekHead, Cues, Tags, Void, track details):
++                    // not needed, skip it whole.
++                    let Some(size) = size else {
++                        // Only masters may have an unknown size; look inside.
++                        position += header;
++                        continue;
++                    };
++                    let available = (data.len() - header) as u64;
++                    if available >= size {
++                        position += header + size as usize;
++                    } else {
++                        self.skip = size - available;
++                        return self.pending.len();
++                    }
++                },
++            }
++        }
++    }
++
++    fn webm_block(&mut self, relative_timecode: i16, timestamp_offset: f64) {
++        let Some(Format::WebM(ref mut state)) = self.format else {
++            unreachable!("webm_block runs for WebM streams");
++        };
++        let timecode = (state.cluster_timecode as i64 + relative_timecode as i64).max(0) as u64;
++        let start_ns = timecode.saturating_mul(state.timecode_scale_ns);
++        if let Some(previous) = state.previous_block_ns &&
++            start_ns > previous
++        {
++            state.estimated_frame_ns = start_ns - previous;
++        }
++        state.previous_block_ns = Some(start_ns);
++        let duration_ns = state.default_duration_ns.unwrap_or(state.estimated_frame_ns);
++        let start = start_ns as f64 / 1e9 + timestamp_offset;
++        let end = (start_ns + duration_ns) as f64 / 1e9 + timestamp_offset;
++        self.add_range(start, end);
++    }
++
++    /// Returns how many bytes of `pending` were consumed.
++    fn parse_mp4(&mut self, timestamp_offset: f64) -> usize {
++        let mut position = 0;
++        loop {
++            let data = &self.pending[position..];
++            if data.len() < 8 {
++                return position;
++            }
++            let short_size = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as u64;
++            let box_type = [data[4], data[5], data[6], data[7]];
++            let (size, header) = match short_size {
++                1 => {
++                    if data.len() < 16 {
++                        return position;
++                    }
++                    (u64::from_be_bytes(data[8..16].try_into().unwrap()), 16)
++                },
++                // Runs to the end of the stream: nothing after it to parse.
++                0 => {
++                    self.skip = u64::MAX;
++                    return self.pending.len();
++                },
++                size => (size, 8),
++            };
++            if size < header as u64 {
++                // Corrupt; stop parsing this stream rather than misread it.
++                self.skip = u64::MAX;
++                return self.pending.len();
++            }
++            match &box_type {
++                b"moov" | b"trak" | b"mdia" | b"mvex" | b"moof" => position += header,
++                b"traf" => {
++                    let Some(Format::Mp4(ref mut state)) = self.format else {
++                        unreachable!("parse_mp4 runs for MP4 streams");
++                    };
++                    state.tfhd_default_duration = None;
++                    position += header;
++                },
++                b"mdhd" | b"trex" | b"tfhd" | b"tfdt" | b"trun" => {
++                    let size = size as usize;
++                    if data.len() < size {
++                        return position;
++                    }
++                    let body = data[header..size].to_vec();
++                    self.mp4_box(&box_type, &body, timestamp_offset);
++                    position += size;
++                },
++                _ => {
++                    let available = (data.len() - header) as u64;
++                    let payload = size - header as u64;
++                    if available >= payload {
++                        position += size as usize;
++                    } else {
++                        self.skip = payload - available;
++                        return self.pending.len();
++                    }
++                },
++            }
++        }
++    }
++
++    fn mp4_box(&mut self, box_type: &[u8; 4], body: &[u8], timestamp_offset: f64) {
++        let Some(Format::Mp4(ref mut state)) = self.format else {
++            unreachable!("mp4_box runs for MP4 streams");
++        };
++        // Full boxes: version (1 byte) and flags (3 bytes) come first.
++        if body.len() < 4 {
++            return;
++        }
++        let version = body[0];
++        let flags = u32::from_be_bytes([0, body[1], body[2], body[3]]);
++        let fields = &body[4..];
++        let u32_at = |offset: usize| -> Option<u32> {
++            fields
++                .get(offset..offset + 4)
++                .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()))
++        };
++        match box_type {
++            b"mdhd" => {
++                // v1: creation (8), modification (8), timescale; v0: 4, 4, timescale.
++                let offset = if version == 1 { 16 } else { 8 };
++                if let Some(timescale) = u32_at(offset).filter(|timescale| *timescale > 0) {
++                    state.timescale = timescale;
++                }
++            },
++            b"trex" => {
++                // track_ID, default_sample_description_index, default_sample_duration.
++                if let Some(duration) = u32_at(8) {
++                    state.trex_default_duration = duration;
++                }
++            },
++            b"tfhd" => {
++                let mut offset = 4; // track_ID
++                if flags & 0x01 != 0 {
++                    offset += 8; // base_data_offset
++                }
++                if flags & 0x02 != 0 {
++                    offset += 4; // sample_description_index
++                }
++                if flags & 0x08 != 0 {
++                    state.tfhd_default_duration = u32_at(offset);
++                }
++            },
++            b"tfdt" => {
++                state.next_decode_time = if version == 1 {
++                    fields
++                        .get(..8)
++                        .map(|bytes| u64::from_be_bytes(bytes.try_into().unwrap()))
++                        .unwrap_or(0)
++                } else {
++                    u32_at(0).unwrap_or(0) as u64
++                };
++            },
++            b"trun" => {
++                let Some(sample_count) = u32_at(0) else {
++                    return;
++                };
++                let mut offset = 4;
++                if flags & 0x001 != 0 {
++                    offset += 4; // data_offset
++                }
++                if flags & 0x004 != 0 {
++                    offset += 4; // first_sample_flags
++                }
++                let per_sample = [0x100, 0x200, 0x400, 0x800]
++                    .iter()
++                    .filter(|flag| flags & **flag != 0)
++                    .count() *
++                    4;
++                let default_duration = state
++                    .tfhd_default_duration
++                    .unwrap_or(state.trex_default_duration) as u64;
++                let mut total = 0u64;
++                for sample in 0..sample_count as usize {
++                    total += if flags & 0x100 != 0 {
++                        u32_at(offset + sample * per_sample).unwrap_or(0) as u64
++                    } else {
++                        default_duration
++                    };
++                }
++                let timescale = state.timescale as f64;
++                let start = state.next_decode_time as f64 / timescale + timestamp_offset;
++                let end = (state.next_decode_time + total) as f64 / timescale + timestamp_offset;
++                state.next_decode_time += total;
++                if end > start {
++                    self.add_range(start, end);
++                }
++            },
++            _ => {},
++        }
++    }
++}
++
++fn detect_format(bytes: &[u8]) -> Option<Format> {
++    if bytes.len() < 8 {
++        return None;
++    }
++    if bytes[..4] == [0x1A, 0x45, 0xDF, 0xA3] {
++        return Some(Format::WebM(WebMState::default()));
++    }
++    if matches!(
++        &bytes[4..8],
++        b"ftyp" | b"styp" | b"moov" | b"moof" | b"sidx" | b"emsg" | b"free"
++    ) {
++        return Some(Format::Mp4(Mp4State::default()));
++    }
++    // Neither: leave `format` unset so nothing is misparsed; `buffered` stays empty.
++    None
++}
++
++/// An EBML element id with its length-marker bits kept.
++fn read_ebml_id(data: &[u8]) -> Option<(u64, usize)> {
++    let first = *data.first()?;
++    let length = first.leading_zeros() as usize + 1;
++    if length > 4 || data.len() < length {
++        return None;
++    }
++    Some((
++        data[..length]
++            .iter()
++            .fold(0u64, |value, byte| (value << 8) | *byte as u64),
++        length,
++    ))
++}
++
++/// An EBML size (marker bit removed); `None` for the reserved "unknown size" value.
++fn read_ebml_size(data: &[u8]) -> Option<(Option<u64>, usize)> {
++    let first = *data.first()?;
++    let length = first.leading_zeros() as usize + 1;
++    if length > 8 || data.len() < length {
++        return None;
++    }
++    let mask = if length == 8 { 0 } else { 0xFFu8 >> length };
++    let mut value = (first & mask) as u64;
++    for byte in &data[1..length] {
++        value = (value << 8) | *byte as u64;
++    }
++    let unknown = value == (1u64 << (7 * length)) - 1;
++    Some((if unknown { None } else { Some(value) }, length))
++}
++
++fn read_uint(bytes: &[u8]) -> u64 {
++    bytes
++        .iter()
++        .take(8)
++        .fold(0u64, |value, byte| (value << 8) | *byte as u64)
++}
+diff --git a/components/script/dom/media/mediasource.rs b/components/script/dom/media/mediasource.rs
+index 2323f1488b3..163a0e75037 100644
+--- a/components/script/dom/media/mediasource.rs
++++ b/components/script/dom/media/mediasource.rs
+@@ -91,6 +91,11 @@ impl MediaSource {
+     }
+ 
+     /// Whether `readyState` is `"open"`.
++    /// What the attached media element can play: the time ranges every SourceBuffer holds.
++    pub(crate) fn buffered(&self) -> Vec<(f64, f64)> {
++        self.source_buffers.buffered_intersection()
++    }
++
+     pub(crate) fn is_open(&self) -> bool {
+         self.ready_state.get() == ReadyState::Open
+     }
+@@ -164,9 +169,19 @@ impl MediaSourceMethods<crate::DomTypeHolder> for MediaSource {
+         if self.ready_state.get() != ReadyState::Open {
+             return Err(Error::InvalidState(None));
+         }
+-        // Steps 5-7. Create the SourceBuffer, add it to sourceBuffers (which queues the
+-        // `addsourcebuffer` event at the list).
+-        let source_buffer = SourceBuffer::new(&self.global(), self, CanGc::deprecated_note());
++        // Steps 5-7. Create the SourceBuffer with its own input stream in the player, and add it
++        // to sourceBuffers (which queues the `addsourcebuffer` event at the list). An open
++        // MediaSource is always attached to an element with a player.
++        let player = self
++            .media_element()
++            .and_then(|element| element.get_player())
++            .expect("an open MediaSource has a media element with a player");
++        let stream = player.lock().unwrap().add_source_buffer().map_err(|error| {
++            warn!("MSE addSourceBuffer: {error:?}");
++            Error::NotSupported(None)
++        })?;
++        let source_buffer =
++            SourceBuffer::new(&self.global(), self, stream, CanGc::deprecated_note());
+         self.source_buffers.add(&source_buffer);
+         Ok(source_buffer)
+     }
+diff --git a/components/script/dom/media/mod.rs b/components/script/dom/media/mod.rs
+index b0902c61570..6e93fdf961b 100644
+--- a/components/script/dom/media/mod.rs
++++ b/components/script/dom/media/mod.rs
+@@ -16,6 +16,7 @@ pub(crate) mod medialist;
+ pub(crate) mod mediametadata;
+ pub(crate) mod mediaquerylist;
+ pub(crate) mod mediaquerylistevent;
++pub(crate) mod mediasegmentparser;
+ pub(crate) mod mediasession;
+ pub(crate) mod mediasource;
+ pub(crate) mod mediastream;
+diff --git a/components/script/dom/media/sourcebuffer.rs b/components/script/dom/media/sourcebuffer.rs
+index f2e0d214a4c..1c6328aeba7 100644
+--- a/components/script/dom/media/sourcebuffer.rs
++++ b/components/script/dom/media/sourcebuffer.rs
+@@ -2,13 +2,14 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+-//! Media Source Extensions `SourceBuffer` — Phase 1 scaffold (state only). `appendBuffer` /
+-//! `remove` and the GStreamer append pipeline land in Phase 2.
++//! Media Source Extensions `SourceBuffer`. Appended bytes go to this SourceBuffer's own stream
++//! in the player; `buffered` comes from the segments' container timestamps.
+ 
+ use std::cell::Cell;
+ use std::ffi::CString;
+ 
+ use dom_struct::dom_struct;
++use script_bindings::cell::DomRefCell;
+ use script_bindings::reflector::reflect_dom_object;
+ use stylo_atoms::Atom;
+ 
+@@ -21,6 +22,7 @@ use crate::dom::bindings::reflector::DomGlobal;
+ use crate::dom::bindings::root::{Dom, DomRoot};
+ use crate::dom::eventtarget::EventTarget;
+ use crate::dom::globalscope::GlobalScope;
++use crate::dom::media::mediasegmentparser::MediaSegmentParser;
+ use crate::dom::media::mediasource::MediaSource;
+ use crate::dom::timeranges::{TimeRanges, TimeRangesContainer};
+ use js::context::JSContext;
+@@ -31,9 +33,11 @@ pub(crate) struct SourceBuffer {
+     eventtarget: EventTarget,
+     mode: Cell<AppendMode>,
+     updating: Cell<bool>,
+-    /// Running total of bytes appended, used to keep the player's input size in sync so its
+-    /// (percent-based) buffering query and playback progress work.
+-    total_bytes: Cell<u64>,
++    /// This SourceBuffer's input stream in the player.
++    stream: usize,
++    #[no_trace]
++    #[ignore_malloc_size_of = "Holds only partial headers and time ranges"]
++    segments: DomRefCell<MediaSegmentParser>,
+     timestamp_offset: Cell<f64>,
+     append_window_start: Cell<f64>,
+     append_window_end: Cell<f64>,
+@@ -41,12 +45,13 @@ pub(crate) struct SourceBuffer {
+ }
+ 
+ impl SourceBuffer {
+-    fn new_inherited(media_source: &MediaSource) -> SourceBuffer {
++    fn new_inherited(media_source: &MediaSource, stream: usize) -> SourceBuffer {
+         SourceBuffer {
+             eventtarget: EventTarget::new_inherited(),
+             mode: Cell::new(AppendMode::Segments),
+             updating: Cell::new(false),
+-            total_bytes: Cell::new(0),
++            stream,
++            segments: Default::default(),
+             timestamp_offset: Cell::new(0.0),
+             append_window_start: Cell::new(0.0),
+             append_window_end: Cell::new(f64::INFINITY),
+@@ -57,10 +62,11 @@ impl SourceBuffer {
+     pub(crate) fn new(
+         global: &GlobalScope,
+         media_source: &MediaSource,
++        stream: usize,
+         can_gc: CanGc,
+     ) -> DomRoot<SourceBuffer> {
+         reflect_dom_object(
+-            Box::new(SourceBuffer::new_inherited(media_source)),
++            Box::new(SourceBuffer::new_inherited(media_source, stream)),
+             global,
+             can_gc,
+         )
+@@ -79,22 +85,28 @@ impl SourceBuffer {
+             }));
+     }
+ 
+-    /// The async segment of `appendBuffer`: push the bytes into the attached element's player,
+-    /// then clear `updating` and fire `update` + `updateend`.
++    pub(crate) fn buffered_ranges(&self) -> Vec<(f64, f64)> {
++        self.segments.borrow().ranges().to_vec()
++    }
++
++    /// The async segment of `appendBuffer`: record the segments' time ranges, push the bytes
++    /// into this SourceBuffer's stream in the player, then clear `updating` and fire `update` +
++    /// `updateend`.
+     fn finish_append(&self, cx: &mut js::context::JSContext, bytes: Vec<u8>) {
+         self.upcast::<EventTarget>()
+             .fire_event(cx, Atom::from("updatestart"));
+ 
+-        let total = self.total_bytes.get().saturating_add(bytes.len() as u64);
+-        self.total_bytes.set(total);
++        self.segments
++            .borrow_mut()
++            .append(&bytes, self.timestamp_offset.get());
+         if let Some(element) = self.media_source.media_element() &&
+-            let Some(player) = element.get_player()
++            let Some(player) = element.get_player() &&
++            let Err(error) = player
++                .lock()
++                .unwrap()
++                .push_source_buffer_data(self.stream, bytes)
+         {
+-            let player = player.lock().unwrap();
+-            let _ = player.set_input_size(total);
+-            if let Err(error) = player.push_data(bytes) {
+-                warn!("MSE appendBuffer push_data failed: {error:?}");
+-            }
++            warn!("MSE appendBuffer push failed: {error:?}");
+         }
+ 
+         self.updating.set(false);
+@@ -136,6 +148,7 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
+             return Err(Error::InvalidState(None));
+         }
+         // Abort any in-progress append: reset updating and fire abort + updateend.
++        self.segments.borrow_mut().reset_partial();
+         if self.updating.get() {
+             self.updating.set(false);
+             self.queue_event("abort");
+@@ -159,9 +172,8 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
+                 CString::new("Invalid remove range").unwrap(),
+             ));
+         }
+-        // Run the removal asynchronously. NB: the GStreamer appsrc cannot drop already-pushed
+-        // data, so `buffered` does not shrink (best-effort); the update events still fire so
+-        // players that call remove() for buffer management proceed normally.
++        // Run the removal asynchronously. The player's stream can't drop data it already took,
++        // but `buffered` drops the range, which is what players managing their buffer check.
+         self.updating.set(true);
+         let this = Trusted::new(self);
+         self.global()
+@@ -171,6 +183,7 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
+                 let sb = this.root();
+                 sb.upcast::<EventTarget>()
+                     .fire_event(cx, Atom::from("updatestart"));
++                sb.segments.borrow_mut().remove(start, end);
+                 sb.updating.set(false);
+                 sb.upcast::<EventTarget>()
+                     .fire_event(cx, Atom::from("update"));
+@@ -191,15 +204,12 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
+         self.updating.get()
+     }
+     /// <https://w3c.github.io/media-source/#dom-sourcebuffer-buffered>
+-    /// Reports the ranges the attached element's player has actually buffered.
+     fn GetBuffered(&self, cx: &mut JSContext) -> Fallible<DomRoot<TimeRanges>> {
+         let mut buffered = TimeRangesContainer::default();
+-        if let Some(element) = self.media_source.media_element() &&
+-            let Some(player) = element.get_player()
+-        {
+-            for range in player.lock().unwrap().buffered() {
+-                let _ = buffered.add(range.start, range.end);
+-            }
++        for (start, end) in self.buffered_ranges() {
++            buffered
++                .add(start, end)
++                .expect("MediaSegmentParser ranges are valid and disjoint");
+         }
+         Ok(TimeRanges::new(cx, self.global().as_window(), buffered))
+     }
+diff --git a/components/script/dom/media/sourcebufferlist.rs b/components/script/dom/media/sourcebufferlist.rs
+index bbcb909b6cb..c3a327e8711 100644
+--- a/components/script/dom/media/sourcebufferlist.rs
++++ b/components/script/dom/media/sourcebufferlist.rs
+@@ -44,6 +44,20 @@ impl SourceBufferList {
+         self.queue_event("addsourcebuffer");
+     }
+ 
++    /// The presentation times every SourceBuffer in the list holds: the intersection of their
++    /// `buffered` ranges, which is what the media element can play
++    /// (<https://w3c.github.io/media-source/#htmlmediaelement-extensions-buffered>).
++    pub(crate) fn buffered_intersection(&self) -> Vec<(f64, f64)> {
++        let buffers = self.buffers.borrow();
++        let mut buffers = buffers.iter();
++        let Some(first) = buffers.next() else {
++            return vec![];
++        };
++        buffers.fold(first.buffered_ranges(), |intersection, buffer| {
++            intersect_ranges(&intersection, &buffer.buffered_ranges())
++        })
++    }
++
+     /// Queue a task that fires a named event at this SourceBufferList.
+     fn queue_event(&self, name: &'static str) {
+         let this = Trusted::new(self);
+@@ -70,3 +84,22 @@ impl SourceBufferListMethods<crate::DomTypeHolder> for SourceBufferList {
+             .map(|b| DomRoot::from_ref(&**b))
+     }
+ }
++
++/// Intersect two sorted lists of disjoint `[start, end)` ranges.
++fn intersect_ranges(a: &[(f64, f64)], b: &[(f64, f64)]) -> Vec<(f64, f64)> {
++    let (mut i, mut j) = (0, 0);
++    let mut intersection = vec![];
++    while i < a.len() && j < b.len() {
++        let start = a[i].0.max(b[j].0);
++        let end = a[i].1.min(b[j].1);
++        if start < end {
++            intersection.push((start, end));
++        }
++        if a[i].1 < b[j].1 {
++            i += 1;
++        } else {
++            j += 1;
++        }
++    }
++    intersection
++}
+-- 
+2.43.0
+

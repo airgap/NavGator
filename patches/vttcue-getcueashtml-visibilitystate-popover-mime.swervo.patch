@@ -1,0 +1,302 @@
+From 1c77f1f6adece8adb7a669b8e67cde181b665f5a Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sat, 3 Oct 2026 03:59:02 -0400
+Subject: [PATCH] web compat: VTTCue.getCueAsHTML, visibilityState, popover,
+ MIME, fonts, nosniff
+
+- VTTCue.getCueAsHTML() returns the cue text as a fragment instead of
+  being unimplemented (Reddit's video player threw on it).
+- document.visibilityState starts visible for documents with a browsing
+  context; hidden made sites pause work and lazy-loaders stall.
+- [popover] elements that aren't open are display: none.
+- extract_mime_type_as_mime re-parses through the mime crate's own type.
+- The fontconfig substitute check builds its pattern with
+  FcPatternAddString, so names like -apple-system aren't parsed as
+  fontconfig syntax and fall back like Chrome.
+- local() in @font-face picks the face its style words name; taking the
+  family's first face rendered mdBook's sidebar in italics.
+- nosniff stylesheets are blocked unless the MIME type is exactly
+  text/css (the check used && where the spec needs ||).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/fonts/font_context.rs              | 59 ++++++++++++++++---
+ .../fonts/platform/freetype/font_list.rs      | 14 ++++-
+ components/layout/stylesheets/user-agent.css  |  4 ++
+ components/net/fetch/methods.rs               |  4 +-
+ components/script/dom/document/document.rs    |  9 ++-
+ components/script/dom/webvtt/vttcue.rs        | 42 ++++++++++++-
+ .../script_bindings/codegen/Bindings.conf     |  4 ++
+ components/shared/net/fetch/headers.rs        |  9 +--
+ 8 files changed, 125 insertions(+), 20 deletions(-)
+
+diff --git a/components/fonts/font_context.rs b/components/fonts/font_context.rs
+index 4fc4156e9ca..50fc6bf42e8 100644
+--- a/components/fonts/font_context.rs
++++ b/components/fonts/font_context.rs
+@@ -45,7 +45,9 @@ use style::shared_lock::SharedRwLockReadGuard;
+ use style::stylesheets::{
+     CssRule, CustomMediaMap, DocumentStyleSheet, FontFaceRule, StylesheetInDocument,
+ };
+-use style::values::computed::font::{FamilyName, FontFamilyNameSyntax, SingleFontFamily};
++use style::values::computed::font::{
++    FamilyName, FontFamilyNameSyntax, FontStyle, SingleFontFamily,
++};
+ use url::Url;
+ use uuid::Uuid;
+ use webrender_api::{FontInstanceFlags, FontInstanceKey, FontKey, FontVariation};
+@@ -939,9 +941,10 @@ impl FontContext {
+         // loading the list of web font `src`s we may be running in the context of the router thread, which
+         // means we won't be able to seend IPC messages to the FontCacheThread.
+         //
+-        // TODO: This is completely wrong. The specification says that `local()` font-family should match
+-        // against full PostScript names, but this is matching against font family names. This works...
+-        // sometimes.
++        // TODO: The specification says that `local()` matches full font names and PostScript
++        // names, but the font service is only queried by family. A full name is usually the
++        // family plus the face's style ("Open Sans Light Italic" is family "Open Sans Light"),
++        // so the face is chosen by the style words in the name; see `face_named_by`.
+         let mut local_fonts = HashMap::new();
+         for source in sources.iter() {
+             if let Source::Local(family_name) = source {
+@@ -952,10 +955,11 @@ impl FontContext {
+                             name: family_name.name.clone(),
+                             syntax: FontFamilyNameSyntax::Quoted,
+                         });
+-                        self.system_font_service_proxy
+-                            .find_matching_font_templates(None, &family)
+-                            .first()
+-                            .cloned()
++                        face_named_by(
++                            &family_name.name,
++                            self.system_font_service_proxy
++                                .find_matching_font_templates(None, &family),
++                        )
+                     });
+             }
+         }
+@@ -1225,3 +1229,42 @@ impl Hash for FontGroupCacheKey {
+         self.style.hash.hash(hasher)
+     }
+ }
++
++/// The face among `faces` (one family's) that a `local()` full name like "Open Sans Light Italic"
++/// names: italic if the name says italic or oblique, upright otherwise, and the weight closest to
++/// the one its weight word gives (400 without one). Taking the family's first face instead picked
++/// an italic for `local('Open Sans Light')`, so mdBook's sidebar rendered in italics.
++fn face_named_by(name: &str, faces: Vec<FontTemplateRef>) -> Option<FontTemplateRef> {
++    let words = name.to_ascii_lowercase().replace([' ', '-', '_'], "");
++    let italic = words.contains("italic") || words.contains("oblique");
++    const WEIGHT_WORDS: [(&str, f32); 13] = [
++        ("extralight", 200.),
++        ("ultralight", 200.),
++        ("semibold", 600.),
++        ("demibold", 600.),
++        ("extrabold", 800.),
++        ("ultrabold", 800.),
++        ("hairline", 100.),
++        ("thin", 100.),
++        ("light", 300.),
++        ("medium", 500.),
++        ("bold", 700.),
++        ("black", 900.),
++        ("heavy", 900.),
++    ];
++    let weight = WEIGHT_WORDS
++        .iter()
++        .find(|(word, _)| words.contains(word))
++        .map_or(400., |(_, weight)| *weight);
++    faces.into_iter().min_by(|a, b| {
++        let mismatch = |face: &FontTemplateRef| {
++            let descriptor = face.descriptor();
++            let style_mismatch = (descriptor.style.0 != FontStyle::NORMAL) != italic;
++            let weight_distance = (descriptor.weight.0.value() - weight).abs();
++            (style_mismatch, weight_distance)
++        };
++        mismatch(a)
++            .partial_cmp(&mismatch(b))
++            .expect("font weights are finite")
++    })
++}
+diff --git a/components/fonts/platform/freetype/font_list.rs b/components/fonts/platform/freetype/font_list.rs
+index 6d412c7f1a9..34ed2b8f34f 100644
+--- a/components/fonts/platform/freetype/font_list.rs
++++ b/components/fonts/platform/freetype/font_list.rs
+@@ -424,10 +424,22 @@ pub(crate) fn font_family_substitute(name: &str) -> Option<String> {
+ fn acceptable_fontconfig_substitute(name: &str) -> Option<String> {
+     let cname = CString::new(name).ok()?;
+     unsafe {
+-        let pattern = FcNameParse(cname.as_ptr() as *mut FcChar8);
++        // The family set directly, not via FcNameParse: its pattern syntax reads a leading `-`
++        // as a size, so `-apple-system` became an empty pattern that fontconfig filled with its
++        // default family, which then passed as a substitute.
++        let pattern = FcPatternCreate();
+         if pattern.is_null() {
+             return None;
+         }
++        if FcPatternAddString(
++            pattern,
++            FC_FAMILY.as_ptr() as *mut c_char,
++            cname.as_ptr() as *const FcChar8,
++        ) == 0
++        {
++            FcPatternDestroy(pattern);
++            return None;
++        }
+         FcConfigSubstitute(ptr::null_mut(), pattern, FcMatchPattern);
+         let post_config_family = pattern_family(pattern, 0);
+         FcDefaultSubstitute(pattern);
+diff --git a/components/layout/stylesheets/user-agent.css b/components/layout/stylesheets/user-agent.css
+index 064c75ae5c7..30a72a8d345 100644
+--- a/components/layout/stylesheets/user-agent.css
++++ b/components/layout/stylesheets/user-agent.css
+@@ -57,6 +57,10 @@ listing, plaintext, pre, xmp {
+ }
+ 
+ dialog:not([open]) { display: none; }
++/* https://html.spec.whatwg.org/multipage/#flow-content-3: closed popovers are hidden. The Popover
++ * API isn't implemented yet, so this keeps them out of the page flow (Notion scrolled its page
++ * to a closed language menu laid out inline). */
++[popover]:not(:popover-open):not(dialog[open]) { display: none; }
+ dialog {
+   position: absolute;
+   inset-inline-start: 0; inset-inline-end: 0;
+diff --git a/components/net/fetch/methods.rs b/components/net/fetch/methods.rs
+index ef66f635cf7..564123a17b1 100644
+--- a/components/net/fetch/methods.rs
++++ b/components/net/fetch/methods.rs
+@@ -1174,9 +1174,9 @@ pub fn should_be_blocked_due_to_nosniff(
+     match mime_type {
+         // Step 4
+         Some(ref mime_type) if destination.is_script_like() => !is_javascript_mime_type(mime_type),
+-        // Step 5
++        // Step 5: blocked unless the essence is exactly text/css.
+         Some(ref mime_type) if destination == Destination::Style => {
+-            mime_type.type_() != mime::TEXT && mime_type.subtype() != mime::CSS
++            mime_type.type_() != mime::TEXT || mime_type.subtype() != mime::CSS
+         },
+ 
+         None if destination == Destination::Style || destination.is_script_like() => true,
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index 0e0ec86c08f..f3f8311b851 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -3830,7 +3830,14 @@ impl Document {
+             declarative_refresh: Default::default(),
+             resize_observers: Default::default(),
+             fonts: Default::default(),
+-            visibility_state: Cell::new(DocumentVisibilityState::Hidden),
++            // <https://html.spec.whatwg.org/multipage/#initialise-the-document-object>: the
++            // navigable's system visibility state. Pages size, animate and play only when
++            // visible, and nothing later flips a normal load to visible.
++            visibility_state: Cell::new(if has_browsing_context {
++                DocumentVisibilityState::Visible
++            } else {
++                DocumentVisibilityState::Hidden
++            }),
+             status_code,
+             is_initial_about_blank: Cell::new(is_initial_about_blank),
+             allow_declarative_shadow_roots: Cell::new(allow_declarative_shadow_roots),
+diff --git a/components/script/dom/webvtt/vttcue.rs b/components/script/dom/webvtt/vttcue.rs
+index d2e46cef8d2..5ce18c913f8 100644
+--- a/components/script/dom/webvtt/vttcue.rs
++++ b/components/script/dom/webvtt/vttcue.rs
+@@ -18,7 +18,13 @@ use crate::dom::bindings::error::{Error, ErrorResult};
+ use crate::dom::bindings::num::Finite;
+ use crate::dom::bindings::root::{Dom, DomRoot};
+ use crate::dom::bindings::str::DOMString;
++use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
++use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
++use crate::dom::bindings::inheritance::Castable;
++use crate::dom::bindings::reflector::DomGlobal;
+ use crate::dom::documentfragment::DocumentFragment;
++use crate::dom::node::Node;
++use crate::dom::text::Text;
+ use crate::dom::texttrackcue::TextTrackCue;
+ use crate::dom::vttregion::VTTRegion;
+ use crate::dom::window::Window;
+@@ -206,8 +212,19 @@ impl VTTCueMethods<crate::DomTypeHolder> for VTTCue {
+     }
+ 
+     /// <https://w3c.github.io/webvtt/#dom-vttcue-getcueashtml>
+-    fn GetCueAsHTML(&self) -> DomRoot<DocumentFragment> {
+-        todo!()
++    ///
++    /// The cue text with its markup dropped: the WebVTT cue text parser that would turn `<b>`,
++    /// `<c.class>`, `<v name>`, ruby and timestamp tags into elements isn't implemented, but a
++    /// fragment of the plain text is what captions need to be readable.
++    fn GetCueAsHTML(&self, cx: &mut JSContext) -> DomRoot<DocumentFragment> {
++        let document = self.global().as_window().Document();
++        let fragment = DocumentFragment::new(cx, &document);
++        let text = Text::new(cx, DOMString::from(cue_text_without_markup(&self.text.borrow().str())), &document);
++        fragment
++            .upcast::<Node>()
++            .AppendChild(cx, text.upcast())
++            .expect("a fresh fragment accepts a text child");
++        fragment
+     }
+ }
+ 
+@@ -238,3 +255,24 @@ impl From<LineAndPositionSetting> for VTTCueBinding::LineAndPositionSetting {
+         }
+     }
+ }
++
++/// Cue text without its tags, with the character references WebVTT allows decoded.
++fn cue_text_without_markup(text: &str) -> String {
++    let mut plain = String::with_capacity(text.len());
++    let mut in_tag = false;
++    for character in text.chars() {
++        match character {
++            '<' => in_tag = true,
++            '>' if in_tag => in_tag = false,
++            _ if !in_tag => plain.push(character),
++            _ => {},
++        }
++    }
++    plain
++        .replace("&lt;", "<")
++        .replace("&gt;", ">")
++        .replace("&nbsp;", "\u{a0}")
++        .replace("&lrm;", "\u{200e}")
++        .replace("&rlm;", "\u{200f}")
++        .replace("&amp;", "&")
++}
+diff --git a/components/script_bindings/codegen/Bindings.conf b/components/script_bindings/codegen/Bindings.conf
+index 664b7d8ae81..7bb070f7563 100644
+--- a/components/script_bindings/codegen/Bindings.conf
++++ b/components/script_bindings/codegen/Bindings.conf
+@@ -1250,6 +1250,10 @@ DOMInterfaces = {
+     'cx': ['CreatePolicy', 'EmptyHTML', 'EmptyScript', 'IsHTML', 'IsScript', 'IsScriptURL'],
+ },
+ 
++'VTTCue': {
++    'cx': ['GetCueAsHTML'],
++},
++
+ 'URL': {
+     'weakReferenceable': True,
+     'cx': ['Parse', 'SearchParams'],
+diff --git a/components/shared/net/fetch/headers.rs b/components/shared/net/fetch/headers.rs
+index 37be79aa400..107d1fde877 100644
+--- a/components/shared/net/fetch/headers.rs
++++ b/components/shared/net/fetch/headers.rs
+@@ -275,12 +275,9 @@ pub fn extract_mime_type(headers: &HeaderMap) -> Option<Vec<u8>> {
+ 
+ pub fn extract_mime_type_as_mime(headers: &HeaderMap) -> Option<mime::Mime> {
+     extract_mime_type_as_dataurl_mime(headers).and_then(|mime: DataUrlMime| {
+-        // Try to transform a data-url::mime::Mime into a mime::Mime
+-        let mut mime_as_str = format!("{}/{}", mime.type_, mime.subtype);
+-        for p in mime.parameters {
+-            mime_as_str.push_str(format!("; {}={}", p.0, p.1).as_str());
+-        }
+-        mime_as_str.parse().ok()
++        // Through data-url's serialization, which re-quotes parameter values: wikimedia's math
++        // SVGs carry `profile="https://…"`, and unquoted that no longer parses.
++        mime.to_string().parse().ok()
+     })
+ }
+ 
+-- 
+2.43.0
+

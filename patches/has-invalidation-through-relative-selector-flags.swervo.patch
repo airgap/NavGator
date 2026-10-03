@@ -1,0 +1,107 @@
+From 987e4d9358e789593fa0a9370a745a89c92a2713 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sat, 3 Oct 2026 03:58:35 -0400
+Subject: [PATCH] script: :has() invalidation through relative-selector flags
+
+stylo parses :has() for Servo now (separate stylo change). Matching
+flags the anchor and every element the search visits. On a state change,
+attribute change or child-list mutation, walk up from the changed element
+(and back over preceding siblings where the search ran sideways) and
+restyle each flagged anchor with its subtree. stylo's precise
+relative-selector invalidation is driven by Gecko's restyle manager.
+Pages without :has() carry none of these flags and never walk.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/document/document.rs |  1 +
+ components/script/dom/element/element.rs   | 48 ++++++++++++++++++++++
+ 2 files changed, 49 insertions(+)
+
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index dc9bbdb8306..ad9ad6ebfed 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -4302,6 +4302,7 @@ impl Document {
+         // I'm getting rid of the whole hashtable soon anyway, since all it does
+         // right now is populate the element restyle data in layout, and we
+         // could in theory do it in the DOM I think.
++        el.invalidate_relative_selector_anchors();
+         let mut entry = self.ensure_pending_restyle(el);
+         if entry.snapshot.is_none() {
+             entry.snapshot = Some(Snapshot::new());
+diff --git a/components/script/dom/element/element.rs b/components/script/dom/element/element.rs
+index 152d480dc8c..fa0b6e49cab 100644
+--- a/components/script/dom/element/element.rs
++++ b/components/script/dom/element/element.rs
+@@ -379,6 +379,52 @@ impl Element {
+         self.style_data.borrow_mut().take();
+     }
+ 
++    /// Restyle the `:has()` anchors whose match may depend on a change at this element: a state
++    /// or attribute change here, or a change to its children. Matching a `:has()` selector flags
++    /// the anchor and every element its search visits (ancestor direction for descendant
++    /// arguments, sibling direction for `+`/`~` ones), so the anchors are found by walking up
++    /// from a visited element and, where the search ran along siblings, back over preceding
++    /// siblings. Each anchor restyles with its subtree, as selectors like `.a:has(.b) .c` style
++    /// its descendants. stylo's precise relative-selector invalidation is driven by Gecko's
++    /// restyle manager, which servo doesn't have. Elements no `:has()` search reached carry
++    /// none of these flags, so pages without `:has()` never walk.
++    pub(crate) fn invalidate_relative_selector_anchors(&self) {
++        const ANCHORS: ElementSelectorFlags = ElementSelectorFlags::ANCHORS_RELATIVE_SELECTOR
++            .union(ElementSelectorFlags::ANCHORS_RELATIVE_SELECTOR_NON_SUBJECT);
++        let searched = ElementSelectorFlags::RELATIVE_SELECTOR_SEARCH_DIRECTION_ANCESTOR_SIBLING;
++        if !self.get_selector_flags().intersects(searched | ANCHORS) {
++            return;
++        }
++        let document = self.owner_document();
++        let restyle_if_anchor = |element: &Element| {
++            if element.get_selector_flags().intersects(ANCHORS) {
++                document
++                    .ensure_pending_restyle(element)
++                    .hint
++                    .insert(RestyleHint::restyle_subtree());
++            }
++        };
++        for ancestor in self
++            .upcast::<Node>()
++            .inclusive_ancestors(ShadowIncluding::No)
++            .filter_map(DomRoot::downcast::<Element>)
++        {
++            restyle_if_anchor(&ancestor);
++            if ancestor
++                .get_selector_flags()
++                .intersects(ElementSelectorFlags::RELATIVE_SELECTOR_SEARCH_DIRECTION_SIBLING)
++            {
++                for sibling in ancestor
++                    .upcast::<Node>()
++                    .preceding_siblings()
++                    .filter_map(DomRoot::downcast::<Element>)
++                {
++                    restyle_if_anchor(&sibling);
++                }
++            }
++        }
++    }
++
+     pub(crate) fn restyle(&self, damage: NodeDamage) {
+         let doc = self.node.owner_doc();
+         let mut restyle = doc.ensure_pending_restyle(self);
+@@ -4964,6 +5010,7 @@ impl VirtualMethods for Element {
+             s.children_changed(cx, mutation);
+         }
+ 
++        self.invalidate_relative_selector_anchors();
+         let flags = self.get_selector_flags();
+         if flags.intersects(ElementSelectorFlags::HAS_SLOW_SELECTOR) {
+             // All children of this node need to be restyled when any child changes.
+@@ -5230,6 +5277,7 @@ impl Element {
+                 snapshot.state = Some(self.state());
+             }
+         }
++        self.invalidate_relative_selector_anchors();
+ 
+         self.state.set(state);
+     }
+-- 
+2.43.0
+

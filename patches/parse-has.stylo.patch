@@ -1,0 +1,29 @@
+From 05b38aa823e68f254df5d4b6b5b3b237169706bd Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sat, 3 Oct 2026 03:59:38 -0400
+Subject: [PATCH] servo: parse :has()
+
+Servo's script restyles :has() anchors from the relative-selector
+selector flags when DOM state, attributes or children change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ style/servo/selector_parser.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/style/servo/selector_parser.rs b/style/servo/selector_parser.rs
+index 655e160dc..349a8495d 100644
+--- a/style/servo/selector_parser.rs
++++ b/style/servo/selector_parser.rs
+@@ -595,7 +595,7 @@ impl<'a, 'i> ::selectors::Parser<'i> for SelectorParser<'a> {
+ 
+     #[inline]
+     fn parse_has(&self) -> bool {
+-        false
++        true
+     }
+ 
+     #[inline]
+-- 
+2.43.0
+
