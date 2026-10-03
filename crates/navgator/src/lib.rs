@@ -159,6 +159,22 @@ pub fn desktop_main() -> Result<(), Box<dyn Error>> {
                     log::error!("{info}");
                     default_hook(info);
                 }));
+                // A content process outlives a browser that dies without shutting it down (a
+                // crash, SIGKILL): its script thread never notices the dead IPC peer and the
+                // process sleeps on forever (hundreds piled up, ~5 MB each, after test runs).
+                // Exit once reparented. Polling `getppid` instead of PR_SET_PDEATHSIG, which fires
+                // when the *thread* that forked us exits rather than the process. Spawned before
+                // the sandbox, whose seccomp policy allows getppid and nanosleep.
+                let browser_pid = std::os::unix::process::parent_id();
+                std::thread::Builder::new()
+                    .name("ParentWatch".into())
+                    .spawn(move || loop {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        if std::os::unix::process::parent_id() != browser_pid {
+                            std::process::exit(0);
+                        }
+                    })
+                    .expect("Failed to spawn the parent watchdog thread");
                 run_content_process(token);
                 return Ok(());
             }
