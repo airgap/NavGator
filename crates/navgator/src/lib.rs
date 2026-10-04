@@ -2684,7 +2684,13 @@ const LINKHINT_JS: &str = r#"(function () {
       return;
     }
     if (e.ctrlKey || e.altKey || e.metaKey) return;
-    if (editable(e.target) || editable(document.activeElement)) return;
+    // Look through shadow roots: an input inside a web component (MDN's sidebar filter) retargets
+    // `e.target` and `document.activeElement` to its host, so its `f`/`l` keystrokes were being
+    // taken as hint commands.
+    var active = document.activeElement;
+    while (active && active.shadowRoot && active.shadowRoot.activeElement)
+      active = active.shadowRoot.activeElement;
+    if (editable(e.composedPath()[0]) || editable(active)) return;
     if (e.key === "f") { e.preventDefault(); e.stopPropagation(); activate("follow"); }
     else if (e.key === "F") { e.preventDefault(); e.stopPropagation(); activate("newtab"); }
     else if (e.key === "y") { e.preventDefault(); e.stopPropagation(); activate("yank"); }
