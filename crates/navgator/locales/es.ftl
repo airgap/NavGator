@@ -10,6 +10,7 @@ toolbar-maximize = Maximizar
 toolbar-restore = Restaurar
 toolbar-close-window = Cerrar
 toolbar-userscripts = Scripts de usuario / complementos
+toolbar-fill-login = Rellenar el inicio de sesión guardado de esta página
 toolbar-save-login = Guardar el inicio de sesión de esta página
 toolbar-unlock-vault = Desbloquear la bóveda (contraseñas + autocompletado)
 

@@ -11,6 +11,7 @@ toolbar-maximize = Maximise
 toolbar-restore = Restore
 toolbar-close-window = Close
 toolbar-userscripts = Userscripts / add-ons
+toolbar-fill-login = Fill this page's saved login
 toolbar-save-login = Save this page's login
 toolbar-unlock-vault = Unlock vault (passwords + autofill)
 
