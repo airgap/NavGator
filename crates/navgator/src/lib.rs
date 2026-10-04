@@ -3207,6 +3207,25 @@ this._startTime = now() - this._currentTime / this.playbackRate;
 this._tick(now(), true);
 },
 });
+Object.defineProperty(Anim.prototype, "startTime", {
+get: function () {
+return this.playState === "running" || this.playState === "finished" ? this._startTime : null;
+},
+set: function (v) {
+if (v == null) {
+if (this.playState === "running") {
+this._tick(now(), false);
+this.playState = "paused";
+}
+this._startTime = null;
+return;
+}
+this._startTime = v;
+this.playState = "running";
+this._tick(now(), true);
+scheduleTick();
+},
+});
 Object.defineProperty(Anim.prototype, "finished", {
 get: function () {
 var self = this;
