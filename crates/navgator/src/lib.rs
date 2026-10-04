@@ -88,6 +88,7 @@ mod password;
 mod autofill;
 mod highlights;
 mod keyring_store;
+mod migrate;
 mod theme;
 mod fonts;
 mod palette;

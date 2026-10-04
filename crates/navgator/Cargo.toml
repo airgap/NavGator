@@ -92,22 +92,26 @@ sys-locale = "0.3"
 
 # X11-only: query surfman's GL config's native X visual so the window is created with the SAME
 # visual, or strict EGL drivers (NVIDIA) fail eglCreateWindowSurface -> surfman panics on launch.
-# Plus the OS keyring for the sync passphrase — the Secret Service backend is Linux-only (macOS
-# and Windows use their native keychains below). keyring_store is called unconditionally, so
-# every desktop target needs a backend.
+# Plus the OS keyring for the sync passphrase: keyring-core with the Secret Service store, which
+# is Linux-only (macOS and Windows use their native stores below). keyring_store is called
+# unconditionally, so every desktop target needs a store. keyring 4 split into keyring-core plus
+# one crate per store, and its docs ask applications to link those directly (LYK-616).
 [target.'cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))'.dependencies]
 khronos-egl = { version = "6", features = ["dynamic"] }
 libloading = "0.8"
 raw-window-handle = "0.6"
-keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+keyring-core = "1.0.0"
+dbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
 
 # macOS Keychain backend for the sync passphrase.
 [target.'cfg(target_os = "macos")'.dependencies]
-keyring = { version = "3", default-features = false, features = ["apple-native"] }
+keyring-core = "1.0.0"
+apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 
 # Windows Credential Manager backend for the sync passphrase.
 [target.'cfg(target_os = "windows")'.dependencies]
-keyring = { version = "3", default-features = false, features = ["windows-native"] }
+keyring-core = "1.0.0"
+windows-native-keyring-store = { version = "1.1.0", default-features = false }
 
 # Embed packaging/navgator.ico (+ version info) into the .exe via build.rs. winresource is the
 # maintained fork of winres.
