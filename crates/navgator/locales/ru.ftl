@@ -8,6 +8,7 @@ toolbar-maximize = Развернуть
 toolbar-restore = Восстановить
 toolbar-close-window = Закрыть
 toolbar-userscripts = Пользовательские скрипты / дополнения
+toolbar-fill-login = Заполнить сохранённые данные для входа на этой странице
 toolbar-save-login = Сохранить данные для входа на этой странице
 toolbar-unlock-vault = Разблокировать хранилище (пароли + автозаполнение)
 
