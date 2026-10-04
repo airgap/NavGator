@@ -54,7 +54,8 @@ use navgator_engine::{
     EmbedderControlId, EventLoopWaker, FilePicker, FilterPattern, Image, InputEvent, InputEventId,
     InputEventResult, JSValue, Key,
     KeyState, KeyboardEvent, LoadStatus, Location, MediaSessionEvent, MediaSessionPlaybackState, Modifiers,
-    MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
+    MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent,
+    MouseMoveEvent,
     NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, Opts, PermissionRequest,
     PixelFormat, Preferences, RenderingContext, run_content_process,
     SandboxOutcome, apply_sandbox, content_process_policy,
@@ -4079,6 +4080,9 @@ struct AppState {
     fullscreen: Cell<bool>,
     scale: Cell<f64>,
     cursor: Cell<(f64, f64)>,
+    /// Whether the last pointer move went to the page, so leaving the page (into the chrome or out
+    /// of the window) tells it, as pages rely on mouseleave/pointerleave to end hover effects.
+    pointer_in_page: Cell<bool>,
     /// The CSS cursor the page wants under the pointer (from `notify_cursor_changed`); applied to
     /// the window while the pointer is over a page area (not the chrome). LYK-style: link→Pointer,
     /// text→Text, etc.
@@ -11956,6 +11960,7 @@ fn open_window(
         fullscreen: Cell::new(false),
         scale: Cell::new(scale),
         cursor: Cell::new((0.0, 0.0)),
+        pointer_in_page: Cell::new(false),
         page_cursor: Cell::new(CursorIcon::Default),
         ctrl: Cell::new(false),
         shift: Cell::new(false),
@@ -12464,6 +12469,7 @@ impl ApplicationHandler<WakeUp> for App {
                 let off = if state.split.get() && foc == 1 { mid_dev } else { left_dev };
                 let over_focused = !state.split.get() || ((foc == 0) == (cx < mid_dev));
                 if !(resp.consumed || over_chrome || dialog_open) && over_focused {
+                    state.pointer_in_page.set(true);
                     state.forward_to_page(InputEvent::MouseMove(MouseMoveEvent::new(
                         DevicePoint::new(
                             (position.x - off) as f32,
@@ -12471,6 +12477,18 @@ impl ApplicationHandler<WakeUp> for App {
                         )
                         .into(),
                     )));
+                } else if state.pointer_in_page.replace(false) {
+                    state.forward_to_page(InputEvent::MouseLeftViewport(
+                        MouseLeftViewportEvent::default(),
+                    ));
+                }
+            }
+
+            WindowEvent::CursorLeft { .. } => {
+                if state.pointer_in_page.replace(false) {
+                    state.forward_to_page(InputEvent::MouseLeftViewport(
+                        MouseLeftViewportEvent::default(),
+                    ));
                 }
             }
 
