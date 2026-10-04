@@ -5826,6 +5826,17 @@ impl AppState {
         }
     }
 
+    /// Tell every open tab (both panes) that the window moved or resized. swervo caches
+    /// `screen_geometry` per document and only asks again after this, so hidden tabs (which get
+    /// no viewport resize) must hear about it too.
+    fn notify_screen_geometry_changed_all(&self) {
+        for pane in 0..2 {
+            for tab in self.pane(pane).tabs.borrow().iter() {
+                tab.webview.notify_screen_geometry_changed();
+            }
+        }
+    }
+
     /// Locate a webview across BOTH panes, returning `(pane, tab index)`. Delegate callbacks fire
     /// for whichever pane owns the webview — not necessarily the focused one — so they must route
     /// updates here rather than assuming `focused_pane()`.
@@ -12333,6 +12344,10 @@ impl ApplicationHandler<WakeUp> for App {
             WindowEvent::Resized(size) => {
                 state.window_context.resize(*size);
                 state.window.request_redraw();
+                state.notify_screen_geometry_changed_all();
+            }
+            WindowEvent::Moved(_) => {
+                state.notify_screen_geometry_changed_all();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 state.scale.set(*scale_factor);
