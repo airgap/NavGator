@@ -5164,6 +5164,7 @@ dependencies = [
  "egui_glow",
  "euclid",
  "fluent",
+ "fontdb",
  "glow",
  "keyring",
  "khronos-egl",
