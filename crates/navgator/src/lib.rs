@@ -12579,9 +12579,11 @@ impl ApplicationHandler<WakeUp> for App {
                     let (dx, dy, mode) = match delta {
                         // Converted to pixels here, so the page sees DOM_DELTA_PIXEL like
                         // Chrome; reporting these values as lines made libraries that scale line
-                        // deltas (maps, custom scrollers) scroll ~40x too far.
+                        // deltas (maps, custom scrollers) scroll ~40x too far. One line is one
+                        // wheel tick, which Chrome on Linux reports and scrolls as 120px; the
+                        // engine derives the legacy `wheelDelta` (120 per tick) from it.
                         MouseScrollDelta::LineDelta(lx, ly) => {
-                            ((lx * 76.0) as f64, (ly * 76.0) as f64, WheelMode::DeltaPixel)
+                            ((lx * 120.0) as f64, (ly * 120.0) as f64, WheelMode::DeltaPixel)
                         }
                         MouseScrollDelta::PixelDelta(p) => (p.x, p.y, WheelMode::DeltaPixel),
                     };
