@@ -10,7 +10,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DRV="$HERE/driver.sh"
-OUT=/tmp/idb-index; mkdir -p "$OUT"
+OUT="$(mktemp -d /tmp/idb-index.XXXXXX)"  # per run: agents run gates concurrently
 PORT="${IDB_PORT:-8988}"
 
 ( cd "$HERE/idb-index" && setsid python3 -m http.server "$PORT" >/dev/null 2>&1 </dev/null & ); sleep 1

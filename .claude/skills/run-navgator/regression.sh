@@ -32,14 +32,15 @@ DISPLAY="$DISP" xdpyinfo >/dev/null 2>&1 || {
   sleep 3; }
 ( cd "$DIR" && setsid python3 -m http.server "$PORT" >/dev/null 2>&1 < /dev/null & ); sleep 1
 export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-/tmp/navgator-run/profile}"; mkdir -p "$XDG_CONFIG_HOME"
+OUT="$(mktemp -d /tmp/regression.XXXXXX)"  # per run: agents run the suite concurrently
 
-render() { # <name> <page.html>  -> /tmp/reg_<name>_c.png (content region, toolbar cropped)
+render() { # <name> <page.html>  -> $OUT/reg_<name>_c.png (content region, toolbar cropped)
   local name="$1" page="$2"
   setsid env DISPLAY="$DISP" "$BIN" "http://localhost:$PORT/$page" >/dev/null 2>&1 < /dev/null &
   local pid=$!; disown 2>/dev/null; sleep 7
-  ffmpeg -y -draw_mouse 0 -f x11grab -video_size ${W}x${H} -i "${DISP}.0" -frames:v 1 "/tmp/reg_$name.png" >/dev/null 2>&1
+  ffmpeg -y -draw_mouse 0 -f x11grab -video_size ${W}x${H} -i "${DISP}.0" -frames:v 1 "$OUT/reg_$name.png" >/dev/null 2>&1
   { kill -9 "$pid"; pkill -9 -P "$pid"; } 2>/dev/null
-  ffmpeg -y -i "/tmp/reg_$name.png" -vf "crop=${W}:$((H-TOP)):0:$TOP" "/tmp/reg_${name}_c.png" >/dev/null 2>&1
+  ffmpeg -y -i "$OUT/reg_$name.png" -vf "crop=${W}:$((H-TOP)):0:$TOP" "$OUT/reg_${name}_c.png" >/dev/null 2>&1
 }
 ssim() { ffmpeg -i "$1" -i "$2" -lavfi ssim -f null - 2>&1 | grep -oE 'All:[0-9.]+' | tail -1 | cut -d: -f2; }
 diffpct() { # % of pixels where some channel differs by more than 48
@@ -68,8 +69,8 @@ PY
 for t in mask_circle mask_chevron scheme_light clip_text grid_cols light_dark svg_xref_mask svg_foreignobject svg_image_href svg_fo_use_mask svg_css_paint svg_paint_restyle svg_fo_in_group list_numbers aspect_ratio has_selector line_clamp container_query; do
   render "${t}_t" "${t}.test.html"
   render "${t}_r" "${t}.ref.html"
-  s=$(ssim "/tmp/reg_${t}_t_c.png" "/tmp/reg_${t}_r_c.png")
-  d=$(diffpct "/tmp/reg_${t}_t_c.png" "/tmp/reg_${t}_r_c.png")
+  s=$(ssim "$OUT/reg_${t}_t_c.png" "$OUT/reg_${t}_r_c.png")
+  d=$(diffpct "$OUT/reg_${t}_t_c.png" "$OUT/reg_${t}_r_c.png")
   ok=$(awk -v s="${s:-0}" -v m="$SSIM_MIN" -v d="${d:-100}" -v x="$DIFF_MAX" \
     'BEGIN{print (s>=m && d<=x)?"PASS":"FAIL"}')
   printf '[%s] %-17s SSIM=%-9s (>= %s)  diff=%s%% (<= %s%%)\n' "$ok" "$t" "${s:-NA}" "$SSIM_MIN" "${d:-NA}" "$DIFF_MAX"
@@ -78,7 +79,7 @@ done
 
 # --- color assertion: form-control accent (#007aff) must be present (not grey/black) ---
 render forms "forms_accent.html"
-blue=$(python3 - "/tmp/reg_forms_c.png" <<'PY'
+blue=$(python3 - "$OUT/reg_forms_c.png" <<'PY'
 import sys, warnings
 warnings.filterwarnings("ignore")
 from PIL import Image

@@ -19,7 +19,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DRV="$HERE/driver.sh"
-OUT=/tmp/resize-reflow; mkdir -p "$OUT"
+OUT="$(mktemp -d /tmp/resize-reflow.XXXXXX)"  # per run: agents run gates concurrently
 PORT="${RR_PORT:-8996}"
 # Window is 1280x800 on start; shrink to:
 SW=1000; SH=600

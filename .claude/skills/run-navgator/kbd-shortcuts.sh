@@ -14,7 +14,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DRV="$HERE/driver.sh"
-OUT=/tmp/kbd-shortcuts; mkdir -p "$OUT"
+OUT="$(mktemp -d /tmp/kbd-shortcuts.XXXXXX)"  # per run: agents run gates concurrently
 PORT="${KS_PORT:-8993}"
 # Field crop in display coords (1280x800 capture): the textarea is page (20,40)+600x120, inset by
 # 4px to stay inside its border, and the page renders below the measured chrome height.
