@@ -29,6 +29,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::net::TcpStream as UnixStream;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -12192,6 +12193,9 @@ impl ApplicationHandler<WakeUp> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WakeUp) {
+        if let WakeUp::Wake = event {
+            WAKE_PENDING.store(false, Ordering::Release);
+        }
         let App::Running { browser, windows } = self else { return };
         if let WakeUp::Exit = event {
             // Gracefully shut the engine down first so its network thread flushes cookies, HSTS,
@@ -12788,6 +12792,12 @@ impl ApplicationHandler<WakeUp> for App {
 #[derive(Clone)]
 struct Waker(EventLoopProxy<WakeUp>);
 
+/// Whether a `WakeUp::Wake` is queued and not yet handled. Servo wakes the UI thread once per
+/// message it sends (each decoded video frame, for one), and winit hands every queued user event
+/// over before it redraws, so an unbounded stream of wake-ups starved painting and input. One
+/// queued wake-up is enough: handling it pumps every message that has arrived.
+static WAKE_PENDING: AtomicBool = AtomicBool::new(false);
+
 /// Events posted to the winit loop from other threads.
 #[derive(Debug)]
 enum WakeUp {
@@ -12828,7 +12838,9 @@ impl EventLoopWaker for Waker {
     }
 
     fn wake(&self) {
-        let _ = self.0.send_event(WakeUp::Wake);
+        if !WAKE_PENDING.swap(true, Ordering::AcqRel) {
+            let _ = self.0.send_event(WakeUp::Wake);
+        }
     }
 }
 
