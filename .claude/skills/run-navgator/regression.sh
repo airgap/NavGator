@@ -66,7 +66,7 @@ PY
 # aspect_ratio needs aspect-ratio on non-replaced boxes; has_selector needs :has() parsing and
 # its invalidation on DOM/state changes; line_clamp needs -webkit-box + -webkit-line-clamp;
 # container_query needs @container, cq units and the relayout after containers are sized.
-for t in mask_circle mask_chevron scheme_light clip_text grid_cols light_dark svg_xref_mask svg_foreignobject svg_image_href svg_fo_use_mask svg_css_paint svg_paint_restyle svg_fo_in_group list_numbers aspect_ratio has_selector line_clamp container_query; do
+for t in mask_circle mask_chevron scheme_light clip_text grid_cols light_dark svg_xref_mask svg_foreignobject svg_image_href svg_fo_use_mask svg_css_paint svg_paint_restyle svg_fo_in_group list_numbers aspect_ratio has_selector line_clamp container_query grid_abspos_img; do
   render "${t}_t" "${t}.test.html"
   render "${t}_r" "${t}.ref.html"
   s=$(ssim "$OUT/reg_${t}_t_c.png" "$OUT/reg_${t}_r_c.png")
