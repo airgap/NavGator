@@ -3583,12 +3583,16 @@ fn js_string(s: &str) -> String {
 /// Find-in-page highlighter (no native find API in the fork): wraps matches of `q` in
 /// `<span data-ngf>` (first match orange, rest yellow), scrolls to the first, returns the
 /// match count. Re-run on each query change; `find-step`/`find-clear` JS handle nav/cleanup.
+/// Like Chrome it skips inert text: under an `inert` attribute, or outside an open modal dialog
+/// (which escapes the inertness of its ancestors).
 const FIND_JS: &str = r#"function(q){
+function isInert(el,modal){if(modal&&!modal.contains(el))return true;var i=el.closest('[inert]');return !!i&&!(modal&&i.contains(modal));}
 document.querySelectorAll('span[data-ngf]').forEach(function(s){var p=s.parentNode;if(p){p.replaceChild(document.createTextNode(s.textContent),s);p.normalize();}});
 if(!q)return 0;
 var rx;try{rx=new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'gi');}catch(e){return 0;}
 var w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null);
-var nodes=[],n;while(n=w.nextNode()){var pn=n.parentNode;if(!pn)continue;if(/SCRIPT|STYLE|NOSCRIPT/.test(pn.nodeName))continue;rx.lastIndex=0;if(rx.test(n.nodeValue))nodes.push(n);}
+var modal=document.querySelector('dialog:modal');
+var nodes=[],n;while(n=w.nextNode()){var pn=n.parentNode;if(!pn)continue;if(/SCRIPT|STYLE|NOSCRIPT/.test(pn.nodeName))continue;if(isInert(pn,modal))continue;rx.lastIndex=0;if(rx.test(n.nodeValue))nodes.push(n);}
 var count=0;
 nodes.forEach(function(node){var s=node.nodeValue,frag=document.createDocumentFragment(),last=0,m;rx.lastIndex=0;while(m=rx.exec(s)){if(m[0].length===0){rx.lastIndex++;continue;}if(m.index>last)frag.appendChild(document.createTextNode(s.slice(last,m.index)));var sp=document.createElement('span');sp.setAttribute('data-ngf','');sp.style.background=(count===0?'#ff9632':'#ffe45e');sp.style.color='#000';sp.textContent=m[0];frag.appendChild(sp);last=m.index+m[0].length;count++;}if(last<s.length)frag.appendChild(document.createTextNode(s.slice(last)));node.parentNode.replaceChild(frag,node);});
 window.__ngfActive=0;
