@@ -279,4 +279,21 @@ mod tests {
         let b = seal("p", &salt, b"same plaintext").unwrap();
         assert_ne!(a, b, "ciphertext must differ (fresh nonce)");
     }
+
+    /// A `passwords.enc` sealed by this module under `argon2 =0.6.0-rc.8`. The vault migration
+    /// (LYK-616) has to open stores written by every earlier build, and linking the vault core
+    /// moves argon2 to 0.6.0, so this pins that the old format still opens.
+    const OLD_STORE: &str = "0707070707070707070707070707070722d3ecacb772c8bde6c99e62ab72165e01543dc538acd3edcbde630e9fb6d3a764615c0d14161c6b8e8c8a96044919d97280c1cf204643cdc0d06bb0011390703b8f0cd3c40c95435120d9508408be84de0a3a2e18a9666159ab2876134bbdaaac83b17b72280ec4f96b302875c0a5a229d64f69ee8133ca5c21958e8d5385ab9e5e617e42b5e0e44bc6";
+
+    #[test]
+    fn opens_a_store_from_an_earlier_build() {
+        let blob = crate::hex_decode(OLD_STORE).unwrap();
+        let creds: Vec<Credential> =
+            serde_json::from_slice(&open("fixture passphrase", &blob).unwrap()).unwrap();
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0].origin, "https://example.com");
+        assert_eq!(creds[0].username, "alice");
+        assert_eq!(creds[0].password, "hunter2");
+        assert_eq!(creds[0].updated, 1_700_000_000_000);
+    }
 }

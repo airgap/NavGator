@@ -15,6 +15,10 @@
 
 use crate::oauth;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+
+/// Both servers cap a pull page at this many rows.
+const PULL_LIMIT: usize = 1000;
 
 #[derive(Serialize)]
 struct WireItem {
@@ -187,12 +191,63 @@ fn pull(
         .send_json(PullReq {
             collections: vec![collection.to_string()],
             since,
-            limit: 1000,
+            limit: PULL_LIMIT as i64,
         })
         .map_err(err_str)?
         .into_json()
         .map_err(|e| e.to_string())?;
     Ok(resp.items)
+}
+
+/// Every row of the old `passwords` collection, for the one-time vault migration (LYK-616).
+/// `run_sync` pulls one page from a cursor; the migration needs all of it, from the start.
+#[allow(dead_code)] // the vault migration's caller, which waits on the core link (crate::migrate)
+pub fn pull_all_passwords(
+    platform: &str,
+    tenant: Option<&str>,
+    bearer: &str,
+) -> Result<Vec<PulledPassword>, String> {
+    let plat = oauth::platform(platform);
+    let url = format!("{}{}", plat.api_base, plat.sync_pull_path);
+    pull_pages(|since| pull(&url, bearer, tenant, "passwords", since))
+}
+
+/// Pages through `updated > since` until a short page. The cursor is a client mtime, so rows that
+/// share the last timestamp of a full page would fall between pages: each later page starts one
+/// millisecond earlier and drops the ids it has already seen.
+fn pull_pages(
+    mut fetch: impl FnMut(i64) -> Result<Vec<WireItemIn>, String>,
+) -> Result<Vec<PulledPassword>, String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let mut since = 0;
+    loop {
+        let page = fetch(since)?;
+        let full = page.len() >= PULL_LIMIT;
+        let mut newest = since;
+        let mut added = 0;
+        for it in page {
+            newest = newest.max(it.updated);
+            if seen.insert(it.item_id.clone()) {
+                added += 1;
+                out.push(PulledPassword {
+                    item_id: it.item_id,
+                    payload: it.payload,
+                    updated: it.updated,
+                    deleted: it.deleted,
+                });
+            }
+        }
+        if !full {
+            return Ok(out);
+        }
+        if added == 0 {
+            return Err(format!(
+                "more than {PULL_LIMIT} password rows share one timestamp; cannot page past them"
+            ));
+        }
+        since = newest - 1;
+    }
 }
 
 fn now_ms() -> i64 {
@@ -442,4 +497,60 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
         out.passwords.len(),
     );
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: usize, updated: i64) -> WireItemIn {
+        WireItemIn {
+            item_id: format!("id{id}"),
+            payload: format!("{id:02x}"),
+            deleted: false,
+            updated,
+        }
+    }
+
+    /// The servers' pull: rows with `updated > since`, oldest first, at most one page.
+    fn server(rows: &[WireItemIn]) -> impl FnMut(i64) -> Result<Vec<WireItemIn>, String> + '_ {
+        move |since| {
+            let mut page: Vec<&WireItemIn> = rows.iter().filter(|r| r.updated > since).collect();
+            page.sort_by_key(|r| r.updated);
+            Ok(page
+                .into_iter()
+                .take(PULL_LIMIT)
+                .map(|r| WireItemIn {
+                    item_id: r.item_id.clone(),
+                    payload: r.payload.clone(),
+                    deleted: r.deleted,
+                    updated: r.updated,
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn pulls_every_row_across_pages_sharing_a_boundary_timestamp() {
+        // Rows 995..1005 share one timestamp and sort to positions 995..1004, straddling the end
+        // of the first page; a cursor of that timestamp alone would skip the five past it.
+        let rows: Vec<WireItemIn> = (0..2500)
+            .map(|i| row(i, if (995..1005).contains(&i) { 996 } else { i as i64 + 1 }))
+            .collect();
+        let got = pull_pages(server(&rows)).unwrap();
+        assert_eq!(got.len(), rows.len());
+        let ids: HashSet<String> = got.iter().map(|p| p.item_id.clone()).collect();
+        assert_eq!(ids.len(), rows.len());
+    }
+
+    #[test]
+    fn a_full_page_of_one_timestamp_fails_rather_than_dropping_rows() {
+        let rows: Vec<WireItemIn> = (0..PULL_LIMIT + 5).map(|i| row(i, 7)).collect();
+        assert!(pull_pages(server(&rows)).is_err());
+    }
+
+    #[test]
+    fn a_failed_page_fails_the_pull() {
+        assert!(pull_pages(|_| Err("HTTP 500".to_string())).is_err());
+    }
 }
