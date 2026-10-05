@@ -8,6 +8,7 @@ toolbar-maximize = 最大化
 toolbar-restore = 还原
 toolbar-close-window = 关闭
 toolbar-userscripts = 用户脚本 / 附加组件
+toolbar-fill-login = 填入此页面已保存的登录信息
 toolbar-save-login = 保存此页面的登录信息
 toolbar-unlock-vault = 解锁保险库（密码 + 自动填充）
 

@@ -84,8 +84,8 @@ All of the following are implemented in `main.rs` and verified in the running ap
   EmbedderMsg/delegate, `airgap/swervo` @ `33abd9`), since libservo has no download
   delegate — closing the old §2.2 gap.
 - **E2EE password manager** — an Argon2id + XChaCha20-Poly1305 credential store
-  (`passwords.enc`, zero-knowledge); unlock in Settings; **autofill** on load and **save**
-  via a 🔑 toolbar button (both through `evaluate_javascript`, so the credential never
+  (`passwords.enc`, zero-knowledge); unlock in Settings; **fill** and **save**
+  via toolbar buttons, fill only on a click (both through `evaluate_javascript`, so the credential never
   touches page-readable storage); a `gator://passwords` manager; opt-in E2EE sync to Lyku's
   `passwords` collection (ciphertext only, encrypted on the UI thread).
 - **Ad / tracker blocking** — Brave's `adblock-rust` checked in `load_web_resource`:
