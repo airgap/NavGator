@@ -25,7 +25,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DRV="$HERE/driver.sh"
 OUT=/tmp/forms-baseline; mkdir -p "$OUT"
-PORT="${FB_PORT:-8993}"; W=560; H=400; TOP=78
+PORT="${FB_PORT:-8993}"; W=560; H=400
+TOP="$("$DRV" chrome-top)" || exit 1
 TOL="${FB_POS_TOL:-0.3}"
 # name:x:y:w:h — must match forms-baseline/forms.html's absolute positions (shared by both engines)
 RECTS="textinput:20:20:380:46 submit:20:90:220:46 buttoninput:20:160:240:46 buttonelem:20:230:230:46 textarea:20:300:380:46"

@@ -1,0 +1,534 @@
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index 99ba7b47d77..dc9bbdb8306 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -154,6 +154,7 @@ use crate::dom::focusevent::FocusEvent;
+ use crate::dom::globalscope::GlobalScope;
+ use crate::dom::hashchangeevent::HashChangeEvent;
+ use crate::dom::history::History;
++use crate::dom::html::htmlallcollection::HTMLAllCollection;
+ use crate::dom::html::htmlanchorelement::HTMLAnchorElement;
+ use crate::dom::html::htmlareaelement::HTMLAreaElement;
+ use crate::dom::html::htmlbaseelement::HTMLBaseElement;
+@@ -411,6 +412,7 @@ pub(crate) struct Document {
+     scripts: MutNullableDom<HTMLCollection>,
+     anchors: MutNullableDom<HTMLCollection>,
+     applets: MutNullableDom<HTMLCollection>,
++    all: MutNullableDom<HTMLAllCollection>,
+     /// Information about the `<iframes>` in this [`Document`].
+     iframes: RefCell<IFrameCollection>,
+     /// Shared locks used for style attributes, author-origin stylesheets, and user and
+@@ -3766,6 +3768,7 @@ impl Document {
+             scripts: Default::default(),
+             anchors: Default::default(),
+             applets: Default::default(),
++            all: Default::default(),
+             iframes: RefCell::new(IFrameCollection::new()),
+             shared_style_locks,
+             stylesheets: DomRefCell::new(DocumentStylesheetSet::new()),
+@@ -5981,6 +5984,12 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
+             .or_init(|| HTMLCollection::always_empty(cx, &self.window, self.upcast()))
+     }
+ 
++    /// <https://html.spec.whatwg.org/multipage/#dom-document-all>
++    fn All(&self, cx: &mut JSContext) -> DomRoot<HTMLAllCollection> {
++        self.all
++            .or_init(|| HTMLAllCollection::new(cx, &self.window, self))
++    }
++
+     /// <https://html.spec.whatwg.org/multipage/#dom-document-location>
+     fn GetLocation(&self, cx: &mut JSContext) -> Option<DomRoot<Location>> {
+         if self.is_fully_active() {
+diff --git a/components/script/dom/html/htmlallcollection.rs b/components/script/dom/html/htmlallcollection.rs
+new file mode 100644
+index 00000000000..eee2e06279f
+--- /dev/null
++++ b/components/script/dom/html/htmlallcollection.rs
+@@ -0,0 +1,196 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++use dom_struct::dom_struct;
++use html5ever::{LocalName, local_name, ns};
++use js::context::{JSContext, NoGC};
++use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
++use stylo_atoms::Atom;
++
++use crate::dom::bindings::codegen::Bindings::HTMLAllCollectionBinding::HTMLAllCollectionMethods;
++use crate::dom::bindings::codegen::Bindings::HTMLCollectionBinding::HTMLCollectionMethods;
++use crate::dom::bindings::codegen::UnionTypes::HTMLCollectionOrElement;
++use crate::dom::bindings::inheritance::Castable;
++use crate::dom::bindings::reflector::DomGlobal;
++use crate::dom::bindings::root::{Dom, DomRoot};
++use crate::dom::bindings::str::DOMString;
++use crate::dom::document::Document;
++use crate::dom::element::Element;
++use crate::dom::html::htmlcollection::{CollectionFilter, HTMLCollection};
++use crate::dom::node::Node;
++use crate::dom::window::Window;
++
++/// <https://html.spec.whatwg.org/multipage/#htmlallcollection>
++///
++/// Its [[IsHTMLDDA]] slot and [[Call]] live in the bindings layer (see
++/// `script_bindings::proxyhandler::HTML_ALL_COLLECTION_PROXY_CLASS`).
++#[dom_struct]
++pub(crate) struct HTMLAllCollection {
++    reflector_: Reflector,
++    /// Every element in the document, in tree order.
++    elements: Dom<HTMLCollection>,
++}
++
++/// <https://html.spec.whatwg.org/multipage/#all-named-elements>
++fn is_all_named_element(element: &Element) -> bool {
++    *element.namespace() == ns!(html) &&
++        matches!(
++            *element.local_name(),
++            local_name!("a") |
++                local_name!("button") |
++                local_name!("embed") |
++                local_name!("form") |
++                local_name!("frame") |
++                local_name!("frameset") |
++                local_name!("iframe") |
++                local_name!("img") |
++                local_name!("input") |
++                local_name!("map") |
++                local_name!("meta") |
++                local_name!("object") |
++                local_name!("select") |
++                local_name!("textarea")
++        )
++}
++
++/// Matches the elements step 2 of
++/// <https://html.spec.whatwg.org/multipage/#concept-get-all-named> collects.
++#[derive(JSTraceable, MallocSizeOf)]
++struct AllNamedFilter {
++    #[no_trace]
++    name: Atom,
++}
++
++impl CollectionFilter for AllNamedFilter {
++    fn filter(&self, element: &Element, _root: &Node) -> bool {
++        element.get_id().is_some_and(|id| id == self.name) ||
++            (is_all_named_element(element) &&
++                element.get_name().is_some_and(|name| name == self.name))
++    }
++}
++
++/// <https://tc39.es/ecma262/#array-index>: the canonical decimal form of an integer in
++/// 0..2^32-1. Any other spelling ("01", "+1", "1.0") is a name, not an index.
++fn as_array_index(string: &str) -> Option<u32> {
++    let index: u32 = string.parse().ok()?;
++    (index != u32::MAX && index.to_string() == string).then_some(index)
++}
++
++impl HTMLAllCollection {
++    fn new_inherited(elements: &HTMLCollection) -> HTMLAllCollection {
++        HTMLAllCollection {
++            reflector_: Reflector::new(),
++            elements: Dom::from_ref(elements),
++        }
++    }
++
++    pub(crate) fn new(
++        cx: &mut JSContext,
++        window: &Window,
++        document: &Document,
++    ) -> DomRoot<HTMLAllCollection> {
++        let elements =
++            HTMLCollection::by_qualified_name(cx, window, document.upcast(), LocalName::from("*"));
++        reflect_dom_object_with_cx(
++            Box::new(HTMLAllCollection::new_inherited(&elements)),
++            window,
++            cx,
++        )
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#concept-get-all-named>
++    fn get_all_named(
++        &self,
++        cx: &mut JSContext,
++        name: DOMString,
++    ) -> Option<HTMLCollectionOrElement> {
++        // Step 1.
++        if name.is_empty() {
++            return None;
++        }
++        let filter = AllNamedFilter {
++            name: Atom::from(name),
++        };
++        let root = self.elements.root_node();
++
++        // Steps 3-4, without materializing a collection for the common zero/one-match cases.
++        {
++            let mut matches = self
++                .elements
++                .elements_iter(cx.no_gc())
++                .filter(|element| filter.filter(element, &root));
++            let first = matches.next()?.as_rooted();
++            if matches.next().is_none() {
++                return Some(HTMLCollectionOrElement::Element(first));
++            }
++        }
++
++        // Steps 2 and 5.
++        Some(HTMLCollectionOrElement::HTMLCollection(HTMLCollection::new(
++            cx,
++            self.global().as_window(),
++            &root,
++            Box::new(filter),
++        )))
++    }
++}
++
++impl HTMLAllCollectionMethods<crate::DomTypeHolder> for HTMLAllCollection {
++    /// <https://html.spec.whatwg.org/multipage/#dom-htmlallcollection-length>
++    fn Length(&self, cx: &JSContext) -> u32 {
++        self.elements.Length(cx)
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-htmlallcollection-item>
++    fn IndexedGetter(&self, cx: &JSContext, index: u32) -> Option<DomRoot<Element>> {
++        self.elements.Item(cx, index)
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-htmlallcollection-nameditem>
++    fn NamedItem(&self, cx: &mut JSContext, name: DOMString) -> Option<HTMLCollectionOrElement> {
++        self.get_all_named(cx, name)
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-htmlallcollection-nameditem>
++    fn NamedGetter(&self, cx: &mut JSContext, name: DOMString) -> Option<HTMLCollectionOrElement> {
++        self.get_all_named(cx, name)
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-htmlallcollection-item>
++    fn Item(
++        &self,
++        cx: &mut JSContext,
++        name_or_index: Option<DOMString>,
++    ) -> Option<HTMLCollectionOrElement> {
++        // Step 1.
++        let name_or_index = name_or_index?;
++
++        // Step 2, via <https://html.spec.whatwg.org/multipage/#concept-get-all-indexed-or-named>.
++        if let Some(index) = as_array_index(&name_or_index.str()) {
++            return self
++                .elements
++                .Item(cx, index)
++                .map(HTMLCollectionOrElement::Element);
++        }
++        self.get_all_named(cx, name_or_index)
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#the-htmlallcollection-interface:supported-property-names>
++    fn SupportedPropertyNames(&self, no_gc: &NoGC) -> Vec<DOMString> {
++        let mut result: Vec<DOMString> = vec![];
++        for element in self.elements.elements_iter(no_gc) {
++            let id = element.get_id();
++            let name = element
++                .get_name()
++                .filter(|_| is_all_named_element(&element));
++            for atom in id.into_iter().chain(name) {
++                let name = DOMString::from(&*atom);
++                if !atom.is_empty() && !result.contains(&name) {
++                    result.push(name);
++                }
++            }
++        }
++        result
++    }
++}
+diff --git a/components/script/dom/html/mod.rs b/components/script/dom/html/mod.rs
+index 191929ff246..88131769051 100644
+--- a/components/script/dom/html/mod.rs
++++ b/components/script/dom/html/mod.rs
+@@ -2,6 +2,7 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
++pub(crate) mod htmlallcollection;
+ pub(crate) mod htmlanchorelement;
+ pub(crate) mod htmlareaelement;
+ pub(crate) mod htmlaudioelement;
+diff --git a/components/script_bindings/codegen/Bindings.conf b/components/script_bindings/codegen/Bindings.conf
+index 88e7b47cf2d..664b7d8ae81 100644
+--- a/components/script_bindings/codegen/Bindings.conf
++++ b/components/script_bindings/codegen/Bindings.conf
+@@ -230,6 +230,7 @@ DOMInterfaces = {
+     'cx': [
+         'AdoptedStyleSheets',
+         'AdoptNode',
++        'All',
+         'Anchors',
+         'Append',
+         'Applets',
+@@ -679,6 +680,11 @@ DOMInterfaces = {
+     'implicitCxSetters': True,
+ },
+ 
++'HTMLAllCollection': {
++    'cx': ['Item', 'NamedGetter', 'NamedItem'],
++    'cx_no_gc': ['IndexedGetter', 'Length'],
++},
++
+ 'HTMLButtonElement': {
+     'cx': ['CheckValidity', 'ReportValidity', 'SetCustomValidity', 'Validity', 'ValidationMessage'],
+     'implicitCxSetters': True,
+diff --git a/components/script_bindings/codegen/codegen.py b/components/script_bindings/codegen/codegen.py
+index a283b95e752..97adb9f4e6c 100644
+--- a/components/script_bindings/codegen/codegen.py
++++ b/components/script_bindings/codegen/codegen.py
+@@ -3386,7 +3386,9 @@ class CGWrapMethod(CGAbstractMethod):
+             proxy_handler = "None"
+         prototype_id = f"PrototypeList::ID::{self.descriptor.name}"
+         proto_object_fn = "GetProtoObject::<D>"
+-        if self.descriptor.proxy:
++        if self.descriptor.interface.identifier.name == "HTMLAllCollection":
++            c = "Some(&crate::proxyhandler::HTML_ALL_COLLECTION_PROXY_CLASS)"
++        elif self.descriptor.proxy:
+             c = "None"
+         else:
+             c = "Some(&Class.get().base)"
+@@ -4075,6 +4077,14 @@ class CGDefineProxyHandler(CGAbstractMethod):
+             assert not self.descriptor.operations['NamedGetter']
+             customSet = 'Some(proxyhandler::maybe_cross_origin_set_rawcx::<D>)'
+ 
++        # HTMLAllCollection's [[Call]] has no WebIDL syntax, so it is hardcoded here like its
++        # proxy class (see `HTML_ALL_COLLECTION_PROXY_CLASS`).
++        customCall = 'None'
++        customIsCallable = 'None'
++        if self.descriptor.interface.identifier.name == "HTMLAllCollection":
++            customCall = 'Some(proxyhandler::html_all_collection_call)'
++            customIsCallable = 'Some(proxyhandler::html_all_collection_is_callable)'
++
+         getOwnEnumerablePropertyKeys = "own_property_keys::<D>"
+         if self.descriptor.interface.getExtendedAttribute("LegacyUnenumerableNamedProperties") or \
+            self.descriptor.isMaybeCrossOriginObject():
+@@ -4099,7 +4109,7 @@ let traps = ProxyTraps {{
+     has: None,
+     get: Some(get::<D>),
+     set: {customSet},
+-    call: None,
++    call: {customCall},
+     construct: None,
+     hasOwn: Some(hasOwn::<D>),
+     getOwnEnumerablePropertyKeys: Some({getOwnEnumerablePropertyKeys}),
+@@ -4112,7 +4122,7 @@ let traps = ProxyTraps {{
+     trace: Some({TRACE_HOOK_NAME}::<D>),
+     finalize: Some({FINALIZE_HOOK_NAME}::<D>),
+     objectMoved: None,
+-    isCallable: None,
++    isCallable: {customIsCallable},
+     isConstructor: None,
+ }};
+ 
+diff --git a/components/script_bindings/conversions.rs b/components/script_bindings/conversions.rs
+index 32989839f6e..110b3d7ffa9 100644
+--- a/components/script_bindings/conversions.rs
++++ b/components/script_bindings/conversions.rs
+@@ -523,8 +523,8 @@ where
+ }
+ 
+ /// Returns whether `value` is an array-like object (Array, FileList,
+-/// HTMLCollection, HTMLFormControlsCollection, HTMLOptionsCollection,
+-/// NodeList, DOMTokenList).
++/// HTMLAllCollection, HTMLCollection, HTMLFormControlsCollection,
++/// HTMLOptionsCollection, NodeList, DOMTokenList).
+ pub fn is_array_like<D: crate::DomTypes>(
+     cx: &mut js::context::JSContext,
+     value: HandleValue,
+@@ -542,13 +542,15 @@ pub fn is_array_like<D: crate::DomTypes>(
+     };
+ 
+     unsafe {
+-        // TODO: HTMLAllCollection
+         if root_from_object::<D::DOMTokenList>(object, cx.raw_cx()).is_ok() {
+             return true;
+         }
+         if root_from_object::<D::FileList>(object, cx.raw_cx()).is_ok() {
+             return true;
+         }
++        if root_from_object::<D::HTMLAllCollection>(object, cx.raw_cx()).is_ok() {
++            return true;
++        }
+         if root_from_object::<D::HTMLCollection>(object, cx.raw_cx()).is_ok() {
+             return true;
+         }
+diff --git a/components/script_bindings/proxyhandler.rs b/components/script_bindings/proxyhandler.rs
+index ec88d45d1ca..c12ad125b60 100644
+--- a/components/script_bindings/proxyhandler.rs
++++ b/components/script_bindings/proxyhandler.rs
+@@ -14,13 +14,15 @@ use js::context::{JSContext, RawJSContext};
+ use js::conversions::{ToJSValConvertible, jsstr_to_string};
+ use js::glue::{GetProxyHandler, GetProxyHandlerFamily, GetProxyPrivate, SetProxyPrivate};
+ use js::jsapi::{
+-    DOMProxyShadowsResult, GetObjectRealmOrNull, GetRealmPrincipals, GetStaticPrototype,
++    CallArgs, DOMProxyShadowsResult, GetObjectRealmOrNull, GetRealmPrincipals, GetStaticPrototype,
+     Handle as RawHandle, HandleId as RawHandleId, HandleObject as RawHandleObject,
+-    HandleValue as RawHandleValue, HandleValueArray, IsWindowProxy, JSErrNum, JSFunctionSpec,
++    HandleValue as RawHandleValue, HandleValueArray, IsWindowProxy, JSCLASS_DELAY_METADATA_BUILDER,
++    JSCLASS_EMULATES_UNDEFINED, JSCLASS_IS_PROXY, JSCLASS_RESERVED_SLOTS_MASK,
++    JSCLASS_RESERVED_SLOTS_SHIFT, JSClass, JSClass_NON_NATIVE, JSErrNum, JSFunctionSpec,
+     JSITER_HIDDEN, JSITER_OWNONLY, JSITER_SYMBOLS, JSObject, JSPROP_READONLY, JSPropertySpec,
+     JSString, MutableHandleIdVector as RawMutableHandleIdVector,
+     MutableHandleObject as RawMutableHandleObject, ObjectOpResult, PropertyDescriptor,
+-    SetDOMProxyInformation, SymbolCode, jsid,
++    ProxyClassExtension, ProxyClassOps, ProxyObjectOps, SetDOMProxyInformation, SymbolCode, jsid,
+ };
+ use js::jsid::SymbolId;
+ use js::jsval::{ObjectValue, UndefinedValue};
+@@ -29,7 +31,7 @@ use js::rust::wrappers2::{
+     AppendToIdVector, Call, GetObjectProto, GetPropertyKeys, GetWellKnownSymbol,
+     InvokeGetOwnPropertyDescriptor, JS_AlreadyHasOwnPropertyById, JS_AtomizeAndPinString,
+     JS_DefineFunctions, JS_DefineProperties, JS_DefinePropertyById, JS_DeletePropertyById,
+-    JS_GetOwnPropertyDescriptorById, JS_IdToValue, JS_IsExceptionPending,
++    JS_GetOwnPropertyDescriptorById, JS_GetProperty, JS_IdToValue, JS_IsExceptionPending,
+     JS_NewObjectWithGivenProto, JS_ValueToSource, RUST_INTERNED_STRING_TO_JSID, RUST_JSID_IS_VOID,
+     SetDataPropertyDescriptor, SetPropertyIgnoringNamedGetter, int_to_jsid,
+ };
+@@ -173,6 +175,73 @@ pub(crate) unsafe extern "C" fn is_extensible(
+     true
+ }
+ 
++/// The proxy class of `HTMLAllCollection` reflectors.
++///
++/// `JSCLASS_EMULATES_UNDEFINED` is how SpiderMonkey models the [[IsHTMLDDA]] internal slot
++/// (<https://tc39.es/ecma262/#sec-IsHTMLDDA-internal-slot>): `document.all` is falsy, has
++/// `typeof` "undefined" and is `== null`, yet is never `=== undefined`. Real pages depend on
++/// that last distinction (polymer-resin only passes a binding value through untouched when
++/// `value || value === document.all` is false), so a missing `document.all` breaks them.
++/// Otherwise this matches SpiderMonkey's default `js::ProxyClass`. Gecko likewise hardcodes the
++/// flag for this one interface rather than offering an IDL annotation anyone could reach for.
++pub(crate) static HTML_ALL_COLLECTION_PROXY_CLASS: JSClass = JSClass {
++    name: c"HTMLAllCollection".as_ptr(),
++    flags: JSClass_NON_NATIVE |
++        JSCLASS_IS_PROXY |
++        JSCLASS_DELAY_METADATA_BUILDER |
++        JSCLASS_EMULATES_UNDEFINED |
++        ((2 & JSCLASS_RESERVED_SLOTS_MASK) << JSCLASS_RESERVED_SLOTS_SHIFT),
++    cOps: &raw const ProxyClassOps,
++    spec: ptr::null(),
++    ext: &raw const ProxyClassExtension,
++    oOps: &raw const ProxyObjectOps,
++};
++
++/// The custom [[Call]] of `HTMLAllCollection`
++/// (<https://html.spec.whatwg.org/multipage/#HTMLAllCollection-call>), whose steps are exactly
++/// those of its `item()` method, so it calls the prototype's `item` with the same arguments.
++///
++/// # Safety
++/// `cx` must point to a valid, non-null JSContext and `args` to valid CallArgs.
++pub(crate) unsafe extern "C" fn html_all_collection_call(
++    cx: *mut RawJSContext,
++    proxy: RawHandleObject,
++    args: *const CallArgs,
++) -> bool {
++    // SAFETY: it is safe to construct a JSContext from engine hook.
++    let mut cx = JSContext::from_ptr(NonNull::new(cx).unwrap());
++    let cx = &mut cx;
++    let args = &*args;
++    let proxy = HandleObject::from_raw(proxy);
++
++    // Look `item` up on the prototype: a named property "item" on the collection itself must
++    // not be able to hijack the call.
++    rooted!(&in(cx) let mut proto = ptr::null_mut::<JSObject>());
++    if !GetObjectProto(cx, proxy, proto.handle_mut()) {
++        return false;
++    }
++    rooted!(&in(cx) let mut item = UndefinedValue());
++    if !JS_GetProperty(cx, proto.handle(), c"item".as_ptr(), item.handle_mut()) {
++        return false;
++    }
++    rooted!(&in(cx) let thisv = ObjectValue(proxy.get()));
++    Call(
++        cx,
++        thisv.handle(),
++        item.handle(),
++        &HandleValueArray {
++            length_: args.argc_ as usize,
++            elements_: args.argv_,
++        },
++        MutableHandleValue::from_raw(args.rval()),
++    )
++}
++
++/// `HTMLAllCollection` reflectors are callable (see [`html_all_collection_call`]).
++pub(crate) unsafe extern "C" fn html_all_collection_is_callable(_obj: *mut JSObject) -> bool {
++    true
++}
++
+ /// If `proxy` (underneath any functionally-transparent wrapper proxies) has as
+ /// its `[[GetPrototypeOf]]` trap the ordinary `[[GetPrototypeOf]]` behavior
+ /// defined for ordinary objects, set `*is_ordinary` to true and store `obj`'s
+diff --git a/components/script_bindings/webidls/Document.webidl b/components/script_bindings/webidls/Document.webidl
+index 18bf1aaf084..e60c284200a 100644
+--- a/components/script_bindings/webidls/Document.webidl
++++ b/components/script_bindings/webidls/Document.webidl
+@@ -193,8 +193,7 @@ partial interface Document {
+   undefined captureEvents();
+   undefined releaseEvents();
+ 
+-  // Tracking issue for document.all: https://github.com/servo/servo/issues/7396
+-  // readonly attribute HTMLAllCollection all;
++  [SameObject] readonly attribute HTMLAllCollection all;
+ };
+ 
+ // https://fullscreen.spec.whatwg.org/#api
+diff --git a/components/script_bindings/webidls/HTMLAllCollection.webidl b/components/script_bindings/webidls/HTMLAllCollection.webidl
+new file mode 100644
+index 00000000000..f241ddcb2c0
+--- /dev/null
++++ b/components/script_bindings/webidls/HTMLAllCollection.webidl
+@@ -0,0 +1,14 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++// https://html.spec.whatwg.org/multipage/#htmlallcollection
++// The object's [[IsHTMLDDA]] slot and custom [[Call]] have no WebIDL syntax; the bindings
++// codegen special-cases this interface for both.
++[Exposed=Window, LegacyUnenumerableNamedProperties]
++interface HTMLAllCollection {
++  readonly attribute unsigned long length;
++  getter Element (unsigned long index);
++  getter (HTMLCollection or Element)? namedItem(DOMString name);
++  (HTMLCollection or Element)? item(optional DOMString nameOrIndex);
++};
+diff --git a/components/script_bindings/wrap.rs b/components/script_bindings/wrap.rs
+index be5c73abd7f..09d371b0e14 100644
+--- a/components/script_bindings/wrap.rs
++++ b/components/script_bindings/wrap.rs
+@@ -34,6 +34,7 @@ pub(crate) struct WrapConfig {
+     pub(crate) weak_referenceable: bool,
+     pub(crate) proxy_handler: Option<*const c_void>,
+     pub(crate) prototype_id: PrototypeList::ID,
++    /// For proxies, `None` selects SpiderMonkey's default proxy class.
+     pub(crate) class: Option<&'static JSClass>,
+     // this function has to be more general because we do not have the correct type for globalscope.
+     pub(crate) proto_object_fn: ProtoObjectFn,
+@@ -80,7 +81,9 @@ pub(crate) unsafe fn wrap<T: MutDomObject, D: DomTypes>(
+                     handler,
+                     Handle::undefined(),
+                     canonical_proto.get(),
+-                    ptr::null(),
++                    config
++                        .class
++                        .map_or(ptr::null(), |class| class as *const JSClass),
+                     false,
+                 ));
+             };
+diff --git a/tests/wpt/mozilla/tests/mozilla/interfaces.https.html b/tests/wpt/mozilla/tests/mozilla/interfaces.https.html
+index d162d1ce0cf..b0663adee22 100644
+--- a/tests/wpt/mozilla/tests/mozilla/interfaces.https.html
++++ b/tests/wpt/mozilla/tests/mozilla/interfaces.https.html
+@@ -157,6 +157,7 @@ test_interfaces([
+   "HashChangeEvent",
+   "Headers",
+   "History",
++  "HTMLAllCollection",
+   "HTMLAnchorElement",
+   "HTMLAreaElement",
+   "HTMLAudioElement",

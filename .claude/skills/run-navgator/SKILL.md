@@ -49,7 +49,12 @@ $D stop                        # kill ONLY what the driver started (never touche
 Other subcommands: `$D palette` (Ctrl+K command palette), `$D key ctrl+t` (any xdotool keyspec),
 `$D type <text>`, `$D click <x> <y>` (display coords, 1280x800). Every input subcommand
 `windowfocus`es first (see Gotchas). **Always `Read` the screenshot** — a blank/stale frame means
-it didn't actually do what you think.
+it didn't actually do what you think. `$D chrome-top` prints the height of NavGator's own chrome
+(where page content starts in a screenshot), measured and cached per binary build; every gate crops
+and offsets by it — never hardcode it (it moved 93 → 78 → 68 across chrome redesigns, and the stale
+constants made svg-aspect/kbd-shortcuts "fail" on correct rendering for weeks). `NAVG_BIN=<path>`
+drives another binary (e.g. `target/release/navgator`); `regression.sh` reads `NAVGATOR_BIN`.
+`shot` deletes its target first, so a failed capture never leaves the previous run's image behind.
 
 `$D start` takes any URL as argv[1] (`http://…`, `gator://export`, a `data:` URL). State (pids,
 logs, default screenshot) lives in `/tmp/navgator-run/`; the engine log is `/tmp/navgator-run/nav.log`.
@@ -133,9 +138,16 @@ cargo build -p navgator
 ```
 Covers (each = a landed swervo fix): `mask_circle` / `mask_chevron` (CSS `mask-image`, LYK-1246),
 `clip_text` (`background-clip:text`, LYK-1296), `grid_cols` (CSS Grid, LYK-1248), `scheme_light`
-(dark mode, LYK-1295) and `forms_accent` (checkbox/radio accent colour, LYK-1253). **Add a case**
-by dropping `regression/<name>.test.html` + `<name>.ref.html` and adding `<name>` to the SSIM loop,
-or a colour/pixel assertion for a non-shape case (see `forms_accent`).
+(dark mode, LYK-1295), the LYK-136 inline-SVG serializer cases, `svg_css_paint` (page CSS painting
+inline SVG: inherited `currentColor`, stylesheet fills, `var()` in presentation attributes,
+`color-mix()`, rules on nested/Lottie shapes), `svg_paint_restyle` (paint changed after first
+paint must re-serialize), `svg_fo_in_group` (native foreignObject inside `<g>`) and `forms_accent`
+(checkbox/radio accent colour, LYK-1253). Each case must pass SSIM **and** a pixel-difference cap
+(`REG_DIFF_MAX`, default 0.5% of pixels differing by >48): SSIM alone passed a test page missing
+its whole subject at 0.99. **Add a case** by dropping `regression/<name>.test.html` +
+`<name>.ref.html` and adding `<name>` to the SSIM loop, or a colour/pixel assertion for a
+non-shape case (see `forms_accent`). The suite uses the driver's profile dir by default; if it holds
+a copy of a real profile (dark mode), `scheme_light` fails — delete `/tmp/navgator-run/profile`.
 
 **Standalone per-feature gates** (run individually; each catches a class `regression.sh`/
 `forms-baseline.sh` can't — a square viewBox or a flex-stretched control):
@@ -150,6 +162,11 @@ or a colour/pixel assertion for a non-shape case (see `forms_accent`).
   on paste via field ink count. Catches the regression where NavGator forwarded page keys with no
   modifiers so Ctrl+A/C/X/V typed literal letters. Needs `ctrl`/`shift` on the forwarded
   `KeyboardEvent.modifiers`.
+- `document-all.sh` — `document.all` (HTMLAllCollection): 32 JS checks painting GREEN/RED — falsy /
+  `typeof "undefined"` / `== null` but `!== undefined` (incl. after JIT warm-up), polymer-resin's exact
+  `c || c === document.all` test, indexed/named/callable lookups, liveness. All 32 also pass in Chrome
+  (`google-chrome --headless=new --dump-dom` on the fixture). Before HTMLAllCollection, `document.all`
+  was plain `undefined` and YouTube hid its search results.
 - `idb-index.sh` — IndexedDB index support (LYK-1310): a JS-driven gate that creates a store with a
   unique + non-unique index, then exercises `index.get/getKey/getAll/getAllKeys/count/openCursor`
   (cursor `continue()`-ing every record) and paints the page GREEN/RED by result; the gate samples a

@@ -17,8 +17,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 DRV="$HERE/driver.sh"
 PAGE="${1:-seek.html}"
 D="${2:-1000}"
-W=1280; H=722                  # content viewport (matches driver window 1280x800 minus 78px chrome)
-TOP=78
+TOP="$("$DRV" chrome-top)" || exit 1
+W=1280; H=$((800 - TOP))       # content viewport of the driver's 1280x800 window
 PORT="${ANIM_PORT:-8995}"
 OUT=/tmp/anim-base; mkdir -p "$OUT"
 SAMPLES="-5 -1 0 1 5 25 50 75 95 99 100 101 105"

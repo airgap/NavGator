@@ -16,7 +16,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DRV="$HERE/driver.sh"
 OUT=/tmp/textarea-clip; mkdir -p "$OUT"
-PORT="${TC_PORT:-8994}"; TOP=93
+PORT="${TC_PORT:-8994}"
+TOP="$("$DRV" chrome-top)" || exit 1
 THRESH="${TC_THRESH:-0.90}"
 # name:x:y:w:h — page-content crop rects (add TOP for the swervo capture's chrome offset).
 # TEST line sits at content y = 20(box) + 14(pad) .. ; REF at y = 120 .. — crop generously.

@@ -1,0 +1,332 @@
+diff --git a/components/fonts/platform/freetype/font_list.rs b/components/fonts/platform/freetype/font_list.rs
+index d12517d221b..6d412c7f1a9 100644
+--- a/components/fonts/platform/freetype/font_list.rs
++++ b/components/fonts/platform/freetype/font_list.rs
+@@ -286,23 +286,87 @@ pub(crate) fn default_system_generic_font_family(
+     .into()
+ }
+ 
+-/// Families that Skia (and so Chrome) accepts in place of one another when fontconfig substitutes
+-/// one for another: they share metrics, so a page laid out against one lays out the same with any.
+-/// The Latin and office groups of Skia's `kFontEquivMap`; its CJK groups are not mirrored.
+-const METRIC_COMPATIBLE_FAMILIES: &[&[&str]] = &[
+-    &["Arial", "Arimo", "Liberation Sans"],
+-    &["Times New Roman", "Tinos", "Liberation Serif"],
+-    &["Courier New", "Cousine", "Liberation Mono"],
+-    &["Symbol", "Symbol Neu"],
+-    &["Cambria", "Caladea"],
+-    &["Calibri", "Carlito"],
++/// Skia's `kFontEquivMap` (Chrome's fontconfig matcher): families accepted in place of one
++/// another when fontconfig substitutes one for another, because they share metrics. A family's
++/// class is its *first* entry (a few CJK families are listed twice), as in Skia's
++/// `GetFontEquivClass`.
++const FONT_EQUIVALENCE_CLASSES: &[(&str, &str)] = &[
++    ("sans", "Arial"),
++    ("sans", "Arimo"),
++    ("sans", "Liberation Sans"),
++    ("serif", "Times New Roman"),
++    ("serif", "Tinos"),
++    ("serif", "Liberation Serif"),
++    ("mono", "Courier New"),
++    ("mono", "Cousine"),
++    ("mono", "Liberation Mono"),
++    ("symbol", "Symbol"),
++    ("symbol", "Symbol Neu"),
++    ("pgothic", "MS PGothic"),
++    ("pgothic", "ＭＳ Ｐゴシック"),
++    ("pgothic", "Noto Sans CJK JP"),
++    ("pgothic", "IPAPGothic"),
++    ("pgothic", "MotoyaG04Gothic"),
++    ("gothic", "MS Gothic"),
++    ("gothic", "ＭＳ ゴシック"),
++    ("gothic", "Noto Sans Mono CJK JP"),
++    ("gothic", "IPAGothic"),
++    ("gothic", "MotoyaG04GothicMono"),
++    ("pmincho", "MS PMincho"),
++    ("pmincho", "ＭＳ Ｐ明朝"),
++    ("pmincho", "Noto Serif CJK JP"),
++    ("pmincho", "IPAPMincho"),
++    ("pmincho", "MotoyaG04Mincho"),
++    ("mincho", "MS Mincho"),
++    ("mincho", "ＭＳ 明朝"),
++    ("mincho", "Noto Serif CJK JP"),
++    ("mincho", "IPAMincho"),
++    ("mincho", "MotoyaG04MinchoMono"),
++    ("simsun", "Simsun"),
++    ("simsun", "宋体"),
++    ("simsun", "Noto Serif CJK SC"),
++    ("simsun", "MSung GB18030"),
++    ("simsun", "Song ASC"),
++    ("nsimsun", "NSimsun"),
++    ("nsimsun", "新宋体"),
++    ("nsimsun", "Noto Serif CJK SC"),
++    ("nsimsun", "MSung GB18030"),
++    ("nsimsun", "N Song ASC"),
++    ("simhei", "Simhei"),
++    ("simhei", "黑体"),
++    ("simhei", "Noto Sans CJK SC"),
++    ("simhei", "MYingHeiGB18030"),
++    ("simhei", "MYingHeiB5HK"),
++    ("pmingliu", "PMingLiU"),
++    ("pmingliu", "新細明體"),
++    ("pmingliu", "Noto Serif CJK TC"),
++    ("pmingliu", "MSung B5HK"),
++    ("mingliu", "MingLiU"),
++    ("mingliu", "細明體"),
++    ("mingliu", "Noto Serif CJK TC"),
++    ("mingliu", "MSung B5HK"),
++    ("pmingliuhk", "PMingLiU_HKSCS"),
++    ("pmingliuhk", "新細明體_HKSCS"),
++    ("pmingliuhk", "Noto Serif CJK TC"),
++    ("pmingliuhk", "MSung B5HK"),
++    ("mingliuhk", "MingLiU_HKSCS"),
++    ("mingliuhk", "細明體_HKSCS"),
++    ("mingliuhk", "Noto Serif CJK TC"),
++    ("mingliuhk", "MSung B5HK"),
++    ("cambria", "Cambria"),
++    ("cambria", "Caladea"),
++    ("calibri", "Calibri"),
++    ("calibri", "Carlito"),
+ ];
+ 
+ fn is_metric_compatible(requested: &str, matched: &str) -> bool {
+-    METRIC_COMPATIBLE_FAMILIES.iter().any(|group| {
+-        group.iter().any(|family| family.eq_ignore_ascii_case(requested)) &&
+-            group.iter().any(|family| family.eq_ignore_ascii_case(matched))
+-    })
++    let class_of = |family: &str| {
++        FONT_EQUIVALENCE_CLASSES
++            .iter()
++            .find(|(_, name)| name.eq_ignore_ascii_case(family))
++            .map(|(class, _)| *class)
++    };
++    class_of(requested).is_some_and(|class| class_of(matched) == Some(class))
+ }
+ 
+ /// Blink's `AlternateFamilyName`: the name Chrome retries when a family can't be found. It is
+@@ -374,15 +438,21 @@ fn acceptable_fontconfig_substitute(name: &str) -> Option<String> {
+         if font_match.is_null() {
+             return None;
+         }
+-        let acceptable = (0..)
+-            .map_while(|index| pattern_family(font_match, index))
+-            .any(|matched| {
+-                post_config_family
+-                    .as_deref()
+-                    .is_some_and(|post_config| post_config.eq_ignore_ascii_case(&matched)) ||
+-                    matched.eq_ignore_ascii_case(name) ||
+-                    is_metric_compatible(name, &matched)
+-            });
++        // Skia lets these generic-sounding names take whatever fontconfig picks
++        // (`IsFallbackFontAllowed`).
++        let fallback_allowed = ["sans", "serif", "monospace"]
++            .iter()
++            .any(|generic| generic.eq_ignore_ascii_case(name));
++        let acceptable = fallback_allowed ||
++            (0..)
++                .map_while(|index| pattern_family(font_match, index))
++                .any(|matched| {
++                    post_config_family
++                        .as_deref()
++                        .is_some_and(|post_config| post_config.eq_ignore_ascii_case(&matched)) ||
++                        matched.eq_ignore_ascii_case(name) ||
++                        is_metric_compatible(name, &matched)
++                });
+         let family = if acceptable {
+             pattern_family(font_match, 0)
+         } else {
+diff --git a/components/layout/dom_traversal.rs b/components/layout/dom_traversal.rs
+index fcd0abe40fa..db516d85148 100644
+--- a/components/layout/dom_traversal.rs
++++ b/components/layout/dom_traversal.rs
+@@ -141,7 +141,7 @@ fn traverse_children_of<'dom>(
+     }
+ }
+ 
+-fn is_foreign_object<'dom>(element: &impl LayoutElement<'dom>) -> bool {
++pub(crate) fn is_foreign_object<'dom>(element: &impl LayoutElement<'dom>) -> bool {
+     element.is_svg_element() && *element.local_name() == LocalName::from("foreignObject")
+ }
+ 
+diff --git a/components/layout/traversal.rs b/components/layout/traversal.rs
+index 0bca291fc54..1b34c0cfef6 100644
+--- a/components/layout/traversal.rs
++++ b/components/layout/traversal.rs
+@@ -18,6 +18,7 @@ use style::traversal::{DomTraversal, PerLevelTraversalData, recalc_style_at};
+ use crate::BoxTree;
+ use crate::context::LayoutContext;
+ use crate::dom::{DOMLayoutData, NodeExt};
++use crate::dom_traversal::is_foreign_object;
+ use crate::layout_root::LayoutRoot;
+ 
+ pub struct RecalcStyle<'a> {
+@@ -204,6 +205,15 @@ pub(crate) fn compute_damage_and_rebuild_box_tree_below_dirty_root<'dom>(
+     if !element_damage.is_empty() && svg_paint_is_stale(layout_context, node) {
+         element_damage |= LayoutDamage::BoxDamage;
+     }
++    // Descendants' computed paint is baked into the enclosing `<svg>`'s serialization as well,
++    // but only the root's is fingerprinted: re-serialize when a descendant restyles.
++    if !element_damage.is_empty() {
++        if let Some(svg) = enclosing_serialized_svg(node) {
++            layout_context
++                .image_resolver
++                .queue_svg_element_for_serialization(svg);
++        }
++    }
+ 
+     let has_dirty_descendants;
+     #[expect(unsafe_code)]
+@@ -257,6 +267,37 @@ fn svg_paint_is_stale(layout_context: &LayoutContext, node: ServoLayoutNode<'_>)
+     svg_data.source_paint_signature.as_deref() != Some(svg_paint_signature(&style).as_str())
+ }
+ 
++/// The `<svg>` whose rasterized serialization paints `node`, when `node` is an svg element
++/// below it (not inside a `<foreignObject>`, whose HTML content lays out normally) and that
++/// serialization exists.
++#[expect(unsafe_code)]
++fn enclosing_serialized_svg(node: ServoLayoutNode<'_>) -> Option<ServoLayoutNode<'_>> {
++    let element = node.as_element()?;
++    if !element.is_svg_element() || is_foreign_object(&element) {
++        return None;
++    }
++    // The outermost svg of the contiguous svg-namespace ancestor chain is the replaced one;
++    // nested `<svg>`s are serialized as part of it.
++    let mut enclosing_svg = None;
++    let mut ancestor = unsafe { node.dangerous_flat_tree_parent() };
++    while let Some(current) = ancestor {
++        let Some(current_element) = current.as_element() else {
++            break;
++        };
++        if !current_element.is_svg_element() || is_foreign_object(&current_element) {
++            break;
++        }
++        if current.as_svg().is_some() {
++            enclosing_svg = Some(current);
++        }
++        ancestor = unsafe { current.dangerous_flat_tree_parent() };
++    }
++    enclosing_svg.filter(|svg| {
++        svg.as_svg()
++            .is_some_and(|data| matches!(data.source, Some(Ok(_))))
++    })
++}
++
+ enum BoxDamageAction<'a> {
+     RebuildAncestor,
+     TryRebuild,
+diff --git a/components/script_bindings/codegen/codegen.py b/components/script_bindings/codegen/codegen.py
+index 97adb9f4e6c..8261ee2af3a 100644
+--- a/components/script_bindings/codegen/codegen.py
++++ b/components/script_bindings/codegen/codegen.py
+@@ -4082,7 +4082,7 @@ class CGDefineProxyHandler(CGAbstractMethod):
+         customCall = 'None'
+         customIsCallable = 'None'
+         if self.descriptor.interface.identifier.name == "HTMLAllCollection":
+-            customCall = 'Some(proxyhandler::html_all_collection_call)'
++            customCall = 'Some(proxyhandler::html_all_collection_call::<D>)'
+             customIsCallable = 'Some(proxyhandler::html_all_collection_is_callable)'
+ 
+         getOwnEnumerablePropertyKeys = "own_property_keys::<D>"
+diff --git a/components/script_bindings/proxyhandler.rs b/components/script_bindings/proxyhandler.rs
+index c12ad125b60..8018a8c8339 100644
+--- a/components/script_bindings/proxyhandler.rs
++++ b/components/script_bindings/proxyhandler.rs
+@@ -11,7 +11,7 @@ use std::ptr;
+ use std::ptr::NonNull;
+ 
+ use js::context::{JSContext, RawJSContext};
+-use js::conversions::{ToJSValConvertible, jsstr_to_string};
++use js::conversions::{ConversionResult, FromJSValConvertible, ToJSValConvertible, jsstr_to_string};
+ use js::glue::{GetProxyHandler, GetProxyHandlerFamily, GetProxyPrivate, SetProxyPrivate};
+ use js::jsapi::{
+     CallArgs, DOMProxyShadowsResult, GetObjectRealmOrNull, GetRealmPrincipals, GetStaticPrototype,
+@@ -31,7 +31,7 @@ use js::rust::wrappers2::{
+     AppendToIdVector, Call, GetObjectProto, GetPropertyKeys, GetWellKnownSymbol,
+     InvokeGetOwnPropertyDescriptor, JS_AlreadyHasOwnPropertyById, JS_AtomizeAndPinString,
+     JS_DefineFunctions, JS_DefineProperties, JS_DefinePropertyById, JS_DeletePropertyById,
+-    JS_GetOwnPropertyDescriptorById, JS_GetProperty, JS_IdToValue, JS_IsExceptionPending,
++    JS_GetOwnPropertyDescriptorById, JS_IdToValue, JS_IsExceptionPending,
+     JS_NewObjectWithGivenProto, JS_ValueToSource, RUST_INTERNED_STRING_TO_JSID, RUST_JSID_IS_VOID,
+     SetDataPropertyDescriptor, SetPropertyIgnoringNamedGetter, int_to_jsid,
+ };
+@@ -41,7 +41,10 @@ use js::rust::{
+ };
+ 
+ use crate::DomTypes;
+-use crate::conversions::{is_dom_proxy, jsid_to_string, native_from_object};
++use crate::codegen::GenericBindings::HTMLAllCollectionBinding::HTMLAllCollection_Binding::HTMLAllCollectionMethods;
++use crate::conversions::{
++    StringificationBehavior, is_dom_proxy, jsid_to_string, native_from_object, root_from_object,
++};
+ use crate::error::Error;
+ use crate::interfaces::{DomHelpers, GlobalScopeHelpers};
+ use crate::principals::ServoJSPrincipalsRef;
+@@ -198,12 +201,13 @@ pub(crate) static HTML_ALL_COLLECTION_PROXY_CLASS: JSClass = JSClass {
+ };
+ 
+ /// The custom [[Call]] of `HTMLAllCollection`
+-/// (<https://html.spec.whatwg.org/multipage/#HTMLAllCollection-call>), whose steps are exactly
+-/// those of its `item()` method, so it calls the prototype's `item` with the same arguments.
++/// (<https://html.spec.whatwg.org/multipage/#HTMLAllCollection-call>): the steps of `item()`,
++/// performed on the collection itself whatever `thisArgument` is, and independent of any
++/// script-visible `item` property.
+ ///
+ /// # Safety
+ /// `cx` must point to a valid, non-null JSContext and `args` to valid CallArgs.
+-pub(crate) unsafe extern "C" fn html_all_collection_call(
++pub(crate) unsafe extern "C" fn html_all_collection_call<D: DomTypes>(
+     cx: *mut RawJSContext,
+     proxy: RawHandleObject,
+     args: *const CallArgs,
+@@ -212,29 +216,29 @@ pub(crate) unsafe extern "C" fn html_all_collection_call(
+     let mut cx = JSContext::from_ptr(NonNull::new(cx).unwrap());
+     let cx = &mut cx;
+     let args = &*args;
+-    let proxy = HandleObject::from_raw(proxy);
++    let collection = root_from_object::<D::HTMLAllCollection>(proxy.get(), cx.raw_cx())
++        .expect("only HTMLAllCollection reflectors get this trap");
+ 
+-    // Look `item` up on the prototype: a named property "item" on the collection itself must
+-    // not be able to hijack the call.
+-    rooted!(&in(cx) let mut proto = ptr::null_mut::<JSObject>());
+-    if !GetObjectProto(cx, proxy, proto.handle_mut()) {
+-        return false;
+-    }
+-    rooted!(&in(cx) let mut item = UndefinedValue());
+-    if !JS_GetProperty(cx, proto.handle(), c"item".as_ptr(), item.handle_mut()) {
+-        return false;
+-    }
+-    rooted!(&in(cx) let thisv = ObjectValue(proxy.get()));
+-    Call(
+-        cx,
+-        thisv.handle(),
+-        item.handle(),
+-        &HandleValueArray {
+-            length_: args.argc_ as usize,
+-            elements_: args.argv_,
+-        },
+-        MutableHandleValue::from_raw(args.rval()),
+-    )
++    // Step 1. An absent argument reads as undefined.
++    let first_argument = HandleValue::from_raw(args.get(0));
++    let name_or_index = if first_argument.get().is_undefined() {
++        None
++    } else {
++        // Step 2.
++        match DOMString::safe_from_jsval(cx, first_argument, StringificationBehavior::Default) {
++            Ok(ConversionResult::Success(name_or_index)) => Some(name_or_index),
++            Ok(ConversionResult::Failure(_)) => {
++                unreachable!("DOMString conversion either succeeds or throws")
++            },
++            Err(()) => return false,
++        }
++    };
++
++    // Steps 3-4.
++    collection
++        .Item(cx, name_or_index)
++        .to_jsval(cx.raw_cx(), MutableHandleValue::from_raw(args.rval()));
++    true
+ }
+ 
+ /// `HTMLAllCollection` reflectors are callable (see [`html_all_collection_call`]).

@@ -1,0 +1,958 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 239a0c9d309..3aae43be474 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -7586,7 +7586,7 @@ dependencies = [
+ [[package]]
+ name = "selectors"
+ version = "0.39.0"
+-source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
++source = "git+https://github.com/airgap/stylo?rev=23a4897b8769339a7eefdab7fc01e7ca3a438662#23a4897b8769339a7eefdab7fc01e7ca3a438662"
+ dependencies = [
+  "bitflags 2.13.0",
+  "cssparser",
+@@ -9346,7 +9346,7 @@ dependencies = [
+ [[package]]
+ name = "servo_arc"
+ version = "0.4.3"
+-source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
++source = "git+https://github.com/airgap/stylo?rev=23a4897b8769339a7eefdab7fc01e7ca3a438662#23a4897b8769339a7eefdab7fc01e7ca3a438662"
+ dependencies = [
+  "serde",
+  "stable_deref_trait",
+@@ -9817,7 +9817,7 @@ dependencies = [
+ [[package]]
+ name = "stylo"
+ version = "0.19.0"
+-source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
++source = "git+https://github.com/airgap/stylo?rev=23a4897b8769339a7eefdab7fc01e7ca3a438662#23a4897b8769339a7eefdab7fc01e7ca3a438662"
+ dependencies = [
+  "app_units",
+  "arrayvec",
+@@ -9873,7 +9873,7 @@ dependencies = [
+ [[package]]
+ name = "stylo_atoms"
+ version = "0.19.0"
+-source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
++source = "git+https://github.com/airgap/stylo?rev=23a4897b8769339a7eefdab7fc01e7ca3a438662#23a4897b8769339a7eefdab7fc01e7ca3a438662"
+ dependencies = [
+  "string_cache",
+  "string_cache_codegen",
+@@ -9882,7 +9882,7 @@ dependencies = [
+ [[package]]
+ name = "stylo_derive"
+ version = "0.19.0"
+-source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
++source = "git+https://github.com/airgap/stylo?rev=23a4897b8769339a7eefdab7fc01e7ca3a438662#23a4897b8769339a7eefdab7fc01e7ca3a438662"
+ dependencies = [
+  "darling",
+  "proc-macro2",
+@@ -9894,7 +9894,7 @@ dependencies = [
+ [[package]]
+ name = "stylo_dom"
+ version = "0.19.0"
+-source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
++source = "git+https://github.com/airgap/stylo?rev=23a4897b8769339a7eefdab7fc01e7ca3a438662#23a4897b8769339a7eefdab7fc01e7ca3a438662"
+ dependencies = [
+  "bitflags 2.13.0",
+  "stylo_malloc_size_of",
+@@ -9903,7 +9903,7 @@ dependencies = [
+ [[package]]
+ name = "stylo_malloc_size_of"
+ version = "0.19.0"
+-source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
++source = "git+https://github.com/airgap/stylo?rev=23a4897b8769339a7eefdab7fc01e7ca3a438662#23a4897b8769339a7eefdab7fc01e7ca3a438662"
+ dependencies = [
+  "app_units",
+  "cssparser",
+@@ -9920,7 +9920,7 @@ dependencies = [
+ [[package]]
+ name = "stylo_static_prefs"
+ version = "0.19.0"
+-source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
++source = "git+https://github.com/airgap/stylo?rev=23a4897b8769339a7eefdab7fc01e7ca3a438662#23a4897b8769339a7eefdab7fc01e7ca3a438662"
+ dependencies = [
+  "toml",
+ ]
+@@ -9928,7 +9928,7 @@ dependencies = [
+ [[package]]
+ name = "stylo_traits"
+ version = "0.19.0"
+-source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
++source = "git+https://github.com/airgap/stylo?rev=23a4897b8769339a7eefdab7fc01e7ca3a438662#23a4897b8769339a7eefdab7fc01e7ca3a438662"
+ dependencies = [
+  "app_units",
+  "bitflags 2.13.0",
+@@ -10348,7 +10348,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
+ [[package]]
+ name = "to_shmem"
+ version = "0.5.0"
+-source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
++source = "git+https://github.com/airgap/stylo?rev=23a4897b8769339a7eefdab7fc01e7ca3a438662#23a4897b8769339a7eefdab7fc01e7ca3a438662"
+ dependencies = [
+  "cssparser",
+  "servo_arc",
+@@ -10361,7 +10361,7 @@ dependencies = [
+ [[package]]
+ name = "to_shmem_derive"
+ version = "0.1.0"
+-source = "git+https://github.com/airgap/stylo?rev=ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700#ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700"
++source = "git+https://github.com/airgap/stylo?rev=23a4897b8769339a7eefdab7fc01e7ca3a438662#23a4897b8769339a7eefdab7fc01e7ca3a438662"
+ dependencies = [
+  "darling",
+  "proc-macro2",
+diff --git a/Cargo.toml b/Cargo.toml
+index 7bbc836786a..02597bf43a9 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -455,15 +455,18 @@ codegen-units = 1
+ # into the shared `values` list so Servo gets it too. This patch tree is servo/stylo at the
+ # rev pinned above (bc25ec93) plus that one-line longhands.toml change — keep the rev bumped
+ # in lockstep with the servo/stylo rev above. Branch: navgator-background-clip-text.
++# Now also carries the light-dark() resolution fix and fill/stroke + the SVG paint properties
++# enabled for Servo (inline-SVG serialization copies them in). Branch:
++# nicole/svg-paint-properties-servo.
+ [patch."https://github.com/servo/stylo"]
+-selectors = { git = "https://github.com/airgap/stylo", rev = "ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700" }
+-servo_arc = { git = "https://github.com/airgap/stylo", rev = "ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700" }
+-stylo = { git = "https://github.com/airgap/stylo", rev = "ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700" }
+-stylo_atoms = { git = "https://github.com/airgap/stylo", rev = "ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700" }
+-stylo_dom = { git = "https://github.com/airgap/stylo", rev = "ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700" }
+-stylo_malloc_size_of = { git = "https://github.com/airgap/stylo", rev = "ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700" }
+-stylo_static_prefs = { git = "https://github.com/airgap/stylo", rev = "ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700" }
+-stylo_traits = { git = "https://github.com/airgap/stylo", rev = "ca6f5d497a0439efcdf17ca15d3e6f3c2e5dd700" }
++selectors = { git = "https://github.com/airgap/stylo", rev = "23a4897b8769339a7eefdab7fc01e7ca3a438662" }
++servo_arc = { git = "https://github.com/airgap/stylo", rev = "23a4897b8769339a7eefdab7fc01e7ca3a438662" }
++stylo = { git = "https://github.com/airgap/stylo", rev = "23a4897b8769339a7eefdab7fc01e7ca3a438662" }
++stylo_atoms = { git = "https://github.com/airgap/stylo", rev = "23a4897b8769339a7eefdab7fc01e7ca3a438662" }
++stylo_dom = { git = "https://github.com/airgap/stylo", rev = "23a4897b8769339a7eefdab7fc01e7ca3a438662" }
++stylo_malloc_size_of = { git = "https://github.com/airgap/stylo", rev = "23a4897b8769339a7eefdab7fc01e7ca3a438662" }
++stylo_static_prefs = { git = "https://github.com/airgap/stylo", rev = "23a4897b8769339a7eefdab7fc01e7ca3a438662" }
++stylo_traits = { git = "https://github.com/airgap/stylo", rev = "23a4897b8769339a7eefdab7fc01e7ca3a438662" }
+ #
+ # Or for another Git dependency:
+ #
+diff --git a/components/layout/dom_traversal.rs b/components/layout/dom_traversal.rs
+index f6ba50c8a33..fcd0abe40fa 100644
+--- a/components/layout/dom_traversal.rs
++++ b/components/layout/dom_traversal.rs
+@@ -117,12 +117,22 @@ fn traverse_children_of<'dom>(
+         traverse_eager_pseudo_element(PseudoElement::Before, parent_element_info, context, handler);
+     }
+ 
+-    for child in parent_element_info.node.flat_tree_children() {
+-        if child.is_text_node() {
+-            let info = NodeAndStyleInfo::new(child, child.style(&context.style_context));
+-            handler.handle_text(&info, child.text_content());
+-        } else if child.is_element() {
+-            traverse_element(child, context, handler);
++    // Inside a native-foreignObject `<svg>` host only `<foreignObject>`s become boxes (in the
++    // host's widget); every other svg element paints through the host's rasterized image.
++    if parent_element_info
++        .node
++        .as_element()
++        .is_some_and(|element| element.is_svg_element() && !is_foreign_object(&element))
++    {
++        traverse_svg_foreign_objects(parent_element_info.node, context, handler);
++    } else {
++        for child in parent_element_info.node.flat_tree_children() {
++            if child.is_text_node() {
++                let info = NodeAndStyleInfo::new(child, child.style(&context.style_context));
++                handler.handle_text(&info, child.text_content());
++            } else if child.is_element() {
++                traverse_element(child, context, handler);
++            }
+         }
+     }
+ 
+@@ -131,6 +141,37 @@ fn traverse_children_of<'dom>(
+     }
+ }
+ 
++fn is_foreign_object<'dom>(element: &impl LayoutElement<'dom>) -> bool {
++    element.is_svg_element() && *element.local_name() == LocalName::from("foreignObject")
++}
++
++/// Traverse the `<foreignObject>` descendants of an svg element, looking through svg containers
++/// (`<g>`, `<a>`, `<switch>`, …) that are themselves painted as part of the rasterized svg. Text,
++/// `<title>`, `<desc>` and the like never lay out as boxes; a container hidden with
++/// `display: none` hides the foreignObjects inside it.
++fn traverse_svg_foreign_objects<'dom>(
++    svg_parent: ServoLayoutNode<'dom>,
++    context: &LayoutContext,
++    handler: &mut impl TraversalHandler<'dom>,
++) {
++    for child in svg_parent.flat_tree_children() {
++        let Some(element) = child.as_element() else {
++            continue;
++        };
++        if !element.is_svg_element() {
++            continue;
++        }
++        if is_foreign_object(&element) {
++            traverse_element(child, context, handler);
++        } else if !matches!(
++            Display::from(child.style(&context.style_context).get_box().display),
++            Display::None
++        ) {
++            traverse_svg_foreign_objects(child, context, handler);
++        }
++    }
++}
++
+ fn traverse_element<'dom>(
+     element: ServoLayoutNode<'dom>,
+     context: &LayoutContext,
+diff --git a/components/layout/formatting_contexts.rs b/components/layout/formatting_contexts.rs
+index ec492f061ee..37cd92f24c5 100644
+--- a/components/layout/formatting_contexts.rs
++++ b/components/layout/formatting_contexts.rs
+@@ -189,7 +189,7 @@ impl IndependentFormattingContext {
+                 // A replaced `<svg>` reuses the same slot for native `<foreignObject>` HTML
+                 // content when `dom_svg_foreignobject_native` is on (LYK-136 stage 3): the
+                 // svg raster paints below, the widget IFC's fragments lay out, paint, and
+-                // hit-test on top. The UA sheet collapses non-foreignObject svg children.
++                // hit-test on top. Only foreignObjects get boxes (`traverse_svg_foreign_objects`).
+                 let node = node_and_style_info.node;
+                 let is_native_foreign_object_host = matches!(
+                     contents.kind,
+diff --git a/components/layout/replaced.rs b/components/layout/replaced.rs
+index 607996e473b..6bd9d799865 100644
+--- a/components/layout/replaced.rs
++++ b/components/layout/replaced.rs
+@@ -8,7 +8,10 @@ use app_units::{Au, MAX_AU};
+ use data_url::DataUrl;
+ use embedder_traits::ViewportDetails;
+ use euclid::{Scale, Size2D};
+-use layout_api::{IFrameSize, LayoutElement, LayoutImageDestination, LayoutNode, SVGElementData};
++use layout_api::{
++    IFrameSize, LayoutElement, LayoutImageDestination, LayoutNode, SVGElementData,
++    svg_paint_signature,
++};
+ use malloc_size_of_derive::MallocSizeOf;
+ use net_traits::image_cache::{Image, ImageOrMetadataAvailable, VectorImage};
+ use net_traits::request::InternalRequest;
+@@ -280,7 +283,19 @@ impl ReplacedContents {
+             },
+             // If `svg_source_result` is `Err()`, it means that the previous attempt
+             // had errored, then don't attempt to serialize again.
+-            Some(svg_source_result) => svg_source_result.ok(),
++            Some(svg_source_result) => {
++                // Paint properties are baked into the serialization; when they have changed
++                // since, keep painting the old one until script has produced a fresh one.
++                if svg_source_result.is_ok() &&
++                    svg_data.source_paint_signature.as_deref() !=
++                        Some(svg_paint_signature(&parent_style).as_str())
++                {
++                    context
++                        .image_resolver
++                        .queue_svg_element_for_serialization(node);
++                }
++                svg_source_result.ok()
++            },
+         };
+ 
+         let cached_image = svg_source.and_then(|svg_source| {
+diff --git a/components/layout/stylesheets/servo.css b/components/layout/stylesheets/servo.css
+index fbb5fb8c8e5..b752b6f2c45 100644
+--- a/components/layout/stylesheets/servo.css
++++ b/components/layout/stylesheets/servo.css
+@@ -460,15 +460,6 @@ details[open]::details-content {
+   display: block;
+ }
+ 
+-/*
+- * Until servo supports svg properly, make sure to at least prevent svg
+- * children from being layed out and rendered like usual html.
+- * https://github.com/servo/servo/issues/10646
+- */
+-svg > * {
+-  display: none;
+-}
+-
+ *|*::-servo-anonymous-box {
+   unicode-bidi: inherit;
+   direction: inherit;
+diff --git a/components/layout/stylesheets/user-agent.css b/components/layout/stylesheets/user-agent.css
+index c32cb90dc2d..064c75ae5c7 100644
+--- a/components/layout/stylesheets/user-agent.css
++++ b/components/layout/stylesheets/user-agent.css
+@@ -423,10 +423,11 @@ marquee {
+   white-space: nowrap;
+ }
+ 
+-/* Native <foreignObject> layout (pref dom_svg_foreignobject_native, LYK-136): when the
+- * replaced <svg> builds a widget IFC over its children, only foreignObject subtrees may
+- * contribute boxes — shape/def elements collapse. Inert without the pref (a replaced svg
+- * never descends). foreignObject geometry attributes are SVG2 presentation attributes. */
++/* Native <foreignObject> layout (pref dom_svg_foreignobject_native, LYK-136): the replaced
++ * <svg> builds a widget over its foreignObject descendants only; layout gives other svg
++ * elements no box (they paint through the svg's raster, which takes their computed paint
++ * properties). Inert without the pref (a replaced svg never descends). foreignObject
++ * geometry attributes are SVG2 presentation attributes. */
+ *|foreignObject {
+   display: block;
+ }
+diff --git a/components/layout/traversal.rs b/components/layout/traversal.rs
+index 1e8c15f770f..0bca291fc54 100644
+--- a/components/layout/traversal.rs
++++ b/components/layout/traversal.rs
+@@ -6,6 +6,7 @@ use std::sync::Arc;
+ 
+ use layout_api::{
+     DangerousStyleElement, DangerousStyleNode, LayoutDamage, LayoutElement, LayoutNode,
++    svg_paint_signature,
+ };
+ use script::layout_dom::ServoLayoutNode;
+ use style::context::{SharedStyleContext, StyleContext};
+@@ -190,13 +191,19 @@ pub(crate) fn compute_damage_and_rebuild_box_tree_below_dirty_root<'dom>(
+         return damage_from_parent;
+     };
+ 
+-    let (element_damage, is_display_none) = {
++    let (mut element_damage, is_display_none) = {
+         let mut element_data = element.element_data_mut();
+         (
+             LayoutDamage::from(std::mem::take(&mut element_data.damage)),
+             element_data.styles.is_display_none(),
+         )
+     };
++    // An inline <svg> paints from a cached serialization with its paint properties baked in,
++    // so a restyle that changes them (even a repaint-only `color` change) has to rebuild its
++    // box, which requests a fresh serialization.
++    if !element_damage.is_empty() && svg_paint_is_stale(layout_context, node) {
++        element_damage |= LayoutDamage::BoxDamage;
++    }
+ 
+     let has_dirty_descendants;
+     #[expect(unsafe_code)]
+@@ -236,6 +243,20 @@ pub(crate) fn compute_damage_and_rebuild_box_tree_below_dirty_root<'dom>(
+     damage_set.apply_damage(layout_context, layout_roots)
+ }
+ 
++/// Whether `node` is an `<svg>` whose cached serialization was built from different paint
++/// properties than its current style has. Unserialized or failed serializations don't count:
++/// the former is already queued, the latter is never retried.
++fn svg_paint_is_stale(layout_context: &LayoutContext, node: ServoLayoutNode<'_>) -> bool {
++    let Some(svg_data) = node.as_svg() else {
++        return false;
++    };
++    if !matches!(svg_data.source, Some(Ok(_))) {
++        return false;
++    }
++    let style = node.style(&layout_context.style_context);
++    svg_data.source_paint_signature.as_deref() != Some(svg_paint_signature(&style).as_str())
++}
++
+ enum BoxDamageAction<'a> {
+     RebuildAncestor,
+     TryRebuild,
+diff --git a/components/script/dom/element/element.rs b/components/script/dom/element/element.rs
+index f1f0b5f3397..240d3ccdf50 100644
+--- a/components/script/dom/element/element.rs
++++ b/components/script/dom/element/element.rs
+@@ -1011,6 +1011,17 @@ impl Element {
+             .map(|data| data.element_data.borrow().styles.primary().clone())
+     }
+ 
++    /// The element's style from the last restyle, without the reflow [`Self::style`] forces.
++    /// For code that already runs right after layout (inline-SVG serialization), where a
++    /// re-entrant reflow is both unnecessary and unsafe. `None` for unstyled elements, e.g.
++    /// descendants of a `display: none` element.
++    pub(crate) fn style_from_last_restyle(&self) -> Option<ServoArc<ComputedValues>> {
++        self.style_data
++            .borrow()
++            .as_ref()
++            .and_then(|data| data.element_data.borrow().styles.get_primary().cloned())
++    }
++
+     pub(crate) fn is_styled(&self) -> bool {
+         self.style_data.borrow().is_some()
+     }
+@@ -1188,8 +1199,9 @@ impl<'dom> LayoutDom<'dom, Element> {
+         };
+ 
+         // Native <foreignObject> layout (LYK-136 stage 3): when the pref is on, the replaced
+-        // <svg> builds a widget IFC over its children — foreignObject becomes a block and
+-        // every other svg child collapses (they render via the raster, never as boxes).
++        // <svg> builds a widget over its foreignObject descendants, which become blocks; layout
++        // gives no other svg element a box (they render via the raster). They stay styled, not
++        // `display: none`, because the raster takes their computed paint properties.
+         // Done as presentation hints rather than UA-sheet rules because camelCase SVG type
+         // selectors don't match through the stylesheet path (selector names are lowercased
+         // at parse; svg local names are matched case-sensitively). Author styles still win.
+@@ -1308,10 +1320,6 @@ impl<'dom> LayoutDom<'dom, Element> {
+                         ),
+                     ));
+                 }
+-            } else if *self.local_name() != local_name!("svg") {
+-                push(PropertyDeclaration::Display(
+-                    style::values::specified::Display::None,
+-                ));
+             }
+         }
+ 
+diff --git a/components/script/dom/node/node.rs b/components/script/dom/node/node.rs
+index 60c1a91066a..5e22b90b4f8 100644
+--- a/components/script/dom/node/node.rs
++++ b/components/script/dom/node/node.rs
+@@ -114,7 +114,7 @@ use crate::dom::node::virtualmethods::{VirtualMethods, vtable_for};
+ use crate::dom::pointerevent::{PointerEvent, PointerId};
+ use crate::dom::range::WeakRangeVec;
+ use crate::dom::raredata::NodeRareData;
+-use crate::dom::servoparser::html::HtmlSerialize;
++use crate::dom::servoparser::html::{HtmlSerialize, StylePrefix};
+ use crate::dom::servoparser::serialize_html_fragment;
+ use crate::dom::shadowroot::{IsUserAgentWidget, ShadowRoot};
+ use crate::dom::text::Text;
+@@ -3217,6 +3217,7 @@ impl Node {
+             traversal_scope,
+             serialize_shadow_roots,
+             shadow_roots,
++            None,
+         )
+         .expect("Serializing node failed");
+ 
+@@ -3228,11 +3229,32 @@ impl Node {
+     pub(crate) fn xml_serialize(
+         &self,
+         traversal_scope: xml_serialize::TraversalScope,
++    ) -> Fallible<DOMString> {
++        self.xml_serialize_inner(traversal_scope, HtmlSerialize::new(self))
++    }
++
++    /// [`Self::xml_serialize`], with `style_prefix`'s declarations merged into each element's
++    /// `style` attribute in the output.
++    pub(crate) fn xml_serialize_with_style_prefix(
++        &self,
++        traversal_scope: xml_serialize::TraversalScope,
++        style_prefix: StylePrefix<'_>,
++    ) -> Fallible<DOMString> {
++        self.xml_serialize_inner(
++            traversal_scope,
++            HtmlSerialize::with_style_prefix(self, style_prefix),
++        )
++    }
++
++    fn xml_serialize_inner(
++        &self,
++        traversal_scope: xml_serialize::TraversalScope,
++        serializable: HtmlSerialize<'_>,
+     ) -> Fallible<DOMString> {
+         let mut writer = vec![];
+         xml_serialize::serialize(
+             &mut writer,
+-            &HtmlSerialize::new(self),
++            &serializable,
+             xml_serialize::SerializeOpts { traversal_scope },
+         )
+         .map_err(|error| {
+diff --git a/components/script/dom/servoparser/html.rs b/components/script/dom/servoparser/html.rs
+index ce9bbb1634c..650941db63b 100644
+--- a/components/script/dom/servoparser/html.rs
++++ b/components/script/dom/servoparser/html.rs
+@@ -128,7 +128,15 @@ impl Tokenizer {
+ }
+ 
+ /// <https://html.spec.whatwg.org/multipage/#html-fragment-serialisation-algorithm>
+-fn start_element<S: Serializer>(element: &Element, serializer: &mut S) -> io::Result<()> {
++/// Supplies CSS declarations (`;`-terminated) to prepend to an element's `style` attribute as
++/// it is serialized, without mutating the DOM.
++pub(crate) type StylePrefix<'a> = &'a dyn Fn(&Element) -> Option<String>;
++
++fn start_element<S: Serializer>(
++    element: &Element,
++    serializer: &mut S,
++    style_prefix: Option<StylePrefix<'_>>,
++) -> io::Result<()> {
+     let name = QualName::new(
+         None,
+         element.namespace().clone(),
+@@ -154,6 +162,17 @@ fn start_element<S: Serializer>(element: &Element, serializer: &mut S) -> io::Re
+         (qname, value)
+     }));
+ 
++    if let Some(declarations) = style_prefix.and_then(|style_prefix| style_prefix(element)) {
++        let style_name = QualName::new(None, ns!(), local_name!("style"));
++        match attributes.iter_mut().find(|(name, _)| *name == style_name) {
++            // Prepended, so the element's own inline declarations still win.
++            Some((_, value)) => {
++                *value = AttrValue::String(format!("{declarations}{}", &**value));
++            },
++            None => attributes.push((style_name, AttrValue::String(declarations))),
++        }
++    }
++
+     let attr_refs = attributes.iter().map(|(qname, value)| {
+         let ar: AttrRef = (qname, &**value);
+         ar
+@@ -290,6 +309,7 @@ pub(crate) fn serialize_html_fragment<S: Serializer>(
+     traversal_scope: TraversalScope,
+     serialize_shadow_roots: bool,
+     shadow_roots: Vec<DomRoot<ShadowRoot>>,
++    style_prefix: Option<StylePrefix<'_>>,
+ ) -> io::Result<()> {
+     let iter = SerializationIterator::new(
+         cx,
+@@ -302,7 +322,7 @@ pub(crate) fn serialize_html_fragment<S: Serializer>(
+     for cmd in iter {
+         match cmd {
+             SerializationCommand::OpenElement(n) => {
+-                start_element(&n, serializer)?;
++                start_element(&n, serializer, style_prefix)?;
+             },
+             SerializationCommand::CloseElement(name) => {
+                 serializer.end_elem(name)?;
+@@ -374,11 +394,25 @@ pub(crate) fn serialize_html_fragment<S: Serializer>(
+ 
+ pub(crate) struct HtmlSerialize<'a> {
+     node: &'a Node,
++    style_prefix: Option<StylePrefix<'a>>,
+ }
+ 
+ impl<'a> HtmlSerialize<'a> {
+     pub(crate) fn new(node: &'a Node) -> HtmlSerialize<'a> {
+-        HtmlSerialize { node }
++        HtmlSerialize {
++            node,
++            style_prefix: None,
++        }
++    }
++
++    pub(crate) fn with_style_prefix(
++        node: &'a Node,
++        style_prefix: StylePrefix<'a>,
++    ) -> HtmlSerialize<'a> {
++        HtmlSerialize {
++            node,
++            style_prefix: Some(style_prefix),
++        }
+     }
+ }
+ 
+@@ -391,6 +425,14 @@ impl Serialize for HtmlSerialize<'_> {
+         // TODO: https://github.com/servo/servo/issues/42839
+         let mut cx = unsafe { temp_cx() };
+         let cx = &mut cx;
+-        serialize_html_fragment(cx, self.node, serializer, traversal_scope, false, vec![])
++        serialize_html_fragment(
++            cx,
++            self.node,
++            serializer,
++            traversal_scope,
++            false,
++            vec![],
++            self.style_prefix,
++        )
+     }
+ }
+diff --git a/components/script/dom/svg/svgsvgelement.rs b/components/script/dom/svg/svgsvgelement.rs
+index 95c5c42038e..7fee1896136 100644
+--- a/components/script/dom/svg/svgsvgelement.rs
++++ b/components/script/dom/svg/svgsvgelement.rs
+@@ -10,14 +10,20 @@ use dom_struct::dom_struct;
+ use html5ever::{LocalName, Prefix, QualName, local_name, ns};
+ use js::context::JSContext;
+ use js::rust::HandleObject;
+-use layout_api::SVGElementData;
++use layout_api::{SVG_PAINT_PROPERTIES, SVGElementData, svg_paint_signature};
++use percent_encoding::percent_decode_str;
+ use pixels::EncodedImageType;
+ use script_bindings::cell::DomRefCell;
+ use servo_url::ServoUrl;
++use style::Atom;
+ use style::attr::AttrValue;
+-use style::parser::ParserContext;
++use style::color::AbsoluteColor;
++use style::parser::{Parse, ParserContext};
++use style::properties::{ComputedValues, LonghandId, PropertyDeclarationId};
+ use style::stylesheets::Origin;
+-use style::values::specified::LengthPercentage;
++use style::values::computed::{Color as ComputedColor, SVGPaint};
++use style::values::generics::svg::{SVGPaintFallback, SVGPaintKind};
++use style::values::specified::{Color as SpecifiedColor, LengthPercentage};
+ use style_traits::ParsingMode;
+ use uuid::Uuid;
+ use xml5ever::serialize::TraversalScope;
+@@ -48,6 +54,9 @@ pub(crate) struct SVGSVGElement {
+     // on each layout and must be invalidated when the subtree changes.
+     #[no_trace]
+     cached_serialized_data_url: DomRefCell<Option<Result<ServoUrl, ()>>>,
++    /// The `svg_paint_signature` of this element's style that the cached serialization was
++    /// built with; layout re-requests serialization when the current style no longer matches.
++    cached_paint_signature: DomRefCell<Option<String>>,
+ }
+ 
+ impl SVGSVGElement {
+@@ -60,6 +69,7 @@ impl SVGSVGElement {
+             svggraphicselement: SVGGraphicsElement::new_inherited(local_name, prefix, document),
+             uuid: Uuid::new_v4().to_string(),
+             cached_serialized_data_url: Default::default(),
++            cached_paint_signature: Default::default(),
+         }
+     }
+ 
+@@ -80,6 +90,18 @@ impl SVGSVGElement {
+     }
+ 
+     pub(crate) fn serialize_and_cache_subtree(&self, cx: &mut js::context::JSContext) {
++        // A re-serialization (layout saw the paint properties change) must not leave the
++        // previous document's raster behind: rasterizations are cached per svg element.
++        if self.cached_serialized_data_url.borrow().is_some() {
++            self.evict_cached_images();
++        }
++        // Recorded only once the passes below are done: their temporary clones mutate this
++        // subtree, which invalidates (clears) the cache, signature included.
++        let paint_signature = self
++            .upcast::<Element>()
++            .style_from_last_restyle()
++            .map(|style| svg_paint_signature(&style));
++
+         let mut cloned_nodes = self.process_use_elements(cx);
+         // Order matters: lowering `<foreignObject>` and `<image href>` first means the
+         // `<image>` elements those passes insert (which carry `mask`/`clip-path`/`filter`
+@@ -88,11 +110,13 @@ impl SVGSVGElement {
+         cloned_nodes.extend(self.process_image_elements(cx));
+         cloned_nodes.extend(self.process_external_references(cx));
+ 
++        let paint_declarations = |element: &Element| self.paint_declarations(element);
+         let serialize_result = self
+             .upcast::<Node>()
+-            .xml_serialize(TraversalScope::IncludeNode);
++            .xml_serialize_with_style_prefix(TraversalScope::IncludeNode, &paint_declarations);
+ 
+         self.cleanup_cloned_nodes(cx, &cloned_nodes);
++        *self.cached_paint_signature.borrow_mut() = paint_signature;
+ 
+         let Ok(xml_source) = serialize_result else {
+             *self.cached_serialized_data_url.borrow_mut() = Some(Err(()));
+@@ -597,7 +621,99 @@ impl SVGSVGElement {
+         }
+     }
+ 
+-    pub(crate) fn invalidate_cached_serialized_subtree_and_rasterization_result(&self) {
++    /// CSS declarations that carry `element`'s cascaded paint properties (see
++    /// `SVG_PAINT_PROPERTIES`) into the standalone serialization, which otherwise sees none of
++    /// the page's stylesheets, inherited values or custom properties. A property is copied where
++    /// a rule set it, i.e. where it differs from the flat-tree parent's value. The root `<svg>`
++    /// also gets the inherited properties it merely inherits from the page, since the standalone
++    /// document has no ancestors, unless a presentation attribute of the same name sets the
++    /// property there (in the cascade a presentation attribute beats inheritance but loses to a
++    /// rule). Presentation attributes using `var()` get the custom properties substituted, as
++    /// browsers parse them as CSS. Unstyled elements (inside `display: none` subtrees, clones
++    /// made for serialization) inherit from the serialized parent like the cascade would.
++    fn paint_declarations(&self, element: &Element) -> Option<String> {
++        let style = element.style_from_last_restyle();
++        let parent_style = element
++            .upcast::<Node>()
++            .parent_in_flat_tree()
++            .and_then(DomRoot::downcast::<Element>)
++            .and_then(|parent| parent.style_from_last_restyle());
++        let custom_property_style = style.clone().or_else(|| {
++            element
++                .upcast::<Node>()
++                .inclusive_ancestors_in_flat_tree()
++                .filter_map(DomRoot::downcast::<Element>)
++                .find_map(|ancestor| ancestor.style_from_last_restyle())
++        });
++        let is_root = std::ptr::eq(element, self.upcast::<Element>());
++
++        let mut declarations = String::new();
++        for property in SVG_PAINT_PROPERTIES {
++            let attribute = element.get_attribute_string_value_with_namespace(
++                &ns!(),
++                &LocalName::from(property.name()),
++            );
++            let from_cascade = style.as_ref().and_then(|style| {
++                let value = rasterizer_value(style, property);
++                let set_by_a_rule = parent_style
++                    .as_ref()
++                    .is_none_or(|parent| rasterizer_value(parent, property) != value);
++                let inherited_into_root = is_root && property.inherited() && attribute.is_none();
++                (set_by_a_rule || inherited_into_root).then_some(value)
++            });
++            let value = from_cascade.or_else(|| {
++                let attribute = attribute.filter(|attribute| attribute.contains("var("))?;
++                let style = custom_property_style.as_ref()?;
++                let substituted = substitute_custom_properties(&attribute, style)?;
++                Some(self.rasterizer_text(property, &substituted, style))
++            });
++            if let Some(value) = value {
++                declarations.push_str(property.name());
++                declarations.push(':');
++                declarations.push_str(&value);
++                declarations.push(';');
++            }
++        }
++        (!declarations.is_empty()).then_some(declarations)
++    }
++
++    /// `text` (a property value after `var()` substitution) with any colour in it rewritten as
++    /// the rasterizer needs, see [`rasterizer_value`]; `none`, `url(#…)` pass through.
++    fn rasterizer_text(&self, property: LonghandId, text: &str, style: &ComputedValues) -> String {
++        if !matches!(
++            property,
++            LonghandId::Color | LonghandId::Fill | LonghandId::Stroke | LonghandId::StopColor
++        ) {
++            return text.to_owned();
++        }
++        let document = self.owner_document();
++        let url = document.url().into_url().into();
++        let context = ParserContext::new(
++            Origin::Author,
++            &url,
++            None,
++            ParsingMode::DEFAULT,
++            document.quirks_mode(),
++            /* namespaces = */ Default::default(),
++            None,
++            None,
++            /* attr_taint = */ Default::default(),
++        );
++        let mut input = ParserInput::new(text);
++        let mut parser = Parser::new(&mut input);
++        let color = parser.parse_entirely(|parser| SpecifiedColor::parse(&context, parser));
++        match color
++            .ok()
++            .and_then(|color| color.to_computed_color(None).ok())
++        {
++            Some(color) => {
++                rasterizer_paint_color(&color, &style.get_inherited_text().clone_color())
++            },
++            None => text.to_owned(),
++        }
++    }
++
++    fn evict_cached_images(&self) {
+         let owner_window = self.owner_window();
+         owner_window
+             .image_cache()
+@@ -610,8 +726,12 @@ impl SVGSVGElement {
+                 &None,
+             );
+         }
++    }
+ 
++    pub(crate) fn invalidate_cached_serialized_subtree_and_rasterization_result(&self) {
++        self.evict_cached_images();
+         *self.cached_serialized_data_url.borrow_mut() = None;
++        *self.cached_paint_signature.borrow_mut() = None;
+         self.upcast::<Node>().dirty(NodeDamage::Other);
+     }
+ }
+@@ -714,6 +834,112 @@ fn serialize_reference_closure(cx: &mut JSContext, subtree: &Node) -> String {
+     serialized
+ }
+ 
++/// `property`'s computed value written for the inline-SVG rasterizer (resvg) rather than as
++/// CSS: colours become sRGB `rgba()` (resvg has no `oklab()`, `color-mix()`, `light-dark()`, …),
++/// `currentcolor` keeps the `currentColor` spelling resvg requires, so it keeps tracking `color`,
++/// and paint-server urls become in-document `url(#id)` references.
++fn rasterizer_value(style: &ComputedValues, property: LonghandId) -> String {
++    let current_color = style.get_inherited_text().clone_color();
++    match property {
++        LonghandId::Color => rasterizer_color(&current_color),
++        LonghandId::StopColor => rasterizer_color(
++            &style
++                .get_svg()
++                .clone_stop_color()
++                .resolve_to_absolute(&current_color),
++        ),
++        LonghandId::Fill => {
++            rasterizer_paint(&style.get_inherited_svg().clone_fill(), &current_color)
++        },
++        LonghandId::Stroke => {
++            rasterizer_paint(&style.get_inherited_svg().clone_stroke(), &current_color)
++        },
++        _ => {
++            let mut value = String::new();
++            style
++                .computed_or_resolved_value(property, None, &mut value)
++                .expect("Writing CSS to a String cannot fail");
++            value
++        },
++    }
++}
++
++fn rasterizer_color(color: &AbsoluteColor) -> String {
++    let [red, green, blue, alpha] = *color.clone().into_srgb_legacy().raw_components();
++    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
++    format!(
++        "rgba({}, {}, {}, {})",
++        channel(red),
++        channel(green),
++        channel(blue),
++        alpha.clamp(0.0, 1.0)
++    )
++}
++
++fn rasterizer_paint_color(color: &ComputedColor, current_color: &AbsoluteColor) -> String {
++    if color.is_currentcolor() {
++        "currentColor".to_owned()
++    } else {
++        rasterizer_color(&color.resolve_to_absolute(current_color))
++    }
++}
++
++fn rasterizer_paint(paint: &SVGPaint, current_color: &AbsoluteColor) -> String {
++    let kind = match &paint.kind {
++        SVGPaintKind::None => "none".to_owned(),
++        SVGPaintKind::Color(color) => rasterizer_paint_color(color, current_color),
++        // Paint servers live in the page; a reference that resolves to no fragment can't.
++        SVGPaintKind::PaintServer(url) => match url.url().and_then(|url| url.fragment()) {
++            Some(fragment) => format!("url(#{})", percent_decode_str(fragment).decode_utf8_lossy()),
++            None => "none".to_owned(),
++        },
++        SVGPaintKind::ContextFill => "context-fill".to_owned(),
++        SVGPaintKind::ContextStroke => "context-stroke".to_owned(),
++    };
++    match &paint.fallback {
++        SVGPaintFallback::Unset => kind,
++        SVGPaintFallback::None => format!("{kind} none"),
++        SVGPaintFallback::Color(color) => {
++            format!("{kind} {}", rasterizer_paint_color(color, current_color))
++        },
++    }
++}
++
++/// `value` with each `var(--name[, fallback])` replaced by the custom property's computed value
++/// in `style`, or else its fallback. `None` when a reference has neither, which makes the whole
++/// value invalid.
++fn substitute_custom_properties(value: &str, style: &ComputedValues) -> Option<String> {
++    let mut substituted = String::new();
++    let mut rest = value;
++    while let Some(start) = rest.find("var(") {
++        substituted.push_str(&rest[..start]);
++        let arguments = &rest[start + "var(".len()..];
++        let mut depth = 1;
++        let end = arguments.char_indices().find_map(|(index, character)| {
++            match character {
++                '(' => depth += 1,
++                ')' => depth -= 1,
++                _ => {},
++            }
++            (depth == 0).then_some(index)
++        })?;
++        let (name, fallback) = match arguments[..end].split_once(',') {
++            Some((name, fallback)) => (name.trim(), Some(fallback.trim())),
++            None => (arguments[..end].trim(), None),
++        };
++        let name = Atom::from(name.strip_prefix("--")?);
++        let custom_value = style.computed_value_to_string(PropertyDeclarationId::Custom(&name));
++        if custom_value.trim().is_empty() {
++            substituted.push_str(&substitute_custom_properties(fallback?, style)?);
++        } else {
++            substituted.push_str(custom_value.trim());
++        }
++        rest = &arguments[end + 1..];
++    }
++    substituted.push_str(rest);
++    Some(substituted)
++}
++
+ /// Extract `id` from a `url(#id)` attribute value (quotes and whitespace tolerated).
+ /// Returns `None` for non-fragment urls and the `none` keyword.
+ fn parse_url_fragment_reference(value: &str) -> Option<String> {
+@@ -744,6 +970,12 @@ impl<'dom> LayoutDom<'dom, SVGSVGElement> {
+                     .borrow_for_layout()
+                     .clone()
+             },
++            source_paint_signature: unsafe {
++                self.unsafe_get()
++                    .cached_paint_signature
++                    .borrow_for_layout()
++                    .clone()
++            },
+             width,
+             height,
+             view_box,
+diff --git a/components/script/layout_dom/servo_layout_element.rs b/components/script/layout_dom/servo_layout_element.rs
+index 1f91e255c64..474aaa5d723 100644
+--- a/components/script/layout_dom/servo_layout_element.rs
++++ b/components/script/layout_dom/servo_layout_element.rs
+@@ -226,6 +226,10 @@ impl<'dom> LayoutElement<'dom> for ServoLayoutElement<'dom> {
+         self.element.local_name()
+     }
+ 
++    fn is_svg_element(&self) -> bool {
++        *self.element.namespace() == ns!(svg)
++    }
++
+     fn attribute(&self, namespace: &Namespace, name: &LocalName) -> Option<&AttrValue> {
+         self.element.get_attr_for_layout(namespace, name)
+     }
+diff --git a/components/shared/layout/layout_element.rs b/components/shared/layout/layout_element.rs
+index b38d0e17031..372ca12c1b8 100644
+--- a/components/shared/layout/layout_element.rs
++++ b/components/shared/layout/layout_element.rs
+@@ -86,6 +86,9 @@ pub trait LayoutElement<'dom>: Copy + Debug + Send + Sync {
+     /// <https://dom.spec.whatwg.org/#concept-element-local-name>.
+     fn local_name(&self) -> &LocalName;
+ 
++    /// Whether this element is in the SVG namespace.
++    fn is_svg_element(&self) -> bool;
++
+     /// Get the attribute with the given `namespace` and `name` as an [`AttrValue`] if it
+     /// exists, otherwise return `None`.
+     fn attribute(&self, namespace: &Namespace, name: &LocalName) -> Option<&AttrValue>;
+diff --git a/components/shared/layout/lib.rs b/components/shared/layout/lib.rs
+index 08377524dd2..5bbc8f6a6e1 100644
+--- a/components/shared/layout/lib.rs
++++ b/components/shared/layout/lib.rs
+@@ -64,7 +64,7 @@ use style::device::Device;
+ use style::dom::OpaqueNode;
+ use style::invalidation::element::restyle_hints::RestyleHint;
+ use style::properties::style_structs::Font;
+-use style::properties::{ComputedValues, PropertyId};
++use style::properties::{ComputedValues, LonghandId, PropertyId};
+ use style::selector_parser::{PseudoElement, RestyleDamage, Snapshot};
+ use style::str::char_is_whitespace;
+ use style::stylesheets::{DocumentStyleSheet, Stylesheet};
+@@ -156,9 +156,47 @@ pub struct HTMLCanvasData {
+     pub height: u32,
+ }
+ 
++/// CSS properties that style how an inline `<svg>` paints. Inline SVG is rasterized from a
++/// standalone serialization of its subtree, which has none of the page's cascade, so the
++/// serializer copies these computed values into it. `color` is included for `currentColor`.
++pub const SVG_PAINT_PROPERTIES: [LonghandId; 16] = [
++    LonghandId::Color,
++    LonghandId::Fill,
++    LonghandId::FillOpacity,
++    LonghandId::FillRule,
++    LonghandId::Stroke,
++    LonghandId::StrokeWidth,
++    LonghandId::StrokeOpacity,
++    LonghandId::StrokeLinecap,
++    LonghandId::StrokeLinejoin,
++    LonghandId::StrokeMiterlimit,
++    LonghandId::StrokeDasharray,
++    LonghandId::StrokeDashoffset,
++    LonghandId::PaintOrder,
++    LonghandId::ClipRule,
++    LonghandId::StopColor,
++    LonghandId::StopOpacity,
++];
++
++/// A fingerprint of the paint properties an `<svg>` element's serialization was built from.
++/// The serialization is cached across restyles, so layout compares this to detect paint changes
++/// (a hover colour, a theme switch) that must re-serialize the subtree.
++pub fn svg_paint_signature(style: &ComputedValues) -> String {
++    let mut signature = String::new();
++    for property in SVG_PAINT_PROPERTIES {
++        style
++            .computed_or_resolved_value(property, None, &mut signature)
++            .expect("Writing CSS to a String cannot fail");
++        signature.push(';');
++    }
++    signature
++}
++
+ pub struct SVGElementData<'dom> {
+     /// The SVG's XML source represented as a base64 encoded `data:` url.
+     pub source: Option<Result<ServoUrl, ()>>,
++    /// The [`svg_paint_signature`] of the element's style when `source` was serialized.
++    pub source_paint_signature: Option<String>,
+     pub width: Option<&'dom AttrValue>,
+     pub height: Option<&'dom AttrValue>,
+     pub svg_id: String,
