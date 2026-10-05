@@ -2209,6 +2209,14 @@ fn localize_html(html: &str) -> String {
 }
 
 /// Escape text for safe interpolation into HTML (the gator://welcome template).
+/// Show the `gator://crash` recovery page in `webview` for a renderer that died while showing
+/// `crashed_url` (its Reload button leads back there), with `reason` under Details.
+fn load_crash_page(webview: &WebView, crashed_url: &str, reason: &str) {
+    let recovery = Url::parse_with_params("gator://crash", &[("url", crashed_url), ("reason", reason)])
+        .expect("gator://crash with query parameters is a valid URL");
+    webview.load(recovery);
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -11671,16 +11679,32 @@ impl WebViewDelegate for AppState {
                     webview.load(u);
                 }
             },
-            None => {
-                let recovery = Url::parse_with_params(
-                    "gator://crash",
-                    &[("url", crashed_url.as_str()), ("reason", reason.as_str())],
-                );
-                if let Ok(recovery) = recovery {
-                    webview.load(recovery);
-                }
-            },
+            None => load_crash_page(&webview, &crashed_url, &reason),
         }
+        self.window.request_redraw();
+    }
+
+    /// The content process rendering this tab died from a signal (SIGSEGV, the OOM killer's
+    /// SIGKILL, a `kill` by hand). Like Chrome's "Aw, Snap!", park the tab on the crash page with
+    /// a Reload button instead of auto-reloading: whatever killed the process (memory pressure
+    /// above all) would likely kill the reloaded one too, and the user should see that it died.
+    fn notify_content_process_terminated(&self, webview: WebView, reason: String) {
+        let Some((p, i)) = self.locate_tab(&webview) else {
+            return;
+        };
+        let crashed_url = {
+            let mut tabs = self.pane(p).tabs.borrow_mut();
+            let tab = &mut tabs[i];
+            tab.loading = false;
+            tab.crashed = true;
+            if tab.url.starts_with("gator://crash") {
+                String::new()
+            } else {
+                tab.url.clone()
+            }
+        };
+        eprintln!("navgator: renderer process died ({crashed_url}): {reason}");
+        load_crash_page(&webview, &crashed_url, &reason);
         self.window.request_redraw();
     }
 
