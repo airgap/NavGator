@@ -90,6 +90,7 @@ mod password;
 mod autofill;
 mod highlights;
 mod keyring_store;
+mod migrate;
 mod theme;
 mod fonts;
 mod palette;
@@ -1071,6 +1072,16 @@ mod icon {
         p.add(egui::Shape::line(pts, st));
         // Keyhole.
         p.circle_filled(body.center(), 1.3, c);
+    }
+
+    /// A password field (a box of dots): fills the saved login into the page.
+    pub fn fill_login(p: &Painter, r: Rect, c: Color32) {
+        let field = Rect::from_center_size(r.center(), vec2(r.width() * 0.78, r.height() * 0.42));
+        p.rect_stroke(field, CornerRadius::same(2), s(c), StrokeKind::Inside);
+        let step = field.width() / 4.0;
+        for i in 1..=3 {
+            p.circle_filled(pos2(field.left() + step * i as f32, field.center().y), 1.4, c);
+        }
     }
 
     /// Gear — Settings (the conventional cog).
@@ -2410,16 +2421,37 @@ fn map_cursor(c: Cursor) -> CursorIcon {
 }
 
 /// Escape a string into a JS double-quoted string literal.
-/// Autofill JS: fill a login form's username + password. Called as `(AUTOFILL_JS)(u, p)`.
-const AUTOFILL_JS: &str = r#"function(u,p){
-  var pw=document.querySelector('input[type="password"]');
-  if(!pw)return 0;
+/// Login-fill JS, run only after the user clicks the toolbar's fill button (GATO-121). Called as
+/// `(AUTOFILL_JS)(origin, u, p)`; returns "origin", "none" or "ok". The origin check catches a
+/// navigation between the click and this script running. A field must pass the ADR-0060
+/// Decision 8 checks: rendered, non-zero size, in the viewport, topmost at its centre, and no
+/// ancestor hidden by display, visibility, near-zero opacity, a filter or a clip-path, because an
+/// invisible or covered field is how a page harvests a fill it tricked the user into.
+const AUTOFILL_JS: &str = r#"function(o,u,p){
+  if(location.origin!==o)return "origin";
+  function shown(el){
+    var r=el.getBoundingClientRect();
+    if(r.width<1||r.height<1)return false;
+    if(r.right<=0||r.bottom<=0||r.left>=innerWidth||r.top>=innerHeight)return false;
+    if(document.elementFromPoint(r.left+r.width/2,r.top+r.height/2)!==el)return false;
+    for(var n=el;n&&n.nodeType===1;n=n.parentElement){
+      var s=getComputedStyle(n);
+      if(s.display==='none'||s.visibility!=='visible')return false;
+      if(parseFloat(s.opacity)<0.1)return false;
+      if(s.filter&&s.filter!=='none')return false;
+      if(s.clipPath&&s.clipPath!=='none')return false;
+    }
+    return true;
+  }
+  function first(list){for(var i=0;i<list.length;i++){if(shown(list[i]))return list[i];}return null;}
+  var pw=first(document.querySelectorAll('input[type="password"]'));
+  if(!pw)return "none";
   var scope=pw.form||document;
+  var un=first(scope.querySelectorAll('input[autocomplete="username"],input[type="email"],input[type="text"]'));
   pw.value=p;
-  var un=scope.querySelector('input[autocomplete="username"],input[type="email"],input[type="text"]');
   if(un)un.value=u;
   [un,pw].forEach(function(f){if(f){f.dispatchEvent(new Event('input',{bubbles:true}));f.dispatchEvent(new Event('change',{bubbles:true}));}});
-  return 1;
+  return "ok";
 }"#;
 
 /// Form-autofill JS (LYK-1371): fill address + card fields from a profile object. Called as
@@ -6896,6 +6928,12 @@ impl AppState {
                             self.show_addons.set(!self.show_addons.get());
                         }
                     }
+                    if self.active_login_origin().is_some()
+                        && icon_button(ui, true, &tr!("toolbar-fill-login"), &pal, icon::fill_login)
+                            .clicked()
+                    {
+                        self.fill_login_active();
+                    }
                     if self.browser.password_store.borrow().is_unlocked() {
                         if icon_button(ui, true, &tr!("toolbar-save-login"), &pal, icon::key).clicked() {
                             self.save_login_active();
@@ -10133,22 +10171,16 @@ impl AppState {
         self.window.request_redraw();
     }
 
-    /// Autofill the login form of tab `tab_idx` if the store is unlocked and a saved login
-    /// matches the page origin. The credential goes straight from the store into the form via
-    /// evaluate_javascript — it is never exposed to page-readable storage.
-    fn autofill(&self, pane: usize, tab_idx: usize) {
-        if !self.browser.password_store.borrow().is_unlocked() {
+    /// Fill the active page's login form from the (unlocked) store, invoked only by the toolbar's
+    /// fill button. Never called on page load: a fill with no gesture hands the credential to an
+    /// injected or hidden form (GATO-121, ADR-0060 Decision 8). The credential goes straight from
+    /// the store into the form via evaluate_javascript and never touches page-readable storage.
+    fn fill_login_active(&self) {
+        let Some(tab) = self.active_tab() else {
             return;
-        }
-        let (webview, origin) = {
-            let tabs = self.pane(pane).tabs.borrow();
-            let Some(t) = tabs.get(tab_idx) else {
-                return;
-            };
-            let Some(origin) = origin_of(&t.url) else {
-                return;
-            };
-            (t.webview.clone(), origin)
+        };
+        let Some(origin) = self.active_login_origin() else {
+            return;
         };
         let cred = self
             .browser
@@ -10160,14 +10192,56 @@ impl AppState {
         let Some((user, pass)) = cred else {
             return;
         };
-        let js = format!("({})({}, {})", AUTOFILL_JS, js_string(&user), js_string(&pass));
-        webview.evaluate_javascript(js, |_| {});
+        let js = format!(
+            "({})({}, {}, {})",
+            AUTOFILL_JS,
+            js_string(&origin),
+            js_string(&user),
+            js_string(&pass)
+        );
+        let me = self.weak_self.borrow().clone();
+        tab.evaluate_javascript(js, move |res| {
+            let Some(me) = me.upgrade() else {
+                return;
+            };
+            let msg = match res {
+                Ok(JSValue::String(s)) if s == "ok" => return,
+                Ok(JSValue::String(s)) if s == "origin" => {
+                    "The page changed before the login could be filled.".to_string()
+                }
+                Ok(JSValue::String(s)) if s == "none" => {
+                    "No visible password field on this page to fill.".to_string()
+                }
+                other => format!("Could not fill the login: {other:?}"),
+            };
+            *me.browser.password_msg.borrow_mut() = Some(msg);
+            me.window.request_redraw();
+        });
+    }
+
+    /// The active tab's origin when the store is unlocked and holds a login for it, which is when
+    /// the toolbar offers to fill.
+    fn active_login_origin(&self) -> Option<String> {
+        let store = self.browser.password_store.borrow();
+        if !store.is_unlocked() {
+            return None;
+        }
+        let origin = self
+            .focused_pane()
+            .tabs
+            .borrow()
+            .get(self.focused_pane().active.get())
+            .and_then(|t| origin_of(&t.url))?;
+        if store.for_origin(&origin).is_empty() {
+            return None;
+        }
+        Some(origin)
     }
 
     /// Fill the active page's address/card fields from the (unlocked) autofill profile — invoked by
     /// the user (Ctrl+Shift+A), never automatically, since it injects card data (LYK-1371). The
     /// values go straight from the store into the form via evaluate_javascript, never touching
-    /// page-readable storage (mirrors `autofill`).
+    /// page-readable storage (mirrors `fill_login_active`).
     fn autofill_form(&self, pane: usize, tab_idx: usize) {
         if !self.browser.autofill_store.borrow().is_unlocked() {
             // Prompt for the vault passphrase; the user re-presses Ctrl+Shift+A once unlocked.
@@ -11384,7 +11458,6 @@ impl WebViewDelegate for AppState {
                 }
             }
             if matches!(status, LoadStatus::Complete) {
-                self.autofill(p, i);
                 self.reapply_highlights(p, i); // re-draw saved highlights (LYK-1281)
                 self.apply_cosmetic(p, i);
                 if let Some(t) = self.pane(p).tabs.borrow().get(i) {

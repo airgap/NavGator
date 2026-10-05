@@ -8,6 +8,7 @@ toolbar-maximize = Agrandir
 toolbar-restore = Restaurer
 toolbar-close-window = Fermer
 toolbar-userscripts = Scripts utilisateur / extensions
+toolbar-fill-login = Remplir l'identifiant enregistré pour cette page
 toolbar-save-login = Enregistrer l'identifiant de cette page
 toolbar-unlock-vault = Déverrouiller le coffre (mots de passe + saisie automatique)
 
