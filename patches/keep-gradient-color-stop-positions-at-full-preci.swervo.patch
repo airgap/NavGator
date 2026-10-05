@@ -1,0 +1,91 @@
+From 5b29e46e822524b1c4709eabd509652ba053c032 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 04:22:17 -0400
+Subject: [PATCH] layout: keep gradient color stop positions at full precision
+
+Linear and radial gradient stop positions were computed as a fraction of the
+gradient line held in app units, so every stop offset was rounded to a
+multiple of 1/60. For a 200px line a stop at 3px became 3.33px and one at 7px
+became 6.67px, which made repeating-linear-gradient and
+repeating-radial-gradient stripes visibly thinner than in Chrome, shifted
+their phase on angled gradients, and made stripes vanish entirely on long
+lines where a stop rounded to zero. Resolve the stop against the line length
+in floating point instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/display_list/gradient.rs | 24 +++++++++++-----------
+ 1 file changed, 12 insertions(+), 12 deletions(-)
+
+diff --git a/components/layout/display_list/gradient.rs b/components/layout/display_list/gradient.rs
+index 7b978a3a73a..d5bc75b0bcd 100644
+--- a/components/layout/display_list/gradient.rs
++++ b/components/layout/display_list/gradient.rs
+@@ -4,12 +4,13 @@
+ 
+ use app_units::Au;
+ use euclid::Size2D;
+-use style::Zero;
+ use style::color::mix::{ColorInterpolationMethod, ColorMixItem, HueInterpolationMethod, mix_many};
+ use style::color::{AbsoluteColor, ColorSpace};
+ use style::properties::ComputedValues;
+ use style::values::computed::image::{EndingShape, Gradient, LineDirection};
+-use style::values::computed::{Angle, AngleOrPercentage, Color, LengthPercentage, Position};
++use style::values::computed::{
++    Angle, AngleOrPercentage, Color, Length, LengthPercentage, Position,
++};
+ use style::values::generics::color::ColorMixFlags;
+ use style::values::generics::image::{
+     Circle, ColorStop, Ellipse, GradientFlags, GradientItem, ShapeExtent,
+@@ -177,8 +178,7 @@ pub(super) fn build_linear(
+         wr::ExtendMode::Clamp
+     };
+ 
+-    let mut color_stops =
+-        gradient_items_to_color_stops(style, items, Au::from_f32_px(gradient_line_length));
++    let mut color_stops = gradient_items_to_color_stops(style, items, gradient_line_length);
+     let stops = create_webrender_stops(&mut color_stops, color_interpolation_method, extend_mode);
+ 
+     WebRenderGradient::Linear(builder.wr().create_gradient(
+@@ -283,8 +283,7 @@ pub(super) fn build_radial(
+         wr::ExtendMode::Clamp
+     };
+ 
+-    let mut color_stops =
+-        gradient_items_to_color_stops(style, items, Au::from_f32_px(gradient_line_length));
++    let mut color_stops = gradient_items_to_color_stops(style, items, gradient_line_length);
+     let stops = create_webrender_stops(&mut color_stops, color_interpolation_method, extend_mode);
+ 
+     WebRenderGradient::Radial(builder.wr().create_radial_gradient(
+@@ -375,7 +374,7 @@ fn conic_gradient_items_to_color_stops(
+ fn gradient_items_to_color_stops(
+     style: &ComputedValues,
+     items: &[GradientItem<Color, LengthPercentage>],
+-    gradient_line_length: Au,
++    gradient_line_length: f32,
+ ) -> Vec<ColorStop<AbsoluteColor, f32>> {
+     // Remove color transititon hints, which are not supported yet.
+     // https://drafts.csswg.org/css-images-4/#color-transition-hint
+@@ -397,13 +396,14 @@ fn gradient_items_to_color_stops(
+                 }),
+                 GradientItem::ComplexColorStop { color, position } => Some(ColorStop {
+                     color: style.resolve_color(color),
+-                    position: Some(if gradient_line_length.is_zero() {
++                    // Stop positions are fractions of the gradient line, far finer than app
++                    // units can represent: rounding them to app units shifts hard stops by
++                    // whole pixels, and repeating gradients multiply that error per period.
++                    position: Some(if gradient_line_length == 0. {
+                         0.
+                     } else {
+-                        position
+-                            .to_used_value(gradient_line_length)
+-                            .scale_by(1. / gradient_line_length.to_f32_px())
+-                            .to_f32_px()
++                        position.resolve(Length::new(gradient_line_length)).px() /
++                            gradient_line_length
+                     }),
+                 }),
+                 // FIXME: approximate like in:
+-- 
+2.43.0
+

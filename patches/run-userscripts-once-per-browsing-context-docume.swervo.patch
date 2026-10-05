@@ -1,0 +1,89 @@
+From 6b292d860af2d713d123201d3c4f5b3d39ea65a2 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 05:35:35 -0400
+Subject: [PATCH] script: run userscripts once per browsing-context document
+
+HTMLHeadElement::bind_to_tree queued the window's userscripts for every head
+bound to any tree in any document belonging to the window. Documents from
+DOMParser, createHTMLDocument and XHR share the window, so each one re-ran
+every userscript (archive.org ran each 43 times per load), as did stray or
+disconnected heads.
+
+Only queue them when the head is connected, the document has a browsing
+context, and the document has not queued them already.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/document/document.rs    | 9 +++++++++
+ components/script/dom/html/htmlheadelement.rs | 4 +++-
+ components/script/dom/userscripts.rs          | 6 ++++++
+ 3 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index 534318f23c8..eb03aaf6125 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -591,6 +591,8 @@ pub(crate) struct Document {
+     delayed_tasks: DomRefCell<Vec<Box<dyn NonSendTaskBox>>>,
+     /// <https://html.spec.whatwg.org/multipage/#completely-loaded>
+     completely_loaded: Cell<bool>,
++    /// Whether the window's userscripts have been queued for this document.
++    userscripts_loaded: Cell<bool>,
+     /// Set of shadow roots connected to the document tree.
+     shadow_roots: DomRefCell<HashSet<Dom<ShadowRoot>>>,
+     /// Whether any of the shadow roots need the stylesheets flushed.
+@@ -4128,6 +4130,7 @@ impl Document {
+             navigation_timing: Default::default(),
+             resource_fetch_timing: RefCell::new(None),
+             completely_loaded: Cell::new(false),
++            userscripts_loaded: Cell::new(false),
+             script_and_layout_blockers: Cell::new(0),
+             delayed_tasks: Default::default(),
+             shadow_roots: DomRefCell::new(HashSet::new()),
+@@ -4274,6 +4277,12 @@ impl Document {
+         }
+     }
+ 
++    /// Record that userscripts have been queued for this document, returning whether they
++    /// already had been.
++    pub(crate) fn mark_userscripts_loaded(&self) -> bool {
++        self.userscripts_loaded.replace(true)
++    }
++
+     /// Enqueue a task to run as soon as any JS and layout blockers are removed.
+     pub(crate) fn add_delayed_task<T: 'static + NonSendTaskBox>(&self, task: T) {
+         self.delayed_tasks.borrow_mut().push(Box::new(task));
+diff --git a/components/script/dom/html/htmlheadelement.rs b/components/script/dom/html/htmlheadelement.rs
+index 4b29fbee8fb..d10f34abec0 100644
+--- a/components/script/dom/html/htmlheadelement.rs
++++ b/components/script/dom/html/htmlheadelement.rs
+@@ -58,6 +58,8 @@ impl VirtualMethods for HTMLHeadElement {
+         if let Some(s) = self.super_type() {
+             s.bind_to_tree(cx, context);
+         }
+-        load_script(self);
++        if context.tree_connected {
++            load_script(self);
++        }
+     }
+ }
+diff --git a/components/script/dom/userscripts.rs b/components/script/dom/userscripts.rs
+index 44eb726d15e..348df6666c6 100644
+--- a/components/script/dom/userscripts.rs
++++ b/components/script/dom/userscripts.rs
+@@ -11,6 +11,12 @@ use crate::realms::enter_auto_realm;
+ 
+ pub(crate) fn load_script(head: &HTMLHeadElement) {
+     let doc = head.owner_document();
++    // Documents without a browsing context (DOMParser, createHTMLDocument, XHR responses)
++    // share the window but are never rendered, and a page that adds more heads must not
++    // re-run the scripts: like extension content scripts, they run once per loaded document.
++    if !doc.has_browsing_context() || doc.mark_userscripts_loaded() {
++        return;
++    }
+     let userscripts = doc.window().userscripts().to_owned();
+     if userscripts.is_empty() {
+         return;
+-- 
+2.43.0
+

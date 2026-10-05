@@ -1,0 +1,210 @@
+From 81bd49b793451e15b098a1622b1b06c0c4453b29 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 16:26:30 -0400
+Subject: [PATCH] grid: stop growing tracks that already reached their limit
+
+distribute_space_up_to_limits() computed each iteration's increase from
+the distance between a track's base size and its limit without counting
+the increase already incurred in earlier iterations, and then applied that
+increase to every affected track, including ones frozen at their limit.
+With minmax(0, 756px) minmax(0, 316px) in a 936px wide grid, the second
+iteration handed the remaining 304px to both tracks, giving 620px/620px
+where the spec (and Chrome) freeze the second track at 316px and give the
+first 620px.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/compute/grid/track_sizing.rs              | 17 ++++++++++---
+ ...inmax_maximise_tracks_frozen_at_limit.html | 18 ++++++++++++++
+ ...tracks_frozen_at_limit__border_box_ltr.xml | 15 ++++++++++++
+ ...tracks_frozen_at_limit__border_box_rtl.xml | 15 ++++++++++++
+ ...racks_frozen_at_limit__content_box_ltr.xml | 15 ++++++++++++
+ ...racks_frozen_at_limit__content_box_rtl.xml | 15 ++++++++++++
+ tests/xml/mod.rs                              | 24 +++++++++++++++++++
+ 7 files changed, 116 insertions(+), 3 deletions(-)
+ create mode 100644 test_fixtures/grid/grid_minmax_maximise_tracks_frozen_at_limit.html
+ create mode 100644 tests/xml/grid/grid_minmax_maximise_tracks_frozen_at_limit__border_box_ltr.xml
+ create mode 100644 tests/xml/grid/grid_minmax_maximise_tracks_frozen_at_limit__border_box_rtl.xml
+ create mode 100644 tests/xml/grid/grid_minmax_maximise_tracks_frozen_at_limit__content_box_ltr.xml
+ create mode 100644 tests/xml/grid/grid_minmax_maximise_tracks_frozen_at_limit__content_box_rtl.xml
+
+diff --git a/src/compute/grid/track_sizing.rs b/src/compute/grid/track_sizing.rs
+index 10e3ea20..1cffc1c5 100644
+--- a/src/compute/grid/track_sizing.rs
++++ b/src/compute/grid/track_sizing.rs
+@@ -1399,15 +1399,26 @@ fn distribute_space_up_to_limits(
+             .iter()
+             .filter(|track| track_affected_property(track) + track.item_incurred_increase < track_limit(track))
+             .filter(|track| track_is_affected(track))
+-            .map(|track| (track_limit(track) - track_affected_property(track)) / track_distribution_proportion(track))
++            .map(|track| {
++                (track_limit(track) - track_affected_property(track) - track.item_incurred_increase)
++                    / track_distribution_proportion(track)
++            })
+             .min_by(|a, b| a.total_cmp(b))
+             .unwrap(); // We will never pass an empty track list to this function
+         let iteration_item_incurred_increase =
+             f32_min(min_increase_limit, space_to_distribute / track_distribution_proportion_sum);
+ 
+-        for track in tracks.iter_mut().filter(|track| track_is_affected(track)) {
++        // Tracks frozen at their limit in an earlier iteration must not grow any further
++        for track in tracks
++            .iter_mut()
++            .filter(|track| track_affected_property(track) + track.item_incurred_increase < track_limit(track))
++            .filter(|track| track_is_affected(track))
++        {
+             let increase = iteration_item_incurred_increase * track_distribution_proportion(track);
+-            if increase > 0.0 && track_affected_property(track) + increase <= track_limit(track) + THRESHOLD {
++            if increase > 0.0
++                && track_affected_property(track) + track.item_incurred_increase + increase
++                    <= track_limit(track) + THRESHOLD
++            {
+                 track.item_incurred_increase += increase;
+                 space_to_distribute -= increase;
+             }
+diff --git a/test_fixtures/grid/grid_minmax_maximise_tracks_frozen_at_limit.html b/test_fixtures/grid/grid_minmax_maximise_tracks_frozen_at_limit.html
+new file mode 100644
+index 00000000..796f3566
+--- /dev/null
++++ b/test_fixtures/grid/grid_minmax_maximise_tracks_frozen_at_limit.html
+@@ -0,0 +1,18 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <script src="../../scripts/gentest/test_helper.js"></script>
++  <link rel="stylesheet" type="text/css" href="../../scripts/gentest/test_base_style.css">
++  <title>
++    Test description
++  </title>
++</head>
++<body>
++
++<div id="test-root" style="width: 240px; display: grid; grid-template-columns: minmax(0px, 200px) minmax(0px, 80px); grid-template-rows: 40px;">
++  <div></div>
++  <div></div>
++</div>
++
++</body>
++</html>
+diff --git a/tests/xml/grid/grid_minmax_maximise_tracks_frozen_at_limit__border_box_ltr.xml b/tests/xml/grid/grid_minmax_maximise_tracks_frozen_at_limit__border_box_ltr.xml
+new file mode 100644
+index 00000000..df60aa9a
+--- /dev/null
++++ b/tests/xml/grid/grid_minmax_maximise_tracks_frozen_at_limit__border_box_ltr.xml
+@@ -0,0 +1,15 @@
++<test name="grid_minmax_maximise_tracks_frozen_at_limit__border_box_ltr" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="grid" direction="ltr" width="240px" grid-template-rows="40px" grid-template-columns="minmax(0px,200px) minmax(0px,80px)">
++      <div direction="ltr"/>
++      <div direction="ltr"/>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="240" height="40">
++      <node x="0" y="0" width="160" height="40"/>
++      <node x="160" y="0" width="80" height="40"/>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/grid/grid_minmax_maximise_tracks_frozen_at_limit__border_box_rtl.xml b/tests/xml/grid/grid_minmax_maximise_tracks_frozen_at_limit__border_box_rtl.xml
+new file mode 100644
+index 00000000..2bbdd6fe
+--- /dev/null
++++ b/tests/xml/grid/grid_minmax_maximise_tracks_frozen_at_limit__border_box_rtl.xml
+@@ -0,0 +1,15 @@
++<test name="grid_minmax_maximise_tracks_frozen_at_limit__border_box_rtl" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="grid" direction="rtl" width="240px" grid-template-rows="40px" grid-template-columns="minmax(0px,200px) minmax(0px,80px)">
++      <div direction="rtl"/>
++      <div direction="rtl"/>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="240" height="40">
++      <node x="80" y="0" width="160" height="40"/>
++      <node x="0" y="0" width="80" height="40"/>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/grid/grid_minmax_maximise_tracks_frozen_at_limit__content_box_ltr.xml b/tests/xml/grid/grid_minmax_maximise_tracks_frozen_at_limit__content_box_ltr.xml
+new file mode 100644
+index 00000000..88381c93
+--- /dev/null
++++ b/tests/xml/grid/grid_minmax_maximise_tracks_frozen_at_limit__content_box_ltr.xml
+@@ -0,0 +1,15 @@
++<test name="grid_minmax_maximise_tracks_frozen_at_limit__content_box_ltr" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="grid" box-sizing="content-box" direction="ltr" width="240px" grid-template-rows="40px" grid-template-columns="minmax(0px,200px) minmax(0px,80px)">
++      <div box-sizing="content-box" direction="ltr"/>
++      <div box-sizing="content-box" direction="ltr"/>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="240" height="40">
++      <node x="0" y="0" width="160" height="40"/>
++      <node x="160" y="0" width="80" height="40"/>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/grid/grid_minmax_maximise_tracks_frozen_at_limit__content_box_rtl.xml b/tests/xml/grid/grid_minmax_maximise_tracks_frozen_at_limit__content_box_rtl.xml
+new file mode 100644
+index 00000000..2f09f2e4
+--- /dev/null
++++ b/tests/xml/grid/grid_minmax_maximise_tracks_frozen_at_limit__content_box_rtl.xml
+@@ -0,0 +1,15 @@
++<test name="grid_minmax_maximise_tracks_frozen_at_limit__content_box_rtl" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="grid" box-sizing="content-box" direction="rtl" width="240px" grid-template-rows="40px" grid-template-columns="minmax(0px,200px) minmax(0px,80px)">
++      <div box-sizing="content-box" direction="rtl"/>
++      <div box-sizing="content-box" direction="rtl"/>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="240" height="40">
++      <node x="80" y="0" width="160" height="40"/>
++      <node x="0" y="0" width="80" height="40"/>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/mod.rs b/tests/xml/mod.rs
+index c2aa514f..f002f3e5 100644
+--- a/tests/xml/mod.rs
++++ b/tests/xml/mod.rs
+@@ -21009,6 +21009,30 @@ mod grid {
+         crate::run_xml_test("grid", "grid_minmax_max_content_percent_indefinite__content_box_rtl");
+     }
+ 
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_minmax_maximise_tracks_frozen_at_limit__border_box_ltr() {
++        crate::run_xml_test("grid", "grid_minmax_maximise_tracks_frozen_at_limit__border_box_ltr");
++    }
++
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_minmax_maximise_tracks_frozen_at_limit__content_box_ltr() {
++        crate::run_xml_test("grid", "grid_minmax_maximise_tracks_frozen_at_limit__content_box_ltr");
++    }
++
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_minmax_maximise_tracks_frozen_at_limit__border_box_rtl() {
++        crate::run_xml_test("grid", "grid_minmax_maximise_tracks_frozen_at_limit__border_box_rtl");
++    }
++
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_minmax_maximise_tracks_frozen_at_limit__content_box_rtl() {
++        crate::run_xml_test("grid", "grid_minmax_maximise_tracks_frozen_at_limit__content_box_rtl");
++    }
++
+     #[cfg(feature = "grid")]
+     #[test]
+     fn grid_minmax_min_content_1fr__border_box_ltr() {
+-- 
+2.43.0
+

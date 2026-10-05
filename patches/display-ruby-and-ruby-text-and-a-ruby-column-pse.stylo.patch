@@ -1,0 +1,186 @@
+From 2b666ed9b77e5899da1e86ae8d05da5037d8dfa6 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 04:24:51 -0400
+Subject: [PATCH] servo: display: ruby and ruby-text, and a ruby column
+ pseudo-element
+
+Servo dropped display: ruby and display: ruby-text as invalid, so the UA
+sheet's ruby rules did nothing and rt rendered inline. Servo now parses
+both, and its layout lays a ruby out as columns of a base with its
+annotation, styled by the new UA-only ::-servo-ruby-column precomputed
+pseudo-element.
+
+Servo does not generate anonymous ruby containers, so a ruby-text box
+whose parent is not a ruby becomes an inline box, which renders like the
+plain text Chrome shows for it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ style/servo/selector_parser.rs |  9 +++++++++
+ style/style_adjuster.rs        | 19 +++++++++++++++++++
+ style/values/specified/box.rs  | 10 ----------
+ 3 files changed, 28 insertions(+), 10 deletions(-)
+
+diff --git a/style/servo/selector_parser.rs b/style/servo/selector_parser.rs
+index eb501ad96..f4074e672 100644
+--- a/style/servo/selector_parser.rs
++++ b/style/servo/selector_parser.rs
+@@ -87,6 +87,7 @@ pub enum PseudoElement {
+     ServoAnonymousTable,
+     ServoAnonymousTableCell,
+     ServoAnonymousTableRow,
++    ServoRubyColumn,
+     ServoTableGrid,
+     ServoTableWrapper,
+ }
+@@ -128,6 +129,7 @@ impl ToCss for PseudoElement {
+             ServoAnonymousTable => "::-servo-anonymous-table",
+             ServoAnonymousTableCell => "::-servo-anonymous-table-cell",
+             ServoAnonymousTableRow => "::-servo-anonymous-table-row",
++            ServoRubyColumn => "::-servo-ruby-column",
+             ServoTableGrid => "::-servo-table-grid",
+             ServoTableWrapper => "::-servo-table-wrapper",
+         })
+@@ -295,6 +297,7 @@ impl PseudoElement {
+             | PseudoElement::ServoAnonymousTable
+             | PseudoElement::ServoAnonymousTableCell
+             | PseudoElement::ServoAnonymousTableRow
++            | PseudoElement::ServoRubyColumn
+             | PseudoElement::ServoTableGrid
+             | PseudoElement::ServoTableWrapper => PseudoElementCascadeType::Precomputed,
+         }
+@@ -788,6 +791,12 @@ impl<'a, 'i> ::selectors::Parser<'i> for SelectorParser<'a> {
+                 }
+                 ServoAnonymousTableCell
+             },
++            "-servo-ruby-column" => {
++                if !self.in_user_agent_stylesheet() {
++                    return Err(location.new_custom_error(SelectorParseErrorKind::UnexpectedIdent(name.clone())))
++                }
++                ServoRubyColumn
++            },
+             "-servo-table-grid" => {
+                 if !self.in_user_agent_stylesheet() {
+                     return Err(location.new_custom_error(SelectorParseErrorKind::UnexpectedIdent(name.clone())))
+diff --git a/style/style_adjuster.rs b/style/style_adjuster.rs
+index c6d2fb94d..c42b470e8 100644
+--- a/style/style_adjuster.rs
++++ b/style/style_adjuster.rs
+@@ -265,6 +265,23 @@ impl<'a, 'b: 'a> StyleAdjuster<'a, 'b> {
+             .set_adjusted_display(Display::Inline, false);
+     }
+ 
++    /// Servo lays a ruby annotation out only from within the ruby that contains it, and does
++    /// not wrap one outside of a ruby in the anonymous ruby that
++    /// <https://drafts.csswg.org/css-ruby/#anon-gen-anon-ruby> asks for. Such an annotation is
++    /// an inline box instead, which renders it as the plain text it looks like in Chrome.
++    #[cfg(feature = "servo")]
++    fn adjust_for_ruby_text_outside_ruby(&mut self, layout_parent_style: &ComputedValues) {
++        use crate::values::specified::box_::DisplayInside;
++        if self.style.get_box().clone_display() != Display::RubyText
++            || layout_parent_style.get_box().clone_display().inside() == DisplayInside::Ruby
++        {
++            return;
++        }
++        self.style
++            .mutate_box()
++            .set_adjusted_display(Display::Inline, false);
++    }
++
+     /// Apply the blockification rules based on the table in CSS 2.2 section 9.7.
+     /// <https://drafts.csswg.org/css2/visuren.html#dis-pos-flo>
+     /// A ::marker pseudo-element with 'list-style-position:outside' needs to
+@@ -1119,6 +1136,8 @@ impl<'a, 'b: 'a> StyleAdjuster<'a, 'b> {
+         self.adjust_for_br(element);
+         #[cfg(feature = "servo")]
+         self.adjust_for_webkit_box();
++        #[cfg(feature = "servo")]
++        self.adjust_for_ruby_text_outside_ruby(layout_parent_style);
+         self.blockify_if_necessary(layout_parent_style, element);
+         #[cfg(feature = "gecko")]
+         self.adjust_for_webkit_line_clamp();
+diff --git a/style/values/specified/box.rs b/style/values/specified/box.rs
+index c283e963b..6eb39df62 100644
+--- a/style/values/specified/box.rs
++++ b/style/values/specified/box.rs
+@@ -91,7 +91,6 @@ pub enum DisplayOutside {
+     Block,
+     TableCaption,
+     InternalTable,
+-    #[cfg(feature = "gecko")]
+     InternalRuby,
+ }
+ 
+@@ -113,13 +112,11 @@ pub enum DisplayInside {
+     TableFooterGroup,
+     TableRow,
+     TableCell,
+-    #[cfg(feature = "gecko")]
+     Ruby,
+     #[cfg(feature = "gecko")]
+     RubyBase,
+     #[cfg(feature = "gecko")]
+     RubyBaseContainer,
+-    #[cfg(feature = "gecko")]
+     RubyText,
+     #[cfg(feature = "gecko")]
+     RubyTextContainer,
+@@ -141,7 +138,6 @@ impl DisplayInside {
+     ///     — except for ruby, which defaults to inline.
+     fn default_display_outside(self) -> DisplayOutside {
+         match self {
+-            #[cfg(feature = "gecko")]
+             DisplayInside::Ruby => DisplayOutside::Inline,
+             _ => DisplayOutside::Block,
+         }
+@@ -209,7 +205,6 @@ impl Display {
+     pub const TableCaption: Self = Self(
+         ((DisplayOutside::TableCaption as u16) << Self::OUTSIDE_SHIFT) | DisplayInside::Flow as u16,
+     );
+-    #[cfg(feature = "gecko")]
+     pub const Ruby: Self =
+         Self(((DisplayOutside::Inline as u16) << Self::OUTSIDE_SHIFT) | DisplayInside::Ruby as u16);
+     pub const WebkitBox: Self = Self(
+@@ -261,7 +256,6 @@ impl Display {
+         ((DisplayOutside::InternalRuby as u16) << Self::OUTSIDE_SHIFT)
+             | DisplayInside::RubyBaseContainer as u16,
+     );
+-    #[cfg(feature = "gecko")]
+     pub const RubyText: Self = Self(
+         ((DisplayOutside::InternalRuby as u16) << Self::OUTSIDE_SHIFT)
+             | DisplayInside::RubyText as u16,
+@@ -463,7 +457,6 @@ impl DisplayKeyword {
+             "ruby-base" => Full(Display::RubyBase),
+             #[cfg(feature = "gecko")]
+             "ruby-base-container" => Full(Display::RubyBaseContainer),
+-            #[cfg(feature = "gecko")]
+             "ruby-text" => Full(Display::RubyText),
+             #[cfg(feature = "gecko")]
+             "ruby-text-container" => Full(Display::RubyTextContainer),
+@@ -484,7 +477,6 @@ impl DisplayKeyword {
+             "flow-root" => Inside(DisplayInside::FlowRoot),
+             "table" => Inside(DisplayInside::Table),
+             "grid" if grid_enabled() => Inside(DisplayInside::Grid),
+-            #[cfg(feature = "gecko")]
+             "ruby" => Inside(DisplayInside::Ruby),
+         })
+     }
+@@ -506,7 +498,6 @@ impl ToCss for Display {
+                 (DisplayOutside::Inline, DisplayInside::Grid) => dest.write_str("inline-grid"),
+                 (DisplayOutside::Inline, DisplayInside::Flex) => dest.write_str("inline-flex"),
+                 (DisplayOutside::Inline, DisplayInside::Table) => dest.write_str("inline-table"),
+-                #[cfg(feature = "gecko")]
+                 (DisplayOutside::Block, DisplayInside::Ruby) => dest.write_str("block ruby"),
+                 (_, inside) => {
+                     if self.is_list_item() {
+@@ -539,7 +530,6 @@ impl ToTyped for Display {
+         let outside = self.outside();
+         let inside = self.inside();
+ 
+-        #[cfg(feature = "gecko")]
+         if outside == DisplayOutside::Block && inside == DisplayInside::Ruby {
+             return Err(());
+         }
+-- 
+2.43.0
+

@@ -1,0 +1,325 @@
+From decfb7f5fdd18ac7d0f77dce70748f51158b847e Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 19:53:15 -0400
+Subject: [PATCH] layout: re-point boxes at the fragments of a reused layout
+ result
+
+A formatting context keeps two cached layout results, one from measuring
+it and one from its final layout, so that nested flex containers don't
+take time exponential in their depth. Laying the context out at another
+size in between replaced the fragments its descendant boxes keep for
+layout queries, so reusing the other result left them pointing at
+fragments that are not in the fragment tree: getBoundingClientRect() on a
+cell of a stretched table in a column flexbox returned an empty rectangle
+at the origin.
+
+Each fragment now refers back to the fragment list of the box it was made
+for. Reusing a cached result makes the fragments in it the fragments of
+their boxes again, unless the box already knows that its descendants hold
+the fragments of that result.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../layout/fragment_tree/base_fragment.rs     |   9 +-
+ components/layout/layout_box_base.rs          | 142 +++++++++++++++---
+ 2 files changed, 132 insertions(+), 19 deletions(-)
+
+diff --git a/components/layout/fragment_tree/base_fragment.rs b/components/layout/fragment_tree/base_fragment.rs
+index dfcb1c9b2a9..71cc9f44f1b 100644
+--- a/components/layout/fragment_tree/base_fragment.rs
++++ b/components/layout/fragment_tree/base_fragment.rs
+@@ -2,10 +2,11 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
++use std::sync::Weak;
+ use std::sync::atomic::{AtomicU8, Ordering};
+ 
+ use app_units::Au;
+-use atomic_refcell::AtomicRef;
++use atomic_refcell::{AtomicRef, AtomicRefCell};
+ use bitflags::bitflags;
+ use layout_api::{LayoutElement, LayoutNode, PseudoElementChain, combine_id_with_fragment_type};
+ use malloc_size_of::malloc_size_of_is_0;
+@@ -22,6 +23,7 @@ use web_atoms::local_name;
+ use crate::SharedStyle;
+ use crate::dom_traversal::NodeAndStyleInfo;
+ use crate::geom::{PhysicalPoint, PhysicalRect, PhysicalSize, SyncPhysicalRectAu};
++use crate::layout_box_base::BoxFragments;
+ 
+ #[derive(Clone, Debug, Default, FromPrimitive, MallocSizeOf, PartialEq)]
+ #[repr(u8)]
+@@ -63,6 +65,10 @@ pub(crate) struct BaseFragment {
+ 
+     /// A [`FragmentStatus`] used to track fragment reuse when collecting reflow statistics.
+     pub status: AtomicU8,
++
++    /// The fragments of the box that this fragment was made the fragment of, if any.
++    #[ignore_malloc_size_of = "Owned by the box"]
++    pub owner: AtomicRefCell<Option<Weak<BoxFragments>>>,
+ }
+ 
+ impl std::fmt::Debug for BaseFragment {
+@@ -91,6 +97,7 @@ impl BaseFragment {
+             style,
+             rect: SyncPhysicalRectAu::new(rect),
+             status: AtomicU8::new(FragmentStatus::New as u8),
++            owner: Default::default(),
+         }
+     }
+ 
+diff --git a/components/layout/layout_box_base.rs b/components/layout/layout_box_base.rs
+index 29924a99835..8a9ab9821ef 100644
+--- a/components/layout/layout_box_base.rs
++++ b/components/layout/layout_box_base.rs
+@@ -3,11 +3,12 @@
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+ use std::fmt::{Debug, Formatter};
+-use std::sync::Arc;
+-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++use std::sync::{Arc, Weak};
++use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+ 
+ use app_units::Au;
+ use atomic_refcell::{AtomicRef, AtomicRefCell};
++use rustc_hash::FxHashMap;
+ use euclid::Point2D;
+ use layout_api::LayoutDamage;
+ use malloc_size_of_derive::MallocSizeOf;
+@@ -72,10 +73,76 @@ pub(crate) struct LayoutBoxBase {
+     /// This is used as a heuristic to know when to perform parallel layout.
+     subtree_size: AtomicUsize,
+ 
+-    pub fragments: AtomicRefCell<Vec<Fragment>>,
++    #[conditional_malloc_size_of]
++    fragments: Arc<BoxFragments>,
+     pub parent_box: Option<WeakLayoutBox>,
+ }
+ 
++/// The fragments of a box. Each of them refers back to this, so that reusing a cached layout
++/// result can make the fragments in it the fragments of their boxes again: in the meantime the
++/// boxes may have been laid out at another size, and layout queries would otherwise look at
++/// fragments that are not in the fragment tree.
++#[derive(Default, MallocSizeOf)]
++pub(crate) struct BoxFragments {
++    fragments: AtomicRefCell<Vec<Fragment>>,
++    /// Which of the cached layout results of the box the fragments of its descendants belong to:
++    /// one of the `CONTENTS_FROM_*` values.
++    contents_from: AtomicU8,
++}
++
++const CONTENTS_FROM_UNKNOWN: u8 = 0;
++const CONTENTS_FROM_LAYOUT: u8 = 1;
++const CONTENTS_FROM_MEASURE: u8 = 2;
++
++/// Make `fragments` and their descendants the fragments of the boxes they were made for.
++fn make_fragments_current(fragments: &[Fragment]) {
++    type FragmentsByOwner = FxHashMap<*const BoxFragments, (Arc<BoxFragments>, Vec<Fragment>)>;
++    fn collect(fragment: &Fragment, by_owner: &mut FragmentsByOwner) {
++        if let Some(owner) = fragment
++            .base()
++            .and_then(|base| base.owner.borrow().as_ref().and_then(Weak::upgrade))
++        {
++            by_owner
++                .entry(Arc::as_ptr(&owner))
++                .or_insert_with(|| (owner.clone(), Vec::new()))
++                .1
++                .push(fragment.clone());
++        }
++        match fragment {
++            Fragment::LayoutRoot(layout_root_fragment) => {
++                collect(&layout_root_fragment.inner(), by_owner)
++            },
++            Fragment::Box(box_fragment) | Fragment::Float(box_fragment) => {
++                for child in &box_fragment.children {
++                    collect(child, by_owner);
++                }
++            },
++            Fragment::Positioning(positioning_fragment) => {
++                for child in &positioning_fragment.children {
++                    collect(child, by_owner);
++                }
++            },
++            Fragment::Text(_) |
++            Fragment::AbsoluteOrFixedPositionedPlaceholder(_) |
++            Fragment::Image(_) |
++            Fragment::IFrame(_) => {},
++        }
++    }
++
++    let mut by_owner = FxHashMap::default();
++    for fragment in fragments {
++        collect(fragment, &mut by_owner);
++    }
++    for (owner, fragments) in by_owner.into_values() {
++        *owner.fragments.borrow_mut() = fragments;
++        // The descendants of this box now hold the fragments of one of its earlier layouts,
++        // which might not be the one its cache slots remember as current.
++        owner
++            .contents_from
++            .store(CONTENTS_FROM_UNKNOWN, Ordering::Relaxed);
++    }
++}
++
+ impl LayoutBoxBase {
+     pub(crate) fn new(
+         base_fragment_info: BaseFragmentInfo,
+@@ -90,7 +157,7 @@ impl LayoutBoxBase {
+             cached_measure_result: AtomicRefCell::default(),
+             cached_layout_result_dirty: AtomicBool::default(),
+             subtree_size: AtomicUsize::default(),
+-            fragments: AtomicRefCell::default(),
++            fragments: Arc::default(),
+             parent_box: None,
+         }
+     }
+@@ -148,19 +215,38 @@ impl LayoutBoxBase {
+     }
+ 
+     pub(crate) fn fragments(&self) -> AtomicRef<'_, Vec<Fragment>> {
+-        self.fragments.borrow()
++        self.fragments.fragments.borrow()
++    }
++
++    fn claim_fragment(&self, fragment: &Fragment) {
++        if let Some(base) = fragment.base() {
++            *base.owner.borrow_mut() = Some(Arc::downgrade(&self.fragments));
++        }
+     }
+ 
+     pub(crate) fn add_fragment(&self, fragment: Fragment) {
+-        self.fragments.borrow_mut().push(fragment);
++        self.claim_fragment(&fragment);
++        self.fragments.fragments.borrow_mut().push(fragment);
+     }
+ 
+     pub(crate) fn set_fragment(&self, fragment: Fragment) {
+-        *self.fragments.borrow_mut() = vec![fragment];
++        self.claim_fragment(&fragment);
++        *self.fragments.fragments.borrow_mut() = vec![fragment];
+     }
+ 
+     pub(crate) fn clear_fragments(&self) {
+-        self.fragments.borrow_mut().clear();
++        self.fragments.fragments.borrow_mut().clear();
++    }
++
++    /// Record that the fragments of the descendants of this box belong to the cached layout
++    /// result in `contents_from`, making them so first if they don't.
++    fn use_contents_from(&self, contents_from: u8, fragments: &[Fragment]) {
++        if self.fragments.contents_from.load(Ordering::Relaxed) != contents_from {
++            make_fragments_current(fragments);
++            self.fragments
++                .contents_from
++                .store(contents_from, Ordering::Relaxed);
++        }
+     }
+ 
+     /// Clear all resulting fragments and dirty and fragment caches. Resulting fragments are
+@@ -173,7 +259,7 @@ impl LayoutBoxBase {
+ 
+     pub(crate) fn repair_style(&mut self, new_style: &ServoArc<ComputedValues>) {
+         self.style = new_style.clone();
+-        for fragment in self.fragments.borrow_mut().iter_mut() {
++        for fragment in self.fragments.fragments.borrow_mut().iter_mut() {
+             if let Some(base) = fragment.base() {
+                 base.repair_style(new_style);
+             }
+@@ -251,29 +337,38 @@ impl LayoutBoxBase {
+         let layout_cache = self.cached_layout_result.borrow();
+         let measure_cache = self.cached_measure_result.borrow();
+         let measure = measure_cache.as_deref().filter(|cache| applies(cache));
+-        let cache = match lazy_block_size {
++        let measure =
++            |filter: &dyn Fn(&IndependentFormattingContextLayoutResultAndInputs) -> bool| {
++                measure
++                    .filter(|cache| filter(cache))
++                    .map(|cache| (cache, CONTENTS_FROM_MEASURE))
++            };
++        let (cache, contents_from) = match lazy_block_size {
+             LazySizeKind::Fixed(block_size) => {
+                 let layout = match &*layout_cache {
+                     Some(LayoutResultAndInputs::IndependentFormattingContext(cache))
+                         if cache.lazy_block_size == lazy_block_size && applies(cache) =>
+                     {
+-                        Some(&**cache)
++                        Some((&**cache, CONTENTS_FROM_LAYOUT))
+                     },
+                     _ => None,
+                 };
+                 // Being told to use the block size that the contents asked for anyway gives
+                 // the same layout as measuring, which is what a flex container does with
+                 // its items while it is itself being measured.
+-                layout.or(measure.filter(|cache| {
+-                    cache.lazy_block_size == LazySizeKind::Intrinsic &&
+-                        cache.result.content_block_size == block_size
+-                }))
++                layout.or_else(|| {
++                    measure(&|cache| {
++                        cache.lazy_block_size == LazySizeKind::Intrinsic &&
++                            cache.result.content_block_size == block_size
++                    })
++                })
+             },
+             LazySizeKind::Intrinsic | LazySizeKind::Constrained => {
+-                measure.filter(|cache| cache.lazy_block_size == lazy_block_size)
++                measure(&|cache| cache.lazy_block_size == lazy_block_size)
+             },
+         }?;
+ 
++        self.use_contents_from(contents_from, &cache.result.fragments);
+         positioning_context.append(cache.positioning_context.clone());
+         Some(cache.result.clone())
+     }
+@@ -295,6 +390,13 @@ impl LayoutBoxBase {
+             lazy_block_size,
+         });
+         // Clearing the dirty flag revalidates both slots, so the one not written here must go.
++        let contents_from = match lazy_block_size {
++            LazySizeKind::Fixed(_) => CONTENTS_FROM_LAYOUT,
++            LazySizeKind::Intrinsic | LazySizeKind::Constrained => CONTENTS_FROM_MEASURE,
++        };
++        self.fragments
++            .contents_from
++            .store(contents_from, Ordering::Relaxed);
+         match lazy_block_size {
+             LazySizeKind::Fixed(_) => {
+                 if was_dirty {
+@@ -342,6 +444,7 @@ impl LayoutBoxBase {
+         }
+ 
+         let fragment = result.result.fragment.clone();
++        self.use_contents_from(CONTENTS_FROM_LAYOUT, &fragment.children);
+         {
+             let mut origin = result.result.original_offset;
+             if self.style.clone_position() == Position::Relative {
+@@ -377,6 +480,9 @@ impl LayoutBoxBase {
+         {
+             *self.cached_measure_result.borrow_mut() = None;
+         }
++        self.fragments
++            .contents_from
++            .store(CONTENTS_FROM_LAYOUT, Ordering::Relaxed);
+         *self.cached_layout_result.borrow_mut() =
+             Some(LayoutResultAndInputs::SameFormattingContextBlock(Box::new(
+                 SameFormattingContextBlockLayoutResultAndInputs {
+@@ -400,13 +506,13 @@ impl LayoutBoxBase {
+     }
+ 
+     pub(crate) fn clear_scrollable_overflow_all_on_fragments(&self) {
+-        for fragment in self.fragments.borrow().iter() {
++        for fragment in self.fragments().iter() {
+             fragment.clear_scrollable_overflow();
+         }
+     }
+ 
+     pub(crate) fn mark_fragments_as_descendants_changed(&self) {
+-        for fragment in self.fragments.borrow().iter() {
++        for fragment in self.fragments().iter() {
+             if let Some(base) = fragment.base() {
+                 base.set_status(FragmentStatus::OnlyDescendantsChanged);
+             }
+-- 
+2.43.0
+

@@ -1,0 +1,31 @@
+From a1b6e22d1a26787522012381118d0419f9221d19 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 06:13:46 -0400
+Subject: [PATCH] animations: cancel ::backdrop animations of removed nodes
+
+::backdrop now has transitions and animations like ::before and ::after,
+so cancelling a node's animations has to include them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/animations.rs | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/components/script/animations.rs b/components/script/animations.rs
+index 6be8205a773..8190c11b1a1 100644
+--- a/components/script/animations.rs
++++ b/components/script/animations.rs
+@@ -142,6 +142,10 @@ impl Animations {
+             opaque_node,
+             PseudoElement::After,
+         ));
++        cancel_animations_for(AnimationSetKey::new_for_pseudo(
++            opaque_node,
++            PseudoElement::Backdrop,
++        ));
+     }
+ 
+     /// This does three things:
+-- 
+2.43.0
+

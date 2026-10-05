@@ -1,0 +1,952 @@
+From 35c0b86b7cd7e78828d7248841ef1264c0a53d04 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 00:49:14 -0400
+Subject: [PATCH] range: getClientRects/getBoundingClientRect return the
+ selected text's glyph boxes
+
+Range.getClientRects() walked start.following_nodes() up to the end node, which
+skipped the start node, ran to the end of the document when start and end were
+the same node, and returned whole-node border boxes (text nodes have none, so
+the result was mostly unrelated elements). getBoundingClientRect() then folded
+those from a zero rect at the origin. Tooltips, popovers and Wikipedia
+reference previews anchored to ranges were placed far from their text.
+
+Follow CSSOM View instead: visit the nodes from the start node to the end
+boundary point, include the border boxes of contained elements whose parent is
+not contained, and for each selected or partially selected Text node include
+the boxes of just its selected characters, one per line box. The bounding rect
+skips empty rects and falls back to the first one.
+
+The text boxes come from a new layout query. Text fragments now record the
+index of their first character in the inline formatting context, and text runs
+record which characters each DOM text node produced (several adjacent nodes can
+share a run), along with the white space and capitalization state needed to
+replay the node's text transformation so DOM UTF-16 offsets can be mapped to
+rendered characters. The box block size is ascent plus descent, as in Chrome.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/construct_modern.rs       |   2 +-
+ components/layout/dom.rs                    |   9 +
+ components/layout/flow/inline/construct.rs  | 136 ++++++++-----
+ components/layout/flow/inline/line.rs       |  16 +-
+ components/layout/flow/inline/mod.rs        |   4 +
+ components/layout/flow/inline/text_run.rs   |  32 ++-
+ components/layout/fragment_tree/fragment.rs |  61 ++++++
+ components/layout/layout_impl.rs            |  27 ++-
+ components/layout/query.rs                  | 213 +++++++++++++++++++-
+ components/script/dom/range/range.rs        |  61 +++++-
+ components/script/dom/window/window.rs      |  11 +
+ components/shared/layout/lib.rs             |   6 +
+ 12 files changed, 509 insertions(+), 69 deletions(-)
+
+diff --git a/components/layout/construct_modern.rs b/components/layout/construct_modern.rs
+index 00eb99d7397..2742b53a811 100644
+--- a/components/layout/construct_modern.rs
++++ b/components/layout/construct_modern.rs
+@@ -81,7 +81,7 @@ impl<'dom> ModernContainerJob<'dom> {
+                     }
+                     last_style_from_display_contents = flex_text_run.style_from_display_contents;
+                     inline_formatting_context_builder
+-                        .push_text(flex_text_run.text, &flex_text_run.info);
++                        .push_text(flex_text_run.text, 0, &flex_text_run.info);
+                 }
+ 
+                 let inline_formatting_context = inline_formatting_context_builder
+diff --git a/components/layout/dom.rs b/components/layout/dom.rs
+index 0fe8ab71042..8e96e5bb923 100644
+--- a/components/layout/dom.rs
++++ b/components/layout/dom.rs
+@@ -360,6 +360,8 @@ pub(crate) trait NodeExt<'dom> {
+     fn rendering_type(&self) -> NodeRenderingType;
+ 
+     fn fragments_for_pseudo(&self, pseudo_element: Option<PseudoElement>) -> Vec<Fragment>;
++    /// The [`TextRun`] holding this text node's text, if it is rendered.
++    fn text_run(&self) -> Option<ArcRefCell<TextRun>>;
+     fn with_layout_box_base(&self, callback: impl FnMut(&LayoutBoxBase));
+     fn with_layout_box_base_including_pseudos(&self, callback: impl FnMut(&LayoutBoxBase));
+ 
+@@ -582,6 +584,13 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
+         }
+     }
+ 
++    fn text_run(&self) -> Option<ArcRefCell<TextRun>> {
++        match &*self.inner_layout_data()?.self_box.borrow() {
++            Some(LayoutBox::Text(text_run)) => Some(text_run.clone()),
++            _ => None,
++        }
++    }
++
+     fn repair_style(&self, context: &SharedStyleContext) {
+         if let Some(layout_data) = self.inner_layout_data() {
+             layout_data.repair_style(self, context);
+diff --git a/components/layout/flow/inline/construct.rs b/components/layout/flow/inline/construct.rs
+index 23cca0926af..242d8b417ab 100644
+--- a/components/layout/flow/inline/construct.rs
++++ b/components/layout/flow/inline/construct.rs
+@@ -13,12 +13,13 @@ use style::computed_values::_webkit_text_security::T as WebKitTextSecurity;
+ use style::computed_values::direction::T as Direction;
+ use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
+ use style::dom::NodeInfo;
++use style::properties::ComputedValues;
+ use style::selector_parser::PseudoElement;
+ use style::values::specified::text::TextTransformCase;
+ use unicode_bidi::Level;
+ use unicode_categories::UnicodeCategories;
+ 
+-use super::text_run::TextRun;
++use super::text_run::{TextRun, TextRunNodeSegment};
+ use super::{
+     InlineBox, InlineBoxIdentifier, InlineBoxes, InlineFormattingContext, InlineItem,
+     SharedInlineStyles,
+@@ -310,14 +311,14 @@ impl InlineFormattingContextBuilder {
+         layout_context: &LayoutContext,
+     ) -> bool {
+         if self.has_processed_first_letter || !container_info.pseudo_element_chain().is_empty() {
+-            self.push_text(text, info);
++            self.push_text(text, 0, info);
+             return false;
+         }
+ 
+         let Some(first_letter_info) =
+             container_info.with_pseudo_element(layout_context, PseudoElement::FirstLetter)
+         else {
+-            self.push_text(text, info);
++            self.push_text(text, 0, info);
+             return false;
+         };
+ 
+@@ -328,7 +329,7 @@ impl InlineFormattingContextBuilder {
+ 
+         // Push any leading white space first.
+         if first_letter_range.start != 0 {
+-            self.push_text(Cow::Borrowed(&text[0..first_letter_range.start]), info);
++            self.push_text(Cow::Borrowed(&text[0..first_letter_range.start]), 0, info);
+         }
+ 
+         // Push the first-letter text into an anonymous box with the `::first-letter` style.
+@@ -340,58 +341,41 @@ impl InlineFormattingContextBuilder {
+         box_slot.set(LayoutBox::InlineLevel(inline_item));
+ 
+         let first_letter_text = Cow::Borrowed(&text[first_letter_range.clone()]);
+-        self.push_text(first_letter_text, &first_letter_info);
++        self.push_text(
++            first_letter_text,
++            first_letter_range.start,
++            &first_letter_info,
++        );
+         self.end_inline_box();
+         self.has_processed_first_letter = true;
+ 
+         // Now push the non-first-letter text.
+-        self.push_text(Cow::Borrowed(&text[first_letter_range.end..]), info);
++        self.push_text(
++            Cow::Borrowed(&text[first_letter_range.end..]),
++            first_letter_range.end,
++            info,
++        );
+ 
+         true
+     }
+ 
+-    pub(crate) fn push_text<'dom>(&mut self, text: Cow<'dom, str>, info: &NodeAndStyleInfo<'dom>) {
+-        let white_space_collapse = info.style.clone_white_space_collapse();
+-        let collapsed = WhitespaceCollapse::new(
+-            text.chars(),
+-            white_space_collapse,
+-            self.last_inline_box_ended_with_collapsible_white_space,
++    /// Push the text of a node. `text_offset` is the byte offset of `text` within the text
++    /// of `info`'s node, which is non-zero when `::first-letter` took the start of it.
++    pub(crate) fn push_text<'dom>(
++        &mut self,
++        text: Cow<'dom, str>,
++        text_offset: usize,
++        info: &NodeAndStyleInfo<'dom>,
++    ) {
++        let trim_beginning_white_space = self.last_inline_box_ended_with_collapsible_white_space;
++        let starts_on_word_boundary = self.on_word_boundary;
++        let char_iterator = rendered_characters(
++            &text,
++            &info.style,
++            trim_beginning_white_space,
++            starts_on_word_boundary,
+         );
+ 
+-        // TODO: Not all text transforms are about case, this logic should stop ignoring
+-        // TextTransform::FULL_WIDTH and TextTransform::FULL_SIZE_KANA.
+-        let text_transform = info.style.clone_text_transform().case();
+-        let capitalized_text: String;
+-        let char_iterator: Box<dyn Iterator<Item = char>> = match text_transform {
+-            TextTransformCase::None => Box::new(collapsed),
+-            TextTransformCase::Capitalize => {
+-                // `TextTransformation` doesn't support capitalization, so we must capitalize the whole
+-                // string at once and make a copy. Here `on_word_boundary` indicates whether or not the
+-                // inline formatting context as a whole is on a word boundary. This is different from
+-                // `last_inline_box_ended_with_collapsible_white_space` because the word boundaries are
+-                // between atomic inlines and at the start of the IFC, and because preserved spaces
+-                // are a word boundary.
+-                let collapsed_string: String = collapsed.collect();
+-                capitalized_text = capitalize_string(&collapsed_string, self.on_word_boundary);
+-                Box::new(capitalized_text.chars())
+-            },
+-            _ => {
+-                // If `text-transform` is active, wrap the `WhitespaceCollapse` iterator in
+-                // a `TextTransformation` iterator.
+-                Box::new(TextTransformation::new(collapsed, text_transform))
+-            },
+-        };
+-
+-        let char_iterator = if info.style.clone__webkit_text_security() != WebKitTextSecurity::None
+-        {
+-            Box::new(TextSecurityTransform::new(
+-                char_iterator,
+-                info.style.clone__webkit_text_security(),
+-            ))
+-        } else {
+-            char_iterator
+-        };
+-
+         let bidi_class_map = icu_properties::maps::bidi_class();
+         let white_space_collapse = info.style.clone_white_space_collapse();
+         let mut character_count = 0;
+@@ -443,6 +427,13 @@ impl InlineFormattingContextBuilder {
+         self.text_segments.push(new_text);
+ 
+         let current_inline_styles = self.shared_inline_styles();
++        let node_segment = info.node.is_text_node().then(|| TextRunNodeSegment {
++            node: info.node.opaque(),
++            text_offset,
++            character_range: new_character_range.clone(),
++            trim_beginning_white_space,
++            starts_on_word_boundary,
++        });
+ 
+         if let Some(InlineItem::TextRun(text_run)) = self.inline_items.last() &&
+             text_run
+@@ -457,6 +448,7 @@ impl InlineFormattingContextBuilder {
+                 let mut text_run = text_run.borrow_mut();
+                 text_run.text_range.end = new_range.end;
+                 text_run.character_range.end = new_character_range.end;
++                text_run.node_segments.extend(node_segment);
+ 
+                 // If this text node does not have a `TextRun` in the box slot, this means that
+                 // it is either new or dirty, which means that the entire `TextRun` just extended
+@@ -477,6 +469,7 @@ impl InlineFormattingContextBuilder {
+             current_inline_styles,
+             new_range,
+             new_character_range,
++            node_segment,
+             box_slot
+                 .as_ref()
+                 .and_then(|box_slot| box_slot.take_layout_box_as_text_run()),
+@@ -524,6 +517,57 @@ fn preserve_segment_break() -> bool {
+     true
+ }
+ 
++/// The characters that layout shapes and renders for `text`, after white space collapsing,
++/// `text-transform` and `-webkit-text-security`. `trim_beginning_white_space` and
++/// `on_word_boundary` describe the inline formatting context just before `text`.
++pub(crate) fn rendered_characters<'text>(
++    text: &'text str,
++    style: &ComputedValues,
++    trim_beginning_white_space: bool,
++    on_word_boundary: bool,
++) -> Box<dyn Iterator<Item = char> + 'text> {
++    let collapsed = WhitespaceCollapse::new(
++        text.chars(),
++        style.clone_white_space_collapse(),
++        trim_beginning_white_space,
++    );
++
++    // TODO: Not all text transforms are about case, this logic should stop ignoring
++    // TextTransform::FULL_WIDTH and TextTransform::FULL_SIZE_KANA.
++    let text_transform = style.clone_text_transform().case();
++    let char_iterator: Box<dyn Iterator<Item = char> + 'text> = match text_transform {
++        TextTransformCase::None => Box::new(collapsed),
++        TextTransformCase::Capitalize => {
++            // `TextTransformation` doesn't support capitalization, so we must capitalize the whole
++            // string at once and make a copy. Here `on_word_boundary` indicates whether or not the
++            // inline formatting context as a whole is on a word boundary. This is different from
++            // `trim_beginning_white_space` because the word boundaries are between atomic inlines
++            // and at the start of the IFC, and because preserved spaces are a word boundary.
++            let collapsed_string: String = collapsed.collect();
++            Box::new(
++                capitalize_string(&collapsed_string, on_word_boundary)
++                    .chars()
++                    .collect::<Vec<_>>()
++                    .into_iter(),
++            )
++        },
++        _ => {
++            // If `text-transform` is active, wrap the `WhitespaceCollapse` iterator in
++            // a `TextTransformation` iterator.
++            Box::new(TextTransformation::new(collapsed, text_transform))
++        },
++    };
++
++    if style.clone__webkit_text_security() != WebKitTextSecurity::None {
++        Box::new(TextSecurityTransform::new(
++            char_iterator,
++            style.clone__webkit_text_security(),
++        ))
++    } else {
++        char_iterator
++    }
++}
++
+ pub struct WhitespaceCollapse<InputIterator> {
+     char_iterator: InputIterator,
+     white_space_collapse: WhiteSpaceCollapse,
+diff --git a/components/layout/flow/inline/line.rs b/components/layout/flow/inline/line.rs
+index 4a0822a1445..5bbeb04d2cb 100644
+--- a/components/layout/flow/inline/line.rs
++++ b/components/layout/flow/inline/line.rs
+@@ -616,6 +616,7 @@ impl LineItemLayout<'_, '_> {
+                 glyphs: text_item.text,
+                 justification_adjustment: self.justification_adjustment,
+                 offsets: text_item.offsets,
++                character_start: text_item.character_start,
+                 is_empty_for_text_cursor: text_item.is_empty_for_text_cursor,
+             })),
+             content_rect,
+@@ -871,6 +872,10 @@ pub(super) struct TextRunLineItem {
+     /// When necessary, this field store the [`TextRunOffsets`] for a particular
+     /// [`TextRunLineItem`]. This is currently only used inside of text inputs.
+     pub offsets: Option<Box<TextRunOffsets>>,
++    /// The index of the first character of `text` within the characters of the inline
++    /// formatting context, or `None` for generated glyphs (such as a `text-overflow`
++    /// ellipsis) that do not correspond to any text in the DOM.
++    pub character_start: Option<usize>,
+     /// Whether or not this [`TextFragment`] is an empty fragment added for the
+     /// benefit of placing a text cursor on an otherwise empty editable line.
+     pub is_empty_for_text_cursor: bool,
+@@ -925,11 +930,12 @@ impl TextRunLineItem {
+             .position(|glyph| !glyph.is_whitespace())
+             .unwrap_or(self.text.len());
+ 
+-        *whitespace_trimmed += self
+-            .text
+-            .drain(0..index_of_first_non_whitespace)
+-            .map(|glyph| glyph.total_advance())
+-            .sum();
++        for glyph in self.text.drain(0..index_of_first_non_whitespace) {
++            *whitespace_trimmed += glyph.total_advance();
++            if let Some(character_start) = self.character_start.as_mut() {
++                *character_start += glyph.character_count();
++            }
++        }
+ 
+         // Only keep going if we only encountered whitespace.
+         self.text.is_empty()
+diff --git a/components/layout/flow/inline/mod.rs b/components/layout/flow/inline/mod.rs
+index 3429d2bb204..0c7f5a529f3 100644
+--- a/components/layout/flow/inline/mod.rs
++++ b/components/layout/flow/inline/mod.rs
+@@ -1359,6 +1359,7 @@ impl InlineFormattingContextLayout<'_> {
+             inline_styles: self.ifc.shared_inline_styles.clone(),
+             text: vec![ellipsis.clone()],
+             offsets: None,
++            character_start: None,
+             is_empty_for_text_cursor: false,
+         };
+ 
+@@ -1744,6 +1745,7 @@ impl InlineFormattingContextLayout<'_> {
+         text_run: &TextRun,
+         info: &Arc<FontAndScriptInfo>,
+         offsets: Option<TextRunOffsets>,
++        character_start: usize,
+     ) {
+         let inline_advance = glyph_store.total_advance();
+         let flags = if glyph_store.is_whitespace() {
+@@ -1806,6 +1808,7 @@ impl InlineFormattingContextLayout<'_> {
+                 inline_styles: text_run.inline_styles.clone(),
+                 info: info.clone(),
+                 offsets: offsets.map(Box::new),
++                character_start: Some(character_start),
+                 is_empty_for_text_cursor: false,
+             },
+         ));
+@@ -1848,6 +1851,7 @@ impl InlineFormattingContextLayout<'_> {
+                 inline_styles: self.ifc.shared_inline_styles.clone(),
+                 info: Arc::new(FontAndScriptInfo::simple_for_font(font)),
+                 offsets: Some(Box::new(offsets)),
++                character_start: None,
+                 is_empty_for_text_cursor: true,
+             },
+         ));
+diff --git a/components/layout/flow/inline/text_run.rs b/components/layout/flow/inline/text_run.rs
+index 51597421282..9eee4605031 100644
+--- a/components/layout/flow/inline/text_run.rs
++++ b/components/layout/flow/inline/text_run.rs
+@@ -22,6 +22,7 @@ use style::computed_values::font_variant_position::T as FontVariantPosition;
+ use style::computed_values::text_rendering::T as TextRendering;
+ use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
+ use style::computed_values::word_break::T as WordBreak;
++use style::dom::OpaqueNode;
+ use style::properties::ComputedValues;
+ use style::str::char_is_whitespace;
+ use style::values::computed::{
+@@ -255,7 +256,13 @@ impl TextRunSegment {
+                 ifc.process_soft_wrap_opportunity();
+             }
+ 
+-            ifc.push_glyph_store_to_unbreakable_segment(run.clone(), text_run, &self.info, offsets);
++            ifc.push_glyph_store_to_unbreakable_segment(
++                run.clone(),
++                text_run,
++                &self.info,
++                offsets,
++                character_range_start,
++            );
+             character_range_start = new_character_range_end;
+         }
+     }
+@@ -443,6 +450,27 @@ pub(crate) struct TextRun {
+     /// by things such as font and script as well as separating out hard line breaks.
+     /// segments, and shaped.
+     pub items: Vec<TextRunItem>,
++
++    /// The DOM text nodes whose text this [`TextRun`] holds, in order. Adjacent text nodes
++    /// with the same inline styles share a single [`TextRun`].
++    pub node_segments: Vec<TextRunNodeSegment>,
++}
++
++/// The part of a [`TextRun`] produced from one DOM text node. This allows mapping offsets in
++/// the DOM text to glyphs, which is needed for the geometry of DOM ranges.
++#[derive(Debug, MallocSizeOf)]
++pub(crate) struct TextRunNodeSegment {
++    pub node: OpaqueNode,
++    /// The byte offset in the node's text where the text given to layout starts. This is
++    /// non-zero when `::first-letter` took the start of the text.
++    pub text_offset: usize,
++    /// The range of characters in [`super::InlineFormattingContext::text_content`] produced
++    /// from this node's text.
++    pub character_range: Range<usize>,
++    /// The white space collapsing and capitalization state of the inline formatting context
++    /// before this text, needed to reproduce its transformation into rendered characters.
++    pub trim_beginning_white_space: bool,
++    pub starts_on_word_boundary: bool,
+ }
+ 
+ impl TextRun {
+@@ -451,6 +479,7 @@ impl TextRun {
+         inline_styles: SharedInlineStyles,
+         text_range: Range<usize>,
+         character_range: Range<usize>,
++        node_segment: Option<TextRunNodeSegment>,
+         old_text_run: Option<ArcRefCell<TextRun>>,
+     ) -> Self {
+         // If there was a previous box tree layout of this text run, try to preserve the old shaped text.
+@@ -464,6 +493,7 @@ impl TextRun {
+             text_range,
+             character_range,
+             items,
++            node_segments: node_segment.into_iter().collect(),
+         }
+     }
+ 
+diff --git a/components/layout/fragment_tree/fragment.rs b/components/layout/fragment_tree/fragment.rs
+index 6ec798739b5..271905ba8cb 100644
+--- a/components/layout/fragment_tree/fragment.rs
++++ b/components/layout/fragment_tree/fragment.rs
+@@ -103,6 +103,10 @@ pub(crate) struct TextFragment {
+     /// When necessary, this field store the [`TextRunOffsets`] for a particular
+     /// [`TextRunLineItem`]. This is currently only used inside of text inputs.
+     pub offsets: Option<Box<TextRunOffsets>>,
++    /// The index of the first character of `glyphs` within the characters of the inline
++    /// formatting context, or `None` for generated glyphs that have no DOM text. Used to
++    /// find the geometry of DOM text ranges.
++    pub character_start: Option<usize>,
+     /// Whether or not this [`TextFragment`] is an empty fragment added for the
+     /// benefit of placing a text cursor on an otherwise empty editable line.
+     pub is_empty_for_text_cursor: bool,
+@@ -449,6 +453,63 @@ impl TextFragment {
+         Au::from_f64_px((dx.to_f64_px().powi(2) + dy.to_f64_px().powi(2)).sqrt())
+     }
+ 
++    /// The rectangle, relative to this fragment's containing fragment, of the glyphs for the
++    /// characters in `character_range` (characters of the inline formatting context). Returns
++    /// `None` when this fragment holds none of those characters. A collapsed range yields a
++    /// zero-width rectangle at its position. The block size is the font's ascent plus descent,
++    /// matching what other engines report for the boxes of text.
++    ///
++    /// TODO: Right-to-left text, whose glyphs are stored in visual order, is not handled.
++    pub(crate) fn rect_for_character_range(
++        &self,
++        character_range: &std::ops::Range<usize>,
++    ) -> Option<PhysicalRect<Au>> {
++        let fragment_start = self.character_start?;
++        let fragment_end = fragment_start +
++            self.glyphs
++                .iter()
++                .map(|slice| slice.character_count())
++                .sum::<usize>();
++        let intersects = if character_range.is_empty() {
++            (fragment_start..=fragment_end).contains(&character_range.start)
++        } else {
++            character_range.start < fragment_end && character_range.end > fragment_start
++        };
++        if !intersects {
++            return None;
++        }
++
++        let mut start_advance = None;
++        let mut end_advance = None;
++        let mut character_index = fragment_start;
++        let mut advance = Au::zero();
++        for glyph in self.glyphs.iter().flat_map(|slice| slice.glyphs()) {
++            if start_advance.is_none() && character_index >= character_range.start {
++                start_advance = Some(advance);
++            }
++            if character_index >= character_range.end {
++                end_advance = Some(advance);
++                break;
++            }
++            character_index += glyph.character_count();
++            advance += glyph.advance();
++            if glyph.char_is_word_separator() {
++                advance += self.justification_adjustment;
++            }
++        }
++        let start_advance = start_advance.unwrap_or(advance);
++        let end_advance = end_advance.unwrap_or(advance);
++
++        let rect = self.base.rect();
++        Some(PhysicalRect::new(
++            PhysicalPoint::new(rect.origin.x + start_advance, rect.origin.y),
++            Size2D::new(
++                end_advance - start_advance,
++                self.font_metrics.ascent + self.font_metrics.descent,
++            ),
++        ))
++    }
++
+     /// Given a point relative to this [`TextFragment`], find the most appropriate
+     /// character offset.
+     ///
+diff --git a/components/layout/layout_impl.rs b/components/layout/layout_impl.rs
+index 149d7a3e1ce..cecbe4312c3 100644
+--- a/components/layout/layout_impl.rs
++++ b/components/layout/layout_impl.rs
+@@ -6,6 +6,7 @@
+ 
+ use std::cell::{Cell, OnceCell, RefCell};
+ use std::collections::HashMap;
++use std::ops::Range;
+ use std::sync::atomic::Ordering;
+ use std::fmt::Debug;
+ use std::rc::Rc;
+@@ -96,7 +97,7 @@ use crate::query::{
+     process_current_css_zoom_query, process_effective_overflow_query,
+     process_node_scroll_area_request, process_offset_parent_query, process_padding_request,
+     process_resolved_font_style_query, process_resolved_style_request,
+-    process_scroll_container_query,
++    process_scroll_container_query, process_text_range_rects_request,
+ };
+ use crate::fragment_tree::Fragment;
+ use crate::traversal::{RecalcStyle, compute_damage_and_rebuild_box_tree};
+@@ -488,6 +489,30 @@ impl Layout for LayoutThread {
+         .unwrap_or_default()
+     }
+ 
++    /// Get the bounding boxes of the glyphs for a range of a text node's data, one per line box,
++    /// in the coordinate space of the Document. This is used to implement `Range.getClientRects()`.
++    ///
++    /// See <https://drafts.csswg.org/cssom-view/#dom-range-getclientrects>.
++    #[servo_tracing::instrument(skip_all)]
++    fn query_text_range_rects(
++        &self,
++        node: TrustedNodeAddress,
++        utf16_range: Range<usize>,
++    ) -> CSSPixelRectVec {
++        with_layout_state(|| {
++            let node = unsafe { ServoLayoutNode::new(&node) };
++            let stacking_context_tree = self.stacking_context_tree.borrow();
++            let stacking_context_tree = stacking_context_tree.as_ref()?;
++            Some(process_text_range_rects_request(
++                self,
++                stacking_context_tree,
++                node,
++                utf16_range,
++            ))
++        })
++        .unwrap_or_default()
++    }
++
+     #[servo_tracing::instrument(skip_all)]
+     fn query_client_rect(&self, node: TrustedNodeAddress) -> Rect<i32, CSSPixel> {
+         with_layout_state(|| {
+diff --git a/components/layout/query.rs b/components/layout/query.rs
+index cab5a4c3690..35bf0a305e8 100644
+--- a/components/layout/query.rs
++++ b/components/layout/query.rs
+@@ -4,12 +4,13 @@
+ 
+ //! Utilities for querying the layout, as needed by layout.
+ use std::cell::LazyCell;
++use std::ops::Range;
+ use std::rc::Rc;
+ use std::sync::Arc;
+ 
+ use app_units::Au;
+ use embedder_traits::UntrustedNodeAddress;
+-use euclid::{Point2D, Rect, Size2D};
++use euclid::{Point2D, Rect, Size2D, Vector2D};
+ use itertools::Itertools;
+ use layout_api::{
+     AxesOverflow, BoxAreaType, CSSPixelRectVec, DangerousStyleElementOf, LayoutElement,
+@@ -49,10 +50,14 @@ use style_traits::{CSSPixel, ParsingMode, ToCss};
+ 
+ use crate::cell::RefOrAtomicRef;
+ use crate::display_list::{StackingContextTree, au_rect_to_length_rect};
+-use crate::dom::NodeExt;
+-use crate::flow::inline::construct::{TextTransformation, WhitespaceCollapse, capitalize_string};
++use crate::dom::{NodeExt, WeakLayoutBox};
++use crate::flow::inline::construct::{
++    InlineFormattingContextBuilder, TextTransformation, WhitespaceCollapse, capitalize_string,
++    rendered_characters,
++};
++use crate::flow::inline::text_run::TextRunNodeSegment;
+ use crate::fragment_tree::{
+-    BoxFragment, Fragment, FragmentFlags, FragmentTree, SpecificLayoutInfo, TextFragment,
++    BoxFragment, Fragment, FragmentFlags, FragmentTree, SpecificLayoutInfo, Tag, TextFragment,
+ };
+ use crate::layout_impl::LayoutThread;
+ use crate::style_ext::ComputedValuesExt;
+@@ -150,6 +155,206 @@ pub(crate) fn process_box_areas_request(
+         .collect()
+ }
+ 
++/// Get the rectangles of the glyphs for the part of a text node's data in `utf16_range`, one per
++/// text fragment (so one per line box), in the same coordinate space as
++/// [`process_box_areas_request`]. This is used to implement `Range.getClientRects()`.
++///
++/// See <https://drafts.csswg.org/cssom-view/#dom-range-getclientrects>.
++pub(crate) fn process_text_range_rects_request(
++    layout_thread: &LayoutThread,
++    stacking_context_tree: &StackingContextTree,
++    node: ServoLayoutNode<'_>,
++    utf16_range: Range<usize>,
++) -> CSSPixelRectVec {
++    let Some(text_run) = node.text_run() else {
++        return Vec::new();
++    };
++    let text_run = text_run.borrow();
++    let opaque_node = node.opaque();
++    let Some(segment) = text_run
++        .node_segments
++        .iter()
++        .find(|segment| segment.node == opaque_node)
++    else {
++        return Vec::new();
++    };
++    let Some(parent_box) = text_run.parent_box.as_ref().and_then(WeakLayoutBox::upgrade) else {
++        return Vec::new();
++    };
++    let Some(parent_fragments) = parent_box.with_base(|base| base.fragments().clone()) else {
++        return Vec::new();
++    };
++
++    let character_range = character_range_for_utf16_range(
++        &node.text_content(),
++        segment,
++        &text_run.inline_styles.style.borrow(),
++        utf16_range,
++    );
++
++    let mut rects = Vec::new();
++    for fragment in &parent_fragments {
++        let Some(content_rect) =
++            fragment.cumulative_box_area_rect(BoxAreaType::Content, layout_thread.into())
++        else {
++            continue;
++        };
++        collect_text_range_rects(
++            fragment,
++            content_rect.origin.to_vector(),
++            text_run.base_fragment_info.tag,
++            &character_range,
++            &mut rects,
++        );
++    }
++
++    // A collapsed range sits at the end of one line and the start of the next when it is at a
++    // soft wrap opportunity; it only has one position.
++    if character_range.is_empty() {
++        rects.truncate(1);
++    }
++
++    let transform = parent_fragments
++        .first()
++        .and_then(Fragment::retrieve_box_fragment)
++        .and_then(|box_fragment| box_fragment.spatial_tree_node())
++        .map(|scroll_tree_node_id| {
++            stacking_context_tree
++                .paint_info
++                .scroll_tree
++                .cumulative_node_to_root_transform(scroll_tree_node_id)
++        });
++    let Some(transform) = transform else {
++        return rects
++            .into_iter()
++            .map(|rect| Rect::new(rect.origin, Size2D::zero()))
++            .collect();
++    };
++    rects
++        .into_iter()
++        .filter_map(|rect| transform_au_rectangle(rect, transform))
++        .collect()
++}
++
++/// Collect the rectangles for `character_range` of the text fragments with `tag` that are
++/// children of `fragment`, looking through anonymous fragments such as line boxes.
++/// `children_offset` is the origin of the coordinate space of `fragment`'s children.
++fn collect_text_range_rects(
++    fragment: &Fragment,
++    children_offset: Vector2D<Au, CSSPixel>,
++    tag: Option<Tag>,
++    character_range: &Range<usize>,
++    rects: &mut CSSPixelRectVec,
++) {
++    let Some(children) = fragment.children() else {
++        return;
++    };
++    for child in children.iter() {
++        match child {
++            Fragment::Text(text_fragment) if text_fragment.base.tag == tag => {
++                let Some(rect) = text_fragment
++                    .rect_for_character_range(character_range)
++                    .map(|rect| rect.translate(children_offset))
++                else {
++                    continue;
++                };
++                // Line layout may split the text of a line into several fragments (for instance
++                // at every soft wrap opportunity), but the result should have one box per run of
++                // text in a line box, like other engines.
++                match rects.last_mut() {
++                    Some(last)
++                        if last.origin.y == rect.origin.y &&
++                            last.size.height == rect.size.height &&
++                            last.max_x() == rect.min_x() =>
++                    {
++                        last.size.width += rect.size.width;
++                    },
++                    _ => rects.push(rect),
++                }
++            },
++            Fragment::Box(..) | Fragment::Positioning(..) if child.tag().is_none() => {
++                let child_origin = child.base().expect("Has a base").rect().origin;
++                collect_text_range_rects(
++                    child,
++                    children_offset + child_origin.to_vector(),
++                    tag,
++                    character_range,
++                    rects,
++                );
++            },
++            _ => {},
++        }
++    }
++}
++
++/// Map a range of UTF-16 offsets in a text node's data to the characters of the inline
++/// formatting context rendered from them. White space collapsing removes characters and
++/// `text-transform` may expand them, so this replays that transformation on the node's text
++/// and aligns its output with the source characters.
++fn character_range_for_utf16_range(
++    text: &str,
++    segment: &TextRunNodeSegment,
++    style: &ComputedValues,
++    utf16_range: Range<usize>,
++) -> Range<usize> {
++    let source = &text[segment.text_offset..];
++    let rendered: Vec<char> = rendered_characters(
++        source,
++        style,
++        segment.trim_beginning_white_space,
++        segment.starts_on_word_boundary,
++    )
++    .collect();
++
++    // How many rendered characters, at the start of `rest`, came from `character`.
++    let rendered_count = |character: char, rest: &[char]| -> usize {
++        let Some(&next) = rest.first() else {
++            return 0;
++        };
++        if next == character {
++            return 1;
++        }
++        if InlineFormattingContextBuilder::is_document_white_space(character) {
++            // Collapsible white space is either rendered as a single space or removed.
++            return usize::from(next == ' ');
++        }
++        let starts_with = |expansion: &mut dyn Iterator<Item = char>| {
++            let mut count = 0;
++            for expected in expansion {
++                if rest.get(count) != Some(&expected) {
++                    return None;
++                }
++                count += 1;
++            }
++            Some(count)
++        };
++        starts_with(&mut character.to_uppercase())
++            .or_else(|| starts_with(&mut character.to_lowercase()))
++            .unwrap_or(1)
++    };
++
++    let mut utf16_offset = text[..segment.text_offset].encode_utf16().count();
++    let mut rendered_index = 0;
++    let mut start = None;
++    let mut end = None;
++    for character in source.chars() {
++        if start.is_none() && utf16_offset >= utf16_range.start {
++            start = Some(rendered_index);
++        }
++        if utf16_offset >= utf16_range.end {
++            end = Some(rendered_index);
++            break;
++        }
++        utf16_offset += character.len_utf16();
++        rendered_index += rendered_count(character, &rendered[rendered_index..]);
++    }
++    let start = start.unwrap_or(rendered_index);
++    let end = end.unwrap_or(rendered_index);
++
++    let base = segment.character_range.start;
++    (base + start).min(segment.character_range.end)..(base + end).min(segment.character_range.end)
++}
++
+ pub fn process_client_rect_request(node: ServoLayoutNode<'_>) -> Rect<i32, CSSPixel> {
+     node.fragments_for_pseudo(None)
+         .first()
+diff --git a/components/script/dom/range/range.rs b/components/script/dom/range/range.rs
+index 28fafda6858..4dbb8157065 100644
+--- a/components/script/dom/range/range.rs
++++ b/components/script/dom/range/range.rs
+@@ -343,18 +343,50 @@ impl Range {
+         self.abstract_range().Collapsed()
+     }
+ 
+-    fn client_rects(&self) -> impl Iterator<Item = Rect<Au, CSSPixel>> {
+-        // FIXME: For text nodes that are only partially selected, this should return the client
+-        // rect of the selected part, not the whole text node.
++    /// <https://drafts.csswg.org/cssom-view/#dom-range-getclientrects>
++    fn client_rects(&self) -> Vec<Rect<Au, CSSPixel>> {
+         let start = self.start_container();
+         let end = self.end_container();
+-        let document = start.owner_doc();
+-        let end_clone = end.clone();
+-        start
+-            .following_nodes(document.upcast::<Node>(), ShadowIncluding::No)
+-            .take_while(move |node| node != &end)
+-            .chain(iter::once(end_clone))
+-            .flat_map(move |node| node.border_boxes())
++        let start_offset = self.start_offset();
++        let end_offset = self.end_offset();
++        let window = start.owner_window();
++        let ancestor = self.CommonAncestorContainer();
++
++        // Nodes preceding the start node in tree order are neither contained nor partially
++        // contained, and neither is any node from the first one after the end boundary point.
++        let mut rects = Vec::new();
++        for node in iter::once(start.clone())
++            .chain(start.following_nodes(&ancestor, ShadowIncluding::No))
++        {
++            if node != end && bp_position(&node, 0, &end, end_offset) != Some(Ordering::Less) {
++                break;
++            }
++
++            if node.is::<Text>() {
++                // > For each Text node selected or partially selected by the range (including
++                // > when the boundary-points are identical), include scaled DOMRect object (for
++                // > the part that is selected, not the whole line box).
++                if node != start && node != end && !self.contains(&node) {
++                    continue;
++                }
++                let text_start = if node == start { start_offset } else { 0 };
++                let text_end = if node == end { end_offset } else { node.len() };
++                rects.extend(
++                    window.text_range_rects_query(&node, text_start as usize..text_end as usize),
++                );
++            } else if node.is::<Element>() &&
++                self.contains(&node) &&
++                !node
++                    .GetParentNode()
++                    .is_some_and(|parent| self.contains(&parent))
++            {
++                // > For each element selected by the range, whose parent is not selected by the
++                // > range, include the border areas returned by invoking getClientRects() on the
++                // > element.
++                rects.extend(node.border_boxes());
++            }
++        }
++        rects
+     }
+ 
+     /// <https://dom.spec.whatwg.org/#concept-range-bp-set>
+@@ -1230,6 +1262,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
+ 
+         let client_rects = self
+             .client_rects()
++            .into_iter()
+             .map(|rect| {
+                 DOMRect::new(
+                     cx,
+@@ -1256,7 +1289,13 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
+         // Step 3. If all rectangles in list have zero width or height, return the first rectangle in list.
+         // Step 4. Otherwise, return a DOMRect object describing the smallest rectangle that includes all
+         // of the rectangles in list of which the height or width is not zero.
+-        let bounding_rect = list.fold(euclid::Rect::zero(), |acc, rect| acc.union(&rect));
++        let bounding_rect = list
++            .iter()
++            .filter(|rect| !rect.is_empty())
++            .copied()
++            .reduce(|acc, rect| acc.union(&rect))
++            .or_else(|| list.first().copied())
++            .unwrap_or_else(Rect::zero);
+ 
+         DOMRect::new(
+             cx,
+diff --git a/components/script/dom/window/window.rs b/components/script/dom/window/window.rs
+index ea26a188ae1..3d9ae2afa8e 100644
+--- a/components/script/dom/window/window.rs
++++ b/components/script/dom/window/window.rs
+@@ -2955,6 +2955,17 @@ impl Window {
+             .query_box_areas(node.to_trusted_node_address(), area)
+     }
+ 
++    pub(crate) fn text_range_rects_query(
++        &self,
++        node: &Node,
++        utf16_range: std::ops::Range<usize>,
++    ) -> CSSPixelRectVec {
++        self.layout_reflow(QueryMsg::BoxAreas);
++        self.layout
++            .borrow()
++            .query_text_range_rects(node.to_trusted_node_address(), utf16_range)
++    }
++
+     pub(crate) fn client_rect_query(&self, node: &Node) -> Rect<i32, CSSPixel> {
+         self.layout_reflow(QueryMsg::ClientRectQuery);
+         self.layout
+diff --git a/components/shared/layout/lib.rs b/components/shared/layout/lib.rs
+index ca68ac25878..715fefef4bb 100644
+--- a/components/shared/layout/lib.rs
++++ b/components/shared/layout/lib.rs
+@@ -429,6 +429,12 @@ pub trait Layout {
+         exclude_transform_and_inline: bool,
+     ) -> Option<Rect<Au, CSSPixel>>;
+     fn query_box_areas(&self, node: TrustedNodeAddress, area: BoxAreaType) -> CSSPixelRectVec;
++    /// Query the boxes of the glyphs for the given range, in UTF-16 code units, of a text node.
++    fn query_text_range_rects(
++        &self,
++        node: TrustedNodeAddress,
++        utf16_range: Range<usize>,
++    ) -> CSSPixelRectVec;
+     fn query_client_rect(&self, node: TrustedNodeAddress) -> Rect<i32, CSSPixel>;
+     fn query_current_css_zoom(&self, node: TrustedNodeAddress) -> f32;
+     fn query_element_inner_outer_text(&self, node: TrustedNodeAddress) -> String;
+-- 
+2.43.0
+

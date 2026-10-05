@@ -1,0 +1,61 @@
+From 33b35708a97368f52d221f68e2c1571e0996fdbf Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 19:07:35 -0400
+Subject: [PATCH] layout: drop the other layout cache slot whenever a
+ formatting context is laid out
+
+Each new layout replaces the fragments the boxes inside keep for layout
+queries, so the slot not written could be reused while those boxes point
+at fragments no longer in the tree: getBoundingClientRect() on a cell of
+a stretched table in a column flexbox returned 0x0 at the origin. A
+measure followed by a layout at the same size still hits the cache.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/layout_box_base.rs | 18 ++++++++----------
+ 1 file changed, 8 insertions(+), 10 deletions(-)
+
+diff --git a/components/layout/layout_box_base.rs b/components/layout/layout_box_base.rs
+index 29924a99835..fd2c05f066c 100644
+--- a/components/layout/layout_box_base.rs
++++ b/components/layout/layout_box_base.rs
+@@ -285,28 +285,26 @@ impl LayoutBoxBase {
+         child_positioning_context: &PositioningContext,
+         result: &IndependentFormattingContextLayoutResult,
+     ) {
+-        let was_dirty = self
+-            .cached_layout_result_dirty
+-            .swap(false, Ordering::Relaxed);
++        self.cached_layout_result_dirty
++            .store(false, Ordering::Relaxed);
+         let entry = Box::new(IndependentFormattingContextLayoutResultAndInputs {
+             result: result.clone(),
+             positioning_context: child_positioning_context.clone(),
+             containing_block_for_children_size: containing_block_for_children.size.clone(),
+             lazy_block_size,
+         });
+-        // Clearing the dirty flag revalidates both slots, so the one not written here must go.
++        // This layout replaced the fragments that the boxes of the contents keep for layout
++        // queries, so the slot not written here no longer matches them and must go. Otherwise
++        // a table cell laid out at one size and then reused from a result at another size
++        // would answer `getBoundingClientRect()` with a fragment that isn't in the tree.
+         match lazy_block_size {
+             LazySizeKind::Fixed(_) => {
+-                if was_dirty {
+-                    *self.cached_measure_result.borrow_mut() = None;
+-                }
++                *self.cached_measure_result.borrow_mut() = None;
+                 *self.cached_layout_result.borrow_mut() =
+                     Some(LayoutResultAndInputs::IndependentFormattingContext(entry));
+             },
+             LazySizeKind::Intrinsic | LazySizeKind::Constrained => {
+-                if was_dirty {
+-                    *self.cached_layout_result.borrow_mut() = None;
+-                }
++                *self.cached_layout_result.borrow_mut() = None;
+                 *self.cached_measure_result.borrow_mut() = Some(entry);
+             },
+         }
+-- 
+2.43.0
+

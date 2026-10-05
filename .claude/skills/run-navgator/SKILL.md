@@ -143,7 +143,8 @@ inline SVG: inherited `currentColor`, stylesheet fills, `var()` in presentation 
 `color-mix()`, rules on nested/Lottie shapes), `svg_paint_restyle` (paint changed after first
 paint must re-serialize), `svg_fo_in_group` (native foreignObject inside `<g>`), `list_numbers`
 (list ordinals and CSS counters), `aspect_ratio` (non-replaced boxes), `has_selector` (`:has()`
-including dynamic invalidation), `line_clamp` (`-webkit-box` + `-webkit-line-clamp`) and
+including dynamic invalidation), `line_clamp` (`-webkit-box` + `-webkit-line-clamp`), `grid_abspos_img` (an image loading late inside
+an absolutely positioned grid child) and
 `forms_accent` (checkbox/radio accent colour, LYK-1253). Each case must pass SSIM **and** a pixel-difference cap
 (`REG_DIFF_MAX`, default 0.5% of pixels differing by >48): SSIM alone passed a test page missing
 its whole subject at 0.99. **Add a case** by dropping `regression/<name>.test.html` +

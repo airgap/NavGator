@@ -1,0 +1,48 @@
+From 34122d1d71bd7f02de7622693fd8b7b2dc96ae22 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 03:13:20 -0400
+Subject: [PATCH] fonts: report average and max char widths to style
+
+Chrome sizes text fields from the font's average character width and its bounding box width
+(Skia's max char width). FreeType's max_advance now reports the bounding box width, as the
+macOS backend already did, and the layout font metrics provider passes both widths to stylo.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/fonts/platform/freetype/font.rs | 6 +++++-
+ components/layout/layout_impl.rs           | 2 ++
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/components/fonts/platform/freetype/font.rs b/components/fonts/platform/freetype/font.rs
+index 2098d5920e1..80c76749187 100644
+--- a/components/fonts/platform/freetype/font.rs
++++ b/components/fonts/platform/freetype/font.rs
+@@ -331,7 +331,11 @@ impl PlatformFontMethods for PlatformFont {
+             // This converts the value to a float without losing precision.
+             y_scale = freetype_metrics.y_scale as f64 / 65535.0 / 64.0;
+ 
+-            max_advance = (face.as_ref().max_advance_width as f64) * y_scale;
++            // The bounding box width, which is what Skia reports as the max char width (and what
++            // macOS's CTFont gives here). Chrome sizes text fields by it; hhea's advanceWidthMax
++            // differs (17.8px against 24.6px for 13.33px Liberation Sans).
++            let bbox = face.as_ref().bbox;
++            max_advance = ((bbox.xMax - bbox.xMin) as f64) * y_scale;
+             max_ascent = (face.as_ref().ascender as f64) * y_scale;
+             max_descent = -(face.as_ref().descender as f64) * y_scale;
+             line_height = (face.as_ref().height as f64) * y_scale;
+diff --git a/components/layout/layout_impl.rs b/components/layout/layout_impl.rs
+index 63fedcf45df..fff8b649067 100644
+--- a/components/layout/layout_impl.rs
++++ b/components/layout/layout_impl.rs
+@@ -2007,6 +2007,8 @@ impl FontMetricsProvider for LayoutFontMetricsProvider {
+             cap_height: None,
+             ic_width,
+             ascent: first_font_metrics.ascent.into(),
++            average_char_width: Some(first_font_metrics.average_advance.into()),
++            max_char_width: Some(first_font_metrics.max_advance.into()),
+             script_percent_scale_down: None,
+             script_script_percent_scale_down: None,
+         }
+-- 
+2.43.0
+

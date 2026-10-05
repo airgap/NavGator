@@ -1,0 +1,234 @@
+From 9c782d0e33f0da236ca4d16e82db93d5db54a6ce Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 04:41:48 -0400
+Subject: [PATCH] layout: quote depth for open-quote and close-quote
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Every quote used the outermost pair, so nested <q> showed “outer “inner”” instead of
+“outer ‘inner’”, 「外側「内側」」 instead of 「外側『内側』」 in Japanese, and custom `quotes` lists
+never reached their second pair. The depth at a pseudo-element is now computed by walking the
+document in tree order through the rendered ::before/::after content up to it, as the counter
+implementation does; levels past the end of the list reuse its last pair, and a close-quote at
+depth zero renders nothing, per css-content.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/dom_traversal.rs |  50 ++++++++++----
+ components/layout/lists.rs         | 101 ++++++++++++++++++++++++++++-
+ 2 files changed, 138 insertions(+), 13 deletions(-)
+
+diff --git a/components/layout/dom_traversal.rs b/components/layout/dom_traversal.rs
+index ef717986e60..810c56b3f95 100644
+--- a/components/layout/dom_traversal.rs
++++ b/components/layout/dom_traversal.rs
+@@ -21,7 +21,10 @@ use web_atoms::LocalName;
+ use crate::context::LayoutContext;
+ use crate::dom::{BoxSlot, LayoutBox, NodeExt};
+ use crate::flow::inline::SharedInlineStyles;
+-use crate::lists::{counter_values, generate_counter_representation, list_item_ordinal};
++use crate::lists::{
++    apply_quote_item, counter_values, generate_counter_representation, list_item_ordinal,
++    quote_depth,
++};
+ use crate::quotes::quotes_for_lang;
+ use crate::replaced::ReplacedContents;
+ use crate::style_ext::{
+@@ -470,6 +473,16 @@ where
+     }
+ }
+ 
++fn is_quote_item<I>(item: &ContentItem<I>) -> bool {
++    matches!(
++        item,
++        ContentItem::OpenQuote |
++            ContentItem::CloseQuote |
++            ContentItem::NoOpenQuote |
++            ContentItem::NoCloseQuote
++    )
++}
++
+ /// <https://www.w3.org/TR/CSS2/generate.html#propdef-content>
+ pub(crate) fn generate_pseudo_element_content(
+     pseudo_element_info: &NodeAndStyleInfo,
+@@ -478,6 +491,12 @@ pub(crate) fn generate_pseudo_element_content(
+     match &pseudo_element_info.style.get_counters().content {
+         Content::Items(items) => {
+             let mut vec = vec![];
++            let mut current_quote_depth = items
++                .items
++                .iter()
++                .any(is_quote_item)
++                .then(|| quote_depth(context, pseudo_element_info.node))
++                .unwrap_or_default();
+             for item in items.items.iter() {
+                 match item {
+                     ContentItem::String(s) => {
+@@ -524,21 +543,29 @@ pub(crate) fn generate_pseudo_element_content(
+                             vec.push(PseudoElementContentItem::Replaced(replaced_content));
+                         }
+                     },
+-                    ContentItem::OpenQuote | ContentItem::CloseQuote => {
+-                        // TODO(xiaochengh): calculate quote depth
++                    ContentItem::OpenQuote |
++                    ContentItem::CloseQuote |
++                    ContentItem::NoOpenQuote |
++                    ContentItem::NoCloseQuote => {
++                        let Some(depth) = apply_quote_item(item, &mut current_quote_depth) else {
++                            continue;
++                        };
++                        // Levels deeper than the list of pairs reuse its last pair.
+                         let maybe_quote = match &pseudo_element_info.style.get_list().quotes {
+                             Quotes::QuoteList(quote_list) => {
+-                                quote_list.0.first().map(|quote_pair| {
+-                                    get_quote_from_pair(
+-                                        item,
+-                                        &*quote_pair.opening,
+-                                        &*quote_pair.closing,
+-                                    )
+-                                })
++                                quote_list.0.get(depth).or(quote_list.0.last()).map(
++                                    |quote_pair| {
++                                        get_quote_from_pair(
++                                            item,
++                                            &*quote_pair.opening,
++                                            &*quote_pair.closing,
++                                        )
++                                    },
++                                )
+                             },
+                             Quotes::Auto => {
+                                 let lang = &pseudo_element_info.style.get_font()._x_lang;
+-                                let quotes = quotes_for_lang(lang.0.as_ref(), 0);
++                                let quotes = quotes_for_lang(lang.0.as_ref(), depth);
+                                 Some(get_quote_from_pair(item, &quotes.opening, &quotes.closing))
+                             },
+                         };
+@@ -573,7 +600,6 @@ pub(crate) fn generate_pseudo_element_content(
+                             .join(separator);
+                         vec.push(PseudoElementContentItem::Text(text));
+                     },
+-                    ContentItem::NoOpenQuote | ContentItem::NoCloseQuote => {},
+                 }
+             }
+             vec
+diff --git a/components/layout/lists.rs b/components/layout/lists.rs
+index 85862b1ff5c..4f8377bb194 100644
+--- a/components/layout/lists.rs
++++ b/components/layout/lists.rs
+@@ -12,7 +12,7 @@ use style::properties::longhands::list_style_type::computed_value::T as ListStyl
+ use style::selector_parser::PseudoElement;
+ use style::values::CustomIdent;
+ use style::values::computed::Image;
+-use style::values::generics::counters::Content;
++use style::values::generics::counters::{Content, ContentItem};
+ use stylo_atoms::atom;
+ use web_atoms::{local_name, ns};
+ 
+@@ -460,3 +460,102 @@ impl CounterWalk<'_> {
+         None
+     }
+ }
++
++/// The quote depth at the start of the generated content of the pseudo-element `node`.
++/// <https://drafts.csswg.org/css-content/#quote-values>: walks the document in tree order up to
++/// `node`; each `open-quote` and `no-open-quote` of a rendered `::before`/`::after` increments the
++/// depth, each `close-quote` and `no-close-quote` decrements it, never below zero.
++#[expect(unsafe_code)]
++pub(crate) fn quote_depth(context: &LayoutContext, node: ServoLayoutNode<'_>) -> usize {
++    let mut root = node;
++    while let Some(parent) = unsafe { root.dangerous_flat_tree_parent() } {
++        root = parent;
++    }
++    let mut walk = QuoteWalk {
++        context,
++        target: node.opaque(),
++        target_pseudo: node.pseudo_element_chain().primary,
++        depth: 0,
++    };
++    for child in root.flat_tree_children() {
++        if walk.visit(child) {
++            break;
++        }
++    }
++    walk.depth
++}
++
++/// Applies one quote item of `content` to the quote `depth`, returning the depth to use for the
++/// quote mark it renders, if it renders one.
++pub(crate) fn apply_quote_item<I>(item: &ContentItem<I>, depth: &mut usize) -> Option<usize> {
++    match item {
++        ContentItem::OpenQuote => {
++            *depth += 1;
++            Some(*depth - 1)
++        },
++        ContentItem::NoOpenQuote => {
++            *depth += 1;
++            None
++        },
++        // A close-quote that would make the depth negative renders nothing.
++        ContentItem::CloseQuote => depth.checked_sub(1).inspect(|new_depth| *depth = *new_depth),
++        ContentItem::NoCloseQuote => {
++            *depth = depth.saturating_sub(1);
++            None
++        },
++        _ => None,
++    }
++}
++
++struct QuoteWalk<'a> {
++    context: &'a LayoutContext<'a>,
++    target: OpaqueNode,
++    target_pseudo: Option<PseudoElement>,
++    depth: usize,
++}
++
++impl QuoteWalk<'_> {
++    fn apply(&mut self, node: ServoLayoutNode<'_>, pseudo: PseudoElement) {
++        let Some(style) = node
++            .as_element()
++            .and_then(|element| element.with_pseudo(pseudo))
++            .map(|element| element.style(&self.context.style_context))
++            .filter(|style| !style.ineffective_content_property())
++        else {
++            return;
++        };
++        if let Content::Items(items) = &style.get_counters().content {
++            for item in items.items.iter() {
++                apply_quote_item(item, &mut self.depth);
++            }
++        }
++    }
++
++    /// Returns true once the target is reached.
++    fn visit(&mut self, node: ServoLayoutNode<'_>) -> bool {
++        if node.as_element().is_none() {
++            return false;
++        }
++        let style = node.style(&self.context.style_context);
++        if style.get_box().display.is_none() {
++            return false;
++        }
++        let is_target = node.opaque() == self.target;
++        // ::marker and ::before precede the element's children. Quotes in ::marker content are
++        // not counted, as computing the (lazy) ::marker style of every element is costly.
++        if is_target && self.target_pseudo != Some(PseudoElement::After) {
++            return true;
++        }
++        self.apply(node, PseudoElement::Before);
++        for child in node.flat_tree_children() {
++            if self.visit(child) {
++                return true;
++            }
++        }
++        if is_target {
++            return true;
++        }
++        self.apply(node, PseudoElement::After);
++        false
++    }
++}
+-- 
+2.43.0
+

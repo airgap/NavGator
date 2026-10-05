@@ -1,0 +1,123 @@
+From 8fccee49b97d4e17bc85d43b2c8850c03e0ef53f Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 19:07:37 -0400
+Subject: [PATCH] layout: fix table baselines and how extra height goes to rows
+
+A table whose first row has no baseline-aligned cell takes its baseline
+from the lowest content edge of that row's cells, per CSS 2 and Blink,
+not from the row's border edge; HTML cells default to middle, so every
+inline-table with padded cells sat too low. A cell spanning several rows
+no longer marks them constrained, rows with a percentage height count as
+constrained when extra height is shared out, and row percentages resolve
+against the table height minus the edge border spacing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/table/layout.rs | 61 +++++++++++++++++++++++++------
+ 1 file changed, 49 insertions(+), 12 deletions(-)
+
+diff --git a/components/layout/table/layout.rs b/components/layout/table/layout.rs
+index 21e92c1d81a..56ed8b95a96 100644
+--- a/components/layout/table/layout.rs
++++ b/components/layout/table/layout.rs
+@@ -469,14 +469,17 @@ impl<'a> TableLayout<'a> {
+         for column_index in 0..self.table.size.width {
+             for row_index in 0..self.table.size.height {
+                 let coords = TableSlotCoordinates::new(column_index, row_index);
++                // Only the cells spanning just this column (row) constrain it, so that the size
++                // of a cell spanning several rows goes to the unconstrained rows it spans.
+                 let cell_constrained = match self.table.resolve_first_cell(coords) {
+-                    Some(cell) if cell.colspan == 1 => cell
+-                        .context
+-                        .base
+-                        .style
+-                        .box_size(writing_mode)
+-                        .map(is_length),
+-                    _ => LogicalVec2::default(),
++                    Some(cell) => {
++                        let size = cell.context.base.style.box_size(writing_mode);
++                        LogicalVec2 {
++                            inline: cell.colspan == 1 && is_length(&size.inline),
++                            block: cell.rowspan == 1 && is_length(&size.block),
++                        }
++                    },
++                    None => LogicalVec2::default(),
+                 };
+ 
+                 let rowspan_greater_than_1 = match self.table.slots[row_index][column_index] {
+@@ -1604,7 +1607,12 @@ impl<'a> TableLayout<'a> {
+             return;
+         }
+ 
+-        let is_constrained = |track_index: &usize| self.rows[*track_index].constrained;
++        // Like Blink, a row with a percentage block size counts as constrained, so that it keeps
++        // the size its percentage asks for while the unconstrained rows take what is left.
++        let is_constrained = |track_index: &usize| {
++            let row = &self.rows[*track_index];
++            row.constrained || !row.percent.is_zero()
++        };
+         let is_unconstrained = |track_index: &usize| !is_constrained(track_index);
+         let is_empty: Vec<bool> = track_sizes.iter().map(|size| size.is_zero()).collect();
+         let is_not_empty = |track_index: &usize| !is_empty[*track_index];
+@@ -1753,11 +1761,15 @@ impl<'a> TableLayout<'a> {
+         // extra space to rows using the same distribution algorithm used for distributing rowspan
+         // space.
+         // TODO: This should first distribute space to row groups and then to rows.
++        // Like Blink, percentages of rows resolve against the table height without the border
++        // spacing before the first row and after the last one.
++        let percentage_resolution_size =
++            self.final_table_height - self.table.border_spacing().block * 2;
+         self.distribute_extra_size_to_rows(
+             self.final_table_height - table_height_from_rows,
+             0..self.table.size.height,
+             &mut row_sizes,
+-            Some(self.final_table_height),
++            Some(percentage_resolution_size),
+             false, /* rowspan_distribution */
+         );
+         self.row_sizes = row_sizes;
+@@ -2063,13 +2075,38 @@ impl<'a> TableLayout<'a> {
+             // > the lowest and highest content edges of the cells in the row. [CSS2]
+             //
+             // If any cell below has baseline alignment, these values will be overwritten,
+-            // but they are initialized to the content edge of the first row.
++            // but they are initialized to the lowest content edge of the cells in the first row,
++            // which is what Blink and CSS 2 use:
++            // <https://drafts.csswg.org/css2/#height-layout>
+             if row_index == 0 {
++                let lowest_content_edge = (0..self.table.size.width)
++                    .filter_map(|column_index| {
++                        let TableSlot::Cell(cell) = &self.table.slots[0][column_index] else {
++                            return None;
++                        };
++                        let cell = cell.borrow();
++                        if cell.rowspan != 1 {
++                            return None;
++                        }
++                        let layout = self.cells_laid_out[0][column_index].as_ref()?;
++                        let cell_rect = table_and_track_dimensions.get_cell_rect(
++                            TableSlotCoordinates::new(column_index, 0),
++                            cell.rowspan,
++                            cell.colspan,
++                        );
++                        Some(
++                            cell_rect.max_block_position() -
++                                layout.padding.block_end -
++                                layout.border.block_end,
++                        )
++                    })
++                    .max();
+                 let row_end = table_and_track_dimensions
+                     .get_row_rect(0)
+                     .max_block_position();
+-                baselines.first = Some(row_end);
+-                baselines.last = Some(row_end);
++                let baseline = lowest_content_edge.unwrap_or(row_end);
++                baselines.first = Some(baseline);
++                baselines.last = Some(baseline);
+             }
+ 
+             let row_is_collapsed = self.is_row_collapsed(row_index);
+-- 
+2.43.0
+

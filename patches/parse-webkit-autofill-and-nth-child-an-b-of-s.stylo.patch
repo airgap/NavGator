@@ -1,0 +1,43 @@
+From 64acb1d0f74085048ed71b587dfe30df88676e0f Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 04:15:53 -0400
+Subject: [PATCH] servo: parse :-webkit-autofill and :nth-child(An+B of S)
+
+querySelector throws on selectors the parser rejects, and both of these
+are valid in Chrome. haaretz.co.il queries input:-webkit-autofill inside a
+React effect, and the SyntaxError reached Next.js's global error boundary,
+which replaced the page with its 500 view. Taboola's loader queries
+:nth-child(1 of .videoCube). The selectors crate already matches NthOf;
+child insertions and removals restyle siblings through the slow-selector
+flags, but a class change on a sibling does not yet re-index the others.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ style/servo/selector_parser.rs | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/style/servo/selector_parser.rs b/style/servo/selector_parser.rs
+index 88387cb42..eb501ad96 100644
+--- a/style/servo/selector_parser.rs
++++ b/style/servo/selector_parser.rs
+@@ -617,7 +617,7 @@ impl<'a, 'i> ::selectors::Parser<'i> for SelectorParser<'a> {
+ 
+     #[inline]
+     fn parse_nth_child_of(&self) -> bool {
+-        false
++        true
+     }
+ 
+     #[inline]
+@@ -653,7 +653,7 @@ impl<'a, 'i> ::selectors::Parser<'i> for SelectorParser<'a> {
+         let pseudo_class = match_ignore_ascii_case! { &name,
+             "active" => NonTSPseudoClass::Active,
+             "any-link" => NonTSPseudoClass::AnyLink,
+-            "autofill" => NonTSPseudoClass::Autofill,
++            "autofill" | "-webkit-autofill" => NonTSPseudoClass::Autofill,
+             "checked" => NonTSPseudoClass::Checked,
+             "default" => NonTSPseudoClass::Default,
+             "defined" => NonTSPseudoClass::Defined,
+-- 
+2.43.0
+

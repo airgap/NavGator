@@ -1,0 +1,58 @@
+From 59944cb354683fbcce338b0df12a2b0ea8c53651 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 06:37:56 -0400
+Subject: [PATCH] script: copy read-loop chunks as Uint8Array bytes
+
+Read-all-bytes converted each chunk with the WebIDL sequence<octet>
+conversion, which walks the typed array through the JS iterator one
+element at a time. Reading a 1.2 MB body with response.text(),
+arrayBuffer() or blob() took ~300 ms, and on linear.app this showed up
+as a hot spot during hydration.
+
+The chunk is now unwrapped as a Uint8Array and its buffer copied
+directly, which also rejects non-Uint8Array chunks with a TypeError as
+https://streams.spec.whatwg.org/#read-loop requires (and as Chrome does).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../script/dom/stream/readablestream.rs       | 20 +++++++++++--------
+ 1 file changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/components/script/dom/stream/readablestream.rs b/components/script/dom/stream/readablestream.rs
+index 378bad5993b..33b00a20a29 100644
+--- a/components/script/dom/stream/readablestream.rs
++++ b/components/script/dom/stream/readablestream.rs
+@@ -2451,18 +2451,22 @@ pub(crate) fn get_read_promise_bytes(
+     .ok_or(Error::Type(c"Promise has no value property.".to_owned()))
+ }
+ 
+-/// Convert a raw stream `chunk` JS value to `Vec<u8>`.
+-/// This mirrors the conversion used inside `get_read_promise_bytes`,
+-/// but operates on the raw chunk (no `{ value, done }` wrapper).
++/// The bytes of a `chunk` read by <https://streams.spec.whatwg.org/#read-loop>, which must be a
++/// `Uint8Array`. Copying the array's buffer directly matters: converting it as a JS sequence
++/// iterates it one element at a time, which made `response.text()`/`json()` on a large body
++/// take seconds.
+ pub(crate) fn bytes_from_chunk_jsval(
+     cx: &mut JSContext,
+     chunk: &RootedTraceableBox<Heap<JSVal>>,
+ ) -> Result<Vec<u8>, Error> {
+-    match Vec::<u8>::safe_from_jsval(cx, chunk.handle(), ConversionBehavior::EnforceRange) {
+-        Ok(ConversionResult::Success(vec)) => Ok(vec),
+-        Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.into_owned())),
+-        _ => Err(Error::Type(c"Unknown format for bytes read.".to_owned())),
+-    }
++    let chunk = chunk.get();
++    if !chunk.is_object() {
++        return Err(Error::Type(c"Chunk is not a Uint8Array.".to_owned()));
++    }
++    typedarray!(&in(cx) let array: Uint8Array = chunk.to_object());
++    array
++        .map(|array| array.to_vec())
++        .map_err(|_| Error::Type(c"Chunk is not a Uint8Array.".to_owned()))
+ }
+ 
+ /// <https://streams.spec.whatwg.org/#rs-transfer>
+-- 
+2.43.0
+

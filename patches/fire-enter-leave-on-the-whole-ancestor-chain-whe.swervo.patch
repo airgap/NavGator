@@ -1,0 +1,50 @@
+From a72dab052a17af5238964d14ddd4f433b313ef95 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 16:47:20 -0400
+Subject: [PATCH] script: fire enter/leave on the whole ancestor chain when
+ there is no related target
+
+With no related target the common ancestor was set to the target itself,
+so the chain was empty: the first hover after load fired no mouseenter or
+pointerenter, and leaving the window fired no mouseleave. Chrome enters
+and leaves every ancestor up to the document.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../script/dom/document/document_event_handler.rs  | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/components/script/dom/document/document_event_handler.rs b/components/script/dom/document/document_event_handler.rs
+index d57829b4847..6f60cdf4727 100644
+--- a/components/script/dom/document/document_event_handler.rs
++++ b/components/script/dom/document/document_event_handler.rs
+@@ -548,19 +548,19 @@ impl DocumentEventHandler {
+             FireMouseEventType::Enter | FireMouseEventType::Leave
+         ));
+ 
+-        let common_ancestor = match related_target.as_ref() {
+-            Some(related_target) => event_target
+-                .common_ancestor_in_flat_tree(related_target)
+-                .unwrap_or_else(|| DomRoot::from_ref(&*event_target)),
+-            None => DomRoot::from_ref(&*event_target),
+-        };
++        // Without a related target in this tree (the pointer came from or went to outside the
++        // document), the target and all of its ancestors up to and including the document are
++        // entered or left, as in Chrome.
++        let common_ancestor = related_target
++            .as_ref()
++            .and_then(|related_target| event_target.common_ancestor_in_flat_tree(related_target));
+ 
+         // We need to create a target chain in case the event target shares
+         // its boundaries with its ancestors.
+         let mut targets = vec![];
+         let mut current = Some(event_target);
+         while let Some(node) = current {
+-            if node == common_ancestor {
++            if common_ancestor.as_ref() == Some(&node) {
+                 break;
+             }
+             current = node.parent_in_flat_tree();
+-- 
+2.43.0
+

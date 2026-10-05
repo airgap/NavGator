@@ -1,0 +1,269 @@
+From f37935576c0834143ea8f2a2c39afaf4bba80f20 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 05:58:00 -0400
+Subject: [PATCH] script: reuse parsed selectors in querySelector, matches and
+ closest
+
+Each call parsed its selector string again, and scripts tend to call
+these in loops with a handful of strings. The document now keeps the
+parsed lists by string, cleared when its URL changes (parsing depends on
+it) and bounded at 256 entries like Blink's SelectorQueryCache.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/document/document.rs    | 36 +++++++++++++++++--
+ components/script/dom/element/element.rs      | 20 ++---------
+ components/script/dom/node/node.rs            | 16 +++++----
+ .../layout_dom/servo_dangerous_style_node.rs  | 31 +++++-----------
+ 4 files changed, 56 insertions(+), 47 deletions(-)
+
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index be5496f0f96..1b87e6c1e19 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -55,6 +55,7 @@ use script_bindings::interfaces::DocumentHelpers;
+ use script_bindings::reflector::reflect_dom_object_with_proto_and_cx;
+ use script_bindings::trace::CustomTraceable;
+ use script_traits::{DocumentActivity, ProgressiveWebMetricType};
++use selectors::parser::SelectorList;
+ use servo_arc::Arc;
+ use servo_base::cross_process_instant::CrossProcessInstant;
+ use servo_base::generic_channel::GenericSend;
+@@ -68,11 +69,11 @@ use style::attr::AttrValue;
+ use style::context::QuirksMode;
+ use style::dom::OpaqueNode;
+ use style::invalidation::element::restyle_hints::RestyleHint;
+-use style::selector_parser::Snapshot;
++use style::selector_parser::{SelectorImpl, SelectorParser, Snapshot};
+ use style::shared_lock::{SharedRwLock, SharedRwLockReadGuard};
+ use style::str::{split_html_space_chars, str_join};
+ use style::stylesheet_set::DocumentStylesheetSet;
+-use style::stylesheets::{Origin, OriginSet, Stylesheet};
++use style::stylesheets::{Origin, OriginSet, Stylesheet, UrlExtraData};
+ use style::stylist::Stylist;
+ use stylo_atoms::Atom;
+ use time::Duration as TimeDuration;
+@@ -506,6 +507,11 @@ pub(crate) struct Document {
+     /// Information on elements needing restyle to ship over to layout when the
+     /// time comes.
+     pending_restyles: DomRefCell<FxHashMap<Dom<Element>, NoTrace<PendingRestyle>>>,
++    /// Selector strings parsed for `querySelector()`, `matches()` and `closest()`. Scripts
++    /// call these in loops with the same few strings, and parsing dominated those calls.
++    #[ignore_malloc_size_of = "defined in selectors"]
++    #[no_trace]
++    selector_cache: DomRefCell<FxHashMap<String, SelectorList<SelectorImpl>>>,
+     /// A collection of reasons that the [`Document`] needs to be restyled at the next
+     /// opportunity for a reflow. If this is empty, then the [`Document`] does not need to
+     /// be restyled.
+@@ -1085,6 +1091,8 @@ impl Document {
+ 
+     pub(crate) fn set_url(&self, url: ServoUrl) {
+         *self.url.borrow_mut() = url;
++        // Parsing depends on the URL (chrome-only selectors).
++        self.selector_cache.borrow_mut().clear();
+     }
+ 
+     pub(crate) fn about_base_url(&self) -> Option<ServoUrl> {
+@@ -1159,6 +1167,29 @@ impl Document {
+         condition
+     }
+ 
++    /// Parses `selectors` the way `querySelector()` does, reusing an earlier parse of the
++    /// same string.
++    pub(crate) fn parse_selector_list(
++        &self,
++        selectors: &str,
++    ) -> Fallible<SelectorList<SelectorImpl>> {
++        if let Some(list) = self.selector_cache.borrow().get(selectors) {
++            return Ok(list.clone());
++        }
++        let list = SelectorParser::parse_author_origin_no_namespace(
++            selectors,
++            &UrlExtraData(self.url().get_arc()),
++        )
++        .map_err(|_| Error::Syntax(None))?;
++        let mut cache = self.selector_cache.borrow_mut();
++        // Bounded like Blink's SelectorQueryCache, for pages that build a new string per call.
++        if cache.len() >= 256 {
++            cache.clear();
++        }
++        cache.insert(selectors.to_owned(), list.clone());
++        Ok(list)
++    }
++
+     /// Returns the first `base` element in the DOM that has an `href` attribute.
+     pub(crate) fn base_element(&self) -> Option<DomRoot<HTMLBaseElement>> {
+         self.base_element.get()
+@@ -4136,6 +4167,7 @@ impl Document {
+             target_base_element: Default::default(),
+             appropriate_template_contents_owner_document: Default::default(),
+             pending_restyles: DomRefCell::new(FxHashMap::default()),
++            selector_cache: Default::default(),
+             needs_restyle: Cell::new(RestyleReason::DOMChanged),
+             origin: DomRefCell::new(origin),
+             referrer,
+diff --git a/components/script/dom/element/element.rs b/components/script/dom/element/element.rs
+index 0bc0e4106f7..e761d6effc8 100644
+--- a/components/script/dom/element/element.rs
++++ b/components/script/dom/element/element.rs
+@@ -49,7 +49,7 @@ use style::properties::{
+     parse_style_attribute,
+ };
+ use style::rule_tree::{CascadeLevel, CascadeOrigin};
+-use style::selector_parser::{RestyleDamage, SelectorParser, Snapshot};
++use style::selector_parser::{RestyleDamage, Snapshot};
+ use style::shared_lock::Locked;
+ use style::stylesheets::layer_rule::LayerOrder;
+ use style::stylesheets::{CssRuleType, UrlExtraData};
+@@ -4102,14 +4102,7 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
+     #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+     fn Matches(&self, selectors: DOMString) -> Fallible<bool> {
+         let document = self.owner_document();
+-        let url = document.url();
+-        let selectors = match SelectorParser::parse_author_origin_no_namespace(
+-            &selectors.str(),
+-            &UrlExtraData(url.get_arc()),
+-        ) {
+-            Err(_) => return Err(Error::Syntax(None)),
+-            Ok(selectors) => selectors,
+-        };
++        let selectors = document.parse_selector_list(&selectors.str())?;
+ 
+         // SAFETY: traced_self is unrooted, but we have a reference to "self" so it won't be freed.
+         let traced_self = Dom::from_ref(self);
+@@ -4134,14 +4127,7 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
+     #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+     fn Closest(&self, selectors: DOMString) -> Fallible<Option<DomRoot<Element>>> {
+         let document = self.owner_document();
+-        let url = document.url();
+-        let selectors = match SelectorParser::parse_author_origin_no_namespace(
+-            &selectors.str(),
+-            &UrlExtraData(url.get_arc()),
+-        ) {
+-            Err(_) => return Err(Error::Syntax(None)),
+-            Ok(selectors) => selectors,
+-        };
++        let selectors = document.parse_selector_list(&selectors.str())?;
+ 
+         // SAFETY: traced_self is unrooted, but we have a reference to "self" so it won't be freed.
+         let traced_self = Dom::from_ref(self);
+diff --git a/components/script/dom/node/node.rs b/components/script/dom/node/node.rs
+index 247083d278c..151f7ac4e74 100644
+--- a/components/script/dom/node/node.rs
++++ b/components/script/dom/node/node.rs
+@@ -1612,7 +1612,9 @@ impl Node {
+     ) -> Fallible<Option<DomRoot<Element>>> {
+         // > The querySelector(selectors) method steps are to return the first result of running scope-match
+         // > a selectors string selectors against this, if the result is not an empty list; otherwise null.
+-        let document_url = self.owner_document().url().get_arc();
++        let selector_list = self
++            .owner_document()
++            .parse_selector_list(&selectors.str())?;
+ 
+         // If there are any duplicate ids, their targets may need to be updated in the id map before
+         // layout runs, so that the map can gather their elements in DOM order.
+@@ -1626,8 +1628,8 @@ impl Node {
+         let first_matching_element = with_layout_state(|| {
+             let layout_node: LayoutDom<'_, _> = unsafe { traced_node.to_layout() };
+             ServoDangerousStyleNode::from(layout_node)
+-                .scope_match_a_selectors_string::<QueryFirst>(document_url, &selectors.str())
+-        })?;
++                .scope_match_a_selector_list::<QueryFirst>(&selector_list)
++        });
+ 
+         Ok(first_matching_element.map(ServoDangerousStyleElement::rooted))
+     }
+@@ -1642,7 +1644,9 @@ impl Node {
+     ) -> Fallible<DomRoot<NodeList>> {
+         // > The querySelectorAll(selectors) method steps are to return the static result of running scope-match
+         // > a selectors string selectors against this.
+-        let document_url = self.owner_document().url().get_arc();
++        let selector_list = self
++            .owner_document()
++            .parse_selector_list(&selectors.str())?;
+ 
+         // If there are any duplicate ids, their targets may need to be updated in the id map before
+         // layout runs, so that the map can gather their elements in DOM order.
+@@ -1654,8 +1658,8 @@ impl Node {
+         let matching_elements = with_layout_state(|| {
+             let layout_node: LayoutDom<'_, _> = unsafe { traced_node.to_layout() };
+             ServoDangerousStyleNode::from(layout_node)
+-                .scope_match_a_selectors_string::<QueryAll>(document_url, &selectors.str())
+-        })?;
++                .scope_match_a_selector_list::<QueryAll>(&selector_list)
++        });
+         let iter = matching_elements
+             .into_iter()
+             .map(ServoDangerousStyleElement::rooted)
+diff --git a/components/script/layout_dom/servo_dangerous_style_node.rs b/components/script/layout_dom/servo_dangerous_style_node.rs
+index 68341e034c1..2b876141922 100644
+--- a/components/script/layout_dom/servo_dangerous_style_node.rs
++++ b/components/script/layout_dom/servo_dangerous_style_node.rs
+@@ -6,17 +6,13 @@
+ #![deny(missing_docs)]
+ 
+ use layout_api::DangerousStyleNode;
+-use script_bindings::error::Fallible;
+-use servo_arc::Arc;
++use selectors::parser::SelectorList;
+ use style;
+ use style::dom::{NodeInfo, TNode};
+ use style::dom_apis::{MayUseInvalidation, SelectorQuery, query_selector};
+-use style::selector_parser::SelectorParser;
+-use style::stylesheets::UrlExtraData;
+-use url::Url;
++use style::selector_parser::SelectorImpl;
+ 
+ use super::{ServoDangerousStyleDocument, ServoDangerousStyleShadowRoot};
+-use crate::dom::bindings::error::Error;
+ use crate::dom::bindings::root::LayoutDom;
+ use crate::dom::node::{Node, NodeFlags};
+ use crate::layout_dom::{ServoDangerousStyleElement, ServoLayoutDomTypeBundle, ServoLayoutNode};
+@@ -34,37 +30,28 @@ unsafe impl Send for ServoDangerousStyleNode<'_> {}
+ unsafe impl Sync for ServoDangerousStyleNode<'_> {}
+ 
+ impl<'dom> ServoDangerousStyleNode<'dom> {
+-    /// <https://dom.spec.whatwg.org/#scope-match-a-selectors-string>
+-    pub(crate) fn scope_match_a_selectors_string<Query>(
++    /// Step 3 of <https://dom.spec.whatwg.org/#scope-match-a-selectors-string>; the caller
++    /// parses the selectors (steps 1 and 2).
++    pub(crate) fn scope_match_a_selector_list<Query>(
+         self,
+-        document_url: Arc<Url>,
+-        selector: &str,
+-    ) -> Fallible<Query::Output>
++        selector_list: &SelectorList<SelectorImpl>,
++    ) -> Query::Output
+     where
+         Query: SelectorQuery<ServoDangerousStyleElement<'dom>>,
+         Query::Output: Default,
+     {
+         let mut result = Query::Output::default();
+ 
+-        // Step 1. Let selector be the result of parse a selector selectors.
+-        let selector_or_error =
+-            SelectorParser::parse_author_origin_no_namespace(selector, &UrlExtraData(document_url));
+-
+-        // Step 2. If selector is failure, then throw a "SyntaxError" DOMException.
+-        let Ok(selector_list) = selector_or_error else {
+-            return Err(Error::Syntax(None));
+-        };
+-
+         // Step 3. Return the result of match a selector against a tree with selector
+         // and node’s root using scoping root node.
+         query_selector::<ServoDangerousStyleElement<'dom>, Query>(
+             self,
+-            &selector_list,
++            selector_list,
+             &mut result,
+             MayUseInvalidation::No,
+         );
+ 
+-        Ok(result)
++        result
+     }
+ }
+ 
+-- 
+2.43.0
+

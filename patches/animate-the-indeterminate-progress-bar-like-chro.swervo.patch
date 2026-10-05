@@ -1,0 +1,90 @@
+From 05001865dad9ac67ea82aa7c59ebae8ec53130c1 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 05:10:37 -0400
+Subject: [PATCH] forms: animate the indeterminate <progress> bar like Chrome
+
+A <progress> without a value attribute now matches :indeterminate, and the
+UA sheet animates its value bar the way Chrome's native theme draws it: a
+fifth of the track sweeping across and back every 2.5s, with rounded ends.
+Under `appearance: none` the bar stays empty, as in Chrome.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/stylesheets/servo.css        | 18 ++++++++++++++++++
+ .../script/dom/html/htmlprogresselement.rs     | 16 ++++++++++++++--
+ 2 files changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/components/layout/stylesheets/servo.css b/components/layout/stylesheets/servo.css
+index 6322801c352..2ed66dbd4d3 100644
+--- a/components/layout/stylesheets/servo.css
++++ b/components/layout/stylesheets/servo.css
+@@ -718,6 +718,19 @@ progress::-webkit-progress-value {
+   background: #0075ff;
+ }
+ 
++/* Chrome's indeterminate bar is a fifth of the track sweeping across it and back every 2.5s
++   (`LayoutProgress` and `ThemePainterDefault::PaintProgressBar`). */
++progress:indeterminate::-webkit-progress-value {
++  inline-size: 20%;
++  border-radius: 20px;
++  animation: -servo-progress-indeterminate 1.25s linear infinite alternate;
++}
++
++@keyframes -servo-progress-indeterminate {
++  from { margin-inline-start: 0; }
++  to { margin-inline-start: 80%; }
++}
++
+ slot {
+   display: contents;
+ }
+@@ -772,6 +785,11 @@ slot {
+     background: green;
+   }
+ 
++  progress:indeterminate::-webkit-progress-value {
++    animation: none;
++    inline-size: 0;
++  }
++
+   meter::-webkit-meter-bar {
+     background: linear-gradient(to bottom, #ddd, #eee 20%, #ccc 45%, #ccc 55%, #ddd);
+   }
+diff --git a/components/script/dom/html/htmlprogresselement.rs b/components/script/dom/html/htmlprogresselement.rs
+index 2ef1aba979b..495d7a0c511 100644
+--- a/components/script/dom/html/htmlprogresselement.rs
++++ b/components/script/dom/html/htmlprogresselement.rs
+@@ -10,6 +10,7 @@ use js::context::JSContext;
+ use js::rust::HandleObject;
+ use script_bindings::cell::DomRefCell;
+ use style::selector_parser::PseudoElement;
++use stylo_dom::ElementState;
+ 
+ use crate::dom::bindings::codegen::Bindings::HTMLProgressElementBinding::HTMLProgressElementMethods;
+ use crate::dom::bindings::codegen::Bindings::NodeBinding::Node_Binding::NodeMethods;
+@@ -126,9 +127,20 @@ impl HTMLProgressElement {
+ 
+     /// Update the visual width of bar
+     fn update_state(&self, cx: &mut JSContext) {
++        // <https://html.spec.whatwg.org/multipage/#selector-indeterminate>
++        let indeterminate = !self
++            .upcast::<Element>()
++            .has_attribute(&local_name!("value"));
++        self.upcast::<Element>()
++            .set_state(ElementState::INDETERMINATE, indeterminate);
++
+         let shadow_tree = self.shadow_tree(cx);
+-        let position = (*self.Value() / *self.Max()) * 100.0;
+-        let style = format!("width: {}%", position);
++        // An indeterminate bar takes its size and motion from the UA sheet.
++        let style = if indeterminate {
++            String::new()
++        } else {
++            format!("width: {}%", (*self.Value() / *self.Max()) * 100.0)
++        };
+ 
+         shadow_tree
+             .progress_value
+-- 
+2.43.0
+

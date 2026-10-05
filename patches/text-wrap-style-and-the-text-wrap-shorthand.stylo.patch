@@ -1,0 +1,62 @@
+From fea6550eb7f37be65653295290b841a313663285 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 04:24:51 -0400
+Subject: [PATCH] servo: text-wrap-style and the text-wrap shorthand
+
+Both were Gecko-only, so text-wrap: balance (gov.uk's homepage heading)
+and even text-wrap: nowrap were dropped as invalid in Servo. Servo now
+parses them, text-wrap-style changes rebuild boxes, and it also accepts
+pretty, which Servo lays out like normal wrapping.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ style/properties/longhands.toml  | 4 ++--
+ style/properties/shorthands.rs   | 1 -
+ style/properties/shorthands.toml | 1 -
+ 3 files changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/style/properties/longhands.toml b/style/properties/longhands.toml
+index b8e4e6745..94b88089e 100644
+--- a/style/properties/longhands.toml
++++ b/style/properties/longhands.toml
+@@ -3955,11 +3955,11 @@ keyword = { values = ["wrap", "nowrap"] }
+ 
+ [text-wrap-style]
+ struct = "inherited_text"
+-engine = "gecko"
+ spec = "https://drafts.csswg.org/css-text-4/#text-wrap-style"
+ animation_type = "discrete"
+ affects = "layout"
+-keyword = { values = ["auto", "stable", "balance"] }
++servo_restyle_damage = "rebuild_box"
++keyword = { values = ["auto", "stable", "balance"], extra_servo_values = ["pretty"] }
+ 
+ [list-style-position]
+ struct = "list"
+diff --git a/style/properties/shorthands.rs b/style/properties/shorthands.rs
+index 6772c9c44..7231347eb 100644
+--- a/style/properties/shorthands.rs
++++ b/style/properties/shorthands.rs
+@@ -969,7 +969,6 @@ pub mod column_rule {
+     }
+ }
+ 
+-#[cfg(feature = "gecko")]
+ pub mod text_wrap {
+     pub use crate::properties::generated::shorthands::text_wrap::*;
+ 
+diff --git a/style/properties/shorthands.toml b/style/properties/shorthands.toml
+index 230ae894e..68097f606 100644
+--- a/style/properties/shorthands.toml
++++ b/style/properties/shorthands.toml
+@@ -535,7 +535,6 @@ spec = "https://drafts.csswg.org/css-text-decor-3/#text-emphasis-property"
+ derive_serialize = true
+ 
+ [text-wrap]
+-engine = "gecko"
+ sub_properties = ["text-wrap-mode", "text-wrap-style"]
+ spec = "https://www.w3.org/TR/css-text-4/#text-wrap"
+ 
+-- 
+2.43.0
+

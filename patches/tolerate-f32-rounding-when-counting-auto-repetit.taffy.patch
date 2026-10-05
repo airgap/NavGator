@@ -1,0 +1,99 @@
+From 67c4fdd3676944b399d326dc51cf2b38d3e8f3ef Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 17:09:05 -0400
+Subject: [PATCH] grid: tolerate f32 rounding when counting auto-repetitions
+
+Track sizes like calc((100% - 3rem) / 7) are written to fill the container
+exactly. Evaluated in f32 the seven tracks plus gaps can come out a few
+millionths of a pixel wider than the container, so the floor() in the
+repetition count lost a whole column (allbirds' size picker showed 6
+columns and wrapped the 7th size where Chrome shows 7). Ignore differences
+below 0.01px when deciding whether repetitions fit, which Chrome's 1/64px
+layout units effectively do too.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/compute/grid/explicit_grid.rs | 47 +++++++++++++++++++++++++++----
+ 1 file changed, 41 insertions(+), 6 deletions(-)
+
+diff --git a/src/compute/grid/explicit_grid.rs b/src/compute/grid/explicit_grid.rs
+index 09c55b46..9fc7eb73 100644
+--- a/src/compute/grid/explicit_grid.rs
++++ b/src/compute/grid/explicit_grid.rs
+@@ -151,16 +151,19 @@ pub(crate) fn compute_explicit_grid_size_in_axis(
+                 + per_repetition_track_used_space
+                 + ((non_auto_repeating_track_count + repetition_track_count).saturating_sub(1) as f32 * gap_size);
+ 
++            // Track sizes such as calc((100% - 3rem) / 7) are meant to fill the container exactly, but f32 rounding can
++            // leave their sum a hair above or below it, which would gain or lose a whole repetition. Ignore differences
++            // smaller than this (Chrome's 1/64px layout units absorb them the same way).
++            const ROUNDING_TOLERANCE: f32 = 0.01;
++
+             // If a single repetition already overflows the container then we return 1 as the repetition count
+             // (the number of repetitions is floored at 1)
+-            if first_repetition_and_non_repeating_tracks_used_space > inner_container_size {
++            if first_repetition_and_non_repeating_tracks_used_space > inner_container_size + ROUNDING_TOLERANCE {
+                 1u16
+             } else {
+                 let per_repetition_gap_used_space = (repetition_track_count as f32) * gap_size;
+                 let per_repetition_used_space = per_repetition_track_used_space + per_repetition_gap_used_space;
+-                let num_repetition_that_fit = (inner_container_size
+-                    - first_repetition_and_non_repeating_tracks_used_space)
+-                    / per_repetition_used_space;
++                let free_space = inner_container_size - first_repetition_and_non_repeating_tracks_used_space;
+ 
+                 // If the container size is a preferred or maximum size:
+                 //   Then we return the maximum number of repetitions that fit into the container without overflowing.
+@@ -169,8 +172,12 @@ pub(crate) fn compute_explicit_grid_size_in_axis(
+                 //
+                 // In all cases we add the additional repetition that was already accounted for in the special-case computation above
+                 match auto_fit_strategy {
+-                    AutoRepeatStrategy::MaxRepetitionsThatDoNotOverflow => (floor(num_repetition_that_fit) as u16) + 1,
+-                    AutoRepeatStrategy::MinRepetitionsThatDoOverflow => (ceil(num_repetition_that_fit) as u16) + 1,
++                    AutoRepeatStrategy::MaxRepetitionsThatDoNotOverflow => {
++                        (floor((free_space + ROUNDING_TOLERANCE) / per_repetition_used_space) as u16) + 1
++                    }
++                    AutoRepeatStrategy::MinRepetitionsThatDoOverflow => {
++                        (ceil((free_space - ROUNDING_TOLERANCE) / per_repetition_used_space) as u16) + 1
++                    }
+                 }
+             }
+         }
+@@ -476,6 +483,34 @@ mod test {
+         assert_eq!(auto_col_reps, 4);
+     }
+ 
++    #[test]
++    #[cfg(feature = "calc")]
++    fn explicit_grid_sizing_auto_fit_calc_exact_fit_rounding() {
++        use RepetitionCount::AutoFit;
++        // repeat(auto-fit, minmax(calc((100% - 48px) / 7), 1fr)) with an 8px gap fills a 422px container with exactly
++        // seven columns, but evaluating the calc in f32 makes the seven columns overflow by a fraction of a pixel
++        let grid_style: Style<DefaultCheapStr> = Style {
++            display: Display::Grid,
++            size: Size { width: length(422.0), height: auto() },
++            gap: Size { width: length(8.0), height: zero() },
++            grid_template_columns: vec![repeat(
++                AutoFit,
++                vec![minmax(MinTrackSizingFunction::calc(0x100 as *const ()), fr(1.0))],
++            )],
++            ..Default::default()
++        };
++        let preferred_size = grid_style.size.map(|s| s.into_option());
++        let (auto_col_reps, col_count) = compute_explicit_grid_size_in_axis(
++            &grid_style,
++            preferred_size.get_abs(AbsoluteAxis::Horizontal),
++            AutoRepeatStrategy::MaxRepetitionsThatDoNotOverflow,
++            |_, basis| basis * (1.0 / 7.0) - 48.0 / 7.0,
++            AbsoluteAxis::Horizontal,
++        );
++        assert_eq!(col_count, 7);
++        assert_eq!(auto_col_reps, 7);
++    }
++
+     #[test]
+     fn explicit_grid_sizing_auto_fill_min_size_exact_fit() {
+         use RepetitionCount::AutoFill;
+-- 
+2.43.0
+

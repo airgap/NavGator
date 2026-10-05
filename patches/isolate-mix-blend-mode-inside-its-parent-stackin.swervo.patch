@@ -1,0 +1,78 @@
+From 9a84bf5f5a2d1cc7c41584a74e0acc6dc0315957 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 00:17:55 -0400
+Subject: [PATCH] layout: isolate mix-blend-mode inside its parent stacking
+ context
+
+Every CSS stacking context is an isolated group for blending, but the
+display list only pushed a WebRender stacking context when the element had
+a filter, opacity, transform, clip-path, mask or blend of its own, and it
+never set IS_BLEND_CONTAINER. WebRender drops a plain transform stacking
+context as redundant, so a blended child of a z-index, isolation:isolate or
+translate3d wrapper blended with whatever was painted behind the wrapper.
+Leaflet puts `mix-blend-mode: plus-lighter` on tiles inside a translate3d
+pane, which turned openstreetmap.org's map white.
+
+A stacking context whose children include a blended element is now always
+pushed and flagged IS_BLEND_CONTAINER, which makes WebRender composite it
+in its own surface the way Gecko's blend containers do.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/display_list/mod.rs | 26 ++++++++++++++++++--------
+ 1 file changed, 18 insertions(+), 8 deletions(-)
+
+diff --git a/components/layout/display_list/mod.rs b/components/layout/display_list/mod.rs
+index 2510533678b..d898fa956a7 100644
+--- a/components/layout/display_list/mod.rs
++++ b/components/layout/display_list/mod.rs
+@@ -479,7 +479,19 @@ impl DisplayListBuilder<'_> {
+         let effects = style.get_effects();
+         let transform_style = style.used_transform_style(fragment.base.flags);
+         let has_mask = fragment.has_mask_image();
+-        if effects.filter.0.is_empty() &&
++        // Every stacking context is an isolated group for its blended descendants
++        // (https://drafts.fxtf.org/compositing-1/#isolation), so one that contains a
++        // `mix-blend-mode` child must reach WebRender flagged as a blend container even when it
++        // has no effect of its own; otherwise the child blends with whatever lies behind it.
++        // Blending elements always establish stacking contexts, and children stolen from
++        // stacking containers are hoisted into the nearest real one, so direct children suffice.
++        let is_blend_container = stacking_context.children.iter().any(|child| {
++            child.fragment().is_some_and(|child| {
++                child.style().get_effects().mix_blend_mode != ComputedMixBlendMode::Normal
++            })
++        });
++        if !is_blend_container &&
++            effects.filter.0.is_empty() &&
+             effects.opacity == 1.0 &&
+             effects.mix_blend_mode == ComputedMixBlendMode::Normal &&
+             !style.has_effective_transform_or_perspective(FragmentFlags::empty()) &&
+@@ -505,12 +517,6 @@ impl DisplayListBuilder<'_> {
+             ));
+         }
+ 
+-        // TODO(jdm): WebRender now requires us to create stacking context items
+-        //            with the IS_BLEND_CONTAINER flag enabled if any children
+-        //            of the stacking context have a blend mode applied.
+-        //            This will require additional tracking during layout
+-        //            before we start collecting stacking contexts so that
+-        //            information will be available when we reach this point.
+         let spatial_id = self.spatial_id(stacking_context.scroll_tree_node_id);
+ 
+         // WebRender has two different ways of expressing "no clip." ClipChainId::INVALID
+@@ -542,7 +548,11 @@ impl DisplayListBuilder<'_> {
+             &filters,
+             &[], // filter_datas
+             wr::RasterSpace::Screen,
+-            wr::StackingContextFlags::empty(),
++            if is_blend_container {
++                wr::StackingContextFlags::IS_BLEND_CONTAINER
++            } else {
++                wr::StackingContextFlags::empty()
++            },
+             None, // snapshot
+         );
+ 
+-- 
+2.43.0
+

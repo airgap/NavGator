@@ -1,0 +1,103 @@
+From a622a699070f7f4a18f2a0e3400e1316767081f6 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 02:53:56 -0400
+Subject: [PATCH] script: skip href-less link fetches;
+ PerformanceResourceTiming.workerStart
+
+- Links are fetched only with a non-empty href, as creating link options
+  asserts; Next.js's href-less <link rel=preload as=image> crashed the
+  content process (notion.com).
+- workerStart is exposed (0, as no service worker handles servo's
+  fetches); Google Docs threw computing timings from undefined.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/html/htmllinkelement.rs    | 16 ++++++++++++++++
+ .../dom/performance/performanceresourcetiming.rs |  9 +++++++++
+ .../webidls/PerformanceResourceTiming.webidl     |  2 +-
+ 3 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/components/script/dom/html/htmllinkelement.rs b/components/script/dom/html/htmllinkelement.rs
+index 6ea2cb4bcef..8acf585278c 100644
+--- a/components/script/dom/html/htmllinkelement.rs
++++ b/components/script/dom/html/htmllinkelement.rs
+@@ -498,6 +498,16 @@ impl HTMLLinkElement {
+     }
+ 
+     /// <https://html.spec.whatwg.org/multipage/#create-link-options-from-element>
++    /// Links are fetched only with a non-empty `href` (or an `imagesrcset`, which isn't supported
++    /// yet), as the appropriate times to fetch and process them require; creating link options
++    /// asserts it. Next.js emits `<link rel=preload as=image>` without an href, which crashed the
++    /// content process.
++    fn has_link_source(&self) -> bool {
++        self.upcast::<Element>()
++            .get_attribute_string_value(&local_name!("href"))
++            .is_some_and(|href| !href.is_empty())
++    }
++
+     fn processing_options(&self) -> LinkProcessingOptions {
+         let element = self.upcast::<Element>();
+ 
+@@ -552,6 +562,9 @@ impl HTMLLinkElement {
+     /// This method does not implement Step 7 (fetching the request) and instead returns the [RequestBuilder],
+     /// as the fetch context that should be used depends on the link type.
+     fn default_fetch_and_process_the_linked_resource(&self) -> Option<RequestBuilder> {
++        if !self.has_link_source() {
++            return None;
++        }
+         // Step 1. Let options be the result of creating link options from el.
+         let options = self.processing_options();
+ 
+@@ -892,6 +905,9 @@ impl HTMLLinkElement {
+     /// <https://html.spec.whatwg.org/multipage/#link-type-preload:fetch-and-process-the-linked-resource-2>
+     /// and type matching destination steps of <https://html.spec.whatwg.org/multipage/#preload>
+     fn handle_preload_url(&self) {
++        if !self.has_link_source() {
++            return;
++        }
+         // Step 1. Update the source set for el.
+         // TODO
+         // Step 2. Let options be the result of creating link options from el.
+diff --git a/components/script/dom/performance/performanceresourcetiming.rs b/components/script/dom/performance/performanceresourcetiming.rs
+index 0244a3904ec..9c72287b24c 100644
+--- a/components/script/dom/performance/performanceresourcetiming.rs
++++ b/components/script/dom/performance/performanceresourcetiming.rs
+@@ -7,6 +7,8 @@ use js::context::JSContext;
+ use net_traits::ResourceFetchTiming;
+ use script_bindings::reflector::reflect_dom_object_with_cx;
+ use servo_base::cross_process_instant::CrossProcessInstant;
++
++use crate::dom::bindings::num::Finite;
+ use servo_url::ServoUrl;
+ use time::Duration;
+ 
+@@ -226,6 +228,13 @@ impl PerformanceResourceTimingMethods<crate::DomTypeHolder> for PerformanceResou
+         self.to_dom_high_res_time_stamp(self.fetch_start)
+     }
+ 
++    /// <https://w3c.github.io/resource-timing/#dom-performanceresourcetiming-workerstart>: 0 when
++    /// no service worker handled the fetch, which servo's fetches never go through. Google Docs
++    /// computes timings from it and threw on the undefined value.
++    fn WorkerStart(&self) -> DOMHighResTimeStamp {
++        Finite::wrap(0.)
++    }
++
+     /// <https://w3c.github.io/resource-timing/#dom-performanceresourcetiming-connectstart>
+     fn ConnectStart(&self) -> DOMHighResTimeStamp {
+         self.to_dom_high_res_time_stamp(self.connect_start)
+diff --git a/components/script_bindings/webidls/PerformanceResourceTiming.webidl b/components/script_bindings/webidls/PerformanceResourceTiming.webidl
+index 50a6dba1416..8c50647d605 100644
+--- a/components/script_bindings/webidls/PerformanceResourceTiming.webidl
++++ b/components/script_bindings/webidls/PerformanceResourceTiming.webidl
+@@ -11,7 +11,7 @@
+ interface PerformanceResourceTiming : PerformanceEntry {
+     readonly attribute DOMString           initiatorType;
+     readonly attribute DOMString           nextHopProtocol;
+-    // readonly attribute DOMHighResTimeStamp workerStart;
++    readonly attribute DOMHighResTimeStamp workerStart;
+     readonly attribute DOMHighResTimeStamp redirectStart;
+     readonly attribute DOMHighResTimeStamp redirectEnd;
+     readonly attribute DOMHighResTimeStamp fetchStart;
+-- 
+2.43.0
+

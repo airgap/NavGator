@@ -1,0 +1,116 @@
+From dc76e3447694310836caa18e29d0967f9710bc5a Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 05:28:56 -0400
+Subject: [PATCH] script: lay out all text again when a stylesheet's removal
+ drops web fonts
+
+Removing a stylesheet removed its web fonts and freed their WebRender
+font and instance keys after the next display list, but nothing forced
+text to be laid out again: the computed font-family was unchanged, so
+cached fragments kept the freed instance keys. WebRender then asserted
+in the glyph rasterizer and took the whole browser down (zillow.com), or,
+without the race, the text vanished instead of falling back. Removal now
+reports whether fonts went away, and the document dirties all nodes, as
+when a web font loads, so the display list built before the keys are
+freed no longer refers to them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/fonts/font_context.rs           | 5 +++--
+ components/layout/layout_impl.rs           | 4 ++--
+ components/script/dom/document/document.rs | 9 +++++++--
+ components/shared/layout/lib.rs            | 4 +++-
+ 4 files changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/components/fonts/font_context.rs b/components/fonts/font_context.rs
+index edca79b05b4..f625fb27749 100644
+--- a/components/fonts/font_context.rs
++++ b/components/fonts/font_context.rs
+@@ -962,7 +962,7 @@ impl FontContext {
+         stylesheet: &DocumentStyleSheet,
+         device: &Device,
+         guard: &SharedRwLockReadGuard,
+-    ) {
++    ) -> bool {
+         let mut web_fonts = self.web_fonts.write();
+ 
+         // TODO: Walking the stylesheet should not be necessary here. Instead, we can diff
+@@ -983,7 +983,7 @@ impl FontContext {
+         }
+ 
+         if !removed_any {
+-            return;
++            return false;
+         };
+ 
+         // Removing this stylesheet modified the available fonts, so invalidate the cache
+@@ -992,6 +992,7 @@ impl FontContext {
+ 
+         // Ensure that we clean up any WebRender resources on the next display list update.
+         self.have_removed_web_fonts.store(true, Ordering::Relaxed);
++        true
+     }
+ 
+     pub fn add_template_to_font_context(
+diff --git a/components/layout/layout_impl.rs b/components/layout/layout_impl.rs
+index 95353713045..6d7221870ff 100644
+--- a/components/layout/layout_impl.rs
++++ b/components/layout/layout_impl.rs
+@@ -349,7 +349,7 @@ impl Layout for LayoutThread {
+     }
+ 
+     #[servo_tracing::instrument(skip_all)]
+-    fn remove_stylesheet(&mut self, stylesheet: ServoArc<Stylesheet>) {
++    fn remove_stylesheet(&mut self, stylesheet: ServoArc<Stylesheet>) -> bool {
+         let guard = stylesheet.shared_lock.read();
+         let stylesheet = DocumentStyleSheet(stylesheet.clone());
+         self.stylist.remove_stylesheet(stylesheet.clone(), &guard);
+@@ -357,7 +357,7 @@ impl Layout for LayoutThread {
+             &stylesheet,
+             self.stylist.device(),
+             &guard,
+-        );
++        )
+     }
+ 
+     #[servo_tracing::instrument(skip_all)]
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index 99f6ce6b8ca..534318f23c8 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -4941,10 +4941,15 @@ impl Document {
+     /// Remove a stylesheet owned by `owner` from the list of document sheets.
+     #[cfg_attr(crown, expect(crown::unrooted_must_root))] // Owner needs to be rooted already necessarily.
+     pub(crate) fn remove_stylesheet(&self, owner: StylesheetSource, stylesheet: &Arc<Stylesheet>) {
+-        if self.has_browsing_context() {
++        // Text laid out with a removed web font still refers to it, and its WebRender
++        // resources are freed after the next display list, so all text has to be laid out
++        // again first, as when a web font loads.
++        if self.has_browsing_context() &&
+             self.window
+                 .layout_mut()
+-                .remove_stylesheet(stylesheet.clone());
++                .remove_stylesheet(stylesheet.clone())
++        {
++            self.dirty_all_nodes();
+         }
+ 
+         DocumentOrShadowRoot::remove_stylesheet(
+diff --git a/components/shared/layout/lib.rs b/components/shared/layout/lib.rs
+index 4c058ea92b5..037c11457dd 100644
+--- a/components/shared/layout/lib.rs
++++ b/components/shared/layout/lib.rs
+@@ -401,7 +401,9 @@ pub trait Layout {
+     fn set_quirks_mode(&mut self, quirks_mode: QuirksMode);
+ 
+     /// Removes a stylesheet from the Layout.
+-    fn remove_stylesheet(&mut self, stylesheet: ServoArc<Stylesheet>);
++    /// Returns whether the stylesheet's removal removed any web fonts, in which case all text
++    /// must be laid out again before the next display list.
++    fn remove_stylesheet(&mut self, stylesheet: ServoArc<Stylesheet>) -> bool;
+ 
+     /// Removes an image from the Layout image resolver cache.
+     fn remove_cached_image(&mut self, image_url: &ServoUrl);
+-- 
+2.43.0
+

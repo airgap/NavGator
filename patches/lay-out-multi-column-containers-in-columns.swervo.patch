@@ -1,0 +1,275 @@
+From aecb4d530b0034cc820f41124a05880a43721de1 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 06:38:32 -0400
+Subject: [PATCH] layout: lay out multi-column containers in columns
+
+column-count and column-width were parsed (NavGator enables
+layout.columns.enabled) but layout ignored them, so a multicol list
+rendered as one full-width column. Dailymotion's Explore feed is a
+column-count: 4 list of break-inside: avoid cards and drew each card at
+the width of the whole feed.
+
+Layout has no block fragmentation, so the content is laid out once at
+the used column width (css-multicol's pseudo-algorithm) and its
+top-level boxes are then distributed over the columns at the shortest
+balanced height, truncating margins at column breaks. Boxes are never
+split, which matches the masonry pattern exactly. Text directly inside
+the container would need line-level fragmentation and keeps the old
+full-width layout.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/flow/mod.rs            |   1 +
+ components/layout/flow/multicol.rs       | 199 +++++++++++++++++++++++
+ components/layout/formatting_contexts.rs |  17 +-
+ 3 files changed, 215 insertions(+), 2 deletions(-)
+ create mode 100644 components/layout/flow/multicol.rs
+
+diff --git a/components/layout/flow/mod.rs b/components/layout/flow/mod.rs
+index 0e34c05eedc..97e6eae0dca 100644
+--- a/components/layout/flow/mod.rs
++++ b/components/layout/flow/mod.rs
+@@ -50,6 +50,7 @@ use crate::{ConstraintSpace, ContainingBlock, ContainingBlockSize, IndefiniteCon
+ mod construct;
+ pub mod float;
+ pub mod inline;
++mod multicol;
+ mod root;
+ mod same_formatting_context_block;
+ 
+diff --git a/components/layout/flow/multicol.rs b/components/layout/flow/multicol.rs
+new file mode 100644
+index 00000000000..ede5b2bf5b1
+--- /dev/null
++++ b/components/layout/flow/multicol.rs
+@@ -0,0 +1,199 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! Multi-column layout. <https://drafts.csswg.org/css-multicol/>
++//!
++//! The content is laid out once as a single column of the used column width and then
++//! distributed over the columns at the boundaries between its top-level boxes. Layout has no
++//! block fragmentation, so a box is never split across columns, as if every child had
++//! `break-inside: avoid`. That is exactly the masonry pattern (`column-count` on a list whose
++//! items avoid breaks) that sites use multicol for.
++
++use app_units::Au;
++use style::Zero;
++use style::properties::ComputedValues;
++use style::values::computed::length::NonNegativeLengthOrAuto;
++use style::values::generics::column::ColumnCount;
++use style::values::generics::length::LengthPercentageOrNormal;
++
++use super::{BlockContainer, BlockFormattingContext};
++use crate::context::LayoutContext;
++use crate::fragment_tree::Fragment;
++use crate::geom::PhysicalSize;
++use crate::layout_box_base::IndependentFormattingContextLayoutResult;
++use crate::positioned::PositioningContext;
++use crate::sizing::SizeConstraint;
++use crate::{ContainingBlock, ContainingBlockSize};
++
++struct ColumnGeometry {
++    count: i32,
++    width: Au,
++    gap: Au,
++}
++
++impl ColumnGeometry {
++    /// <https://drafts.csswg.org/css-multicol/#pseudo-algorithm>
++    fn new(style: &ComputedValues, available_inline_size: Au) -> Self {
++        let gap = match style.clone_column_gap() {
++            // `normal` is 1em in multi-column containers.
++            // <https://drafts.csswg.org/css-align/#column-row-gap>
++            LengthPercentageOrNormal::Normal => style.get_font().font_size.computed_size().into(),
++            LengthPercentageOrNormal::LengthPercentage(gap) => {
++                gap.to_used_value(available_inline_size)
++            },
++        };
++        let available = available_inline_size.max(Au::zero());
++        let column = style.get_column();
++        let count = match (&column.column_width, &column.column_count) {
++            (NonNegativeLengthOrAuto::Auto, ColumnCount::Integer(count)) => count.0,
++            (NonNegativeLengthOrAuto::LengthPercentage(width), count) => {
++                // A zero column width with a zero gap would fit infinitely many columns; one
++                // app unit keeps the division finite.
++                let column_and_gap = (Au::from(*width) + gap).max(Au(1));
++                let fitting = ((available + gap).0 / column_and_gap.0).max(1);
++                match count {
++                    ColumnCount::Integer(count) => count.0.min(fitting),
++                    ColumnCount::Auto => fitting,
++                }
++            },
++            (NonNegativeLengthOrAuto::Auto, ColumnCount::Auto) => {
++                unreachable!("Only multi-column containers have a column geometry")
++            },
++        };
++        let width = ((available + gap) / count - gap).max(Au::zero());
++        Self { count, width, gap }
++    }
++}
++
++/// The block range a top-level box occupies in the single laid-out column. Columns may only
++/// start at a box's border-box edge: margins adjoining a column break are truncated.
++/// <https://drafts.csswg.org/css-break/#break-margins>
++fn block_range(fragment: &Fragment) -> Option<(Au, Au)> {
++    let rect = match fragment {
++        Fragment::Box(box_fragment) => box_fragment.border_rect(),
++        Fragment::Positioning(_) | Fragment::Image(_) | Fragment::IFrame(_) => {
++            fragment.base()?.rect()
++        },
++        _ => return None,
++    };
++    Some((rect.min_y(), rect.max_y()))
++}
++
++/// Greedily fills columns of the given height in order and reports, for every unit, the block
++/// offset in the single column at which its column starts.
++fn column_starts(units: &[(Au, Au)], column_height: Au) -> Vec<Au> {
++    let mut column_start = Au::zero();
++    let mut column_is_empty = true;
++    units
++        .iter()
++        .map(|&(start, end)| {
++            if !column_is_empty && end - column_start > column_height {
++                column_start = start;
++            }
++            column_is_empty = false;
++            column_start
++        })
++        .collect()
++}
++
++fn column_count_for_height(units: &[(Au, Au)], column_height: Au) -> usize {
++    let starts = column_starts(units, column_height);
++    1 + starts.windows(2).filter(|pair| pair[0] != pair[1]).count()
++}
++
++impl BlockFormattingContext {
++    /// Returns `None` when the content cannot be distributed over columns: text directly in the
++    /// container would need line-level fragmentation, so it keeps the ordinary full-width
++    /// layout rather than one narrow overflowing column.
++    pub(crate) fn layout_multicol(
++        &self,
++        layout_context: &LayoutContext,
++        positioning_context: &mut PositioningContext,
++        containing_block: &ContainingBlock,
++        style: &ComputedValues,
++    ) -> Option<IndependentFormattingContextLayoutResult> {
++        if matches!(self.contents, BlockContainer::InlineFormattingContext(_)) ||
++            !style.writing_mode.is_horizontal()
++        {
++            return None;
++        }
++        let geometry = ColumnGeometry::new(style, containing_block.size.inline);
++        let column_containing_block = ContainingBlock {
++            size: ContainingBlockSize {
++                inline: geometry.width,
++                block: containing_block.size.block,
++            },
++            style: containing_block.style,
++        };
++        let mut result = self.layout(
++            layout_context,
++            positioning_context,
++            &column_containing_block,
++        );
++
++        let units: Vec<(Au, Au)> = result.fragments.iter().filter_map(block_range).collect();
++        if units.is_empty() {
++            return Some(result);
++        }
++
++        // Balance: the shortest column height that fits the content in `count` columns.
++        // <https://drafts.csswg.org/css-multicol/#cf>
++        let tallest_unit = units
++            .iter()
++            .enumerate()
++            .map(|(index, &(start, end))| if index == 0 { end } else { end - start })
++            .max()
++            .unwrap_or_default();
++        let mut low = tallest_unit;
++        let mut high = units.last().map_or(low, |&(_, end)| end).max(low);
++        while low < high {
++            let middle = Au((low.0 + high.0) / 2);
++            if column_count_for_height(&units, middle) <= geometry.count as usize {
++                high = middle;
++            } else {
++                low = middle + Au(1);
++            }
++        }
++        // A definite height limits the columns; content that does not fit then continues in
++        // overflow columns in the inline direction.
++        // <https://drafts.csswg.org/css-multicol/#overflow-inline>
++        let column_height = match containing_block.size.block {
++            SizeConstraint::Definite(block_size) => low.min(block_size),
++            SizeConstraint::MinMax(..) => low,
++        };
++
++        let starts = column_starts(&units, column_height);
++        let column_pitch = geometry.width + geometry.gap;
++        let is_rtl = !style.writing_mode.is_bidi_ltr();
++        let mut unit_index = 0;
++        let mut column = 0;
++        let mut column_start = Au::zero();
++        let mut content_block_size = Au::zero();
++        for fragment in &result.fragments {
++            // Fragments that are not distribution units (floats) stay with the column of the
++            // box before them.
++            if let Some((_, end)) = block_range(fragment) {
++                if starts[unit_index] != column_start {
++                    column += 1;
++                    column_start = starts[unit_index];
++                }
++                content_block_size = content_block_size.max(end - column_start);
++                unit_index += 1;
++            }
++            let inline_offset = if is_rtl {
++                containing_block.size.inline - geometry.width - column_pitch * column
++            } else {
++                column_pitch * column
++            };
++            if let Some(base) = fragment.base() {
++                base.translate_rect(PhysicalSize::new(inline_offset, -column_start));
++            }
++        }
++
++        result.content_block_size = content_block_size;
++        // Only the first column's content keeps its position, so only its baseline is known.
++        result.baselines.last = None;
++        Some(result)
++    }
++}
+diff --git a/components/layout/formatting_contexts.rs b/components/layout/formatting_contexts.rs
+index 80da31fea76..693c611dab7 100644
+--- a/components/layout/formatting_contexts.rs
++++ b/components/layout/formatting_contexts.rs
+@@ -511,8 +511,21 @@ impl IndependentFormattingContext {
+                 replaced_layout
+             },
+             IndependentFormattingContextContents::Flow(bfc) => {
+-                let mut result =
+-                    bfc.layout(layout_context, positioning_context, containing_block_for_children);
++                let multicol_result = self
++                    .style()
++                    .is_multicol()
++                    .then(|| {
++                        bfc.layout_multicol(
++                            layout_context,
++                            positioning_context,
++                            containing_block_for_children,
++                            self.style(),
++                        )
++                    })
++                    .flatten();
++                let mut result = multicol_result.unwrap_or_else(|| {
++                    bfc.layout(layout_context, positioning_context, containing_block_for_children)
++                });
+                 align_block_container_content(self.style(), lazy_block_size, &mut result);
+                 // A `<textarea>`'s `rows` attribute gives its intrinsic block size whatever its
+                 // text, which scrolls instead (Chrome's `TextAreaIntrinsicBlockSize`).
+-- 
+2.43.0
+

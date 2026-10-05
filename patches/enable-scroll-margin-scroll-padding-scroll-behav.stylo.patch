@@ -1,0 +1,259 @@
+From 6e057e5811625814f0ff10b92601b966fc3bc3ed Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 03:03:02 -0400
+Subject: [PATCH] properties: enable scroll-margin, scroll-padding,
+ scroll-behavior and scroll-snap for Servo
+
+These longhands and shorthands were Gecko-only, so Servo dropped them at parse
+time and pages that use them (sticky-header sites relying on scroll-padding,
+smooth-scrolling sites, snap carousels) got none of the behaviour. Servo's
+script crate now implements scroll-into-view offsets, smooth scrolling and
+mandatory snapping on top of them.
+
+The scroll-snap-type and scroll-snap-align fields become public so script can
+read the computed axis, strictness and alignment.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ style/properties/longhands.toml  | 20 --------------------
+ style/properties/shorthands.toml |  6 ------
+ style/values/specified/box.rs    |  8 ++++----
+ 3 files changed, 4 insertions(+), 30 deletions(-)
+
+diff --git a/style/properties/longhands.toml b/style/properties/longhands.toml
+index e88d5f079..2dd94a9d6 100644
+--- a/style/properties/longhands.toml
++++ b/style/properties/longhands.toml
+@@ -1834,7 +1834,6 @@ affects = "overflow"
+ type = "ScrollSnapAlign"
+ initial = "computed::ScrollSnapAlign::none()"
+ struct = "box"
+-engine = "gecko"
+ spec = "https://drafts.csswg.org/css-scroll-snap-1/#scroll-snap-align"
+ animation_type = "discrete"
+ affects = "paint"
+@@ -1843,7 +1842,6 @@ affects = "paint"
+ type = "ScrollSnapStop"
+ initial = "computed::ScrollSnapStop::Normal"
+ struct = "box"
+-engine = "gecko"
+ spec = "https://drafts.csswg.org/css-scroll-snap-1/#scroll-snap-stop"
+ animation_type = "discrete"
+ affects = "paint"
+@@ -1852,7 +1850,6 @@ affects = "paint"
+ type = "ScrollSnapType"
+ initial = "computed::ScrollSnapType::none()"
+ struct = "box"
+-engine = "gecko"
+ spec = "https://drafts.csswg.org/css-scroll-snap-1/#scroll-snap-type"
+ animation_type = "discrete"
+ affects = "paint"
+@@ -3348,7 +3345,6 @@ affects = "layout"
+ type = "Length"
+ initial = "computed::Length::zero()"
+ struct = "margin"
+-engine = "gecko"
+ logical_group = "scroll-margin"
+ gecko_ffi_name = "mScrollMargin.0"
+ spec = "https://drafts.csswg.org/css-scroll-snap-1/#propdef-scroll-margin-top"
+@@ -3358,7 +3354,6 @@ affects = ""
+ type = "Length"
+ initial = "computed::Length::zero()"
+ struct = "margin"
+-engine = "gecko"
+ logical_group = "scroll-margin"
+ gecko_ffi_name = "mScrollMargin.1"
+ spec = "https://drafts.csswg.org/css-scroll-snap-1/#propdef-scroll-margin-right"
+@@ -3368,7 +3363,6 @@ affects = ""
+ type = "Length"
+ initial = "computed::Length::zero()"
+ struct = "margin"
+-engine = "gecko"
+ logical_group = "scroll-margin"
+ gecko_ffi_name = "mScrollMargin.2"
+ spec = "https://drafts.csswg.org/css-scroll-snap-1/#propdef-scroll-margin-bottom"
+@@ -3378,7 +3372,6 @@ affects = ""
+ type = "Length"
+ initial = "computed::Length::zero()"
+ struct = "margin"
+-engine = "gecko"
+ logical_group = "scroll-margin"
+ gecko_ffi_name = "mScrollMargin.3"
+ spec = "https://drafts.csswg.org/css-scroll-snap-1/#propdef-scroll-margin-left"
+@@ -3388,7 +3381,6 @@ affects = ""
+ type = "Length"
+ initial = "computed::Length::zero()"
+ struct = "margin"
+-engine = "gecko"
+ logical = true
+ logical_group = "scroll-margin"
+ gecko_ffi_name = "mScrollMargin.4"
+@@ -3399,7 +3391,6 @@ affects = ""
+ type = "Length"
+ initial = "computed::Length::zero()"
+ struct = "margin"
+-engine = "gecko"
+ logical = true
+ logical_group = "scroll-margin"
+ gecko_ffi_name = "mScrollMargin.5"
+@@ -3410,7 +3401,6 @@ affects = ""
+ type = "Length"
+ initial = "computed::Length::zero()"
+ struct = "margin"
+-engine = "gecko"
+ logical = true
+ logical_group = "scroll-margin"
+ gecko_ffi_name = "mScrollMargin.6"
+@@ -3421,7 +3411,6 @@ affects = ""
+ type = "Length"
+ initial = "computed::Length::zero()"
+ struct = "margin"
+-engine = "gecko"
+ logical = true
+ logical_group = "scroll-margin"
+ gecko_ffi_name = "mScrollMargin.7"
+@@ -3522,7 +3511,6 @@ affects = "layout"
+ type = "NonNegativeLengthPercentageOrAuto"
+ initial = "computed::NonNegativeLengthPercentageOrAuto::auto()"
+ struct = "padding"
+-engine = "gecko"
+ logical_group = "scroll-padding"
+ gecko_ffi_name = "mScrollPadding.0"
+ spec = "https://drafts.csswg.org/css-scroll-snap-1/#propdef-scroll-padding-top"
+@@ -3532,7 +3520,6 @@ affects = ""
+ type = "NonNegativeLengthPercentageOrAuto"
+ initial = "computed::NonNegativeLengthPercentageOrAuto::auto()"
+ struct = "padding"
+-engine = "gecko"
+ logical_group = "scroll-padding"
+ gecko_ffi_name = "mScrollPadding.1"
+ spec = "https://drafts.csswg.org/css-scroll-snap-1/#propdef-scroll-padding-right"
+@@ -3542,7 +3529,6 @@ affects = ""
+ type = "NonNegativeLengthPercentageOrAuto"
+ initial = "computed::NonNegativeLengthPercentageOrAuto::auto()"
+ struct = "padding"
+-engine = "gecko"
+ logical_group = "scroll-padding"
+ gecko_ffi_name = "mScrollPadding.2"
+ spec = "https://drafts.csswg.org/css-scroll-snap-1/#propdef-scroll-padding-bottom"
+@@ -3552,7 +3538,6 @@ affects = ""
+ type = "NonNegativeLengthPercentageOrAuto"
+ initial = "computed::NonNegativeLengthPercentageOrAuto::auto()"
+ struct = "padding"
+-engine = "gecko"
+ logical_group = "scroll-padding"
+ gecko_ffi_name = "mScrollPadding.3"
+ spec = "https://drafts.csswg.org/css-scroll-snap-1/#propdef-scroll-padding-left"
+@@ -3562,7 +3547,6 @@ affects = ""
+ type = "NonNegativeLengthPercentageOrAuto"
+ initial = "computed::NonNegativeLengthPercentageOrAuto::auto()"
+ struct = "padding"
+-engine = "gecko"
+ logical = true
+ logical_group = "scroll-padding"
+ gecko_ffi_name = "mScrollPadding.4"
+@@ -3573,7 +3557,6 @@ affects = ""
+ type = "NonNegativeLengthPercentageOrAuto"
+ initial = "computed::NonNegativeLengthPercentageOrAuto::auto()"
+ struct = "padding"
+-engine = "gecko"
+ logical = true
+ logical_group = "scroll-padding"
+ gecko_ffi_name = "mScrollPadding.5"
+@@ -3584,7 +3567,6 @@ affects = ""
+ type = "NonNegativeLengthPercentageOrAuto"
+ initial = "computed::NonNegativeLengthPercentageOrAuto::auto()"
+ struct = "padding"
+-engine = "gecko"
+ logical = true
+ logical_group = "scroll-padding"
+ gecko_ffi_name = "mScrollPadding.6"
+@@ -3595,7 +3577,6 @@ affects = ""
+ type = "NonNegativeLengthPercentageOrAuto"
+ initial = "computed::NonNegativeLengthPercentageOrAuto::auto()"
+ struct = "padding"
+-engine = "gecko"
+ logical = true
+ logical_group = "scroll-padding"
+ gecko_ffi_name = "mScrollPadding.7"
+@@ -3686,7 +3667,6 @@ keyword = { values = ["none", "top"] }
+ 
+ [scroll-behavior]
+ struct = "box"
+-engine = "gecko"
+ spec = "https://drafts.csswg.org/cssom-view/#propdef-scroll-behavior"
+ animation_type = "discrete"
+ affects = ""
+diff --git a/style/properties/shorthands.toml b/style/properties/shorthands.toml
+index a780db99f..230ae894e 100644
+--- a/style/properties/shorthands.toml
++++ b/style/properties/shorthands.toml
+@@ -18,19 +18,16 @@ rule_types_allowed = ["style", "keyframe", "page", "scope", "position-try"]
+ kind = "two_properties"
+ 
+ [scroll-margin]
+-engine = "gecko"
+ sub_properties = ["scroll-margin-top", "scroll-margin-right", "scroll-margin-bottom", "scroll-margin-left"]
+ spec = "https://drafts.csswg.org/css-scroll-snap-1/#propdef-scroll-margin"
+ kind = "four_sides"
+ 
+ [scroll-margin-block]
+-engine = "gecko"
+ sub_properties = ["scroll-margin-block-start", "scroll-margin-block-end"]
+ spec = "https://drafts.csswg.org/css-scroll-snap-1/#propdef-scroll-margin-block"
+ kind = "two_properties"
+ 
+ [scroll-margin-inline]
+-engine = "gecko"
+ sub_properties = ["scroll-margin-inline-start", "scroll-margin-inline-end"]
+ spec = "https://drafts.csswg.org/css-scroll-snap-1/#propdef-scroll-margin-inline"
+ kind = "two_properties"
+@@ -54,19 +51,16 @@ rule_types_allowed = ["style", "keyframe", "page", "scope", "position-try"]
+ kind = "two_properties"
+ 
+ [scroll-padding]
+-engine = "gecko"
+ sub_properties = ["scroll-padding-top", "scroll-padding-right", "scroll-padding-bottom", "scroll-padding-left"]
+ spec = "https://drafts.csswg.org/css-scroll-snap-1/#propdef-scroll-padding"
+ kind = "four_sides"
+ 
+ [scroll-padding-block]
+-engine = "gecko"
+ sub_properties = ["scroll-padding-block-start", "scroll-padding-block-end"]
+ spec = "https://drafts.csswg.org/css-scroll-snap-1/#propdef-scroll-padding-block"
+ kind = "two_properties"
+ 
+ [scroll-padding-inline]
+-engine = "gecko"
+ sub_properties = ["scroll-padding-inline-start", "scroll-padding-inline-end"]
+ spec = "https://drafts.csswg.org/css-scroll-snap-1/#propdef-scroll-padding-inline"
+ kind = "two_properties"
+diff --git a/style/values/specified/box.rs b/style/values/specified/box.rs
+index 11b79aaf4..c283e963b 100644
+--- a/style/values/specified/box.rs
++++ b/style/values/specified/box.rs
+@@ -873,8 +873,8 @@ pub enum ScrollSnapStrictness {
+ #[repr(C)]
+ #[typed(todo_derive_fields)]
+ pub struct ScrollSnapType {
+-    axis: ScrollSnapAxis,
+-    strictness: ScrollSnapStrictness,
++    pub axis: ScrollSnapAxis,
++    pub strictness: ScrollSnapStrictness,
+ }
+ 
+ impl ScrollSnapType {
+@@ -970,8 +970,8 @@ pub enum ScrollSnapAlignKeyword {
+ #[repr(C)]
+ #[typed(todo_derive_fields)]
+ pub struct ScrollSnapAlign {
+-    block: ScrollSnapAlignKeyword,
+-    inline: ScrollSnapAlignKeyword,
++    pub block: ScrollSnapAlignKeyword,
++    pub inline: ScrollSnapAlignKeyword,
+ }
+ 
+ impl ScrollSnapAlign {
+-- 
+2.43.0
+

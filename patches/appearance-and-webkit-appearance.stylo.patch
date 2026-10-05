@@ -1,0 +1,107 @@
+From 15e328e2741b33f52211dcf4bb8fddf8c548a501 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 03:13:19 -0400
+Subject: [PATCH] servo: appearance and -webkit-appearance
+
+appearance was gecko-only, so pages' appearance:none never parsed and custom-styled checkboxes,
+radios and selects kept swervo's native widget parts. Enable appearance and
+-moz-default-appearance for Servo. Servo has no native theme: the UA sheet emulates widget looks
+with ordinary rules, so a widget that computes to appearance:none now starts an
+@appearance-base subtree (the same cascade flag Gecko uses for appearance:base), letting UA rules
+drop the native look for the widget, its pseudo-elements and its UA shadow parts. A widget that
+keeps its native look ends the subtree again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ style/properties/cascade.rs     | 40 ++++++++++++++++++++++++++++++++-
+ style/properties/longhands.toml |  2 --
+ 2 files changed, 39 insertions(+), 3 deletions(-)
+
+diff --git a/style/properties/cascade.rs b/style/properties/cascade.rs
+index fa8b2d002..944a346bf 100644
+--- a/style/properties/cascade.rs
++++ b/style/properties/cascade.rs
+@@ -452,6 +452,22 @@ fn is_base_appearance(context: &computed::Context) -> bool {
+     }
+ }
+ 
++/// Servo has no native theme: the UA sheet emulates each widget's native look with ordinary rules,
++/// and its `@appearance-base` rules restyle the widget for when `appearance` turns that look off
++/// (https://drafts.csswg.org/css-ui-4/#appearance-switching). A widget (an element with a
++/// `-moz-default-appearance`) that computes to `appearance: none` starts such a subtree, so its
++/// pseudo-elements and UA shadow parts drop the native look with it; a widget that keeps its native
++/// look ends the subtree again. Returns `None` for elements that are not widgets.
++#[cfg(feature = "servo")]
++fn uses_primitive_appearance(context: &computed::Context) -> Option<bool> {
++    use computed::Appearance;
++    let box_style = context.builder.get_box();
++    if box_style.clone__moz_default_appearance() == Appearance::None {
++        return None;
++    }
++    Some(box_style.clone_appearance() == Appearance::None)
++}
++
+ fn tweak_when_ignoring_colors(
+     context: &computed::Context,
+     longhand_id: LonghandId,
+@@ -809,7 +825,6 @@ impl<'b> Cascade<'b> {
+             return;
+         }
+ 
+-        #[cfg(feature = "gecko")]
+         apply!(MozDefaultAppearance);
+         #[cfg(feature = "gecko")]
+         if apply!(Appearance) && is_base_appearance(&context) {
+@@ -820,6 +835,29 @@ impl<'b> Cascade<'b> {
+                 .included_cascade_flags
+                 .insert(RuleCascadeFlags::APPEARANCE_BASE);
+         }
++        #[cfg(feature = "servo")]
++        {
++            apply!(Appearance);
++            match uses_primitive_appearance(&context) {
++                Some(true) => {
++                    context
++                        .style()
++                        .add_flags(ComputedValueFlags::IS_IN_APPEARANCE_BASE_SUBTREE);
++                    context
++                        .included_cascade_flags
++                        .insert(RuleCascadeFlags::APPEARANCE_BASE);
++                },
++                Some(false) => {
++                    context
++                        .style()
++                        .remove_flags(ComputedValueFlags::IS_IN_APPEARANCE_BASE_SUBTREE);
++                    context
++                        .included_cascade_flags
++                        .remove(RuleCascadeFlags::APPEARANCE_BASE);
++                },
++                None => {},
++            }
++        }
+ 
+         let has_writing_mode = apply!(WritingMode) | apply!(Direction);
+         #[cfg(feature = "gecko")]
+diff --git a/style/properties/longhands.toml b/style/properties/longhands.toml
+index 2dd94a9d6..76096f674 100644
+--- a/style/properties/longhands.toml
++++ b/style/properties/longhands.toml
+@@ -78,7 +78,6 @@ affects = "layout"
+ type = "Appearance"
+ initial = "computed::Appearance::None"
+ struct = "box"
+-engine = "gecko"
+ animation_type = "none"
+ spec = "Internal (not web-exposed)"
+ enabled_in = "chrome"
+@@ -331,7 +330,6 @@ affects = ""
+ type = "Appearance"
+ initial = "computed::Appearance::None"
+ struct = "box"
+-engine = "gecko"
+ extra_prefixes = ["moz:layout.css.moz-appearance.enabled", "webkit"]
+ spec = "https://drafts.csswg.org/css-ui-4/#propdef-appearance"
+ animation_type = "discrete"
+-- 
+2.43.0
+

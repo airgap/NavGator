@@ -1,0 +1,100 @@
+From 99048b85db2a5648f17b5831a18cb16ec95eb6f1 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 03:13:19 -0400
+Subject: [PATCH] servo: ::-webkit-progress-*, ::-webkit-meter-* and
+ ::-servo-select-arrow
+
+Implemented pseudo-elements for the <progress>/<meter> UA shadow parts, under Chrome's names so
+UA rules can reach them (descendant selectors from a featureless host never matched) and pages
+that style them the Chrome way work. ::-servo-select-arrow is UA-only and lets the select arrow
+be hidden under appearance:none.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ style/servo/selector_parser.rs | 40 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+
+diff --git a/style/servo/selector_parser.rs b/style/servo/selector_parser.rs
+index 61d7abb86..88387cb42 100644
+--- a/style/servo/selector_parser.rs
++++ b/style/servo/selector_parser.rs
+@@ -70,8 +70,15 @@ pub enum PseudoElement {
+     SliderThumb,
+     SliderTrack,
+     WebkitInnerSpinButton,
++    WebkitMeterBar,
++    WebkitMeterEvenLessGoodValue,
++    WebkitMeterOptimumValue,
++    WebkitMeterSuboptimumValue,
++    WebkitProgressBar,
++    WebkitProgressValue,
+ 
+     // Private, Servo-specific implemented pseudos. Only matchable in UA sheet.
++    ServoSelectArrow,
+     ServoTextControlInnerContainer,
+     ServoTextControlInnerEditor,
+ 
+@@ -108,6 +115,13 @@ impl ToCss for PseudoElement {
+             SliderTrack => "::slider-track",
+             SliderThumb => "::slider-thumb",
+             WebkitInnerSpinButton => "::-webkit-inner-spin-button",
++            WebkitMeterBar => "::-webkit-meter-bar",
++            WebkitMeterEvenLessGoodValue => "::-webkit-meter-even-less-good-value",
++            WebkitMeterOptimumValue => "::-webkit-meter-optimum-value",
++            WebkitMeterSuboptimumValue => "::-webkit-meter-suboptimum-value",
++            WebkitProgressBar => "::-webkit-progress-bar",
++            WebkitProgressValue => "::-webkit-progress-value",
++            ServoSelectArrow => "::-servo-select-arrow",
+             ServoTextControlInnerContainer => "::-servo-text-control-inner-container",
+             ServoTextControlInnerEditor => "::-servo-text-control-inner-editor",
+             ServoAnonymousBox => "::-servo-anonymous-box",
+@@ -268,6 +282,13 @@ impl PseudoElement {
+             | PseudoElement::SliderThumb
+             | PseudoElement::SliderTrack
+             | PseudoElement::WebkitInnerSpinButton
++            | PseudoElement::WebkitMeterBar
++            | PseudoElement::WebkitMeterEvenLessGoodValue
++            | PseudoElement::WebkitMeterOptimumValue
++            | PseudoElement::WebkitMeterSuboptimumValue
++            | PseudoElement::WebkitProgressBar
++            | PseudoElement::WebkitProgressValue
++            | PseudoElement::ServoSelectArrow
+             | PseudoElement::ServoTextControlInnerContainer
+             | PseudoElement::ServoTextControlInnerEditor => PseudoElementCascadeType::Lazy,
+             PseudoElement::ServoAnonymousBox
+@@ -351,6 +372,13 @@ impl PseudoElement {
+                     | Self::SliderThumb
+                     | Self::SliderTrack
+                     | Self::WebkitInnerSpinButton
++                    | Self::WebkitMeterBar
++                    | Self::WebkitMeterEvenLessGoodValue
++                    | Self::WebkitMeterOptimumValue
++                    | Self::WebkitMeterSuboptimumValue
++                    | Self::WebkitProgressBar
++                    | Self::WebkitProgressValue
++                    | Self::ServoSelectArrow
+                     | Self::ServoTextControlInnerContainer
+                     | Self::ServoTextControlInnerEditor,
+             )
+@@ -724,6 +752,18 @@ impl<'a, 'i> ::selectors::Parser<'i> for SelectorParser<'a> {
+             "slider-thumb" => SliderThumb,
+             "slider-track" => SliderTrack,
+             "-webkit-inner-spin-button" => WebkitInnerSpinButton,
++            "-webkit-meter-bar" => WebkitMeterBar,
++            "-webkit-meter-even-less-good-value" => WebkitMeterEvenLessGoodValue,
++            "-webkit-meter-optimum-value" => WebkitMeterOptimumValue,
++            "-webkit-meter-suboptimum-value" => WebkitMeterSuboptimumValue,
++            "-webkit-progress-bar" => WebkitProgressBar,
++            "-webkit-progress-value" => WebkitProgressValue,
++            "-servo-select-arrow" => {
++                if !self.in_user_agent_stylesheet() {
++                    return Err(location.new_custom_error(SelectorParseErrorKind::UnexpectedIdent(name.clone())))
++                }
++                ServoSelectArrow
++            },
+             "-servo-anonymous-box" => {
+                 if !self.in_user_agent_stylesheet() {
+                     return Err(location.new_custom_error(SelectorParseErrorKind::UnexpectedIdent(name.clone())))
+-- 
+2.43.0
+

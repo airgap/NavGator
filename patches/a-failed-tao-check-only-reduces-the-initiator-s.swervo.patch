@@ -1,0 +1,153 @@
+From 209c815469a3e192fb5d98608e4bcdeb0e7b5989 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 17:40:12 -0400
+Subject: [PATCH] net: a failed TAO check only reduces the initiator's resource
+ timing entry
+
+The timing-allow check cleared the shared ResourceFetchTiming in place. A
+navigation's request origin is opaque for address-bar loads and is the old
+page's origin for cross-origin links, so such documents reported
+requestStart, responseStart, connectStart and the rest as 0. Per Fetch,
+only the resource timing entry reported to the initiator becomes an
+opaque timing info; the document's own navigation timing is never
+TAO-checked. Navigation redirectCount is 0 when any redirect was
+cross-origin, as Navigation Timing requires, and navigation redirects no
+longer add a duplicate URL to the URL list.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/net/http_loader.rs                 | 18 ++++++++--
+ components/script/network_listener.rs         |  9 +++--
+ components/script/script_thread.rs            | 10 +++---
+ .../shared/net/resource_fetch_timing.rs       | 33 ++++++++++---------
+ 4 files changed, 45 insertions(+), 25 deletions(-)
+
+diff --git a/components/net/http_loader.rs b/components/net/http_loader.rs
+index 2ffc13ad0d9..426bf66d47b 100644
+--- a/components/net/http_loader.rs
++++ b/components/net/http_loader.rs
+@@ -1110,11 +1110,23 @@ pub(crate) async fn http_fetch(
+ 
+     // set back to default
+     response.return_internal = true;
++    // <https://w3c.github.io/navigation-timing/#dom-performancenavigationtiming-redirectcount>
++    // A document does not learn that it was reached through a redirect from another origin.
++    let request = &fetch_params.request;
++    let destination_origin = request.current_url().origin();
++    let redirect_count = if request.is_navigation_request() &&
++        request
++            .url_list
++            .iter()
++            .any(|url| url.origin() != destination_origin)
++    {
++        0
++    } else {
++        request.redirect_count as u16
++    };
+     context
+         .timing
+-        .set_attribute(ResourceAttribute::RedirectCount(
+-            fetch_params.request.redirect_count as u16,
+-        ));
++        .set_attribute(ResourceAttribute::RedirectCount(redirect_count));
+ 
+     response.resource_timing = context.timing.clone();
+ 
+diff --git a/components/script/network_listener.rs b/components/script/network_listener.rs
+index 87ebc8f4407..15e5fe60b48 100644
+--- a/components/script/network_listener.rs
++++ b/components/script/network_listener.rs
+@@ -85,8 +85,13 @@ pub(crate) fn submit_timing_data(
+     initiator_type: InitiatorType,
+     resource_timing: &ResourceFetchTiming,
+ ) {
+-    let performance_entry =
+-        PerformanceResourceTiming::new(cx, global, url, initiator_type, resource_timing);
++    // A fetch that failed the TAO check reports only its start and end to the initiator:
++    // <https://fetch.spec.whatwg.org/#create-an-opaque-timing-info>
++    let performance_entry = if resource_timing.timing_check_passed {
++        PerformanceResourceTiming::new(cx, global, url, initiator_type, resource_timing)
++    } else {
++        PerformanceResourceTiming::new(cx, global, url, initiator_type, &resource_timing.opaque())
++    };
+     global
+         .performance()
+         .queue_entry(performance_entry.upcast::<PerformanceEntry>());
+diff --git a/components/script/script_thread.rs b/components/script/script_thread.rs
+index 8227bcc563b..553bf933f31 100644
+--- a/components/script/script_thread.rs
++++ b/components/script/script_thread.rs
+@@ -4100,11 +4100,13 @@ impl ScriptThread {
+             return;
+         };
+ 
+-        // Update the `url_list` of the incomplete load to track all redirects. This will be reflected
+-        // in the new `RequestBuilder` as well.
+-        incomplete_load.url_list.push(metadata.final_url.clone());
+-
+         let mut request_builder = incomplete_load.request_builder();
++        // `http_redirect_fetch` appends the location URL to the new request's URL list. Track it in
++        // the `url_list` of the incomplete load too, so that a later redirect's request carries every
++        // URL fetched so far, once, and the document's redirect count matches the redirects taken.
++        if let Some(Ok(location_url)) = &metadata.location_url {
++            incomplete_load.url_list.push(location_url.clone());
++        }
+         request_builder.referrer = metadata
+             .referrer
+             .clone()
+diff --git a/components/shared/net/resource_fetch_timing.rs b/components/shared/net/resource_fetch_timing.rs
+index 1b2958bea83..c072e49c67f 100644
+--- a/components/shared/net/resource_fetch_timing.rs
++++ b/components/shared/net/resource_fetch_timing.rs
+@@ -98,15 +98,6 @@ impl ResourceFetchTiming {
+     // TODO currently this is being set with precise time ns when it should be time since
+     // time origin (as described in Performance::now)
+     pub fn set_attribute(&mut self, attribute: ResourceAttribute) {
+-        let should_attribute_always_be_updated = matches!(
+-            attribute,
+-            ResourceAttribute::FetchStart |
+-                ResourceAttribute::ResponseEnd |
+-                ResourceAttribute::StartTime(_)
+-        );
+-        if !self.timing_check_passed && !should_attribute_always_be_updated {
+-            return;
+-        }
+         let now = Some(CrossProcessInstant::now());
+         match attribute {
+             ResourceAttribute::DomainLookupStart => self.domain_lookup_start = now,
+@@ -147,15 +138,25 @@ impl ResourceFetchTiming {
+         }
+     }
+ 
++    /// <https://fetch.spec.whatwg.org/#timing-allow-failed>
++    ///
++    /// The full timing stays recorded: a navigation's own document reads it unchecked, and only
++    /// the resource timing entry reported to the initiator is reduced, see [`Self::opaque`].
+     pub fn mark_timing_check_failed(&mut self) {
+         self.timing_check_passed = false;
+-        self.domain_lookup_start = None;
+-        self.redirect_count = 0;
+-        self.request_start = None;
+-        self.response_start = None;
+-        self.redirect_start = None;
+-        self.connect_start = None;
+-        self.connect_end = None;
++    }
++
++    /// <https://fetch.spec.whatwg.org/#create-an-opaque-timing-info>
++    pub fn opaque(&self) -> ResourceFetchTiming {
++        ResourceFetchTiming {
++            timing_type: self.timing_type,
++            timing_check_passed: false,
++            fetch_start: self.fetch_start,
++            start_time: self.start_time,
++            response_end: self.response_end,
++            preloaded: self.preloaded,
++            ..ResourceFetchTiming::new(self.timing_type)
++        }
+     }
+ }
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,209 @@
+From b2df24e9c9154ee8916d31a1e98a1caeaf488b8b Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 04:42:03 -0400
+Subject: [PATCH] script: window.locationbar, menubar, personalbar, scrollbars,
+ statusbar and toolbar
+
+The BarProp attributes were commented out. weibo.com's bundle names a Vue
+component from an undeclared `toolbar`, which browsers resolve to
+window.toolbar; the ReferenceError kept the app from mounting and the page
+stayed blank. Each attribute is its own BarProp, and visible is true since
+no webview here is a popup with hidden bars.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/barprop.rs              | 37 ++++++++++++++++
+ components/script/dom/mod.rs                  |  1 +
+ components/script/dom/window/window.rs        | 44 +++++++++++++++++++
+ .../script_bindings/codegen/Bindings.conf     |  2 +-
+ .../script_bindings/webidls/BarProp.webidl    |  9 ++++
+ .../script_bindings/webidls/Window.webidl     | 12 ++---
+ 6 files changed, 98 insertions(+), 7 deletions(-)
+ create mode 100644 components/script/dom/barprop.rs
+ create mode 100644 components/script_bindings/webidls/BarProp.webidl
+
+diff --git a/components/script/dom/barprop.rs b/components/script/dom/barprop.rs
+new file mode 100644
+index 00000000000..35f1b762302
+--- /dev/null
++++ b/components/script/dom/barprop.rs
+@@ -0,0 +1,37 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++use dom_struct::dom_struct;
++use script_bindings::reflector::{Reflector, reflect_dom_object};
++
++use crate::dom::bindings::codegen::Bindings::BarPropBinding::BarPropMethods;
++use crate::dom::bindings::root::DomRoot;
++use crate::dom::window::Window;
++use crate::script_runtime::CanGc;
++
++/// <https://html.spec.whatwg.org/multipage/#barprop>
++#[dom_struct]
++pub(crate) struct BarProp {
++    reflector_: Reflector,
++}
++
++impl BarProp {
++    pub(crate) fn new(window: &Window, can_gc: CanGc) -> DomRoot<BarProp> {
++        reflect_dom_object(
++            Box::new(BarProp {
++                reflector_: Reflector::new(),
++            }),
++            window,
++            can_gc,
++        )
++    }
++}
++
++impl BarPropMethods<crate::DomTypeHolder> for BarProp {
++    /// <https://html.spec.whatwg.org/multipage/#dom-barprop-visible>
++    fn Visible(&self) -> bool {
++        // Only popup windows report hidden bars, and every webview here is a full browser tab.
++        true
++    }
++}
+diff --git a/components/script/dom/mod.rs b/components/script/dom/mod.rs
+index b1ee28b58c1..79f6970919a 100644
+--- a/components/script/dom/mod.rs
++++ b/components/script/dom/mod.rs
+@@ -221,6 +221,7 @@ pub(crate) mod bindings;
+ pub(crate) mod bluetooth;
+ #[cfg(feature = "bluetooth")]
+ pub(crate) use self::bluetooth::*;
++pub(crate) mod barprop;
+ pub(crate) mod broadcastchannel;
+ mod canvas;
+ pub(crate) use self::canvas::*;
+diff --git a/components/script/dom/window/window.rs b/components/script/dom/window/window.rs
+index 35927751658..dd22b33b79a 100644
+--- a/components/script/dom/window/window.rs
++++ b/components/script/dom/window/window.rs
+@@ -100,6 +100,7 @@ use time::Duration as TimeDuration;
+ use webrender_api::ExternalScrollId;
+ use webrender_api::units::{DeviceIntSize, DevicePixel, LayoutPixel, LayoutPoint, LayoutVector2D};
+ 
++use crate::dom::barprop::BarProp;
+ use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
+     DocumentMethods, DocumentReadyState, NamedPropertyValue,
+ };
+@@ -359,6 +360,13 @@ pub(crate) struct Window {
+     #[no_trace]
+     navigation_start: Cell<CrossProcessInstant>,
+     screen: MutNullableDom<Screen>,
++    /// <https://html.spec.whatwg.org/multipage/#bar-prop-objects>
++    locationbar: MutNullableDom<BarProp>,
++    menubar: MutNullableDom<BarProp>,
++    personalbar: MutNullableDom<BarProp>,
++    scrollbars: MutNullableDom<BarProp>,
++    statusbar: MutNullableDom<BarProp>,
++    toolbar: MutNullableDom<BarProp>,
+     session_storage: MutNullableDom<Storage>,
+     local_storage: MutNullableDom<Storage>,
+     /// <https://cookiestore.spec.whatwg.org/#globals>
+@@ -1830,6 +1838,36 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
+         self.screen.or_init(|| Screen::new(self, can_gc))
+     }
+ 
++    /// <https://html.spec.whatwg.org/multipage/#dom-window-locationbar>
++    fn Locationbar(&self, can_gc: CanGc) -> DomRoot<BarProp> {
++        self.locationbar.or_init(|| BarProp::new(self, can_gc))
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-window-menubar>
++    fn Menubar(&self, can_gc: CanGc) -> DomRoot<BarProp> {
++        self.menubar.or_init(|| BarProp::new(self, can_gc))
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-window-personalbar>
++    fn Personalbar(&self, can_gc: CanGc) -> DomRoot<BarProp> {
++        self.personalbar.or_init(|| BarProp::new(self, can_gc))
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-window-scrollbars>
++    fn Scrollbars(&self, can_gc: CanGc) -> DomRoot<BarProp> {
++        self.scrollbars.or_init(|| BarProp::new(self, can_gc))
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-window-statusbar>
++    fn Statusbar(&self, can_gc: CanGc) -> DomRoot<BarProp> {
++        self.statusbar.or_init(|| BarProp::new(self, can_gc))
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-window-toolbar>
++    fn Toolbar(&self, can_gc: CanGc) -> DomRoot<BarProp> {
++        self.toolbar.or_init(|| BarProp::new(self, can_gc))
++    }
++
+     /// <https://drafts.csswg.org/cssom-view/#dom-window-visualviewport>
+     fn GetVisualViewport(&self, can_gc: CanGc) -> Option<DomRoot<VisualViewport>> {
+         // > If the associated document is fully active, the visualViewport attribute must return the
+@@ -4163,6 +4201,12 @@ impl Window {
+             performance: Default::default(),
+             navigation_start: Cell::new(navigation_start),
+             screen: Default::default(),
++            locationbar: Default::default(),
++            menubar: Default::default(),
++            personalbar: Default::default(),
++            scrollbars: Default::default(),
++            statusbar: Default::default(),
++            toolbar: Default::default(),
+             session_storage: Default::default(),
+             local_storage: Default::default(),
+             cookie_store: Default::default(),
+diff --git a/components/script_bindings/codegen/Bindings.conf b/components/script_bindings/codegen/Bindings.conf
+index ddec16114d8..491f9bfd9fa 100644
+--- a/components/script_bindings/codegen/Bindings.conf
++++ b/components/script_bindings/codegen/Bindings.conf
+@@ -1405,7 +1405,7 @@ DOMInterfaces = {
+ },
+ 
+ 'Window': {
+-    'canGc': ['GetVisualViewport', 'Screen'],
++    'canGc': ['GetVisualViewport', 'Locationbar', 'Menubar', 'Personalbar', 'Screen', 'Scrollbars', 'Statusbar', 'Toolbar'],
+     'additionalTraits': ['crate::interfaces::WindowHelpers', 'crate::interfaces::HasOrigin'],
+     'realm': ['CreateImageBitmap', 'CreateImageBitmap_', 'WebdriverCallback', 'GetOpener', 'Fetch'],
+     'cx': [
+diff --git a/components/script_bindings/webidls/BarProp.webidl b/components/script_bindings/webidls/BarProp.webidl
+new file mode 100644
+index 00000000000..3b40faf2e30
+--- /dev/null
++++ b/components/script_bindings/webidls/BarProp.webidl
+@@ -0,0 +1,9 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++// https://html.spec.whatwg.org/multipage/#barprop
++[Exposed=Window]
++interface BarProp {
++  readonly attribute boolean visible;
++};
+diff --git a/components/script_bindings/webidls/Window.webidl b/components/script_bindings/webidls/Window.webidl
+index 7e6144afb8e..3fe72b4de32 100644
+--- a/components/script_bindings/webidls/Window.webidl
++++ b/components/script_bindings/webidls/Window.webidl
+@@ -16,12 +16,12 @@
+     readonly attribute Location location;
+   readonly attribute History history;
+   readonly attribute CustomElementRegistry customElements;
+-  //[Replaceable] readonly attribute BarProp locationbar;
+-  //[Replaceable] readonly attribute BarProp menubar;
+-  //[Replaceable] readonly attribute BarProp personalbar;
+-  //[Replaceable] readonly attribute BarProp scrollbars;
+-  //[Replaceable] readonly attribute BarProp statusbar;
+-  //[Replaceable] readonly attribute BarProp toolbar;
++  [Replaceable] readonly attribute BarProp locationbar;
++  [Replaceable] readonly attribute BarProp menubar;
++  [Replaceable] readonly attribute BarProp personalbar;
++  [Replaceable] readonly attribute BarProp scrollbars;
++  [Replaceable] readonly attribute BarProp statusbar;
++  [Replaceable] readonly attribute BarProp toolbar;
+   attribute DOMString status;
+   [CrossOriginCallable] undefined close();
+   [CrossOriginReadable] readonly attribute boolean closed;
+-- 
+2.43.0
+

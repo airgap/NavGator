@@ -1,0 +1,78 @@
+From 1205dd0692bf9729677de13d462869c15d70ab9d Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 06:14:59 -0400
+Subject: [PATCH] layout: inline svg flex items can shrink below their
+ specified size
+
+Chrome shrinks an inline <svg> with width:36px in a 14px-wide flex container
+to 14px while <img>, <canvas> and <video> keep 36px. The difference is the
+SVG UA stylesheet's `overflow: hidden` on non-root svg elements, which Servo
+lacked, combined with Blink zeroing the automatic minimum size of a replaced
+flex item whose computed overflow is scrollable (img/canvas with author
+overflow:hidden shrink too, svg with overflow:clip or visible does not), even
+though the used overflow of a replaced element is clip. Add the SVG UA rule
+and check the computed overflow of replaced items in the automatic minimum
+size. This fixes Excalidraw's oversized toolbar icons.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/flexbox/layout.rs          | 15 ++++++++++++---
+ components/layout/stylesheets/user-agent.css |  5 +++++
+ 2 files changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/components/layout/flexbox/layout.rs b/components/layout/flexbox/layout.rs
+index 88718c0c5bf..321d274d550 100644
+--- a/components/layout/flexbox/layout.rs
++++ b/components/layout/flexbox/layout.rs
+@@ -9,6 +9,7 @@ use std::sync::Arc;
+ use app_units::Au;
+ use atomic_refcell::AtomicRef;
+ use itertools::izip;
++use layout_api::AxesOverflow;
+ use rayon::iter::{
+     IndexedParallelIterator, IntoParallelRefIterator, ParallelDrainRange, ParallelIterator,
+ };
+@@ -2255,7 +2256,17 @@ impl FlexItemBox {
+ 
+         let get_automatic_minimum_size = || {
+             // This is an implementation of <https://drafts.csswg.org/css-flexbox/#min-size-auto>.
+-            if style.establishes_scroll_container(self.base_fragment_info().flags) {
++            //
++            // The used `overflow` of a replaced element is never scrollable, but Blink zeroes the
++            // automatic minimum of replaced items whose computed `overflow` is, which is what lets
++            // an inline `<svg>` (UA `overflow: hidden`) shrink below its specified size.
++            let is_replaced = self.independent_formatting_context.is_replaced();
++            let is_scroll_container = if is_replaced {
++                AxesOverflow::from(&**style).establishes_scroll_container()
++            } else {
++                style.establishes_scroll_container(self.base_fragment_info().flags)
++            };
++            if is_scroll_container {
+                 return Au::zero();
+             }
+ 
+@@ -2266,8 +2277,6 @@ impl FlexItemBox {
+                 .preferred
+                 .maybe_resolve_extrinsic(stretch_size.main);
+ 
+-            let is_replaced = self.independent_formatting_context.is_replaced();
+-
+             // > **content size suggestion**
+             // > The content size suggestion is the min-content size in the main axis, clamped, if it has a
+             // > preferred aspect ratio, by any definite minimum and maximum cross sizes converted through the
+diff --git a/components/layout/stylesheets/user-agent.css b/components/layout/stylesheets/user-agent.css
+index e4fdc3a42cf..66e99a745f9 100644
+--- a/components/layout/stylesheets/user-agent.css
++++ b/components/layout/stylesheets/user-agent.css
+@@ -483,3 +483,8 @@ marquee {
+   display: block;
+ }
+ 
++
++/* https://svgwg.org/svg2-draft/styling.html#UAStyleSheet */
++svg|svg:not(:root), svg|image, svg|marker, svg|pattern, svg|symbol {
++  overflow: hidden;
++}
+-- 
+2.43.0
+

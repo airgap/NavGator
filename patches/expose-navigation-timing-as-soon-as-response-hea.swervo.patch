@@ -1,0 +1,91 @@
+From b89bc0dd2005e7e280ed1709e238ddaee6043f81 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 16:47:21 -0400
+Subject: [PATCH] script/net: expose navigation timing as soon as response
+ headers arrive
+
+performance.timing read 0 and performance.measure(..., 'fetchStart')
+threw InvalidAccessError until the whole document had arrived (reddit
+logged one on every load), because the document's fetch timing was only
+recorded at EOF, and responseStart was never recorded at all. Navigation
+responses now carry their timing in Metadata.timing when headers arrive.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/net/http_loader.rs            |  5 +++--
+ components/script/dom/servoparser/mod.rs |  6 ++++++
+ components/shared/net/lib.rs             | 18 ++++++++++++++----
+ 3 files changed, 23 insertions(+), 6 deletions(-)
+
+diff --git a/components/net/http_loader.rs b/components/net/http_loader.rs
+index 0efb8935212..2ffc13ad0d9 100644
+--- a/components/net/http_loader.rs
++++ b/components/net/http_loader.rs
+@@ -695,8 +695,6 @@ async fn obtain_response(
+                 permit
+             };
+ 
+-            // TODO(#21271) response_start: immediately after receiving first byte of response
+-
+             let msg = if let Some(request_id) = request_id {
+                 if let Some(pipeline_id) = pipeline_id {
+                     if let Some(browsing_context_id) = browsing_context_id {
+@@ -2264,6 +2262,9 @@ async fn http_network_fetch(
+             (res, msg)
+         },
+     };
++    context
++        .timing
++        .set_attribute(ResourceAttribute::ResponseStart);
+ 
+     if log_enabled!(log::Level::Info) {
+         debug!("{:?} response for {}", res.version(), url);
+diff --git a/components/script/dom/servoparser/mod.rs b/components/script/dom/servoparser/mod.rs
+index 582c478947a..d4179098e81 100644
+--- a/components/script/dom/servoparser/mod.rs
++++ b/components/script/dom/servoparser/mod.rs
+@@ -1492,6 +1492,12 @@ impl FetchResponseListener for ParserContext {
+             about_base_url: document.about_base_url(),
+             resource_header: vec![],
+         };
++        // Pages read `performance.timing` and measure from navigation marks while the document
++        // is still arriving, so the fetch timing up to the response headers is recorded now.
++        // `process_response_eof` replaces it with the final timing, which includes responseEnd.
++        if let Some(timing) = metadata.as_ref().and_then(|metadata| metadata.timing.clone()) {
++            document.set_resource_fetch_timing(timing);
++        }
+         self.submit_resource_timing(cx);
+ 
+         // Part of https://html.spec.whatwg.org/multipage/#loading-a-document
+diff --git a/components/shared/net/lib.rs b/components/shared/net/lib.rs
+index d926fbd971e..cc7f12167c9 100644
+--- a/components/shared/net/lib.rs
++++ b/components/shared/net/lib.rs
+@@ -361,10 +361,20 @@ impl FetchTaskTarget for IpcSender<FetchResponseMsg> {
+     }
+ 
+     fn process_response(&mut self, request: &Request, response: &Response) {
+-        let _ = self.send(FetchResponseMsg::ProcessResponse(
+-            request.id,
+-            response.metadata(),
+-        ));
++        let mut metadata = response.metadata();
++        // A document exposes its navigation timing while it is still streaming in, long
++        // before `ProcessResponseEOF` carries the final timing.
++        if request.is_navigation_request() &&
++            let Ok(
++                FetchMetadata::Unfiltered(metadata) |
++                FetchMetadata::Filtered {
++                    unsafe_: metadata, ..
++                },
++            ) = &mut metadata
++        {
++            metadata.timing = Some(response.get_resource_timing().inner().clone());
++        }
++        let _ = self.send(FetchResponseMsg::ProcessResponse(request.id, metadata));
+     }
+ 
+     fn process_response_chunk(&mut self, request: &Request, chunk: Vec<u8>) {
+-- 
+2.43.0
+

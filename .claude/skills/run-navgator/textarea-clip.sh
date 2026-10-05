@@ -15,7 +15,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DRV="$HERE/driver.sh"
-OUT=/tmp/textarea-clip; mkdir -p "$OUT"
+OUT="$(mktemp -d /tmp/textarea-clip.XXXXXX)"  # per run: agents run gates concurrently
 PORT="${TC_PORT:-8994}"
 TOP="$("$DRV" chrome-top)" || exit 1
 THRESH="${TC_THRESH:-0.90}"

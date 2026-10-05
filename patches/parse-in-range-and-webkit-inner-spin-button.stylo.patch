@@ -1,0 +1,73 @@
+From 39ed1d909c08f696308db363206773310ef815e8 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 01:09:45 -0400
+Subject: [PATCH] servo: parse :in-range and ::-webkit-inner-spin-button
+
+:in-range had a NonTSPseudoClass variant and state flag but no parser entry, so
+any selector using it (including element.matches(':in-range')) was a syntax
+error and the whole rule was dropped.
+
+::-webkit-inner-spin-button is the element-backed pseudo for the spin button
+that swervo now puts in the UA shadow tree of <input type=number>, so pages can
+style or hide it the way they do in Chrome.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ style/servo/selector_parser.rs | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/style/servo/selector_parser.rs b/style/servo/selector_parser.rs
+index 349a8495d..61d7abb86 100644
+--- a/style/servo/selector_parser.rs
++++ b/style/servo/selector_parser.rs
+@@ -69,6 +69,7 @@ pub enum PseudoElement {
+     SliderFill,
+     SliderThumb,
+     SliderTrack,
++    WebkitInnerSpinButton,
+ 
+     // Private, Servo-specific implemented pseudos. Only matchable in UA sheet.
+     ServoTextControlInnerContainer,
+@@ -106,6 +107,7 @@ impl ToCss for PseudoElement {
+             SliderFill => "::slider-fill",
+             SliderTrack => "::slider-track",
+             SliderThumb => "::slider-thumb",
++            WebkitInnerSpinButton => "::-webkit-inner-spin-button",
+             ServoTextControlInnerContainer => "::-servo-text-control-inner-container",
+             ServoTextControlInnerEditor => "::-servo-text-control-inner-editor",
+             ServoAnonymousBox => "::-servo-anonymous-box",
+@@ -265,6 +267,7 @@ impl PseudoElement {
+             | PseudoElement::SliderFill
+             | PseudoElement::SliderThumb
+             | PseudoElement::SliderTrack
++            | PseudoElement::WebkitInnerSpinButton
+             | PseudoElement::ServoTextControlInnerContainer
+             | PseudoElement::ServoTextControlInnerEditor => PseudoElementCascadeType::Lazy,
+             PseudoElement::ServoAnonymousBox
+@@ -347,6 +350,7 @@ impl PseudoElement {
+                     | Self::SliderFill
+                     | Self::SliderThumb
+                     | Self::SliderTrack
++                    | Self::WebkitInnerSpinButton
+                     | Self::ServoTextControlInnerContainer
+                     | Self::ServoTextControlInnerEditor,
+             )
+@@ -632,6 +636,7 @@ impl<'a, 'i> ::selectors::Parser<'i> for SelectorParser<'a> {
+             "focus-within" => NonTSPseudoClass::FocusWithin,
+             "fullscreen" => NonTSPseudoClass::Fullscreen,
+             "hover" => NonTSPseudoClass::Hover,
++            "in-range" => NonTSPseudoClass::InRange,
+             "indeterminate" => NonTSPseudoClass::Indeterminate,
+             "invalid" => NonTSPseudoClass::Invalid,
+             "link" => NonTSPseudoClass::Link,
+@@ -718,6 +723,7 @@ impl<'a, 'i> ::selectors::Parser<'i> for SelectorParser<'a> {
+             "slider-fill" => SliderFill,
+             "slider-thumb" => SliderThumb,
+             "slider-track" => SliderTrack,
++            "-webkit-inner-spin-button" => WebkitInnerSpinButton,
+             "-servo-anonymous-box" => {
+                 if !self.in_user_agent_stylesheet() {
+                     return Err(location.new_custom_error(SelectorParseErrorKind::UnexpectedIdent(name.clone())))
+-- 
+2.43.0
+

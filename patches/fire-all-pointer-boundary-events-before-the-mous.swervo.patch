@@ -1,0 +1,322 @@
+From 1854376a2e912947ec7ada9798dffe03f37d523d Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 17:40:12 -0400
+Subject: [PATCH] script: fire all pointer boundary events before the mouse
+ ones, as Chrome does
+
+Hover transitions fired pointer and mouse boundary events interleaved per
+target. Chrome fires pointerout and pointerleave (innermost first), then
+pointerover and pointerenter (outermost first), then the same four as
+mouse events, then pointermove and mousemove; mouse moves and leaving the
+viewport now share one implementation in that order.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../dom/document/document_event_handler.rs    | 242 ++++++++----------
+ 1 file changed, 107 insertions(+), 135 deletions(-)
+
+diff --git a/components/script/dom/document/document_event_handler.rs b/components/script/dom/document/document_event_handler.rs
+index 6f60cdf4727..b4fd855d722 100644
+--- a/components/script/dom/document/document_event_handler.rs
++++ b/components/script/dom/document/document_event_handler.rs
+@@ -486,29 +486,10 @@ impl DocumentEventHandler {
+                 .get()
+                 .and_then(|point| self.window.hit_test_from_point_in_viewport(point))
+             {
+-                let mouse_out_event = MouseEvent::new_for_platform_motion_event(
++                self.fire_hover_boundary_events(
+                     cx,
+-                    &self.window,
+-                    FireMouseEventType::Out,
+-                    &hit_test_result,
+-                    input_event,
+-                );
+-
+-                // Fire pointerout before mouseout
+-                mouse_out_event
+-                    .to_pointer_hover_event(cx, "pointerout")
+-                    .upcast::<Event>()
+-                    .fire(cx, current_hover_target.upcast());
+-
+-                mouse_out_event
+-                    .upcast::<Event>()
+-                    .fire(cx, current_hover_target.upcast());
+-
+-                self.handle_mouse_enter_leave_event(
+-                    cx,
+-                    DomRoot::from_ref(current_hover_target),
++                    Some(current_hover_target),
+                     None,
+-                    FireMouseEventType::Leave,
+                     &hit_test_result,
+                     input_event,
+                 );
+@@ -534,70 +515,124 @@ impl DocumentEventHandler {
+         self.most_recent_mousemove_point.set(None);
+     }
+ 
+-    fn handle_mouse_enter_leave_event(
++    /// Fires the boundary events for the pointer moving from `old_target` to `new_target`, where
++    /// `None` is outside of this document. As in Chrome, every pointer boundary event fires before
++    /// the compatibility mouse events, and each group fires out, leave, over, then enter:
++    /// <https://w3c.github.io/pointerevents/#mapping-for-devices-that-support-hover>
++    fn fire_hover_boundary_events(
+         &self,
+         cx: &mut JSContext,
+-        event_target: DomRoot<Node>,
+-        related_target: Option<DomRoot<Node>>,
+-        event_type: FireMouseEventType,
++        old_target: Option<&Node>,
++        new_target: Option<&Node>,
+         hit_test_result: &HitTestResult,
+         input_event: &ConstellationInputEvent,
+     ) {
+-        assert!(matches!(
+-            event_type,
+-            FireMouseEventType::Enter | FireMouseEventType::Leave
+-        ));
++        let common_ancestor = old_target
++            .zip(new_target)
++            .and_then(|(old_target, new_target)| old_target.common_ancestor_in_flat_tree(new_target));
+ 
+         // Without a related target in this tree (the pointer came from or went to outside the
+         // document), the target and all of its ancestors up to and including the document are
+         // entered or left, as in Chrome.
+-        let common_ancestor = related_target
+-            .as_ref()
+-            .and_then(|related_target| event_target.common_ancestor_in_flat_tree(related_target));
+-
+-        // We need to create a target chain in case the event target shares
+-        // its boundaries with its ancestors.
+-        let mut targets = vec![];
+-        let mut current = Some(event_target);
+-        while let Some(node) = current {
+-            if common_ancestor.as_ref() == Some(&node) {
+-                break;
++        let boundary_chain = |target: Option<&Node>| {
++            let mut nodes = vec![];
++            let mut current = target.map(DomRoot::from_ref);
++            while let Some(node) = current {
++                if common_ancestor.as_ref() == Some(&node) {
++                    break;
++                }
++                current = node.parent_in_flat_tree();
++                nodes.push(node);
+             }
+-            current = node.parent_in_flat_tree();
+-            targets.push(node);
+-        }
+-
+-        // The order for dispatching mouseenter/pointerenter events starts from the topmost
+-        // common ancestor of the event target and the related target.
+-        if event_type == FireMouseEventType::Enter {
+-            targets = targets.into_iter().rev().collect();
+-        }
+-
+-        let pointer_event_name = match event_type {
+-            FireMouseEventType::Enter => "pointerenter",
+-            FireMouseEventType::Leave => "pointerleave",
+-            _ => unreachable!(),
++            nodes
+         };
++        let left_nodes = boundary_chain(old_target);
++        // mouseenter/pointerenter dispatch starts from the topmost entered ancestor.
++        let mut entered_nodes = boundary_chain(new_target);
++        entered_nodes.reverse();
++
++        for as_pointer_event in [true, false] {
++            if let Some(old_target) = old_target {
++                self.fire_hover_boundary_event(
++                    cx,
++                    FireMouseEventType::Out,
++                    as_pointer_event,
++                    old_target,
++                    new_target,
++                    hit_test_result,
++                    input_event,
++                );
++                for node in &left_nodes {
++                    self.fire_hover_boundary_event(
++                        cx,
++                        FireMouseEventType::Leave,
++                        as_pointer_event,
++                        node,
++                        new_target,
++                        hit_test_result,
++                        input_event,
++                    );
++                }
++            }
++            if let Some(new_target) = new_target {
++                self.fire_hover_boundary_event(
++                    cx,
++                    FireMouseEventType::Over,
++                    as_pointer_event,
++                    new_target,
++                    old_target,
++                    hit_test_result,
++                    input_event,
++                );
++                for node in &entered_nodes {
++                    self.fire_hover_boundary_event(
++                        cx,
++                        FireMouseEventType::Enter,
++                        as_pointer_event,
++                        node,
++                        old_target,
++                        hit_test_result,
++                        input_event,
++                    );
++                }
++            }
++        }
++    }
+ 
+-        for target in targets {
+-            let mouse_event = MouseEvent::new_for_platform_motion_event(
+-                cx,
+-                &self.window,
+-                event_type,
+-                hit_test_result,
+-                input_event,
+-            );
+-            mouse_event
+-                .upcast::<Event>()
+-                .set_related_target(related_target.as_ref().map(|target| target.upcast()));
+-
+-            // Fire pointer event before mouse event
++    #[allow(clippy::too_many_arguments)]
++    fn fire_hover_boundary_event(
++        &self,
++        cx: &mut JSContext,
++        event_type: FireMouseEventType,
++        as_pointer_event: bool,
++        target: &Node,
++        related_target: Option<&Node>,
++        hit_test_result: &HitTestResult,
++        input_event: &ConstellationInputEvent,
++    ) {
++        let mouse_event = MouseEvent::new_for_platform_motion_event(
++            cx,
++            &self.window,
++            event_type,
++            hit_test_result,
++            input_event,
++        );
++        mouse_event
++            .upcast::<Event>()
++            .set_related_target(related_target.map(|target| target.upcast()));
++        if as_pointer_event {
++            let pointer_event_name = match event_type {
++                FireMouseEventType::Over => "pointerover",
++                FireMouseEventType::Out => "pointerout",
++                FireMouseEventType::Enter => "pointerenter",
++                FireMouseEventType::Leave => "pointerleave",
++                _ => unreachable!(),
++            };
+             mouse_event
+                 .to_pointer_hover_event(cx, pointer_event_name)
+                 .upcast::<Event>()
+                 .fire(cx, target.upcast());
+-
+-            // Fire mouse event
++        } else {
+             mouse_event.upcast::<Event>().fire(cx, target.upcast());
+         }
+     }
+@@ -674,7 +709,6 @@ impl DocumentEventHandler {
+         // Here we know the target has changed, so we must update the state,
+         // dispatch mouseout to the previous one, mouseover to the new one.
+         if target_has_changed {
+-            // Dispatch pointerout/mouseout and pointerleave/mouseleave to previous target.
+             if let Some(old_target) = self.current_hover_target.get() {
+                 let old_target_is_ancestor_of_new_target = old_target
+                     .upcast::<Node>()
+@@ -691,45 +725,8 @@ impl DocumentEventHandler {
+                         element.set_hover_state(false);
+                     }
+                 }
+-
+-                if !capture_is_active {
+-                    let mouse_out_event = MouseEvent::new_for_platform_motion_event(
+-                        cx,
+-                        &self.window,
+-                        FireMouseEventType::Out,
+-                        &hit_test_result,
+-                        input_event,
+-                    );
+-                    mouse_out_event
+-                        .upcast::<Event>()
+-                        .set_related_target(Some(new_target.upcast()));
+-
+-                    // Fire pointerout before mouseout
+-                    mouse_out_event
+-                        .to_pointer_hover_event(cx, "pointerout")
+-                        .upcast::<Event>()
+-                        .fire(cx, old_target.upcast());
+-
+-                    mouse_out_event
+-                        .upcast::<Event>()
+-                        .fire(cx, old_target.upcast());
+-
+-                    if !old_target_is_ancestor_of_new_target {
+-                        let event_target = DomRoot::from_ref(old_target.upcast::<Node>());
+-                        let moving_into = Some(DomRoot::from_ref(new_target.upcast::<Node>()));
+-                        self.handle_mouse_enter_leave_event(
+-                            cx,
+-                            event_target,
+-                            moving_into,
+-                            FireMouseEventType::Leave,
+-                            &hit_test_result,
+-                            input_event,
+-                        );
+-                    }
+-                }
+             }
+ 
+-            // Dispatch pointerover/mouseover and pointerenter/mouseenter to new target.
+             for element in new_target
+                 .upcast::<Node>()
+                 .inclusive_ancestors(ShadowIncluding::Yes)
+@@ -739,35 +736,10 @@ impl DocumentEventHandler {
+             }
+ 
+             if !capture_is_active {
+-                let mouse_over_event = MouseEvent::new_for_platform_motion_event(
+-                    cx,
+-                    &self.window,
+-                    FireMouseEventType::Over,
+-                    &hit_test_result,
+-                    input_event,
+-                );
+-                mouse_over_event
+-                    .upcast::<Event>()
+-                    .set_related_target(old_hover_target.as_ref().map(|target| target.upcast()));
+-
+-                // Fire pointerover before mouseover
+-                mouse_over_event
+-                    .to_pointer_hover_event(cx, "pointerover")
+-                    .upcast::<Event>()
+-                    .dispatch(cx, new_target.upcast(), false);
+-
+-                mouse_over_event
+-                    .upcast::<Event>()
+-                    .dispatch(cx, new_target.upcast(), false);
+-
+-                let moving_from = old_hover_target
+-                    .map(|old_target| DomRoot::from_ref(old_target.upcast::<Node>()));
+-                let event_target = DomRoot::from_ref(new_target.upcast::<Node>());
+-                self.handle_mouse_enter_leave_event(
++                self.fire_hover_boundary_events(
+                     cx,
+-                    event_target,
+-                    moving_from,
+-                    FireMouseEventType::Enter,
++                    old_hover_target.as_ref().map(|old_target| old_target.upcast::<Node>()),
++                    Some(new_target.upcast()),
+                     &hit_test_result,
+                     input_event,
+                 );
+-- 
+2.43.0
+

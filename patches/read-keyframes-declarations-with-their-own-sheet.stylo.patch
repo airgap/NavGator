@@ -1,0 +1,110 @@
+From ead7e2a0ae3d4ecf7a50fdc719c4782379b69ea9 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 05:10:22 -0400
+Subject: [PATCH] servo: read @keyframes declarations with their own sheet's
+ guard
+
+Servo's animation code read every keyframe block with the author guard, so an
+@keyframes rule in a user-agent stylesheet (whose lock differs from the author
+one in Servo) panicked the script thread as soon as an animation used it.
+KeyframesAnimation now records the origin of the sheet that holds it, and the
+steps are read with that origin's guard. The UA sheet's indeterminate
+<progress> animation needs this.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ style/servo/animation.rs            | 6 ++++--
+ style/stylesheets/keyframes_rule.rs | 7 ++++++-
+ style/stylist.rs                    | 1 +
+ 3 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/style/servo/animation.rs b/style/servo/animation.rs
+index 9d8def9fd..54d1c6398 100644
+--- a/style/servo/animation.rs
++++ b/style/servo/animation.rs
+@@ -24,6 +24,7 @@ use crate::selector_parser::PseudoElement;
+ use crate::shared_lock::{Locked, SharedRwLock};
+ use crate::style_resolver::StyleResolverForElement;
+ use crate::stylesheets::keyframes_rule::{KeyframesAnimation, KeyframesStep, KeyframesStepValue};
++use crate::stylesheets::Origin;
+ use crate::stylesheets::layer_rule::LayerOrder;
+ use crate::values::animated::{Animate, Procedure};
+ use crate::values::computed::TimingFunction;
+@@ -167,7 +168,7 @@ impl IntermediateComputedKeyframe {
+                 intermediate_steps.push(std::mem::replace(&mut current_step, new_step));
+             }
+ 
+-            current_step.update_from_step(step, context, base_style);
++            current_step.update_from_step(step, animation.origin, context, base_style);
+         }
+         intermediate_steps.push(current_step);
+ 
+@@ -182,12 +183,13 @@ impl IntermediateComputedKeyframe {
+     fn update_from_step(
+         &mut self,
+         step: &KeyframesStep,
++        origin: Origin,
+         context: &SharedStyleContext,
+         base_style: &ComputedValues,
+     ) {
+         // Each keyframe declaration may optionally specify a timing function, falling
+         // back to the one defined global for the animation.
+-        let guard = &context.guards.author;
++        let guard = context.guards.for_origin(origin);
+         if let Some(timing_function) = step.get_animation_timing_function(&guard) {
+             self.timing_function = Some(timing_function.to_computed_value_without_context());
+         }
+diff --git a/style/stylesheets/keyframes_rule.rs b/style/stylesheets/keyframes_rule.rs
+index f66e08b8e..99d6dbd0a 100644
+--- a/style/stylesheets/keyframes_rule.rs
++++ b/style/stylesheets/keyframes_rule.rs
+@@ -18,7 +18,7 @@ use crate::properties::{
+ use crate::shared_lock::{DeepCloneWithLock, SharedRwLock, SharedRwLockReadGuard};
+ use crate::shared_lock::{Locked, ToCssWithGuard};
+ use crate::stylesheets::rule_parser::VendorPrefix;
+-use crate::stylesheets::{CssRuleType, StylesheetContents};
++use crate::stylesheets::{CssRuleType, Origin, StylesheetContents};
+ use crate::values::specified::animation::TimelineRangeName;
+ use crate::values::{serialize_percentage, KeyframesName};
+ use cssparser::{
+@@ -452,6 +452,9 @@ pub struct KeyframesAnimation {
+     pub properties_changed: PropertyDeclarationIdSet,
+     /// Vendor prefix type the @keyframes has.
+     pub vendor_prefix: Option<VendorPrefix>,
++    /// The origin of the stylesheet holding the @keyframes rule, whose lock guards the
++    /// declarations of its steps.
++    pub origin: Origin,
+ }
+ 
+ /// Get all the animated properties in a keyframes animation.
+@@ -501,6 +504,7 @@ impl KeyframesAnimation {
+     pub fn from_keyframes(
+         keyframes: &[Arc<Locked<Keyframe>>],
+         vendor_prefix: Option<VendorPrefix>,
++        origin: Origin,
+         guard: &SharedRwLockReadGuard,
+     ) -> Self {
+         let mut result = KeyframesAnimation {
+@@ -508,6 +512,7 @@ impl KeyframesAnimation {
+             steps_with_range_name: vec![],
+             properties_changed: PropertyDeclarationIdSet::default(),
+             vendor_prefix,
++            origin,
+         };
+ 
+         if keyframes.is_empty() {
+diff --git a/style/stylist.rs b/style/stylist.rs
+index 3e67964a2..320425643 100644
+--- a/style/stylist.rs
++++ b/style/stylist.rs
+@@ -4117,6 +4117,7 @@ impl CascadeData {
+                     let animation = KeyframesAnimation::from_keyframes(
+                         &keyframes_rule.keyframes,
+                         keyframes_rule.vendor_prefix.clone(),
++                        stylesheet.contents(guard).origin,
+                         guard,
+                     );
+                     self.animations.try_insert_with(
+-- 
+2.43.0
+

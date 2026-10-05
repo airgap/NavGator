@@ -1,0 +1,273 @@
+From 16e1b855196e31120c16d51dbdb65fe0b6a4335d Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 06:14:59 -0400
+Subject: [PATCH] layout: key layout caches on the lazy block size; separate
+ measure slot
+
+The independent formatting context layout cache was keyed only on the
+containing block size. A column flex item whose main size is not definite is
+laid out with an indefinite containing block block size but a fixed lazy
+block size (its used main size), and a flex container reports that size as
+its content block size. The intrinsic block size query that follows uses the
+same containing block, so it got the earlier used size back instead of the
+content size. Once a list had been squeezed (Trello's board lists are first
+laid out against a zero-height ancestor), every later layout kept it at that
+size: overflow-y:auto card lists stayed 8px tall with scrollHeight 923.
+Record how the block size was determined (LazySizeKind) and only reuse a
+result laid out the same way.
+
+The cache also held a single entry, so the two layouts flex does per item per
+level (measure with the block size left to the contents, then lay out at the
+final size, or the stretch re-layout of row items) evicted each other and
+nested flex containers took time exponential in their depth (booking.com
+spent tens of seconds per reflow). Keep measurements in their own slot, and
+let a layout at a fixed size reuse an intrinsic measurement whose content
+size is that size, which is what a flex container does with its items while
+it is itself being measured.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/formatting_contexts.rs |   3 +
+ components/layout/layout_box_base.rs     | 108 +++++++++++++++++------
+ components/layout/sizing.rs              |  21 +++++
+ 3 files changed, 104 insertions(+), 28 deletions(-)
+
+diff --git a/components/layout/formatting_contexts.rs b/components/layout/formatting_contexts.rs
+index 6469d1f42e0..80da31fea76 100644
+--- a/components/layout/formatting_contexts.rs
++++ b/components/layout/formatting_contexts.rs
+@@ -556,11 +556,13 @@ impl IndependentFormattingContext {
+         preferred_aspect_ratio: Option<AspectRatio>,
+         lazy_block_size: &LazySize,
+     ) -> (IndependentFormattingContextLayoutResult, bool) {
++        let lazy_block_size_kind = lazy_block_size.kind();
+         if let Some(cached_layout_result) = self
+             .base
+             .cached_independent_formatting_context_layout_if_applicable(
+                 positioning_context,
+                 containing_block_for_children,
++                lazy_block_size_kind,
+             )
+         {
+             return (cached_layout_result, true);
+@@ -582,6 +584,7 @@ impl IndependentFormattingContext {
+         );
+         self.base.cache_independent_formatting_context_layout(
+             containing_block_for_children,
++            lazy_block_size_kind,
+             &child_positioning_context,
+             &result,
+         );
+diff --git a/components/layout/layout_box_base.rs b/components/layout/layout_box_base.rs
+index d2f5327dadb..d8f78f4afd4 100644
+--- a/components/layout/layout_box_base.rs
++++ b/components/layout/layout_box_base.rs
+@@ -31,7 +31,7 @@ use crate::fragment_tree::{
+ use crate::geom::LogicalSides1D;
+ use crate::positioned::{PositioningContext, relative_adjustement};
+ use crate::sizing::{
+-    ComputeInlineContentSizes, ContentSizes, InlineContentSizesResult, SizeConstraint,
++    ComputeInlineContentSizes, ContentSizes, InlineContentSizesResult, LazySizeKind, SizeConstraint,
+ };
+ use crate::traversal::ElementDamageSet;
+ use crate::{ConstraintSpace, ContainingBlock, ContainingBlockSize};
+@@ -55,6 +55,14 @@ pub(crate) struct LayoutBoxBase {
+     /// a block flow.
+     cached_layout_result: AtomicRefCell<Option<LayoutResultAndInputs>>,
+ 
++    /// The cached independent formatting context layout whose block size was left to its
++    /// contents (see [`LazySizeKind`]). Flex layout lays an item out
++    /// once to measure it and once more at its final size; keeping the measurement apart
++    /// from [`Self::cached_layout_result`] stops the two from evicting each other, which made
++    /// nested flex containers take time exponential in their depth.
++    cached_measure_result:
++        AtomicRefCell<Option<Box<IndependentFormattingContextLayoutResultAndInputs>>>,
++
+     /// Whether or not the cached layout result for this [`LayoutBoxBase`] is dirty.
+     /// This flag is used to preserve the cache when it can be used to do a faster
+     /// layout, but cannot be reused directly.
+@@ -79,6 +87,7 @@ impl LayoutBoxBase {
+             cached_inline_content_size: AtomicRefCell::default(),
+             outer_inline_content_sizes_depend_on_content: AtomicBool::new(true),
+             cached_layout_result: AtomicRefCell::default(),
++            cached_measure_result: AtomicRefCell::default(),
+             cached_layout_result_dirty: AtomicBool::default(),
+             subtree_size: AtomicUsize::default(),
+             fragments: AtomicRefCell::default(),
+@@ -219,28 +228,45 @@ impl LayoutBoxBase {
+         &self,
+         positioning_context: &mut PositioningContext,
+         containing_block_for_children: &ContainingBlock<'_>,
++        lazy_block_size: LazySizeKind,
+     ) -> Option<IndependentFormattingContextLayoutResult> {
+         if self.cached_layout_result_dirty.load(Ordering::Relaxed) {
+             return None;
+         }
+ 
+-        let cache = self.cached_layout_result.borrow();
+-        let Some(LayoutResultAndInputs::IndependentFormattingContext(cache)) = &*cache else {
+-            return None;
++        let applies = |cache: &IndependentFormattingContextLayoutResultAndInputs| {
++            cache.containing_block_for_children_size.inline ==
++                containing_block_for_children.size.inline &&
++                (cache.containing_block_for_children_size.block ==
++                    containing_block_for_children.size.block ||
++                    !cache.result.depends_on_block_constraints)
+         };
+ 
+-        let cache = &**cache;
+-        if cache.containing_block_for_children_size.inline !=
+-            containing_block_for_children.size.inline
+-        {
+-            return None;
+-        }
+-        if cache.containing_block_for_children_size.block !=
+-            containing_block_for_children.size.block &&
+-            cache.result.depends_on_block_constraints
+-        {
+-            return None;
+-        }
++        let layout_cache = self.cached_layout_result.borrow();
++        let measure_cache = self.cached_measure_result.borrow();
++        let measure = measure_cache.as_deref().filter(|cache| applies(cache));
++        let cache = match lazy_block_size {
++            LazySizeKind::Fixed(block_size) => {
++                let layout = match &*layout_cache {
++                    Some(LayoutResultAndInputs::IndependentFormattingContext(cache))
++                        if cache.lazy_block_size == lazy_block_size && applies(cache) =>
++                    {
++                        Some(&**cache)
++                    },
++                    _ => None,
++                };
++                // Being told to use the block size that the contents asked for anyway gives
++                // the same layout as measuring, which is what a flex container does with
++                // its items while it is itself being measured.
++                layout.or(measure.filter(|cache| {
++                    cache.lazy_block_size == LazySizeKind::Intrinsic &&
++                        cache.result.content_block_size == block_size
++                }))
++            },
++            LazySizeKind::Intrinsic | LazySizeKind::Constrained => {
++                measure.filter(|cache| cache.lazy_block_size == lazy_block_size)
++            },
++        }?;
+ 
+         positioning_context.append(cache.positioning_context.clone());
+         Some(cache.result.clone())
+@@ -249,19 +275,35 @@ impl LayoutBoxBase {
+     pub(crate) fn cache_independent_formatting_context_layout(
+         &self,
+         containing_block_for_children: &ContainingBlock<'_>,
++        lazy_block_size: LazySizeKind,
+         child_positioning_context: &PositioningContext,
+         result: &IndependentFormattingContextLayoutResult,
+     ) {
+-        self.cached_layout_result_dirty
+-            .store(false, Ordering::Relaxed);
+-        *self.cached_layout_result.borrow_mut() =
+-            Some(LayoutResultAndInputs::IndependentFormattingContext(
+-                Box::new(IndependentFormattingContextLayoutResultAndInputs {
+-                    result: result.clone(),
+-                    positioning_context: child_positioning_context.clone(),
+-                    containing_block_for_children_size: containing_block_for_children.size.clone(),
+-                }),
+-            ));
++        let was_dirty = self
++            .cached_layout_result_dirty
++            .swap(false, Ordering::Relaxed);
++        let entry = Box::new(IndependentFormattingContextLayoutResultAndInputs {
++            result: result.clone(),
++            positioning_context: child_positioning_context.clone(),
++            containing_block_for_children_size: containing_block_for_children.size.clone(),
++            lazy_block_size,
++        });
++        // Clearing the dirty flag revalidates both slots, so the one not written here must go.
++        match lazy_block_size {
++            LazySizeKind::Fixed(_) => {
++                if was_dirty {
++                    *self.cached_measure_result.borrow_mut() = None;
++                }
++                *self.cached_layout_result.borrow_mut() =
++                    Some(LayoutResultAndInputs::IndependentFormattingContext(entry));
++            },
++            LazySizeKind::Intrinsic | LazySizeKind::Constrained => {
++                if was_dirty {
++                    *self.cached_layout_result.borrow_mut() = None;
++                }
++                *self.cached_measure_result.borrow_mut() = Some(entry);
++            },
++        }
+     }
+ 
+     pub(crate) fn cached_same_formatting_context_block_if_applicable(
+@@ -323,8 +365,12 @@ impl LayoutBoxBase {
+             }
+         }
+ 
+-        self.cached_layout_result_dirty
+-            .store(false, Ordering::Relaxed);
++        if self
++            .cached_layout_result_dirty
++            .swap(false, Ordering::Relaxed)
++        {
++            *self.cached_measure_result.borrow_mut() = None;
++        }
+         *self.cached_layout_result.borrow_mut() =
+             Some(LayoutResultAndInputs::SameFormattingContextBlock(Box::new(
+                 SameFormattingContextBlockLayoutResultAndInputs {
+@@ -413,6 +459,12 @@ pub(crate) struct IndependentFormattingContextLayoutResultAndInputs {
+     /// for the box itself.
+     pub containing_block_for_children_size: ContainingBlockSize,
+ 
++    /// How the block size of this layout was determined. The result depends on it even when
++    /// the containing block size is indefinite in the block axis, as for a column flex item
++    /// whose main size is not definite: that layout reports the used main size as its content
++    /// block size, which must not be reused when the intrinsic block size is requested.
++    pub lazy_block_size: LazySizeKind,
++
+     /// A [`PositioningContext`] holding absolutely-positioned descendants
+     /// collected during the layout of this box.
+     pub positioning_context: PositioningContext,
+diff --git a/components/layout/sizing.rs b/components/layout/sizing.rs
+index 168575f298b..187dd1e2ed1 100644
+--- a/components/layout/sizing.rs
++++ b/components/layout/sizing.rs
+@@ -843,6 +843,17 @@ struct LazySizeData<'a> {
+     is_table: bool,
+ }
+ 
++/// See [`LazySize::kind`].
++#[derive(Clone, Copy, Debug, MallocSizeOf, PartialEq)]
++pub(crate) enum LazySizeKind {
++    /// Created from an [`Au`]: the size does not depend on the contents.
++    Fixed(Au),
++    /// [`LazySize::intrinsic`]: the size is that of the contents.
++    Intrinsic,
++    /// [`LazySize::new`]: the size of the contents, adjusted by sizing properties.
++    Constrained,
++}
++
+ /// Represents a size that can't be fully resolved until the intrinsic size
+ /// is known. This is useful in the block axis, since the intrinsic size
+ /// depends on layout, but the other inputs are known beforehand.
+@@ -887,6 +898,16 @@ impl<'a> LazySize<'a> {
+         }
+     }
+ 
++    /// How this [`LazySize`] determines the size, for keying layout caches. Must be read
++    /// before [`Self::resolve`], which also fills in the result of an intrinsic [`LazySize`].
++    pub(crate) fn kind(&self) -> LazySizeKind {
++        match (&self.data, self.result.get()) {
++            (Some(_), _) => LazySizeKind::Constrained,
++            (None, Some(size)) => LazySizeKind::Fixed(*size),
++            (None, None) => LazySizeKind::Intrinsic,
++        }
++    }
++
+     /// Resolves the [`LazySize`] into [`Au`], caching the result.
+     /// The argument is a callback that computes the intrinsic size lazily.
+     ///
+-- 
+2.43.0
+

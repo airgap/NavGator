@@ -42,7 +42,7 @@ pub use servo::{
 pub use servo::{WebResourceLoad, WebResourceResponse};
 
 pub use embedder_traits::{
-    ConsoleLogLevel, Cursor, EventLoopWaker, JSValue, ScreenGeometry, Theme,
+    ConsoleLogLevel, Cursor, EventLoopWaker, JSValue, MouseLeftViewportEvent, ScreenGeometry, Theme,
 };
 
 // `http` types (HeaderMap/StatusCode/HeaderValue), version-matched to the engine, for building

@@ -1,0 +1,330 @@
+From 3af9c2dd5d254512176ebbb2c5c58003ca413c24 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 06:28:11 -0400
+Subject: [PATCH] editing: insertParagraph in inline content of an editing host
+ like Chrome
+
+Enter in the middle of "ab" directly in a <div contenteditable> gave
+a<div><br></div>b, where Chrome gives a<div>b</div>: the line of inline content
+in the editing host has no paragraph of its own, and step 11 of the spec wraps
+it before splitting, which Chrome does not do.
+
+When the position is in inline content directly in the editing host,
+insertParagraph now does what Chrome does: at the end of the content an empty
+paragraph follows (keeping the inline elements the caret is in), at the start
+of a line that begins the host or follows a block an empty paragraph precedes
+the line, and otherwise the inline elements around the position are split and
+everything after it moves into a new paragraph, with a <br> keeping a line
+that would otherwise collapse and a trailing space turned into a no-break
+space. The paragraph element follows defaultParagraphSeparator.
+
+Like Chrome, a collapsed selection is not deleted first, which canonicalized
+the white space before the caret ("ab |" became "ab&nbsp;").
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../execcommand/commands/insertparagraph.rs   | 253 +++++++++++++++++-
+ 1 file changed, 246 insertions(+), 7 deletions(-)
+
+diff --git a/components/script/dom/execcommand/commands/insertparagraph.rs b/components/script/dom/execcommand/commands/insertparagraph.rs
+index 17559a339b2..e1da3e73a85 100644
+--- a/components/script/dom/execcommand/commands/insertparagraph.rs
++++ b/components/script/dom/execcommand/commands/insertparagraph.rs
+@@ -2,16 +2,21 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
++use std::cmp::Ordering;
++
+ use html5ever::local_name;
+ use js::context::JSContext;
+ use script_bindings::inheritance::Castable;
+ 
+ use crate::dom::Node;
++use crate::dom::abstractrange::bp_position;
++use crate::dom::bindings::codegen::Bindings::CharacterDataBinding::CharacterDataMethods;
+ use crate::dom::bindings::codegen::Bindings::DocumentBinding::DocumentMethods;
+ use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
+ use crate::dom::bindings::codegen::Bindings::RangeBinding::RangeMethods;
+ use crate::dom::bindings::codegen::Bindings::TextBinding::TextMethods;
+ use crate::dom::bindings::root::DomRoot;
++use crate::dom::characterdata::CharacterData;
+ use crate::dom::comment::Comment;
+ use crate::dom::document::Document;
+ use crate::dom::element::Element;
+@@ -19,6 +24,7 @@ use crate::dom::execcommand::contenteditable::node::{
+     NodeOrString, is_allowed_child, node_matches_local_name, split_the_parent, wrap_node_list,
+ };
+ use crate::dom::html::htmlbrelement::HTMLBRElement;
++use crate::dom::html::htmlimageelement::HTMLImageElement;
+ use crate::dom::iterators::ShadowIncluding;
+ use crate::dom::selection::Selection;
+ use crate::dom::text::Text;
+@@ -30,13 +36,21 @@ pub(crate) fn execute_insert_paragraph_command(
+     selection: &Selection,
+ ) -> bool {
+     // Step 1. Delete the selection.
+-    selection.delete_the_selection(
+-        cx,
+-        document,
+-        Default::default(),
+-        Default::default(),
+-        Default::default(),
+-    );
++    // Other browsers leave a collapsed selection alone here, where deleting it would canonicalize
++    // the white space around it ("ab |" would become "ab&nbsp;|").
++    if !selection
++        .active_range()
++        .expect("Must always have an active range")
++        .collapsed()
++    {
++        selection.delete_the_selection(
++            cx,
++            document,
++            Default::default(),
++            Default::default(),
++            Default::default(),
++        );
++    }
+     // Step 3. Let node and offset be the active range's start node and offset.
+     let active_range = selection
+         .active_range()
+@@ -71,6 +85,14 @@ pub(crate) fn execute_insert_paragraph_command(
+     }
+     // Step 7. Call collapse(node, offset) on the context object's selection.
+     selection.collapse_current_range(&node, offset);
++    // Other browsers split lines of inline content directly in the editing host differently:
++    // they do not wrap the first part in a new paragraph as step 11 does.
++    if let Some(editing_host) = node.editing_host_of() &&
++        node.block_node_of().as_deref() == Some(&*editing_host)
++    {
++        insert_paragraph_in_editing_host(cx, document, selection, &editing_host, node, offset);
++        return true;
++    }
+     // Step 8. Let container equal node.
+     let mut container = node.clone();
+     // Step 9. While container is not a single-line container,
+@@ -424,3 +446,220 @@ pub(crate) fn execute_insert_paragraph_command(
+     // Step 35. Return true.
+     true
+ }
++
++/// A piece of the visible content of an editing host, in tree order.
++enum VisibleContent {
++    Text(DomRoot<Node>),
++    LineBreak(DomRoot<Node>),
++    /// A block or another element that is not inline content to descend into, like an image.
++    Element(DomRoot<Node>),
++}
++
++fn collect_visible_content(cx: &mut JSContext, node: &Node, content: &mut Vec<VisibleContent>) {
++    for child in node.children() {
++        if !child.is_visible(cx.no_gc()) {
++            continue;
++        }
++        if child.is::<Text>() {
++            content.push(VisibleContent::Text(child));
++        } else if child.is::<HTMLBRElement>() {
++            content.push(VisibleContent::LineBreak(child));
++        } else if child.is_block_node() || child.children_count() == 0 {
++            content.push(VisibleContent::Element(child));
++        } else {
++            collect_visible_content(cx, &child, content);
++        }
++    }
++}
++
++/// insertParagraph at (`node`, `offset`), a position between nodes in inline content directly
++/// in `editing_host`, as other browsers do it: at the end of the content a new empty paragraph
++/// follows, at the start of a line after a block (or of the editing host) a new empty paragraph
++/// precedes the line, and otherwise everything after the position moves into a new paragraph.
++fn insert_paragraph_in_editing_host(
++    cx: &mut JSContext,
++    document: &Document,
++    selection: &Selection,
++    editing_host: &Node,
++    mut node: DomRoot<Node>,
++    mut offset: u32,
++) {
++    // A position in a line break or an image is the position before or after it.
++    if node.is::<HTMLBRElement>() || node.is::<HTMLImageElement>() {
++        let parent = node.GetParentNode().expect("Must always have a parent");
++        offset = node.index() + offset.min(1);
++        node = parent;
++    }
++
++    let tag = document.default_single_line_container_name();
++    let new_paragraph = |cx: &mut JSContext| -> DomRoot<Node> {
++        DomRoot::upcast(document.create_element(cx, tag.str()))
++    };
++    let new_line_break =
++        |cx: &mut JSContext| -> DomRoot<Node> { DomRoot::upcast(document.create_element(cx, "br")) };
++    let append = |cx: &mut JSContext, parent: &Node, child: &Node| {
++        parent
++            .AppendChild(cx, child)
++            .expect("Must always be able to append");
++    };
++
++    if editing_host.children_count() == 0 {
++        for _ in 0..2 {
++            let paragraph = new_paragraph(cx);
++            let line_break = new_line_break(cx);
++            append(cx, &paragraph, &line_break);
++            append(cx, editing_host, &paragraph);
++            selection.collapse_current_range(&paragraph, 0);
++        }
++        return;
++    }
++
++    let mut content = Vec::new();
++    collect_visible_content(cx, editing_host, &mut content);
++    let content_node = |piece: &VisibleContent| match piece {
++        VisibleContent::Text(node) |
++        VisibleContent::LineBreak(node) |
++        VisibleContent::Element(node) => node.clone(),
++    };
++    let after_position = content
++        .iter()
++        .position(|piece| {
++            bp_position(&content_node(piece), 0, &node, offset) != Some(Ordering::Less)
++        })
++        .unwrap_or(content.len());
++    let (before, after) = content.split_at(after_position);
++
++    // The position is the last one of the editing host: nothing follows but white space that
++    // collapses away at the end of the line and the line break that keeps the last line.
++    let significant_after: Vec<&VisibleContent> = after
++        .iter()
++        .filter(|piece| {
++            !matches!(piece, VisibleContent::Text(text) if text
++                .downcast::<Text>()
++                .expect("Must always be a Text node")
++                .is_whitespace_node())
++        })
++        .collect();
++    let at_end = significant_after.is_empty() ||
++        (significant_after.len() == 1 &&
++            matches!(significant_after[0], VisibleContent::LineBreak(_)));
++    if at_end {
++        // The new paragraph keeps the inline elements that the position is in.
++        let paragraph = new_paragraph(cx);
++        let mut innermost = paragraph.clone();
++        let mut inline_ancestors: Vec<DomRoot<Node>> = node
++            .inclusive_ancestors(ShadowIncluding::No)
++            .take_while(|ancestor| *ancestor != DomRoot::from_ref(editing_host))
++            .collect();
++        inline_ancestors.reverse();
++        for ancestor in inline_ancestors {
++            let clone = shallow_clone_without_id(cx, document, &ancestor);
++            append(cx, &innermost, &clone);
++            innermost = clone;
++        }
++        let line_break = new_line_break(cx);
++        append(cx, &innermost, &line_break);
++        append(cx, editing_host, &paragraph);
++        selection.collapse_current_range(&innermost, 0);
++        return;
++    }
++
++    let at_line_start = before
++        .last()
++        .is_none_or(|piece| matches!(piece, VisibleContent::Element(node) if node.is_block_node()));
++    if at_line_start {
++        // The caret stays at the start of the line.
++        let (caret_node, caret_offset) = match &after[0] {
++            VisibleContent::Text(text) => (text.clone(), 0),
++            _ if *node == *editing_host => (node.clone(), offset + 1),
++            _ => (node.clone(), offset),
++        };
++        let next = if *node == *editing_host {
++            editing_host.children().nth(offset as usize)
++        } else {
++            node.inclusive_ancestors(ShadowIncluding::No).find(|ancestor| {
++                ancestor
++                    .GetParentNode()
++                    .is_some_and(|parent| *parent == *editing_host)
++            })
++        };
++        let paragraph = new_paragraph(cx);
++        let line_break = new_line_break(cx);
++        append(cx, &paragraph, &line_break);
++        editing_host
++            .InsertBefore(cx, &paragraph, next.as_deref())
++            .expect("Must always be able to insert");
++        selection.collapse_current_range(&caret_node, caret_offset);
++        return;
++    }
++
++    // Split the inline elements that the position is in, up to the editing host.
++    while *node != *editing_host {
++        let clone = shallow_clone_without_id(cx, document, &node);
++        for child in node.children().skip(offset as usize).collect::<Vec<_>>() {
++            append(cx, &clone, &child);
++        }
++        let parent = node.GetParentNode().expect("Must always have a parent");
++        parent
++            .InsertBefore(cx, &clone, node.GetNextSibling().as_deref())
++            .expect("Must always be able to insert");
++        offset = node.index() + 1;
++        node = parent;
++    }
++
++    let paragraph = new_paragraph(cx);
++    for child in editing_host
++        .children()
++        .skip(offset as usize)
++        .collect::<Vec<_>>()
++    {
++        append(cx, &paragraph, &child);
++    }
++    append(cx, editing_host, &paragraph);
++
++    // The line the position ended is empty when a block follows; a line break keeps it.
++    if let Some(first) = paragraph.GetFirstChild() &&
++        first.is_block_node()
++    {
++        let line_break = new_line_break(cx);
++        paragraph
++            .InsertBefore(cx, &line_break, Some(&first))
++            .expect("Must always be able to insert");
++    }
++    if let Some(previous) = paragraph.GetPreviousSibling() {
++        // A line break right before a block ends no line, so the empty line it ended needs
++        // another one.
++        if previous.is::<HTMLBRElement>() {
++            let line_break = new_line_break(cx);
++            editing_host
++                .InsertBefore(cx, &line_break, Some(&paragraph))
++                .expect("Must always be able to insert");
++        }
++        // A space at the end of the line would collapse away.
++        if let Some(text) = previous.downcast::<Text>() &&
++            text.data().ends_with(' ')
++        {
++            let length = previous.len();
++            text.upcast::<CharacterData>()
++                .ReplaceData(cx, length - 1, 1, "\u{a0}".into())
++                .expect("The offset is in the text");
++        }
++    }
++
++    // The caret goes to the start of the new paragraph.
++    let mut first = paragraph;
++    while let Some(child) = first.GetFirstChild() &&
++        !child.is::<HTMLBRElement>()
++    {
++        first = child;
++    }
++    selection.collapse_current_range(&first, 0);
++}
++
++fn shallow_clone_without_id(cx: &mut JSContext, document: &Document, node: &Node) -> DomRoot<Node> {
++    let element = node.downcast::<Element>().expect("Must always be an element");
++    let clone = document.create_element(cx, &element.local_name());
++    element.copy_all_attributes_to_other_element(cx, &clone);
++    clone.remove_attribute_by_name(cx, &local_name!("id"));
++    DomRoot::upcast(clone)
++}
+-- 
+2.43.0
+

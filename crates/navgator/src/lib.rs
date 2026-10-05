@@ -29,6 +29,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::net::TcpStream as UnixStream;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -53,7 +54,8 @@ use navgator_engine::{
     EmbedderControlId, EventLoopWaker, FilePicker, FilterPattern, Image, InputEvent, InputEventId,
     InputEventResult, JSValue, Key,
     KeyState, KeyboardEvent, LoadStatus, Location, MediaSessionEvent, MediaSessionPlaybackState, Modifiers,
-    MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
+    MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent,
+    MouseMoveEvent,
     NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, Opts, PermissionRequest,
     PixelFormat, Preferences, RenderingContext, run_content_process,
     SandboxOutcome, apply_sandbox, content_process_policy,
@@ -2207,6 +2209,14 @@ fn localize_html(html: &str) -> String {
 }
 
 /// Escape text for safe interpolation into HTML (the gator://welcome template).
+/// Show the `gator://crash` recovery page in `webview` for a renderer that died while showing
+/// `crashed_url` (its Reload button leads back there), with `reason` under Details.
+fn load_crash_page(webview: &WebView, crashed_url: &str, reason: &str) {
+    let recovery = Url::parse_with_params("gator://crash", &[("url", crashed_url), ("reason", reason)])
+        .expect("gator://crash with query parameters is a valid URL");
+    webview.load(recovery);
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -2683,7 +2693,13 @@ const LINKHINT_JS: &str = r#"(function () {
       return;
     }
     if (e.ctrlKey || e.altKey || e.metaKey) return;
-    if (editable(e.target) || editable(document.activeElement)) return;
+    // Look through shadow roots: an input inside a web component (MDN's sidebar filter) retargets
+    // `e.target` and `document.activeElement` to its host, so its `f`/`l` keystrokes were being
+    // taken as hint commands.
+    var active = document.activeElement;
+    while (active && active.shadowRoot && active.shadowRoot.activeElement)
+      active = active.shadowRoot.activeElement;
+    if (editable(e.composedPath()[0]) || editable(active)) return;
     if (e.key === "f") { e.preventDefault(); e.stopPropagation(); activate("follow"); }
     else if (e.key === "F") { e.preventDefault(); e.stopPropagation(); activate("newtab"); }
     else if (e.key === "y") { e.preventDefault(); e.stopPropagation(); activate("yank"); }
@@ -3200,6 +3216,25 @@ this._startTime = now() - this._currentTime / this.playbackRate;
 this._tick(now(), true);
 },
 });
+Object.defineProperty(Anim.prototype, "startTime", {
+get: function () {
+return this.playState === "running" || this.playState === "finished" ? this._startTime : null;
+},
+set: function (v) {
+if (v == null) {
+if (this.playState === "running") {
+this._tick(now(), false);
+this.playState = "paused";
+}
+this._startTime = null;
+return;
+}
+this._startTime = v;
+this.playState = "running";
+this._tick(now(), true);
+scheduleTick();
+},
+});
 Object.defineProperty(Anim.prototype, "finished", {
 get: function () {
 var self = this;
@@ -3583,12 +3618,16 @@ fn js_string(s: &str) -> String {
 /// Find-in-page highlighter (no native find API in the fork): wraps matches of `q` in
 /// `<span data-ngf>` (first match orange, rest yellow), scrolls to the first, returns the
 /// match count. Re-run on each query change; `find-step`/`find-clear` JS handle nav/cleanup.
+/// Like Chrome it skips inert text: under an `inert` attribute, or outside an open modal dialog
+/// (which escapes the inertness of its ancestors).
 const FIND_JS: &str = r#"function(q){
+function isInert(el,modal){if(modal&&!modal.contains(el))return true;var i=el.closest('[inert]');return !!i&&!(modal&&i.contains(modal));}
 document.querySelectorAll('span[data-ngf]').forEach(function(s){var p=s.parentNode;if(p){p.replaceChild(document.createTextNode(s.textContent),s);p.normalize();}});
 if(!q)return 0;
 var rx;try{rx=new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'gi');}catch(e){return 0;}
 var w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null);
-var nodes=[],n;while(n=w.nextNode()){var pn=n.parentNode;if(!pn)continue;if(/SCRIPT|STYLE|NOSCRIPT/.test(pn.nodeName))continue;rx.lastIndex=0;if(rx.test(n.nodeValue))nodes.push(n);}
+var modal=document.querySelector('dialog:modal');
+var nodes=[],n;while(n=w.nextNode()){var pn=n.parentNode;if(!pn)continue;if(/SCRIPT|STYLE|NOSCRIPT/.test(pn.nodeName))continue;if(isInert(pn,modal))continue;rx.lastIndex=0;if(rx.test(n.nodeValue))nodes.push(n);}
 var count=0;
 nodes.forEach(function(node){var s=node.nodeValue,frag=document.createDocumentFragment(),last=0,m;rx.lastIndex=0;while(m=rx.exec(s)){if(m[0].length===0){rx.lastIndex++;continue;}if(m.index>last)frag.appendChild(document.createTextNode(s.slice(last,m.index)));var sp=document.createElement('span');sp.setAttribute('data-ngf','');sp.style.background=(count===0?'#ff9632':'#ffe45e');sp.style.color='#000';sp.textContent=m[0];frag.appendChild(sp);last=m.index+m[0].length;count++;}if(last<s.length)frag.appendChild(document.createTextNode(s.slice(last)));node.parentNode.replaceChild(frag,node);});
 window.__ngfActive=0;
@@ -4049,6 +4088,9 @@ struct AppState {
     fullscreen: Cell<bool>,
     scale: Cell<f64>,
     cursor: Cell<(f64, f64)>,
+    /// Whether the last pointer move went to the page, so leaving the page (into the chrome or out
+    /// of the window) tells it, as pages rely on mouseleave/pointerleave to end hover effects.
+    pointer_in_page: Cell<bool>,
     /// The CSS cursor the page wants under the pointer (from `notify_cursor_changed`); applied to
     /// the window while the pointer is over a page area (not the chrome). LYK-style: link→Pointer,
     /// text→Text, etc.
@@ -5822,6 +5864,17 @@ impl AppState {
         for pane in 0..2 {
             for tab in self.pane(pane).tabs.borrow().iter() {
                 tab.webview.notify_theme_change(scheme);
+            }
+        }
+    }
+
+    /// Tell every open tab (both panes) that the window moved or resized. swervo caches
+    /// `screen_geometry` per document and only asks again after this, so hidden tabs (which get
+    /// no viewport resize) must hear about it too.
+    fn notify_screen_geometry_changed_all(&self) {
+        for pane in 0..2 {
+            for tab in self.pane(pane).tabs.borrow().iter() {
+                tab.webview.notify_screen_geometry_changed();
             }
         }
     }
@@ -11626,16 +11679,32 @@ impl WebViewDelegate for AppState {
                     webview.load(u);
                 }
             },
-            None => {
-                let recovery = Url::parse_with_params(
-                    "gator://crash",
-                    &[("url", crashed_url.as_str()), ("reason", reason.as_str())],
-                );
-                if let Ok(recovery) = recovery {
-                    webview.load(recovery);
-                }
-            },
+            None => load_crash_page(&webview, &crashed_url, &reason),
         }
+        self.window.request_redraw();
+    }
+
+    /// The content process rendering this tab died from a signal (SIGSEGV, the OOM killer's
+    /// SIGKILL, a `kill` by hand). Like Chrome's "Aw, Snap!", park the tab on the crash page with
+    /// a Reload button instead of auto-reloading: whatever killed the process (memory pressure
+    /// above all) would likely kill the reloaded one too, and the user should see that it died.
+    fn notify_content_process_terminated(&self, webview: WebView, reason: String) {
+        let Some((p, i)) = self.locate_tab(&webview) else {
+            return;
+        };
+        let crashed_url = {
+            let mut tabs = self.pane(p).tabs.borrow_mut();
+            let tab = &mut tabs[i];
+            tab.loading = false;
+            tab.crashed = true;
+            if tab.url.starts_with("gator://crash") {
+                String::new()
+            } else {
+                tab.url.clone()
+            }
+        };
+        eprintln!("navgator: renderer process died ({crashed_url}): {reason}");
+        load_crash_page(&webview, &crashed_url, &reason);
         self.window.request_redraw();
     }
 
@@ -11915,6 +11984,7 @@ fn open_window(
         fullscreen: Cell::new(false),
         scale: Cell::new(scale),
         cursor: Cell::new((0.0, 0.0)),
+        pointer_in_page: Cell::new(false),
         page_cursor: Cell::new(CursorIcon::Default),
         ctrl: Cell::new(false),
         shift: Cell::new(false),
@@ -12177,6 +12247,9 @@ impl ApplicationHandler<WakeUp> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WakeUp) {
+        if let WakeUp::Wake = event {
+            WAKE_PENDING.store(false, Ordering::Release);
+        }
         let App::Running { browser, windows } = self else { return };
         if let WakeUp::Exit = event {
             // Gracefully shut the engine down first so its network thread flushes cookies, HSTS,
@@ -12333,6 +12406,10 @@ impl ApplicationHandler<WakeUp> for App {
             WindowEvent::Resized(size) => {
                 state.window_context.resize(*size);
                 state.window.request_redraw();
+                state.notify_screen_geometry_changed_all();
+            }
+            WindowEvent::Moved(_) => {
+                state.notify_screen_geometry_changed_all();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 state.scale.set(*scale_factor);
@@ -12416,6 +12493,7 @@ impl ApplicationHandler<WakeUp> for App {
                 let off = if state.split.get() && foc == 1 { mid_dev } else { left_dev };
                 let over_focused = !state.split.get() || ((foc == 0) == (cx < mid_dev));
                 if !(resp.consumed || over_chrome || dialog_open) && over_focused {
+                    state.pointer_in_page.set(true);
                     state.forward_to_page(InputEvent::MouseMove(MouseMoveEvent::new(
                         DevicePoint::new(
                             (position.x - off) as f32,
@@ -12423,6 +12501,18 @@ impl ApplicationHandler<WakeUp> for App {
                         )
                         .into(),
                     )));
+                } else if state.pointer_in_page.replace(false) {
+                    state.forward_to_page(InputEvent::MouseLeftViewport(
+                        MouseLeftViewportEvent::default(),
+                    ));
+                }
+            }
+
+            WindowEvent::CursorLeft { .. } => {
+                if state.pointer_in_page.replace(false) {
+                    state.forward_to_page(InputEvent::MouseLeftViewport(
+                        MouseLeftViewportEvent::default(),
+                    ));
                 }
             }
 
@@ -12531,9 +12621,11 @@ impl ApplicationHandler<WakeUp> for App {
                     let (dx, dy, mode) = match delta {
                         // Converted to pixels here, so the page sees DOM_DELTA_PIXEL like
                         // Chrome; reporting these values as lines made libraries that scale line
-                        // deltas (maps, custom scrollers) scroll ~40x too far.
+                        // deltas (maps, custom scrollers) scroll ~40x too far. One line is one
+                        // wheel tick, which Chrome on Linux reports and scrolls as 120px; the
+                        // engine derives the legacy `wheelDelta` (120 per tick) from it.
                         MouseScrollDelta::LineDelta(lx, ly) => {
-                            ((lx * 76.0) as f64, (ly * 76.0) as f64, WheelMode::DeltaPixel)
+                            ((lx * 120.0) as f64, (ly * 120.0) as f64, WheelMode::DeltaPixel)
                         }
                         MouseScrollDelta::PixelDelta(p) => (p.x, p.y, WheelMode::DeltaPixel),
                     };
@@ -12769,6 +12861,12 @@ impl ApplicationHandler<WakeUp> for App {
 #[derive(Clone)]
 struct Waker(EventLoopProxy<WakeUp>);
 
+/// Whether a `WakeUp::Wake` is queued and not yet handled. Servo wakes the UI thread once per
+/// message it sends (each decoded video frame, for one), and winit hands every queued user event
+/// over before it redraws, so an unbounded stream of wake-ups starved painting and input. One
+/// queued wake-up is enough: handling it pumps every message that has arrived.
+static WAKE_PENDING: AtomicBool = AtomicBool::new(false);
+
 /// Events posted to the winit loop from other threads.
 #[derive(Debug)]
 enum WakeUp {
@@ -12809,7 +12907,9 @@ impl EventLoopWaker for Waker {
     }
 
     fn wake(&self) {
-        let _ = self.0.send_event(WakeUp::Wake);
+        if !WAKE_PENDING.swap(true, Ordering::AcqRel) {
+            let _ = self.0.send_event(WakeUp::Wake);
+        }
     }
 }
 

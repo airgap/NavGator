@@ -1,0 +1,90 @@
+From 339c756c2268c74858b28c00ea644e0cf797618e Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 01:21:06 -0400
+Subject: [PATCH] svg: serialize an absolute CSS size as the viewport of a root
+ without viewBox
+
+An <svg> sized only through CSS (`svg { width: 16px; height: 16px }`, GitLab's icon
+classes) serialized without width/height, so the rasterizer resolved percentages in its
+content against its 100x100 fallback viewport. A <use> referencing a <symbol viewBox>
+defaults to 100% of the viewport, so the icon was drawn at 100x100 and cropped to its
+top-left corner; Chrome resolves those percentages against the CSS box.
+
+When the root has no usable viewBox, its computed width and height are written into the
+serialization when they are absolute lengths. Width and height join the paint signature so
+a size change re-serializes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/svg/svgsvgelement.rs | 26 +++++++++++++++++++++-
+ components/shared/layout/lib.rs            |  8 +++++--
+ 2 files changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/components/script/dom/svg/svgsvgelement.rs b/components/script/dom/svg/svgsvgelement.rs
+index 9ac641fc98b..87572d55c99 100644
+--- a/components/script/dom/svg/svgsvgelement.rs
++++ b/components/script/dom/svg/svgsvgelement.rs
+@@ -21,7 +21,7 @@ use style::color::AbsoluteColor;
+ use style::parser::{Parse, ParserContext};
+ use style::properties::{ComputedValues, LonghandId, PropertyDeclarationId};
+ use style::stylesheets::Origin;
+-use style::values::computed::{Color as ComputedColor, SVGPaint};
++use style::values::computed::{Color as ComputedColor, SVGPaint, Size as StyleSize};
+ use style::values::generics::svg::{SVGPaintFallback, SVGPaintKind};
+ use style::values::specified::{Color as SpecifiedColor, LengthPercentage};
+ use style_traits::ParsingMode;
+@@ -749,6 +749,30 @@ impl SVGSVGElement {
+                 name.ns != ns!() ||
+                     (name.local != local_name!("width") && name.local != local_name!("height"))
+             });
++        } else if std::ptr::eq(element, self.upcast::<Element>()) &&
++            let Some(style) = element.style_from_last_restyle()
++        {
++            // Without a viewBox the rasterizer resolves percentages in the content (a `<use>`'s
++            // default `100%` size, GitLab's CSS-sized sprite icons) against its 100x100
++            // fallback viewport; browsers resolve them against the CSS box. An absolute CSS
++            // size therefore becomes the serialized viewport size.
++            let position = style.get_position();
++            for (name, size) in [
++                (local_name!("width"), &position.width),
++                (local_name!("height"), &position.height),
++            ] {
++                let StyleSize::LengthPercentage(length_percentage) = size else {
++                    continue;
++                };
++                let Some(length) = length_percentage.0.to_length() else {
++                    continue;
++                };
++                attributes.retain(|(attribute, _)| attribute.ns != ns!() || attribute.local != name);
++                attributes.push((
++                    QualName::new(None, ns!(), name),
++                    AttrValue::String(length.px().to_string()),
++                ));
++            }
+         }
+ 
+         let Some(declarations) = self.paint_declarations(element) else {
+diff --git a/components/shared/layout/lib.rs b/components/shared/layout/lib.rs
+index 715fefef4bb..fd82ff342d8 100644
+--- a/components/shared/layout/lib.rs
++++ b/components/shared/layout/lib.rs
+@@ -190,10 +190,14 @@ pub const SVG_PAINT_PROPERTIES: [LonghandId; 16] = [
+ 
+ /// A fingerprint of the paint properties an `<svg>` element's serialization was built from.
+ /// The serialization is cached across restyles, so layout compares this to detect paint changes
+-/// (a hover colour, a theme switch) that must re-serialize the subtree.
++/// (a hover colour, a theme switch) that must re-serialize the subtree. `width` and `height`
++/// are included because a root without a `viewBox` serializes its CSS size as the viewport.
+ pub fn svg_paint_signature(style: &ComputedValues) -> String {
+     let mut signature = String::new();
+-    for property in SVG_PAINT_PROPERTIES {
++    for property in SVG_PAINT_PROPERTIES
++        .into_iter()
++        .chain([LonghandId::Width, LonghandId::Height])
++    {
+         style
+             .computed_or_resolved_value(property, None, &mut signature)
+             .expect("Writing CSS to a String cannot fail");
+-- 
+2.43.0
+

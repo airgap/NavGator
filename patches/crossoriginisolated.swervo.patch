@@ -1,0 +1,70 @@
+From 80643922711cfc9e1f8b4d4d2f0d26e9d111624b Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 05:29:36 -0400
+Subject: [PATCH] script: crossOriginIsolated
+
+Pages read crossOriginIsolated to decide whether SharedArrayBuffer and
+high-resolution timers are available; it was undefined instead of a
+boolean. Cross-origin isolation (COOP + COEP) is not implemented, so it is
+false in windows and workers, as in Chrome for a non-isolated page.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/window/window.rs                      | 6 ++++++
+ components/script/dom/workers/workerglobalscope.rs          | 6 ++++++
+ .../webidls/WindowOrWorkerGlobalScope.webidl                | 5 +++++
+ 3 files changed, 17 insertions(+)
+
+diff --git a/components/script/dom/window/window.rs b/components/script/dom/window/window.rs
+index dd22b33b79a..b736787a559 100644
+--- a/components/script/dom/window/window.rs
++++ b/components/script/dom/window/window.rs
+@@ -2379,6 +2379,12 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
+         self.as_global_scope().is_secure_context()
+     }
+ 
++    /// <https://html.spec.whatwg.org/multipage/#dom-crossoriginisolated>
++    fn CrossOriginIsolated(&self) -> bool {
++        // Cross-origin isolation (COOP + COEP) is not implemented, so no context is isolated.
++        false
++    }
++
+     /// <https://html.spec.whatwg.org/multipage/#dom-window-nameditem>
+     fn NamedGetter(&self, cx: &mut JSContext, name: DOMString) -> Option<NamedPropertyValue> {
+         if name.is_empty() {
+diff --git a/components/script/dom/workers/workerglobalscope.rs b/components/script/dom/workers/workerglobalscope.rs
+index a367a9ca926..c3888b2e17c 100644
+--- a/components/script/dom/workers/workerglobalscope.rs
++++ b/components/script/dom/workers/workerglobalscope.rs
+@@ -1037,6 +1037,12 @@ impl WorkerGlobalScopeMethods<crate::DomTypeHolder> for WorkerGlobalScope {
+         self.upcast::<GlobalScope>().is_secure_context()
+     }
+ 
++    /// <https://html.spec.whatwg.org/multipage/#dom-crossoriginisolated>
++    fn CrossOriginIsolated(&self) -> bool {
++        // Cross-origin isolation (COOP + COEP) is not implemented, so no context is isolated.
++        false
++    }
++
+     /// <https://html.spec.whatwg.org/multipage/#dom-structuredclone>
+     fn StructuredClone(
+         &self,
+diff --git a/components/script_bindings/webidls/WindowOrWorkerGlobalScope.webidl b/components/script_bindings/webidls/WindowOrWorkerGlobalScope.webidl
+index 29b3c8c9d29..78dfc856428 100644
+--- a/components/script_bindings/webidls/WindowOrWorkerGlobalScope.webidl
++++ b/components/script_bindings/webidls/WindowOrWorkerGlobalScope.webidl
+@@ -46,6 +46,11 @@ partial interface mixin WindowOrWorkerGlobalScope {
+   readonly attribute boolean isSecureContext;
+ };
+ 
++// https://html.spec.whatwg.org/multipage/#dom-crossoriginisolated
++partial interface mixin WindowOrWorkerGlobalScope {
++  readonly attribute boolean crossOriginIsolated;
++};
++
+ // https://www.w3.org/TR/trusted-types/#extensions-to-the-windoworworkerglobalscope-interface
+ partial interface mixin WindowOrWorkerGlobalScope {
+   readonly attribute TrustedTypePolicyFactory trustedTypes;
+-- 
+2.43.0
+

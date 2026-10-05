@@ -1,0 +1,219 @@
+From ae21b6fcf6085eede945a02b93b495fa11a66ca8 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 06:38:35 -0400
+Subject: [PATCH] script: fire legacy mousewheel listeners and expose
+ wheelDelta
+
+Blink and WebKit hand trusted wheel events to mousewheel listeners when
+a target has no wheel listeners, and expose wheelDelta, wheelDeltaX and
+wheelDeltaY (120 per wheel tick, positive when scrolling up). Pages
+that do not detect Gecko, Google Maps among them with NavGator's user
+agent, only listen for mousewheel, so wheel zoom did nothing.
+
+The legacy-type step of "invoke" also re-ran the listeners of the
+original type, which by then were known to be empty, so the
+webkitAnimation*/webkitTransition* fallbacks never fired either; it now
+looks up the legacy type's listeners. Non-passive mousewheel listeners
+make wheel events cancelable, as wheel listeners do.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../dom/document/document_event_handler.rs    | 32 +++++++++++------
+ components/script/dom/event/event.rs          |  9 ++++-
+ components/script/dom/event/wheelevent.rs     | 35 +++++++++++++++++++
+ .../script_bindings/webidls/WheelEvent.webidl | 10 ++++++
+ 4 files changed, 75 insertions(+), 11 deletions(-)
+
+diff --git a/components/script/dom/document/document_event_handler.rs b/components/script/dom/document/document_event_handler.rs
+index 8efa0b5f4d8..851d995e833 100644
+--- a/components/script/dom/document/document_event_handler.rs
++++ b/components/script/dom/document/document_event_handler.rs
+@@ -14,7 +14,7 @@ use embedder_traits::{
+     Cursor, EditingActionEvent, EmbedderMsg, ImeEvent, InputEvent, InputEventId, InputEventOutcome,
+     InputEventResult, KeyboardEvent as EmbedderKeyboardEvent, MouseButton, MouseButtonAction,
+     MouseButtonEvent, MouseLeftViewportEvent, TouchEvent as EmbedderTouchEvent, TouchEventType,
+-    TouchId, TouchPointerType, UntrustedNodeAddress, WheelEvent as EmbedderWheelEvent,
++    TouchId, TouchPointerType, UntrustedNodeAddress, WheelEvent as EmbedderWheelEvent, WheelMode,
+ };
+ #[cfg(feature = "gamepad")]
+ use embedder_traits::{
+@@ -1838,18 +1838,19 @@ impl DocumentEventHandler {
+             hit_test_result.point_in_frame
+         );
+ 
+-        let event_type = "wheel".into();
++        let event_type: Atom = "wheel".into();
++        // Listeners for the legacy `mousewheel` type receive trusted wheel events too (see
++        // `invoke` in event.rs), so they can cancel them as well.
++        let legacy_event_type: Atom = "mousewheel".into();
++        let has_non_passive_listener = |target: &EventTarget| {
++            target.has_non_passive_listener(&event_type) ||
++                target.has_non_passive_listener(&legacy_event_type)
++        };
+ 
+         let cancelable = EventCancelable::from(
+-            self.window
+-                .upcast::<EventTarget>()
+-                .has_non_passive_listener(&event_type) ||
++            has_non_passive_listener(self.window.upcast::<EventTarget>()) ||
+                 node.inclusive_ancestors(ShadowIncluding::Yes)
+-                    .any(|target| {
+-                        target
+-                            .upcast::<EventTarget>()
+-                            .has_non_passive_listener(&event_type)
+-                    }),
++                    .any(|target| has_non_passive_listener(target.upcast::<EventTarget>())),
+         );
+         // https://w3c.github.io/uievents/#event-wheelevents
+         let dom_event = WheelEvent::new(
+@@ -1879,6 +1880,17 @@ impl DocumentEventHandler {
+             Finite::wrap(-event.delta.z),
+             event.delta.mode as u32,
+         );
++        // Blink reports 120 per wheel tick in `wheelDelta`, positive when scrolling up or left
++        // like the embedder's deltas. Embedders deliver a tick as one line, or as 120 pixels,
++        // which is how far Chrome on Linux scrolls per tick.
++        let wheel_delta_per_unit = match event.delta.mode {
++            WheelMode::DeltaPixel => 1.0,
++            WheelMode::DeltaLine | WheelMode::DeltaPage => 120.0,
++        };
++        dom_event.set_wheel_delta(
++            (event.delta.x * wheel_delta_per_unit) as i32,
++            (event.delta.y * wheel_delta_per_unit) as i32,
++        );
+ 
+         let dom_event = dom_event.upcast::<Event>();
+         dom_event.set_trusted(true);
+diff --git a/components/script/dom/event/event.rs b/components/script/dom/event/event.rs
+index 39431be95c1..64058a26a48 100644
+--- a/components/script/dom/event/event.rs
++++ b/components/script/dom/event/event.rs
+@@ -1309,8 +1309,15 @@ fn invoke(
+             atom!("animationstart") => atom!("webkitAnimationStart"),
+             atom!("transitionend") => atom!("webkitTransitionEnd"),
+             atom!("transitionrun") => atom!("webkitTransitionRun"),
++            // Not in the DOM standard: Blink and WebKit hand trusted wheel events to
++            // `mousewheel` listeners the same way, and pages that do not detect Gecko only
++            // listen for `mousewheel` (Google Maps zooms that way).
++            ref event_type if &**event_type == "wheel" => Atom::from("mousewheel"),
+             _ => return,
+         };
++        // `listeners` only holds those for the original type (inner invoke's type check is
++        // done up front by `get_listeners_for`), so look up the legacy type's own.
++        let legacy_listeners = segment.invocation_target.get_listeners_for(&legacy_type);
+         *event.type_.borrow_mut() = legacy_type;
+ 
+         // Step 9.3 Inner invoke with event, listeners, phase, invocationTargetInShadowTree,
+@@ -1318,7 +1325,7 @@ fn invoke(
+         inner_invoke(
+             cx,
+             event,
+-            &listeners,
++            &legacy_listeners,
+             phase,
+             invocation_target_in_shadow_tree,
+             timeline_window,
+diff --git a/components/script/dom/event/wheelevent.rs b/components/script/dom/event/wheelevent.rs
+index f04ec45b52b..1f765bb55d1 100644
+--- a/components/script/dom/event/wheelevent.rs
++++ b/components/script/dom/event/wheelevent.rs
+@@ -33,6 +33,8 @@ pub(crate) struct WheelEvent {
+     delta_y: Cell<Finite<f64>>,
+     delta_z: Cell<Finite<f64>>,
+     delta_mode: Cell<u32>,
++    wheel_delta_x: Cell<i32>,
++    wheel_delta_y: Cell<i32>,
+ }
+ 
+ impl WheelEvent {
+@@ -43,6 +45,8 @@ impl WheelEvent {
+             delta_y: Cell::new(Finite::wrap(0.0)),
+             delta_z: Cell::new(Finite::wrap(0.0)),
+             delta_mode: Cell::new(0),
++            wheel_delta_x: Cell::new(0),
++            wheel_delta_y: Cell::new(0),
+         }
+     }
+ 
+@@ -196,6 +200,15 @@ impl WheelEvent {
+         self.delta_y.set(delta_y);
+         self.delta_z.set(delta_z);
+         self.delta_mode.set(delta_mode);
++        // Blink derives the legacy deltas of script-created events from the standard ones,
++        // truncated (`deltaY: -50.7` gives `wheelDeltaY` -50). Trusted events overwrite them.
++        self.wheel_delta_x.set(*delta_x as i32);
++        self.wheel_delta_y.set(*delta_y as i32);
++    }
++
++    pub(crate) fn set_wheel_delta(&self, wheel_delta_x: i32, wheel_delta_y: i32) {
++        self.wheel_delta_x.set(wheel_delta_x);
++        self.wheel_delta_y.set(wheel_delta_y);
+     }
+ }
+ 
+@@ -239,6 +252,12 @@ impl WheelEventMethods<crate::DomTypeHolder> for WheelEvent {
+             init.deltaZ,
+             init.deltaMode,
+         );
++        if init.wheelDeltaX != 0 {
++            event.wheel_delta_x.set(init.wheelDeltaX);
++        }
++        if init.wheelDeltaY != 0 {
++            event.wheel_delta_y.set(init.wheelDeltaY);
++        }
+ 
+         Ok(event)
+     }
+@@ -263,6 +282,22 @@ impl WheelEventMethods<crate::DomTypeHolder> for WheelEvent {
+         self.delta_mode.get()
+     }
+ 
++    /// Legacy, non-standard; implemented as in Blink, which pages that sniff for it expect.
++    fn WheelDeltaX(&self) -> i32 {
++        self.wheel_delta_x.get()
++    }
++
++    fn WheelDeltaY(&self) -> i32 {
++        self.wheel_delta_y.get()
++    }
++
++    fn WheelDelta(&self) -> i32 {
++        match self.wheel_delta_y.get() {
++            0 => self.wheel_delta_x.get(),
++            wheel_delta_y => wheel_delta_y,
++        }
++    }
++
+     /// <https://w3c.github.io/uievents/#widl-WheelEvent-initWheelEvent>
+     fn InitWheelEvent(
+         &self,
+diff --git a/components/script_bindings/webidls/WheelEvent.webidl b/components/script_bindings/webidls/WheelEvent.webidl
+index 476e6a5faee..77a99d0f8cb 100644
+--- a/components/script_bindings/webidls/WheelEvent.webidl
++++ b/components/script_bindings/webidls/WheelEvent.webidl
+@@ -15,12 +15,22 @@ interface WheelEvent : MouseEvent {
+     readonly    attribute unsigned long  deltaMode;
+ };
+ 
++// Legacy members that Blink and WebKit still expose; pages that do not detect Gecko listen
++// for `mousewheel` and read these.
++partial interface WheelEvent {
++    readonly    attribute long           wheelDeltaX;
++    readonly    attribute long           wheelDeltaY;
++    readonly    attribute long           wheelDelta;
++};
++
+ // https://w3c.github.io/pointerevents/#dom-wheeleventinit
+ dictionary WheelEventInit : MouseEventInit {
+     double deltaX = 0.0;
+     double deltaY = 0.0;
+     double deltaZ = 0.0;
+     unsigned long deltaMode = 0;
++    long wheelDeltaX = 0;
++    long wheelDeltaY = 0;
+ };
+ 
+ // https://w3c.github.io/uievents/#idl-interface-WheelEvent-initializers
+-- 
+2.43.0
+

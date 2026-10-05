@@ -15,7 +15,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DRV="$HERE/driver.sh"
-OUT=/tmp/svg-aspect; mkdir -p "$OUT"
+OUT="$(mktemp -d /tmp/svg-aspect.XXXXXX)"  # per run: agents run gates concurrently
 PORT="${SA_PORT:-8995}"; W=1280; H=800
 TOP="$("$DRV" chrome-top)" || exit 1
 TOL="${SA_ASPECT_TOL:-0.18}"

@@ -1,0 +1,40 @@
+From 8d8df78c17d40222078d670ebd1d364926ecbda3 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 06:38:35 -0400
+Subject: [PATCH] layout: align text inputs on their text baseline
+
+The UA sheet gives every text-like <input> `overflow: hidden` so its text is clipped, which
+made it a scroll container, and css-align's legacy rule puts a scroll container's inline-block
+baseline at its block-end margin edge. A line holding an input was therefore 24.5px tall
+instead of Chrome's 21px, with the input's text sitting above the surrounding text. Chrome
+ignores `overflow` for the baseline of its text controls
+(ShouldIgnoreOverflowPropertyForInlineBlockBaseline), so inputs now keep the baseline of
+their text. Textareas keep the margin-edge baseline, as in Chrome.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/fragment_tree/box_fragment.rs | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/components/layout/fragment_tree/box_fragment.rs b/components/layout/fragment_tree/box_fragment.rs
+index 79db41d0b95..53de96d34e9 100644
+--- a/components/layout/fragment_tree/box_fragment.rs
++++ b/components/layout/fragment_tree/box_fragment.rs
+@@ -220,7 +220,13 @@ impl BoxFragment {
+         //
+         // This applies even if there is no baseline set, so we unconditionally set the value here
+         // and ignore anything that is set via [`Self::with_baselines`].
+-        if style.establishes_scroll_container(self.base.flags) {
++        //
++        // `<input>` is a scroll container only because the UA sheet clips its text. Chrome ignores
++        // `overflow` for the baseline of its text controls (`ShouldIgnoreOverflowPropertyFor
++        // InlineBlockBaseline`), aligning them on their text instead of their bottom edge.
++        if style.establishes_scroll_container(self.base.flags) &&
++            !self.base.flags.contains(FragmentFlags::IS_INPUT_ELEMENT)
++        {
+             let content_rect_size = self.content_rect().size.to_logical(writing_mode);
+             let padding = self.padding.to_logical(writing_mode);
+             let border = self.border.to_logical(writing_mode);
+-- 
+2.43.0
+

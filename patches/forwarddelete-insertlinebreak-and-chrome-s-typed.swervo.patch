@@ -1,0 +1,664 @@
+From 165a1d25bbb4b0acf1ecf6a02a0723d0be89ea6c Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 01:44:33 -0400
+Subject: [PATCH] editing: forwardDelete, insertLineBreak and Chrome's typed
+ white space
+
+The Delete key and Shift+Enter did nothing in editing hosts, and spaces typed
+before text stayed no-break spaces ("abc&nbsp;x").
+
+Implement the forwardDelete and insertLineBreak commands from the editing
+spec, for execCommand and for the Delete key (deleteContentForward) and
+Shift+Enter (insertLineBreak). Forward deletion at the end of the editing host
+stops there instead of extending the selection out of it.
+
+insertText now canonicalizes white space at both ends of the inserted text, as
+the spec's steps 15 and 16 do, without deleting collapsed spaces so a second
+space typed at the end of a line is kept, as in Chrome. The start scan of
+canonicalize whitespace now repeats over the whole run of spaces as the spec
+says, instead of stopping after one.
+
+Like Chrome, text typed on a line holding only a placeholder <br> replaces it,
+and a deletion that leaves the caret after a <br> ending its block adds a
+placeholder <br> so the emptied last line stays.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../dom/document/document_event_handler.rs    |   4 +
+ .../script/dom/execcommand/basecommand.rs     |  18 +-
+ .../script/dom/execcommand/commands/delete.rs |  35 +++
+ .../dom/execcommand/commands/forwarddelete.rs | 292 ++++++++++++++++++
+ .../execcommand/commands/insertlinebreak.rs   | 101 ++++++
+ .../dom/execcommand/commands/inserttext.rs    |  45 ++-
+ .../script/dom/execcommand/commands/mod.rs    |   2 +
+ .../dom/execcommand/contenteditable/node.rs   |   3 +-
+ .../script/dom/execcommand/execcommands.rs    |   2 +
+ 9 files changed, 495 insertions(+), 7 deletions(-)
+ create mode 100644 components/script/dom/execcommand/commands/forwarddelete.rs
+ create mode 100644 components/script/dom/execcommand/commands/insertlinebreak.rs
+
+diff --git a/components/script/dom/document/document_event_handler.rs b/components/script/dom/document/document_event_handler.rs
+index 9c9a241ab06..d9007b390a6 100644
+--- a/components/script/dom/document/document_event_handler.rs
++++ b/components/script/dom/document/document_event_handler.rs
+@@ -3202,8 +3202,12 @@ fn typing_command(event: &keyboard_types::KeyboardEvent) -> Option<(CommandName,
+     }
+     Some(match &event.key {
+         Key::Character(text) => (CommandName::InsertText, Some(DOMString::from(text.as_str()))),
++        Key::Named(NamedKey::Enter) if event.modifiers.contains(Modifiers::SHIFT) => {
++            (CommandName::InsertLineBreak, None)
++        },
+         Key::Named(NamedKey::Enter) => (CommandName::InsertParagraph, None),
+         Key::Named(NamedKey::Backspace) => (CommandName::Delete, None),
++        Key::Named(NamedKey::Delete) => (CommandName::ForwardDelete, None),
+         _ => return None,
+     })
+ }
+diff --git a/components/script/dom/execcommand/basecommand.rs b/components/script/dom/execcommand/basecommand.rs
+index 11a660f9d96..392c54672fd 100644
+--- a/components/script/dom/execcommand/basecommand.rs
++++ b/components/script/dom/execcommand/basecommand.rs
+@@ -22,13 +22,15 @@ use crate::dom::execcommand::commands::backcolor::execute_backcolor_command;
+ use crate::dom::execcommand::commands::bold::execute_bold_command;
+ use crate::dom::execcommand::commands::createlink::execute_createlink_command;
+ use crate::dom::execcommand::commands::defaultparagraphseparator::execute_default_paragraph_separator_command;
+-use crate::dom::execcommand::commands::delete::execute_delete_command;
++use crate::dom::execcommand::commands::delete::{execute_delete_command, keep_empty_last_line};
+ use crate::dom::execcommand::commands::fontname::execute_fontname_command;
+ use crate::dom::execcommand::commands::fontsize::{
+     execute_fontsize_command, font_size_loosely_equivalent, value_for_fontsize_command,
+ };
+ use crate::dom::execcommand::commands::forecolor::execute_forecolor_command;
++use crate::dom::execcommand::commands::forwarddelete::execute_forward_delete_command;
+ use crate::dom::execcommand::commands::hilitecolor::execute_hilitecolor_command;
++use crate::dom::execcommand::commands::insertlinebreak::execute_insert_line_break_command;
+ use crate::dom::execcommand::commands::insertparagraph::execute_insert_paragraph_command;
+ use crate::dom::execcommand::commands::inserttext::execute_insert_text_command;
+ use crate::dom::execcommand::commands::italic::execute_italic_command;
+@@ -696,11 +698,23 @@ impl CommandName {
+             CommandName::DefaultParagraphSeparator => {
+                 execute_default_paragraph_separator_command(document, value)
+             },
+-            CommandName::Delete => execute_delete_command(cx, document, selection),
++            CommandName::Delete => {
++                let result = execute_delete_command(cx, document, selection);
++                keep_empty_last_line(cx, document, selection);
++                result
++            },
+             CommandName::FontName => execute_fontname_command(cx, document, selection, value),
+             CommandName::FontSize => execute_fontsize_command(cx, document, selection, value),
+             CommandName::ForeColor => execute_forecolor_command(cx, document, selection, value),
++            CommandName::ForwardDelete => {
++                let result = execute_forward_delete_command(cx, document, selection);
++                keep_empty_last_line(cx, document, selection);
++                result
++            },
+             CommandName::HiliteColor => execute_hilitecolor_command(cx, document, selection, value),
++            CommandName::InsertLineBreak => {
++                execute_insert_line_break_command(cx, document, selection)
++            },
+             CommandName::InsertParagraph => {
+                 execute_insert_paragraph_command(cx, document, selection)
+             },
+diff --git a/components/script/dom/execcommand/commands/delete.rs b/components/script/dom/execcommand/commands/delete.rs
+index 2b18ac405c4..2aed4a15939 100644
+--- a/components/script/dom/execcommand/commands/delete.rs
++++ b/components/script/dom/execcommand/commands/delete.rs
+@@ -326,3 +326,38 @@ pub(crate) fn execute_delete_command(
+     // Step 20. Return true.
+     true
+ }
++
++/// NOTE: Not in the spec, but like other browsers: when deleting leaves the caret after a `<br>`
++/// that ends its block, the line after it would not be laid out, so a placeholder `<br>` keeps
++/// that now empty last line, and the caret on it.
++pub(crate) fn keep_empty_last_line(
++    cx: &mut js::context::JSContext,
++    document: &Document,
++    selection: &Selection,
++) {
++    let active_range = selection
++        .active_range()
++        .expect("Must always have an active range");
++    if !active_range.collapsed() {
++        return;
++    }
++    let node = active_range.start_container();
++    let offset = active_range.start_offset();
++    if offset == 0 ||
++        !node.is_editable_or_editing_host() ||
++        node.children().nth(offset as usize).is_some()
++    {
++        return;
++    }
++    let Some(previous) = node.children().nth(offset as usize - 1) else {
++        return;
++    };
++    if !previous.is::<HTMLBRElement>() || !previous.precedes_a_line_break(cx.no_gc()) {
++        return;
++    }
++    let br = document.create_element(cx, "br");
++    if node.AppendChild(cx, br.upcast()).is_err() {
++        unreachable!("Must always be able to append");
++    }
++    selection.collapse_current_range(&node, offset);
++}
+diff --git a/components/script/dom/execcommand/commands/forwarddelete.rs b/components/script/dom/execcommand/commands/forwarddelete.rs
+new file mode 100644
+index 00000000000..881ae1ef52e
+--- /dev/null
++++ b/components/script/dom/execcommand/commands/forwarddelete.rs
+@@ -0,0 +1,292 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++use js::context::JSContext;
++use script_bindings::inheritance::Castable;
++
++use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
++use crate::dom::characterdata::CharacterData;
++use crate::dom::document::Document;
++use crate::dom::html::htmlbrelement::HTMLBRElement;
++use crate::dom::html::htmlhrelement::HTMLHRElement;
++use crate::dom::html::htmlimageelement::HTMLImageElement;
++use crate::dom::html::htmltableelement::HTMLTableElement;
++use crate::dom::selection::Selection;
++use crate::dom::text::Text;
++
++/// <https://w3c.github.io/editing/docs/execCommand/#the-forwarddelete-command>
++pub(crate) fn execute_forward_delete_command(
++    cx: &mut JSContext,
++    document: &Document,
++    selection: &Selection,
++) -> bool {
++    let active_range = selection
++        .active_range()
++        .expect("Must always have an active range");
++    // Step 1. If the active range is not collapsed, delete the selection and return true.
++    if !active_range.collapsed() {
++        selection.delete_the_selection(
++            cx,
++            document,
++            Default::default(),
++            Default::default(),
++            Default::default(),
++        );
++        return true;
++    }
++
++    // Step 2. Canonicalize whitespace at the active range's start.
++    active_range
++        .start_container()
++        .canonicalize_whitespace(cx, active_range.start_offset(), true);
++
++    // Step 3. Let node and offset be the active range's start node and offset.
++    let mut node = active_range.start_container();
++    let mut offset = active_range.start_offset();
++
++    // Step 4. Repeat the following steps:
++    loop {
++        // Step 4.1. If offset is the length of node and node's nextSibling is an editable
++        // invisible node, remove node's nextSibling from its parent.
++        if offset == node.len() &&
++            let Some(sibling) = node.GetNextSibling() &&
++            sibling.is_editable() &&
++            sibling.is_invisible(cx.no_gc())
++        {
++            sibling.remove_self(cx);
++            continue;
++        }
++        // Step 4.2. Otherwise, if node has a child with index offset and that child is an
++        // editable invisible node, remove that child from node.
++        let child = node.children().nth(offset as usize);
++        if let Some(child) = &child &&
++            child.is_editable() &&
++            child.is_invisible(cx.no_gc())
++        {
++            child.remove_self(cx);
++            continue;
++        }
++        // Step 4.3. Otherwise, if offset is the length of node and node is an inline node, or if
++        // node is invisible, set offset to one plus the index of node, then set node to its
++        // parent.
++        if (offset == node.len() && node.is_inline_node()) || node.is_invisible(cx.no_gc()) {
++            offset = 1 + node.index();
++            node = node.GetParentNode().expect("Must always have a parent");
++            continue;
++        }
++        // Step 4.4. Otherwise, if node has a child with index offset and that child is neither a
++        // block node nor a br nor an img nor a collapsed block prop, set node to that child,
++        // then set offset to zero.
++        if let Some(child) = child &&
++            !(child.is_block_node() ||
++                child.is::<HTMLBRElement>() ||
++                child.is::<HTMLImageElement>() ||
++                child.is_collapsed_block_prop(cx.no_gc()))
++        {
++            node = child;
++            offset = 0;
++            continue;
++        }
++        // Step 4.5. Otherwise, break from this loop.
++        break;
++    }
++
++    // Step 5. If node is a Text node and offset is not node's length:
++    if let Some(text) = node.downcast::<Text>() &&
++        offset != node.len()
++    {
++        // Step 5.1. Let end offset be offset plus one.
++        // Step 5.2. While end offset is not node's length and the end offsetth code unit of
++        // node's data has general category M when interpreted as a Unicode code point, add one
++        // to end offset.
++        let data: Vec<u16> = text
++            .upcast::<CharacterData>()
++            .data()
++            .encode_utf16()
++            .collect();
++        let mut end_offset = offset + 1;
++        // A surrogate pair is one character.
++        if (0xD800..0xDC00).contains(&data[offset as usize]) && end_offset < node.len() {
++            end_offset += 1;
++        }
++        while end_offset != node.len() && is_combining_mark(data[end_offset as usize]) {
++            end_offset += 1;
++        }
++        // Step 5.3. Call collapse(node, offset) on the context object's selection.
++        selection.collapse_current_range(&node, offset);
++        // Step 5.4. Call extend(node, end offset) on the context object's selection.
++        selection.extend_current_range(&node, end_offset);
++        // Step 5.5. Delete the selection.
++        selection.delete_the_selection(
++            cx,
++            document,
++            Default::default(),
++            Default::default(),
++            Default::default(),
++        );
++        // Step 5.6. Return true.
++        return true;
++    }
++
++    // Step 6. If node is an inline node, return true.
++    if node.is_inline_node() {
++        return true;
++    }
++
++    // Step 7. If node has a child with index offset and that child is a br or hr or img, but is
++    // not a collapsed br:
++    if node.children().nth(offset as usize).is_some_and(|child| {
++        child.is::<HTMLHRElement>() ||
++            child.is::<HTMLImageElement>() ||
++            (child.is::<HTMLBRElement>() && !child.precedes_a_line_break(cx.no_gc()))
++    }) {
++        // Step 7.1. Call collapse(node, offset) on the context object's selection.
++        selection.collapse_current_range(&node, offset);
++        // Step 7.2. Call extend(node, offset + 1) on the context object's selection.
++        selection.extend_current_range(&node, offset + 1);
++        // Step 7.3. Delete the selection.
++        selection.delete_the_selection(
++            cx,
++            document,
++            Default::default(),
++            Default::default(),
++            Default::default(),
++        );
++        // Step 7.4. Return true.
++        return true;
++    }
++
++    // Step 8. Let end node equal node and let end offset equal offset.
++    let mut end_node = node.clone();
++    let mut end_offset = offset;
++
++    // Step 9. If end node has a child with index end offset, and that child is a collapsed
++    // block prop, add one to end offset.
++    if end_node
++        .children()
++        .nth(end_offset as usize)
++        .is_some_and(|child| child.is_collapsed_block_prop(cx.no_gc()))
++    {
++        end_offset += 1;
++    }
++
++    // Step 10. Repeat the following steps:
++    loop {
++        // Step 10.1. If end offset is the length of end node, set end offset to one plus the
++        // index of end node and then set end node to its parent.
++        if end_offset == end_node.len() {
++            // NOTE: Not in the spec, but at the end of the editing host there is nothing to
++            // delete; walking out of it would extend the selection past it, while other
++            // browsers do nothing.
++            if end_node.is_editing_host() {
++                return true;
++            }
++            end_offset = 1 + end_node.index();
++            end_node = end_node.GetParentNode().expect("Must always have a parent");
++            continue;
++        }
++        // Step 10.2. Otherwise, if end node has an editable invisible child with index end
++        // offset, remove it from end node.
++        if let Some(child) = end_node.children().nth(end_offset as usize) &&
++            child.is_editable() &&
++            child.is_invisible(cx.no_gc())
++        {
++            child.remove_self(cx);
++            continue;
++        }
++        // Step 10.3. Otherwise, break from this loop.
++        break;
++    }
++
++    // Step 11. If the child of end node with index end offset minus one is a table, return true.
++    if end_offset > 0 &&
++        end_node
++            .children()
++            .nth(end_offset as usize - 1)
++            .is_some_and(|child| child.is::<HTMLTableElement>())
++    {
++        return true;
++    }
++
++    // Step 12. If the child of end node with index end offset is a table:
++    if end_node
++        .children()
++        .nth(end_offset as usize)
++        .is_some_and(|child| child.is::<HTMLTableElement>())
++    {
++        // Step 12.1. Call collapse(end node, end offset) on the context object's selection.
++        selection.collapse_current_range(&end_node, end_offset);
++        // Step 12.2. Call extend(end node, end offset + 1) on the context object's selection.
++        selection.extend_current_range(&end_node, end_offset + 1);
++        // Step 12.3. Return true.
++        return true;
++    }
++
++    // Step 13. If offset is the length of node, and the child of end node with index end offset
++    // is an hr or br:
++    if offset == node.len() &&
++        end_node
++            .children()
++            .nth(end_offset as usize)
++            .is_some_and(|child| child.is::<HTMLHRElement>() || child.is::<HTMLBRElement>())
++    {
++        // Step 13.1. Call collapse(end node, end offset) on the context object's selection.
++        selection.collapse_current_range(&end_node, end_offset);
++        // Step 13.2. Call extend(end node, end offset + 1) on the context object's selection.
++        selection.extend_current_range(&end_node, end_offset + 1);
++        // Step 13.3. Delete the selection.
++        selection.delete_the_selection(
++            cx,
++            document,
++            Default::default(),
++            Default::default(),
++            Default::default(),
++        );
++        // Step 13.4. Call collapse(node, offset) on the context object's selection.
++        selection.collapse_current_range(&node, offset);
++        // Step 13.5. Return true.
++        return true;
++    }
++
++    // Step 14. While end node has a child with index end offset:
++    while let Some(child) = end_node.children().nth(end_offset as usize) {
++        // Step 14.1. If end node's child with index end offset is editable and invisible,
++        // remove it from end node.
++        if child.is_editable() && child.is_invisible(cx.no_gc()) {
++            child.remove_self(cx);
++        } else {
++            // Step 14.2. Otherwise, set end node to its child with index end offset and set end
++            // offset to zero.
++            end_node = child;
++            end_offset = 0;
++        }
++    }
++
++    // Step 15. Call collapse(node, offset) on the context object's selection.
++    selection.collapse_current_range(&node, offset);
++
++    // Step 16. Call extend(end node, end offset) on the context object's selection.
++    selection.extend_current_range(&end_node, end_offset);
++
++    // Step 17. Delete the selection.
++    selection.delete_the_selection(
++        cx,
++        document,
++        Default::default(),
++        Default::default(),
++        Default::default(),
++    );
++
++    // Step 18. Return true.
++    true
++}
++
++/// Whether a UTF-16 code unit is a combining mark (general category M), approximated by the
++/// combining mark blocks of the Basic Multilingual Plane.
++fn is_combining_mark(code_unit: u16) -> bool {
++    matches!(
++        code_unit,
++        0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F
++    )
++}
+diff --git a/components/script/dom/execcommand/commands/insertlinebreak.rs b/components/script/dom/execcommand/commands/insertlinebreak.rs
+new file mode 100644
+index 00000000000..f94aa8c870d
+--- /dev/null
++++ b/components/script/dom/execcommand/commands/insertlinebreak.rs
+@@ -0,0 +1,101 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++use js::context::JSContext;
++use script_bindings::inheritance::Castable;
++
++use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
++use crate::dom::bindings::codegen::Bindings::RangeBinding::RangeMethods;
++use crate::dom::document::Document;
++use crate::dom::element::Element;
++use crate::dom::execcommand::contenteditable::node::{NodeOrString, is_allowed_child};
++use crate::dom::node::Node;
++use crate::dom::selection::Selection;
++use crate::dom::text::Text;
++
++/// <https://w3c.github.io/editing/docs/execCommand/#the-insertlinebreak-command>
++pub(crate) fn execute_insert_line_break_command(
++    cx: &mut JSContext,
++    document: &Document,
++    selection: &Selection,
++) -> bool {
++    // Step 1. Delete the selection, with strip wrappers false.
++    selection.delete_the_selection(
++        cx,
++        document,
++        Default::default(),
++        Default::default(),
++        Default::default(),
++    );
++    let active_range = selection
++        .active_range()
++        .expect("Must always have an active range");
++    let start_node = active_range.start_container();
++    // Step 2. If the active range's start node is neither editable nor an editing host,
++    // return true.
++    if !start_node.is_editable_or_editing_host() {
++        return true;
++    }
++    // Step 3. If the active range's start node is an Element, and "br" is not an allowed child
++    // of it, return true.
++    if start_node.is::<Element>() &&
++        !is_allowed_child(
++            NodeOrString::String("br".to_owned()),
++            NodeOrString::Node(start_node.clone()),
++        )
++    {
++        return true;
++    }
++    // Step 4. If the active range's start node is not an Element, and "br" is not an allowed
++    // child of the active range's start node's parent, return true.
++    if !start_node.is::<Element>() &&
++        !is_allowed_child(
++            NodeOrString::String("br".to_owned()),
++            NodeOrString::Node(start_node.GetParentNode().expect("Must always have a parent")),
++        )
++    {
++        return true;
++    }
++    if start_node.is::<Text>() {
++        // Step 5. If the active range's start node is a Text node and its start offset is zero,
++        // call collapse() on the context object's selection, with first argument equal to the
++        // active range's start node's parent and second argument equal to the active range's
++        // start node's index.
++        if active_range.start_offset() == 0 {
++            let parent = start_node.GetParentNode().expect("Must always have a parent");
++            selection.collapse_current_range(&parent, start_node.index());
++        } else if active_range.start_offset() == start_node.len() {
++            // Step 6. If the active range's start node is a Text node and its start offset is the
++            // length of its start node, call collapse() on the context object's selection, with
++            // first argument equal to the active range's start node's parent and second argument
++            // equal to one plus the active range's start node's index.
++            let parent = start_node.GetParentNode().expect("Must always have a parent");
++            selection.collapse_current_range(&parent, 1 + start_node.index());
++        }
++    }
++    // Step 7. Let br be the result of calling createElement("br") on the context object.
++    let br = document.create_element(cx, "br");
++    // Step 8. Call insertNode(br) on the active range.
++    if active_range.InsertNode(cx, br.upcast()).is_err() {
++        unreachable!("Must always be able to insert");
++    }
++    // Step 9. Call collapse() on the context object's selection, with br's parent as the first
++    // argument and one plus br's index as the second argument.
++    let br = br.upcast::<Node>();
++    let parent = br.GetParentNode().expect("Was just inserted");
++    selection.collapse_current_range(&parent, 1 + br.index());
++    // Step 10. If br is a collapsed line break, call createElement("br") on the context object
++    // and let extra br be the result, then call insertNode(extra br) on the active range.
++    if br.precedes_a_line_break(cx.no_gc()) {
++        let extra_br = document.create_element(cx, "br");
++        if active_range.InsertNode(cx, extra_br.upcast()).is_err() {
++            unreachable!("Must always be able to insert");
++        }
++        // Inserting into the collapsed range made it contain the extra br; the caret stays
++        // between the two, as in other browsers.
++        selection.collapse_current_range(&parent, 1 + br.index());
++    }
++    // Step 11. Return true.
++    true
++}
+diff --git a/components/script/dom/execcommand/commands/inserttext.rs b/components/script/dom/execcommand/commands/inserttext.rs
+index cf67c04ae63..e6a8babb48c 100644
+--- a/components/script/dom/execcommand/commands/inserttext.rs
++++ b/components/script/dom/execcommand/commands/inserttext.rs
+@@ -11,6 +11,7 @@ use crate::dom::bindings::root::DomRoot;
+ use crate::dom::bindings::str::DOMString;
+ use crate::dom::characterdata::CharacterData;
+ use crate::dom::document::Document;
++use crate::dom::html::htmlbrelement::HTMLBRElement;
+ use crate::dom::node::Node;
+ use crate::dom::selection::Selection;
+ use crate::dom::text::Text;
+@@ -91,9 +92,45 @@ pub(crate) fn execute_insert_text_command(
+         }
+     };
+ 
+-    // Step 10. Canonicalize whitespace around the insertion, so a typed space at the end of a
+-    // line stays visible (it becomes a no-break space).
+-    text_node.canonicalize_whitespace(cx, end_offset, true);
+-    selection.collapse_current_range(&text_node, end_offset);
++    // NOTE: Not in the spec, but like other browsers: text typed on a line that only held a
++    // placeholder `<br>` (one keeping an empty last line visible) replaces it.
++    if text_node.len() == inserted_length &&
++        text_node
++            .GetPreviousSibling()
++            .is_none_or(|previous| previous.is::<HTMLBRElement>()) &&
++        let Some(next) = text_node.GetNextSibling() &&
++        next.is::<HTMLBRElement>() &&
++        next.precedes_a_line_break(cx.no_gc())
++    {
++        next.remove_self(cx);
++    }
++
++    // Step 12.2. Call collapse(node, offset) on the context object's selection.
++    // Step 12.3. Call extend(node, offset + 1) on the context object's selection.
++    selection.collapse_current_range(&text_node, end_offset - inserted_length);
++    selection.extend_current_range(&text_node, end_offset);
++
++    // Step 15. Canonicalize whitespace (the active range's start node, the active range's start
++    // offset).
++    // Step 16. Canonicalize whitespace (the active range's end node, the active range's end
++    // offset).
++    //
++    // Canonicalizing at the start turns a no-break space that ended the line back into a space
++    // once text follows it, and at the end makes a typed space at the end of a line a visible
++    // no-break space. Collapsed spaces are not fixed: that would delete a second space typed at
++    // the end of a line, which other browsers keep.
++    let active_range = selection
++        .active_range()
++        .expect("Must always have an active range");
++    active_range
++        .start_container()
++        .canonicalize_whitespace(cx, active_range.start_offset(), false);
++    active_range
++        .end_container()
++        .canonicalize_whitespace(cx, active_range.end_offset(), false);
++
++    // Step 18. Call collapse() on the context object's selection, with first argument equal to
++    // the active range's end node and second argument equal to the active range's end offset.
++    selection.collapse_current_range(&active_range.end_container(), active_range.end_offset());
+     true
+ }
+diff --git a/components/script/dom/execcommand/commands/mod.rs b/components/script/dom/execcommand/commands/mod.rs
+index 456fba047ff..a16e06caffc 100644
+--- a/components/script/dom/execcommand/commands/mod.rs
++++ b/components/script/dom/execcommand/commands/mod.rs
+@@ -10,7 +10,9 @@ pub(crate) mod delete;
+ pub(crate) mod fontname;
+ pub(crate) mod fontsize;
+ pub(crate) mod forecolor;
++pub(crate) mod forwarddelete;
+ pub(crate) mod hilitecolor;
++pub(crate) mod insertlinebreak;
+ pub(crate) mod insertparagraph;
+ pub(crate) mod inserttext;
+ pub(crate) mod italic;
+diff --git a/components/script/dom/execcommand/contenteditable/node.rs b/components/script/dom/execcommand/contenteditable/node.rs
+index 74cd34a0761..17868b70b8b 100644
+--- a/components/script/dom/execcommand/contenteditable/node.rs
++++ b/components/script/dom/execcommand/contenteditable/node.rs
+@@ -1809,7 +1809,7 @@ impl Node {
+     }
+ 
+     /// <https://w3c.github.io/editing/docs/execCommand/#precedes-a-line-break>
+-    fn precedes_a_line_break(&self, no_gc: &NoGC) -> bool {
++    pub(crate) fn precedes_a_line_break(&self, no_gc: &NoGC) -> bool {
+         let mut node = DomRoot::from_ref(self);
+         // Step 1. Let offset be node's length.
+         let mut offset = node.len();
+@@ -1945,6 +1945,7 @@ impl Node {
+                 })
+             {
+                 start_offset -= 1;
++                continue;
+             }
+             // Step 3.4. Otherwise, break from this loop.
+             break;
+diff --git a/components/script/dom/execcommand/execcommands.rs b/components/script/dom/execcommand/execcommands.rs
+index 84c919a2be8..02c35df0e18 100644
+--- a/components/script/dom/execcommand/execcommands.rs
++++ b/components/script/dom/execcommand/execcommands.rs
+@@ -192,7 +192,9 @@ impl Document {
+             "fontname" => CommandName::FontName,
+             "fontsize" => CommandName::FontSize,
+             "forecolor" => CommandName::ForeColor,
++            "forwarddelete" => CommandName::ForwardDelete,
+             "hilitecolor" => CommandName::HiliteColor,
++            "insertlinebreak" => CommandName::InsertLineBreak,
+             "insertparagraph" => CommandName::InsertParagraph,
+             "inserttext" => CommandName::InsertText,
+             "italic" => CommandName::Italic,
+-- 
+2.43.0
+

@@ -1,0 +1,170 @@
+From 6db42bfa1db88f78719aa4cbcf355c679f226a86 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 05:10:25 -0400
+Subject: [PATCH] servo: overlay, and display/overlay transitions that animate
+ elements out
+
+Adds the overlay longhand for Servo (none | auto, discretely animatable)
+so the user agent stylesheet can put top layer elements there and pages
+can transition it. A style with overlay: auto is in the top layer for the
+style adjuster too.
+
+display and overlay interpolate so that their none value only applies at
+the end of an interpolation that goes to or from it
+(https://drafts.csswg.org/css-display-4/#display-animation), which keeps
+an element rendered for the whole of an allow-discrete transition that
+hides it. Servo cancelled every transition once the after-change style
+had display: none; it now keeps them when display itself transitions
+with allow-discrete, so the other properties can animate out alongside.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../helpers/animated_properties.mako.rs       | 42 ++++++++++++++++++-
+ style/properties/longhands.toml               |  8 ++++
+ style/properties/properties.mako.rs           |  7 +++-
+ style/servo/animation.rs                      | 19 ++++++++-
+ 4 files changed, 71 insertions(+), 5 deletions(-)
+
+diff --git a/style/properties/helpers/animated_properties.mako.rs b/style/properties/helpers/animated_properties.mako.rs
+index 7cf2149f8..e2fd3150d 100644
+--- a/style/properties/helpers/animated_properties.mako.rs
++++ b/style/properties/helpers/animated_properties.mako.rs
+@@ -515,6 +515,31 @@ fn animate_discrete<T: Clone>(this: &T, other: &T, procedure: Procedure) -> Resu
+     }
+ }
+ 
++/// Discrete interpolation for `display` and `overlay`, whose `none` value only applies at the end
++/// of the interpolation that goes to or from it, so that an element stays rendered (or in the top
++/// layer) for the whole of a transition that hides it.
++///
++/// <https://drafts.csswg.org/css-display-4/#display-animation>
++/// <https://drafts.csswg.org/css-position-4/#overlay>
++#[cfg(feature = "servo")]
++fn animate_discrete_with_none<T: Clone + PartialEq>(
++    this: &T,
++    other: &T,
++    none: &T,
++    procedure: Procedure,
++) -> Result<T, ()> {
++    let Procedure::Interpolate { progress } = procedure else {
++        return Err(());
++    };
++    if *this == *none && *other != *none {
++        return Ok(if progress <= 0. { this.clone() } else { other.clone() });
++    }
++    if *other == *none && *this != *none {
++        return Ok(if progress >= 1. { other.clone() } else { this.clone() });
++    }
++    animate_discrete(this, other, procedure)
++}
++
+ impl Animate for AnimationValue {
+     fn animate(&self, other: &Self, procedure: Procedure) -> Result<Self, ()> {
+         Ok(unsafe {
+@@ -529,10 +554,25 @@ impl Animate for AnimationValue {
+             match *self {
+                 <% keyfunc = lambda x: (x.animated_type(), x.animation_type == "discrete") %>
+                 % for (ty, discrete), props in groupby(animated, key=keyfunc):
++                <% props = list(props) %>
+                 ${" |\n".join("{}(ref this)".format(prop.camel_case) for prop in props)} => {
+                     let other_repr =
+                         &*(other as *const _ as *const AnimationValueVariantRepr<${ty}>);
+-                    % if discrete:
++                    % if discrete and engine == "servo" and [p.name for p in props] == ["display"]:
++                    let value = animate_discrete_with_none(
++                        this,
++                        &other_repr.value,
++                        &crate::values::computed::Display::None,
++                        procedure,
++                    )?;
++                    % elif discrete and engine == "servo" and [p.name for p in props] == ["overlay"]:
++                    let value = animate_discrete_with_none(
++                        this,
++                        &other_repr.value,
++                        &crate::properties::longhands::overlay::computed_value::T::None,
++                        procedure,
++                    )?;
++                    % elif discrete:
+                     let value = animate_discrete(this, &other_repr.value, procedure)?;
+                     % else:
+                     let value = this.animate(&other_repr.value, procedure)?;
+diff --git a/style/properties/longhands.toml b/style/properties/longhands.toml
+index 6402feed5..3034289bb 100644
+--- a/style/properties/longhands.toml
++++ b/style/properties/longhands.toml
+@@ -3661,6 +3661,14 @@ enabled_in = "ua"
+ affects = "layout"
+ keyword = { values = ["none", "top"] }
+ 
++[overlay]
++struct = "box"
++engine = "servo"
++spec = "https://drafts.csswg.org/css-position-4/#overlay"
++animation_type = "discrete"
++affects = "layout"
++keyword = { values = ["none", "auto"] }
++
+ [scroll-behavior]
+ struct = "box"
+ spec = "https://drafts.csswg.org/cssom-view/#propdef-scroll-behavior"
+diff --git a/style/properties/properties.mako.rs b/style/properties/properties.mako.rs
+index 03053a32f..ff6945bfa 100644
+--- a/style/properties/properties.mako.rs
++++ b/style/properties/properties.mako.rs
+@@ -2563,11 +2563,14 @@ impl<'a> StyleBuilder<'a> {
+         self.get_box().clone_position().is_absolutely_positioned()
+     }
+ 
+-    /// Whether this style has a top-layer style.
++    /// Whether this style has a top-layer style. An element whose removal from the top layer is
++    /// deferred by a transition of `overlay` stays there until `overlay` becomes `none`.
+     #[cfg(feature = "servo")]
+     pub fn in_top_layer(&self) -> bool {
+         matches!(self.get_box().clone__servo_top_layer(),
+-                 longhands::_servo_top_layer::computed_value::T::Top)
++                 longhands::_servo_top_layer::computed_value::T::Top) ||
++            matches!(self.get_box().clone_overlay(),
++                     longhands::overlay::computed_value::T::Auto)
+     }
+ 
+     /// Whether this style has a top-layer style.
+diff --git a/style/servo/animation.rs b/style/servo/animation.rs
+index b19d2b55b..9d8def9fd 100644
+--- a/style/servo/animation.rs
++++ b/style/servo/animation.rs
+@@ -1282,8 +1282,13 @@ impl ElementAnimationSet {
+             None => return,
+         };
+ 
+-        // If the style of this element is display:none, then cancel all active transitions.
+-        if after_change_style.get_box().clone_display().is_none() {
++        // If the style of this element is display:none, then cancel all active transitions, unless
++        // display itself transitions discretely: the element then stays rendered until that
++        // transition ends, so that it can animate out.
++        // <https://drafts.csswg.org/css-transitions-2/#transition-behavior-property>
++        if after_change_style.get_box().clone_display().is_none()
++            && !transitions_display_discretely(after_change_style)
++        {
+             self.cancel_active_transitions();
+             return;
+         }
+@@ -1713,6 +1718,16 @@ impl DocumentAnimationSet {
+ 
+ /// Kick off any new transitions for this node and return all of the properties that are
+ /// transitioning. This is at the end of calculating style for a single node.
++/// Whether `display` has a matching transition-property value whose transition-behavior is
++/// allow-discrete.
++fn transitions_display_discretely(style: &ComputedValues) -> bool {
++    let ui = style.get_ui();
++    style.transition_properties().any(|transition| {
++        transition.property.as_borrowed() == PropertyDeclarationId::Longhand(LonghandId::Display)
++            && ui.transition_behavior_mod(transition.index) == TransitionBehavior::AllowDiscrete
++    })
++}
++
+ pub fn start_transitions_if_applicable(
+     context: &SharedStyleContext,
+     old_style: &ComputedValues,
+-- 
+2.43.0
+

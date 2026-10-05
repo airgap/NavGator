@@ -1,0 +1,171 @@
+From b220c821a6a1839f56c8f2be7645365db334a867 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 04:49:09 -0400
+Subject: [PATCH] layout: apply layout and paint containment to box generation
+
+contain: layout and contain: paint (and the content/strict shorthands) were
+parsed but ignored by layout. Per css-contain-2 both make the principal box a
+stacking context, an independent formatting context and a containing block for
+absolutely and fixed positioned descendants; paint containment also clips
+contents to the overflow clip edge and forces flat transform-style. Without
+the stacking context, a z-index:-1 child painted behind the background of an
+ancestor outside the contained box: msn.com's large feed cards put their image
+at z-index:-1 inside a contain:content root, so the images vanished behind the
+card's dark background.
+
+Changing whether layout/paint containment applies now also rebuilds the box
+tree for block containers, since it changes whether they establish a BFC.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/style_ext.rs                | 67 ++++++++++++++++---
+ .../servo_dangerous_style_element.rs          |  6 +-
+ 2 files changed, 63 insertions(+), 10 deletions(-)
+
+diff --git a/components/layout/style_ext.rs b/components/layout/style_ext.rs
+index fbfbff46b07..82fbc2c92ff 100644
+--- a/components/layout/style_ext.rs
++++ b/components/layout/style_ext.rs
+@@ -338,6 +338,7 @@ pub(crate) trait ComputedValuesExt {
+     fn effective_overflow(&self, fragment_flags: FragmentFlags) -> AxesOverflow;
+     fn used_transform_style(&self, fragment_flags: FragmentFlags) -> ComputedTransformStyle;
+     fn establishes_block_formatting_context(&self, fragment_flags: FragmentFlags) -> bool;
++    fn has_layout_or_paint_containment(&self, fragment_flags: FragmentFlags) -> bool;
+     fn establishes_stacking_context(&self, fragment_flags: FragmentFlags) -> bool;
+     fn in_top_layer(&self) -> bool;
+     fn establishes_scroll_container(&self, fragment_flags: FragmentFlags) -> bool;
+@@ -729,6 +730,21 @@ impl ComputedValuesExt for ComputedValues {
+             return AxesOverflow::default();
+         }
+ 
++        // From <https://drafts.csswg.org/css-contain-2/#containment-paint>:
++        // > The contents of the element including any ink or scrollable overflow must be clipped
++        // > to the overflow clip edge of the paint containment box, taking corner clipping into
++        // > account.
++        if self.get_box().contain.contains(stylo::Contain::PAINT) &&
++            self.has_layout_or_paint_containment(fragment_flags)
++        {
++            if overflow.x == Overflow::Visible {
++                overflow.x = Overflow::Clip;
++            }
++            if overflow.y == Overflow::Visible {
++                overflow.y = Overflow::Clip;
++            }
++        }
++
+         overflow
+     }
+ 
+@@ -757,7 +773,7 @@ impl ComputedValuesExt for ComputedValues {
+         //    used value of the contain property, such as content-visibility:
+         //    hidden.
+         //
+-        // TODO: Support `mask-border-source` and `contain` (`mask-image` is handled below).
++        // TODO: Support `mask-border-source` (`mask-image` is handled below).
+         let effects = self.get_effects();
+         let overflow = self.effective_overflow(fragment_flags);
+         if !matches!(overflow.x, Overflow::Visible | Overflow::Clip) ||
+@@ -772,7 +788,9 @@ impl ComputedValuesExt for ComputedValues {
+                 .iter()
+                 .any(|image| !matches!(image, ComputedImageLayer::None)) ||
+             self.get_box().isolation == ComputedIsolation::Isolate ||
+-            effects.mix_blend_mode != ComputedMixBlendMode::Normal
++            effects.mix_blend_mode != ComputedMixBlendMode::Normal ||
++            (self.get_box().contain.contains(stylo::Contain::PAINT) &&
++                self.has_layout_or_paint_containment(fragment_flags))
+         {
+             return ComputedTransformStyle::Flat;
+         }
+@@ -809,8 +827,38 @@ impl ComputedValuesExt for ComputedValues {
+             return true;
+         }
+ 
+-        // TODO: We need to handle CSS Contain here.
+-        false
++        // From <https://drafts.csswg.org/css-contain-2/#containment-layout> and
++        // <https://drafts.csswg.org/css-contain-2/#containment-paint>:
++        // > The principal box establishes an independent formatting context.
++        self.has_layout_or_paint_containment(fragment_flags)
++    }
++
++    /// Whether layout or paint containment applies to this box. Both make it a stacking
++    /// context, an independent formatting context and a containing block for all positioned
++    /// descendants. From <https://drafts.csswg.org/css-contain-2/#containment-layout>:
++    /// > If the element does not generate a principal box (as is the case with display values
++    /// > of contents or none), or its principal box is an internal table box other than
++    /// > table-cell, or an internal ruby box, or a non-atomic inline-level box, layout
++    /// > containment has no effect.
++    /// Paint containment has the same exceptions.
++    fn has_layout_or_paint_containment(&self, fragment_flags: FragmentFlags) -> bool {
++        if !self
++            .get_box()
++            .contain
++            .intersects(stylo::Contain::LAYOUT | stylo::Contain::PAINT)
++        {
++            return false;
++        }
++        let is_internal_table_box = matches!(
++            self.get_box().display.inside(),
++            stylo::DisplayInside::TableRowGroup |
++                stylo::DisplayInside::TableColumn |
++                stylo::DisplayInside::TableColumnGroup |
++                stylo::DisplayInside::TableHeaderGroup |
++                stylo::DisplayInside::TableFooterGroup |
++                stylo::DisplayInside::TableRow
++        );
++        !is_internal_table_box && !self.is_inline_box(fragment_flags)
+     }
+ 
+     /// Whether or not the `overflow` value of this style establishes a scroll container.
+@@ -953,8 +1001,9 @@ impl ComputedValuesExt for ComputedValues {
+             return true;
+         }
+ 
+-        // TODO: We need to handle CSS Contain here.
+-        false
++        // From <https://drafts.csswg.org/css-contain-2/#containment-layout>:
++        // > The principal box establishes a stacking context.
++        self.has_layout_or_paint_containment(fragment_flags)
+     }
+ 
+     /// Returns true if this style establishes a containing block for absolute
+@@ -1036,8 +1085,10 @@ impl ComputedValuesExt for ComputedValues {
+             return true;
+         }
+ 
+-        // TODO: We need to handle CSS Contain here.
+-        false
++        // From <https://drafts.csswg.org/css-contain-2/#containment-layout>:
++        // > The principal box establishes an absolute positioning containing block and a fixed
++        // > positioning containing block.
++        self.has_layout_or_paint_containment(fragment_flags)
+     }
+ 
+     /// Resolve the preferred aspect ratio according to the given natural aspect
+diff --git a/components/script/layout_dom/servo_dangerous_style_element.rs b/components/script/layout_dom/servo_dangerous_style_element.rs
+index 006e7f8903f..c3f996bbf62 100644
+--- a/components/script/layout_dom/servo_dangerous_style_element.rs
++++ b/components/script/layout_dom/servo_dangerous_style_element.rs
+@@ -39,7 +39,7 @@ use style::stylesheets::scope_rule::ImplicitScopeRoot;
+ use style::values::computed::{Display, Image};
+ use style::values::generics::counters::{Content, ContentItem, GenericContentItems};
+ use style::values::specified::align::AlignFlags;
+-use style::values::specified::box_::{DisplayInside, DisplayOutside};
++use style::values::specified::box_::{Contain, DisplayInside, DisplayOutside};
+ use style::values::{AtomIdent, AtomString};
+ use stylo_atoms::Atom;
+ use stylo_dom::ElementState;
+@@ -593,7 +593,9 @@ impl<'dom> style::dom::TElement for ServoDangerousStyleElement<'dom> {
+                     old_column.is_multicol() != new_column.is_multicol() ||
+                     old_column.column_span != new_column.column_span ||
+                     alignment_establishes_new_block_formatting_context(old) !=
+-                        alignment_establishes_new_block_formatting_context(new)
++                        alignment_establishes_new_block_formatting_context(new) ||
++                    old_box.contain.intersects(Contain::LAYOUT | Contain::PAINT) !=
++                        new_box.contain.intersects(Contain::LAYOUT | Contain::PAINT)
+                 {
+                     return true;
+                 }
+-- 
+2.43.0
+

@@ -1,0 +1,264 @@
+From 607b6b5c5669246d37523011e10f1b55fdbf75ee Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 06:37:54 -0400
+Subject: [PATCH] layout: paint outside disc/circle/square markers with
+ Chrome's geometry
+
+Outside list markers were the font's bullet glyph placed flush against
+the item, so with Liberation Sans the disc was smaller than Chrome's and
+about 7px closer to the text at 17px. Chrome paints these three symbols
+as shapes sized from the marker font's rounded ascent (diameter
+ascent/3, offset 1px in and 3*(ascent - 2/3 ascent)/2 down from the text
+top) and starts the marker box ascent*2/3 + 8px before the content edge
+(Blink's ListMarker::InlineMarginsForOutside, RelativeSymbolMarkerRect
+and ListMarkerPainter::PaintSymbol).
+
+Outside markers whose content is `normal` and that have no
+list-style-image now use that offset in OutsideMarker layout, and their
+text fragment is painted as a filled circle, a 1px stroked circle or a
+filled square, pixel-snapped like Blink. Measured against Chrome at
+12-64px the shapes land within a pixel.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/display_list/mod.rs | 80 +++++++++++++++++++++++++++
+ components/layout/flow/mod.rs         | 13 ++++-
+ components/layout/lists.rs            | 64 +++++++++++++++++++++
+ 3 files changed, 156 insertions(+), 1 deletion(-)
+
+diff --git a/components/layout/display_list/mod.rs b/components/layout/display_list/mod.rs
+index 0e85ad49dbf..ac85961a26d 100644
+--- a/components/layout/display_list/mod.rs
++++ b/components/layout/display_list/mod.rs
+@@ -72,6 +72,7 @@ use crate::fragment_tree::{
+ use crate::geom::{
+     LengthPercentageOrAuto, PhysicalPoint, PhysicalRect, PhysicalSides, PhysicalSize,
+ };
++use crate::lists::SymbolMarker;
+ use crate::replaced::NaturalSizes;
+ use crate::style_ext::{BorderStyleColor, ComputedValuesExt};
+ 
+@@ -934,6 +935,16 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
+         if style.get_inherited_box().visibility != Visibility::Visible {
+             return;
+         }
++        if let Some(symbol) = SymbolMarker::for_outside_marker(&style) {
++            Fragment::build_display_list_for_symbol_marker(
++                symbol,
++                fragment,
++                self,
++                state,
++                &containing_block,
++            );
++            return;
++        }
+         Fragment::build_display_list_for_text_fragment(fragment, self, state, &containing_block);
+     }
+ 
+@@ -1319,6 +1330,75 @@ impl Fragment {
+         }
+     }
+ 
++    /// Paints a disc, circle or square list marker as a shape in place of its glyph, see
++    /// [`SymbolMarker`].
++    fn build_display_list_for_symbol_marker(
++        symbol: SymbolMarker,
++        fragment: &TextFragment,
++        builder: &mut DisplayListBuilder,
++        state: &TraversalState,
++        containing_block: &PhysicalRect<Au>,
++    ) {
++        // The marker's trailing space can end up in a fragment of its own.
++        if fragment
++            .glyphs
++            .iter()
++            .all(|shaped_text_slice| shaped_text_slice.is_whitespace())
++        {
++            return;
++        }
++        let text_origin = fragment.base.rect().origin + containing_block.origin.to_vector();
++        let rect = SymbolMarker::rect(fragment.font_metrics.ascent)
++            .translate(text_origin.to_vector())
++            .to_webrender();
++
++        // Blink pixel-snaps the shape (`ToPixelSnappedRect`) before painting it.
++        let dppx = builder.device_pixel_ratio.get();
++        let snap = |value: f32| (value * dppx).round() / dppx;
++        let bounds = LayoutRect::new(
++            LayoutPoint::new(snap(rect.min.x), snap(rect.min.y)),
++            LayoutPoint::new(snap(rect.max.x), snap(rect.max.y)),
++        );
++
++        let style = fragment.base.style();
++        let color = rgba(style.clone_color());
++        let mut common = builder.common_properties(state, bounds, &style);
++        match symbol {
++            SymbolMarker::Disc => {
++                let radii = wr::BorderRadius::uniform(bounds.width() / 2.0);
++                if let Some(clip_chain_id) = builder.maybe_create_clip(state, radii, bounds, false)
++                {
++                    common.clip_chain_id = clip_chain_id;
++                }
++                builder.wr().push_rect(&common, bounds, color);
++            },
++            SymbolMarker::Circle => {
++                // Blink strokes a 1px line centred on the edge of the rect.
++                let stroke_bounds = bounds.inflate(0.5, 0.5);
++                common.clip_rect = stroke_bounds;
++                let side = BorderSide {
++                    color,
++                    style: wr::BorderStyle::Solid,
++                };
++                builder.wr().push_border(
++                    &common,
++                    stroke_bounds,
++                    LayoutSideOffsets::new_all_same(1.0),
++                    BorderDetails::Normal(NormalBorder {
++                        left: side,
++                        right: side,
++                        top: side,
++                        bottom: side,
++                        radius: wr::BorderRadius::uniform(stroke_bounds.width() / 2.0),
++                        do_aa: true,
++                    }),
++                );
++            },
++            SymbolMarker::Square => builder.wr().push_rect(&common, bounds, color),
++        }
++        builder.check_if_paintable(bounds, common.clip_rect, style.clone_opacity());
++    }
++
+     fn build_display_list_for_broken_image_border(
+         builder: &mut DisplayListBuilder,
+         containing_block: &PhysicalRect<Au>,
+diff --git a/components/layout/flow/mod.rs b/components/layout/flow/mod.rs
+index 7cc686a405e..0e34c05eedc 100644
+--- a/components/layout/flow/mod.rs
++++ b/components/layout/flow/mod.rs
+@@ -36,6 +36,7 @@ use crate::geom::{
+     PhysicalSides, ToLogical, ToLogicalWithContainingBlock,
+ };
+ use crate::layout_box_base::{IndependentFormattingContextLayoutResult, LayoutBoxBase};
++use crate::lists::SymbolMarker;
+ use crate::positioned::{AbsolutelyPositionedBox, PositioningContext, PositioningContextLength};
+ use crate::sizing::{
+     self, ComputeInlineContentSizes, ContentSizes, InlineContentSizesResult, LazySize, Size,
+@@ -378,9 +379,19 @@ impl OutsideMarker {
+         // they are the same, but this could change in the future.
+         let pbm_of_list_item =
+             LayoutStyle::Default(&self.list_item_style).padding_border_margin(containing_block);
++        let font_context = &layout_context.font_context;
++        let marker_inline_offset = SymbolMarker::for_outside_marker(style)
++            .and_then(|_| {
++                font_context
++                    .font_group(style.clone_font())
++                    .first(font_context)
++            })
++            .map_or(max_inline_size, |font| {
++                SymbolMarker::inline_offset(font.metrics.ascent)
++            });
+         let content_rect = LogicalRect {
+             start_corner: LogicalVec2 {
+-                inline: -max_inline_size -
++                inline: -marker_inline_offset -
+                     (pbm_of_list_item.border.inline_start +
+                         pbm_of_list_item.padding.inline_start),
+                 block: Zero::zero(),
+diff --git a/components/layout/lists.rs b/components/layout/lists.rs
+index 4f8377bb194..a5d145f5f09 100644
+--- a/components/layout/lists.rs
++++ b/components/layout/lists.rs
+@@ -2,12 +2,15 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
++use app_units::Au;
++use euclid::{Point2D, Size2D};
+ use layout_api::{DangerousStyleElement, LayoutElement, LayoutNode};
+ use script::layout_dom::{ServoDangerousStyleElement, ServoLayoutNode};
+ use selectors::Element as _;
+ use style::counter_style::{CounterStyle, Symbol, SymbolsType};
+ use style::dom::{OpaqueNode, TElement};
+ use style::properties::ComputedValues;
++use style::properties::longhands::list_style_position::computed_value::T as ListStylePosition;
+ use style::properties::longhands::list_style_type::computed_value::T as ListStyleType;
+ use style::selector_parser::PseudoElement;
+ use style::values::CustomIdent;
+@@ -20,6 +23,7 @@ use crate::context::LayoutContext;
+ use crate::dom_traversal::{
+     NodeAndStyleInfo, PseudoElementContentItem, generate_pseudo_element_content,
+ };
++use crate::geom::PhysicalRect;
+ use crate::replaced::ReplacedContents;
+ 
+ /// <https://drafts.csswg.org/css-lists/#content-property>
+@@ -66,6 +70,66 @@ pub(crate) fn make_marker<'dom>(
+     Some((marker_info, content))
+ }
+ 
++/// A disc, circle or square marking an outside list item. Chrome paints these as shapes sized
++/// from the marker font's ascent rather than as the `•`/`◦`/`▪` glyphs their counter styles
++/// name, and spaces them from the item by that ascent too. Fonts draw the glyphs at widely varying
++/// sizes (Liberation Sans' bullet is about two thirds of Chrome's disc), so following Blink's
++/// geometry (`ListMarker::InlineMarginsForOutside`, `ListMarker::RelativeSymbolMarkerRect`,
++/// `ListMarkerPainter::PaintSymbol`) is what keeps list layouts from shifting.
++#[derive(Clone, Copy)]
++pub(crate) enum SymbolMarker {
++    Disc,
++    Circle,
++    Square,
++}
++
++impl SymbolMarker {
++    pub(crate) fn for_outside_marker(marker_style: &ComputedValues) -> Option<Self> {
++        let list_style = marker_style.get_list();
++        if marker_style.pseudo() != Some(PseudoElement::Marker) ||
++            list_style.list_style_position != ListStylePosition::Outside ||
++            !matches!(marker_style.get_counters().content, Content::Normal) ||
++            !matches!(list_style.list_style_image, Image::None)
++        {
++            return None;
++        }
++        let CounterStyle::Name(name) = &list_style.list_style_type.0 else {
++            return None;
++        };
++        match name.0 {
++            atom!("disc") => Some(Self::Disc),
++            atom!("circle") => Some(Self::Circle),
++            atom!("square") => Some(Self::Square),
++            _ => None,
++        }
++    }
++
++    /// Blink works in whole pixels of the font's rounded ascent.
++    fn ascent_px(ascent: Au) -> i32 {
++        ascent.to_f32_px().round() as i32
++    }
++
++    /// How far the start of the marker box sits before the list item's content edge.
++    pub(crate) fn inline_offset(ascent: Au) -> Au {
++        // `kCMarkerPaddingPx` (7) plus one.
++        Au::from_px(Self::ascent_px(ascent) * 2 / 3 + 8)
++    }
++
++    /// The shape's rect relative to the top-left corner of the marker text, whose top is the
++    /// baseline minus `ascent`.
++    pub(crate) fn rect(ascent: Au) -> PhysicalRect<Au> {
++        let ascent = Self::ascent_px(ascent);
++        let size = Au::from_px(ascent / 3);
++        PhysicalRect::new(
++            Point2D::new(
++                Au::from_px(1),
++                Au::from_px(3 * (ascent - ascent * 2 / 3) / 2),
++            ),
++            Size2D::new(size, size),
++        )
++    }
++}
++
+ fn symbol_to_string(symbol: &Symbol) -> &str {
+     match symbol {
+         Symbol::String(string) => string,
+-- 
+2.43.0
+

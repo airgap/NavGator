@@ -1,0 +1,63 @@
+From 0810ebbc4de926a0275fa139b6f345670c8f76bd Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 19:19:59 -0400
+Subject: [PATCH] Revert "layout: drop the other layout cache slot whenever a
+ formatting context is laid out"
+
+Dropping the measure slot on every layout brought back the exponential
+cost of nested flex layout: a leaf change at depth 20 of nested row
+flexboxes went from 0.19 ms to 1949 ms per reflow (column: 1.1 ms to
+2879 ms at depth 18). The stale-fragment query bug it addressed needs a
+fix that keeps measure results reusable.
+
+This reverts commit 33b35708a97.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/layout_box_base.rs | 18 ++++++++++--------
+ 1 file changed, 10 insertions(+), 8 deletions(-)
+
+diff --git a/components/layout/layout_box_base.rs b/components/layout/layout_box_base.rs
+index fd2c05f066c..29924a99835 100644
+--- a/components/layout/layout_box_base.rs
++++ b/components/layout/layout_box_base.rs
+@@ -285,26 +285,28 @@ impl LayoutBoxBase {
+         child_positioning_context: &PositioningContext,
+         result: &IndependentFormattingContextLayoutResult,
+     ) {
+-        self.cached_layout_result_dirty
+-            .store(false, Ordering::Relaxed);
++        let was_dirty = self
++            .cached_layout_result_dirty
++            .swap(false, Ordering::Relaxed);
+         let entry = Box::new(IndependentFormattingContextLayoutResultAndInputs {
+             result: result.clone(),
+             positioning_context: child_positioning_context.clone(),
+             containing_block_for_children_size: containing_block_for_children.size.clone(),
+             lazy_block_size,
+         });
+-        // This layout replaced the fragments that the boxes of the contents keep for layout
+-        // queries, so the slot not written here no longer matches them and must go. Otherwise
+-        // a table cell laid out at one size and then reused from a result at another size
+-        // would answer `getBoundingClientRect()` with a fragment that isn't in the tree.
++        // Clearing the dirty flag revalidates both slots, so the one not written here must go.
+         match lazy_block_size {
+             LazySizeKind::Fixed(_) => {
+-                *self.cached_measure_result.borrow_mut() = None;
++                if was_dirty {
++                    *self.cached_measure_result.borrow_mut() = None;
++                }
+                 *self.cached_layout_result.borrow_mut() =
+                     Some(LayoutResultAndInputs::IndependentFormattingContext(entry));
+             },
+             LazySizeKind::Intrinsic | LazySizeKind::Constrained => {
+-                *self.cached_layout_result.borrow_mut() = None;
++                if was_dirty {
++                    *self.cached_layout_result.borrow_mut() = None;
++                }
+                 *self.cached_measure_result.borrow_mut() = Some(entry);
+             },
+         }
+-- 
+2.43.0
+

@@ -1,0 +1,73 @@
+From feb63fe1b4f7cbbc6117da2d761922a2bdfde320 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 04:41:47 -0400
+Subject: [PATCH] servo: text-spacing-trim, and mark the initial font-family
+
+text-spacing-trim parses `normal` and `space-all`, the values Servo's layout implements:
+`normal` (the initial value) collapses the spacing of adjacent fullwidth punctuation, as Chrome
+does by default, and `space-all` turns that off.
+
+The initial font-family is `serif` flagged `is_initial`, so font selection can tell it from an
+explicit `serif` and use the language's standard font, which Chrome makes the sans-serif CJK
+font for Japanese, Chinese and Korean content.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ style/properties/longhands.toml | 13 ++++++++++++-
+ style/values/computed/font.rs   |  9 +++++++++
+ 2 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/style/properties/longhands.toml b/style/properties/longhands.toml
+index 94b88089e..2bc2f3f02 100644
+--- a/style/properties/longhands.toml
++++ b/style/properties/longhands.toml
+@@ -856,7 +856,7 @@ affects = "paint"
+ 
+ [font-family]
+ type = "FontFamily"
+-initial = "computed::FontFamily::serif()"
++initial = "computed::FontFamily::initial()"
+ struct = "font"
+ animation_type = "discrete"
+ spec = "https://drafts.csswg.org/css-fonts/#propdef-font-family"
+@@ -3945,6 +3945,17 @@ affects = "layout"
+ servo_restyle_damage = "rebuild_box"
+ keyword = { values = ["none", "circle", "disc", "square"] }
+ 
++# Only the values whose behaviour Servo's layout implements: `normal` collapses the spacing of
++# adjacent fullwidth punctuation, `space-all` turns that off.
++[text-spacing-trim]
++struct = "inherited_text"
++engine = "servo"
++spec = "https://drafts.csswg.org/css-text-4/#text-spacing-trim-property"
++animation_type = "discrete"
++affects = "layout"
++servo_restyle_damage = "rebuild_box"
++keyword = { values = ["normal", "space-all"] }
++
+ [text-wrap-mode]
+ struct = "inherited_text"
+ spec = "https://drafts.csswg.org/css-text-4/#propdef-text-wrap-mode"
+diff --git a/style/values/computed/font.rs b/style/values/computed/font.rs
+index 1661fab72..1c4cea255 100644
+--- a/style/values/computed/font.rs
++++ b/style/values/computed/font.rs
+@@ -387,6 +387,15 @@ impl FontFamily {
+         Self::generic(GenericFontFamily::Serif).clone()
+     }
+ 
++    /// The initial `font-family`: `serif`, marked as initial so that font selection can use the
++    /// language's standard font instead, which is not a serif one for every language.
++    pub fn initial() -> Self {
++        Self {
++            is_initial: true,
++            ..Self::serif()
++        }
++    }
++
+     /// Returns the font family for `-moz-bullet-font`.
+     #[cfg(feature = "gecko")]
+     pub(crate) fn moz_bullet() -> &'static Self {
+-- 
+2.43.0
+

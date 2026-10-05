@@ -24,7 +24,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DRV="$HERE/driver.sh"
-OUT=/tmp/forms-baseline; mkdir -p "$OUT"
+OUT="$(mktemp -d /tmp/forms-baseline.XXXXXX)"  # per run: agents run gates concurrently
 PORT="${FB_PORT:-8993}"; W=560; H=400
 TOP="$("$DRV" chrome-top)" || exit 1
 TOL="${FB_POS_TOL:-0.3}"

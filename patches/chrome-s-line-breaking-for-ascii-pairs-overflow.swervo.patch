@@ -1,0 +1,887 @@
+From 2f3320b0facd89c956ea9f301f8ddd9028c14ac1 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 04:41:50 -0400
+Subject: [PATCH] text: Chrome's line breaking for ASCII pairs, overflow-wrap,
+ CJK fonts and punctuation trimming
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Line breaking: between two printable ASCII characters Chrome uses Blink's kAsciiLineBreakTable
+instead of UAX #14, so it never breaks a URL after `/` and only breaks after `-` and `?` and
+before an opening bracket that follows closing punctuation. The table was derived from Chrome
+pair by pair and replaces ICU's decision for such pairs (not under break-all or anywhere).
+
+overflow-wrap: anywhere | break-word was never implemented; URLs only wrapped because of the
+UAX #14 breaks after `/`. A word that would overflow is now split into glyph clusters, and a
+break inside it is taken only when it does not fit on a line of its own; `anywhere` also
+contributes those opportunities to the min-content size.
+
+CJK fonts: for ja, zh and ko content Chrome replaces the standard, serif, sans-serif, cursive
+and fantasy generics (which have no ideographs) with the language's CJK font, so all the text,
+Latin included, uses it. On Linux that is the Noto CJK face for the language; Han text used to
+fall back to the Hong Kong face whatever the language. Form controls use Arial, as Chrome's
+control font is that named family and does not follow the language.
+
+Punctuation: text-spacing-trim: normal sets one of two adjacent fullwidth punctuation marks
+half-width with the font's halt feature (「、。」, （「, 」）, ”，), following Blink's HanKerning:
+which marks count as opening, closing or middle comes from the font's glyphs, so centered
+Traditional Chinese commas behave unlike left-aligned Japanese ones. Line-start and line-end
+trimming are not implemented.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/fonts/font.rs                      |  53 ++++++-
+ components/fonts/glyph.rs                     |  47 ++++++
+ components/fonts/han_kerning.rs               | 150 ++++++++++++++++++
+ components/fonts/lib.rs                       |   1 +
+ components/fonts/platform/mod.rs              |  63 ++++++++
+ components/fonts/shapers/harfbuzz.rs          |  14 ++
+ components/fonts/tests/font.rs                |   3 +
+ components/layout/flow/inline/line_breaker.rs |  79 ++++++++-
+ components/layout/flow/inline/mod.rs          |  53 ++++++-
+ components/layout/flow/inline/text_run.rs     |  68 ++++++--
+ components/layout/stylesheets/servo.css       |   7 +-
+ .../script/dom/canvas/2d/canvas_state.rs      |   1 +
+ 12 files changed, 515 insertions(+), 24 deletions(-)
+ create mode 100644 components/fonts/han_kerning.rs
+
+diff --git a/components/fonts/font.rs b/components/fonts/font.rs
+index c420a453c4b..f7999cebedc 100644
+--- a/components/fonts/font.rs
++++ b/components/fonts/font.rs
+@@ -5,7 +5,7 @@
+ use std::borrow::ToOwned;
+ use std::collections::HashMap;
+ use std::hash::Hash;
+-use std::ops::Deref;
++use std::ops::{Deref, Range};
+ use std::sync::{Arc, OnceLock};
+ use std::{iter, str};
+ 
+@@ -14,6 +14,7 @@ use bitflags::bitflags;
+ use euclid::default::{Point2D, Rect};
+ use euclid::num::Zero;
+ use fonts_traits::FontDescriptor;
++use icu_locid::LanguageIdentifier;
+ use icu_locid::subtags::Language;
+ use log::debug;
+ use malloc_size_of_derive::MallocSizeOf;
+@@ -41,6 +42,8 @@ use webrender_api::{FontInstanceFlags, FontInstanceKey, FontVariation};
+ use crate::font_context::UnloadedFontFace;
+ use crate::platform::font::{FontTable, PlatformFont};
+ use crate::platform::font_list::fallback_font_families;
++use crate::han_kerning::HanKerningData;
++use crate::platform::han_generic_font_family;
+ use crate::{
+     EmojiPresentationPreference, FallbackFontSelectionOptions, FontContext, FontData,
+     FontDataAndIndex, FontDataError, FontIdentifier, FontTemplateDescriptor, FontTemplateRef,
+@@ -295,6 +298,9 @@ pub struct Font {
+     /// FIXME: This should be removed entirely in favor of better caching if necessary.
+     /// See <https://github.com/servo/servo/pull/11273#issuecomment-222332873>.
+     can_do_fast_shaping: OnceLock<bool>,
++
++    /// How this font's fullwidth punctuation can be set half-width, if it can.
++    han_kerning: OnceLock<Option<HanKerningData>>,
+ }
+ 
+ impl std::fmt::Debug for Font {
+@@ -359,6 +365,7 @@ impl Font {
+             synthesized_small_caps,
+             has_color_bitmap_or_colr_table: OnceLock::new(),
+             can_do_fast_shaping: OnceLock::new(),
++            han_kerning: OnceLock::new(),
+         })
+     }
+ 
+@@ -448,6 +455,10 @@ pub struct ShapingOptions {
+     pub position: FontVariantPosition,
+     /// Various flags.
+     pub flags: ShapingFlags,
++    /// The byte offsets in the shaped text of the fullwidth punctuation to set half-width, as
++    /// `text-spacing-trim` collapses the spacing of adjacent punctuation. See
++    /// [`Font::trimmed_punctuation`].
++    pub trimmed_punctuation: Vec<usize>,
+ }
+ 
+ impl ShapingOptions {
+@@ -472,6 +483,7 @@ struct ShapeCacheEntry {
+     language: Language,
+     font_features: Box<[(Tag, u32)]>,
+     flags: ShapingFlags,
++    trimmed_punctuation: Vec<usize>,
+ }
+ 
+ impl Font {
+@@ -488,6 +500,7 @@ impl Font {
+             language: options.language,
+             flags: options.flags,
+             font_features,
++            trimmed_punctuation: options.trimmed_punctuation.clone(),
+         };
+ 
+         if let Some(shaped_text) = self.cached_shape_data.read().shaped_text.get(&lookup_key) {
+@@ -513,6 +526,18 @@ impl Font {
+         shaped_text
+     }
+ 
++    /// The byte offsets, relative to `range.start`, of the fullwidth punctuation in `text[range]`
++    /// that `text-spacing-trim: normal` sets half-width when it is shaped with this font. The
++    /// characters just outside `range` are taken into account as its neighbours.
++    pub fn trimmed_punctuation(&self, text: &str, range: Range<usize>) -> Vec<usize> {
++        if text[range.clone()].is_ascii() {
++            return Vec::new();
++        }
++        self.han_kerning
++            .get_or_init(|| HanKerningData::for_font(self))
++            .map_or_else(Vec::new, |data| data.trimmed_punctuation(text, range))
++    }
++
+     /// Whether not a particular text and [`ShapingOptions`] combination can use
+     /// "fast shaping" ie shaping without Harfbuzz.
+     ///
+@@ -702,11 +727,35 @@ pub struct FontGroup {
+ 
+ impl FontGroup {
+     pub(crate) fn new(style: &FontStyleStruct, descriptor: FontDescriptor) -> FontGroup {
++        let language = style._x_lang.0.parse::<LanguageIdentifier>().ok();
+         let families: SmallVec<[FontGroupFamily; 8]> = style
+             .font_family
+             .families
+             .iter()
+-            .map(FontGroupFamily::local_or_web)
++            .flat_map(|family| {
++                let han_family = match (family, &language) {
++                    (SingleFontFamily::Generic(generic), Some(language)) => {
++                        let generic = match style.font_family.is_initial {
++                            true => GenericFontFamily::None,
++                            false => *generic,
++                        };
++                        han_generic_font_family(language, generic)
++                    },
++                    _ => None,
++                };
++                // The CJK font goes first so it renders all the text, as Chrome's replaced
++                // generic does; the generic itself still applies if it is not installed.
++                han_family
++                    .map(|name| {
++                        let family = SingleFontFamily::FamilyName(FamilyName {
++                            name: name.into(),
++                            syntax: FontFamilyNameSyntax::Quoted,
++                        });
++                        FontFamilyDescriptor::new(family, FontSearchScope::Local).into()
++                    })
++                    .into_iter()
++                    .chain(iter::once(FontGroupFamily::local_or_web(family)))
++            })
+             .collect();
+ 
+         FontGroup {
+diff --git a/components/fonts/glyph.rs b/components/fonts/glyph.rs
+index d8ca02cbb6a..9e0f43bae41 100644
+--- a/components/fonts/glyph.rs
++++ b/components/fonts/glyph.rs
+@@ -572,6 +572,34 @@ pub struct ShapedTextSlice {
+ }
+ 
+ impl ShapedTextSlice {
++    /// Split this [`ShapedTextSlice`] into slices of one glyph cluster each: the places where
++    /// `overflow-wrap` may break a word. A cluster of several characters, like a ligature, stays
++    /// whole.
++    pub fn split_into_clusters(&self) -> Vec<Arc<ShapedTextSlice>> {
++        let mut slicer = ShapedTextSlicer {
++            current_glyph_offset: if self.shaped_text.is_rtl {
++                self.glyph_range.end
++            } else {
++                self.glyph_range.start
++            },
++            shaped_text: self.shaped_text.clone(),
++        };
++        let mut remaining_characters = self.character_count;
++        let mut clusters = Vec::new();
++        while remaining_characters > 0 {
++            let character_count = slicer
++                .next_cluster_character_count()
++                .clamp(1, remaining_characters);
++            remaining_characters -= character_count;
++            clusters.push(slicer.slice_for_character_count(
++                character_count,
++                self.is_whitespace,
++                self.ends_with_whitespace && remaining_characters == 0,
++            ));
++        }
++        clusters
++    }
++
+     /// Return the [`ShapedText`] that backs this [`ShapedTextSlice`].
+     #[inline]
+     pub fn shaped_text(&self) -> Arc<ShapedText> {
+@@ -678,6 +706,25 @@ impl ShapedTextSlicer {
+         }
+     }
+ 
++    /// The number of characters of the next glyph cluster to be consumed.
++    fn next_cluster_character_count(&self) -> usize {
++        let mut glyphs = if self.shaped_text.is_rtl {
++            Either::Left(
++                self.shaped_text
++                    .glyph_slice(0..self.current_glyph_offset)
++                    .rev(),
++            )
++        } else {
++            Either::Right(
++                self.shaped_text
++                    .glyph_slice(self.current_glyph_offset..self.shaped_text.glyph_count()),
++            )
++        };
++        glyphs
++            .find(|glyph| glyph.character_count() != 0)
++            .map_or(0, |glyph| glyph.character_count())
++    }
++
+     /// Given a desired character count, consume that number of characters worth
+     /// of glyphs from the [`ShapedText`] of this [`ShapedTextSlicer`]. In addition,
+     /// tag the resulting [`ShapedTextSlice`] with the given whitespace-related
+diff --git a/components/fonts/han_kerning.rs b/components/fonts/han_kerning.rs
+new file mode 100644
+index 00000000000..6cea0433503
+--- /dev/null
++++ b/components/fonts/han_kerning.rs
+@@ -0,0 +1,150 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! Collapsing the spacing of adjacent fullwidth punctuation, the `trim-adjacent` part of
++//! `text-spacing-trim: normal` (<https://drafts.csswg.org/css-text-4/#text-spacing-trim-property>).
++//!
++//! Fullwidth punctuation such as `「` or `、` has half an em of blank space built into its glyph.
++//! When two of them meet, as in `」、` or `（「`, one of them is set half-width with the font's
++//! `halt` feature. This follows Chrome's implementation (`HanKerning` in Blink), including how it
++//! decides from the font's glyphs whether `、。，．：；` behave as closing or as middle
++//! punctuation (left-aligned in Japanese and Simplified Chinese fonts, centered in Traditional
++//! Chinese ones) and whether curly quotes are fullwidth.
++
++use icu_properties::{EastAsianWidth, GeneralCategory, maps};
++use read_fonts::FontRead;
++use read_fonts::tables::gpos::Gpos;
++use read_fonts::types::Tag;
++
++use crate::{Font, FontTableMethods, GPOS};
++
++pub(crate) const HALT: Tag = Tag::new(b"halt");
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++enum CharType {
++    Other,
++    Open,
++    Close,
++    Middle,
++}
++
++/// What a font's glyphs say about how its punctuation behaves.
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct HanKerningData {
++    /// The type of `、。，．`.
++    dot: CharType,
++    colon: CharType,
++    semicolon: CharType,
++    /// Whether `“”‘’` are fullwidth, and therefore opening and closing punctuation.
++    quotes_are_fullwidth: bool,
++}
++
++impl HanKerningData {
++    /// Returns `None` if the font cannot set punctuation half-width.
++    pub(crate) fn for_font(font: &Font) -> Option<Self> {
++        let gpos = font.table_for_tag(GPOS)?;
++        let has_halt = Gpos::read(read_fonts::FontData::new(gpos.buffer()))
++            .and_then(|gpos| gpos.feature_list())
++            .is_ok_and(|feature_list| {
++                feature_list
++                    .feature_records()
++                    .iter()
++                    .any(|record| record.feature_tag() == HALT)
++            });
++        if !has_halt {
++            return None;
++        }
++
++        let em = font.descriptor.pt_size.to_f32_px();
++        let type_from_bounds = |characters: &[char]| {
++            let types = characters.iter().map(|character| {
++                let Some(glyph) = font.glyph_index(*character) else {
++                    return CharType::Other;
++                };
++                let bounds = font.typographic_bounds(glyph);
++                let half_em = em / 2.;
++                if bounds.max_x() <= half_em {
++                    CharType::Close
++                } else if bounds.min_x() >= half_em {
++                    CharType::Open
++                } else if bounds.width() <= half_em && bounds.min_x() >= half_em / 2. {
++                    CharType::Middle
++                } else {
++                    CharType::Other
++                }
++            });
++            let mut types = types.peekable();
++            let first = *types.peek().expect("At least one character");
++            match types.all(|char_type| char_type == first) {
++                true => first,
++                false => CharType::Other,
++            }
++        };
++        let is_fullwidth = |character| {
++            font.glyph_index(character)
++                .is_some_and(|glyph| (font.glyph_h_advance(glyph) as f32 - em).abs() < em / 16.)
++        };
++
++        Some(Self {
++            dot: type_from_bounds(&['\u{3001}', '\u{3002}', '\u{FF0C}', '\u{FF0E}']),
++            colon: type_from_bounds(&['\u{FF1A}']),
++            semicolon: type_from_bounds(&['\u{FF1B}']),
++            quotes_are_fullwidth: is_fullwidth('\u{201C}') && is_fullwidth('\u{201D}'),
++        })
++    }
++
++    fn char_type(&self, character: char) -> CharType {
++        match character {
++            '\u{3001}' | '\u{3002}' | '\u{FF0C}' | '\u{FF0E}' => self.dot,
++            '\u{FF1A}' => self.colon,
++            '\u{FF1B}' => self.semicolon,
++            '\u{00B7}' | '\u{3000}' | '\u{30FB}' => CharType::Middle,
++            '\u{2018}' | '\u{201C}' if self.quotes_are_fullwidth => CharType::Open,
++            '\u{2019}' | '\u{201D}' if self.quotes_are_fullwidth => CharType::Close,
++            _ => {
++                let width = maps::east_asian_width().get(character);
++                if width != EastAsianWidth::Wide && width != EastAsianWidth::Fullwidth {
++                    return CharType::Other;
++                }
++                match maps::general_category().get(character) {
++                    GeneralCategory::OpenPunctuation => CharType::Open,
++                    GeneralCategory::ClosePunctuation => CharType::Close,
++                    _ => CharType::Other,
++                }
++            },
++        }
++    }
++
++    /// The byte offsets, relative to `range.start`, of the characters in `text[range]` to set
++    /// half-width. The characters just outside `range` count as neighbours.
++    pub(crate) fn trimmed_punctuation(&self, text: &str, range: std::ops::Range<usize>) -> Vec<usize> {
++        let mut previous = text[..range.start]
++            .chars()
++            .next_back()
++            .map_or(CharType::Other, |character| self.char_type(character));
++        let mut characters = text[range.clone()].char_indices().peekable();
++        let mut following_text = text[range.end..].chars();
++        let mut trimmed = Vec::new();
++        while let Some((offset, character)) = characters.next() {
++            let char_type = self.char_type(character);
++            let next = characters
++                .peek()
++                .map(|(_, character)| *character)
++                .or_else(|| following_text.next())
++                .map_or(CharType::Other, |character| self.char_type(character));
++            let trim = match char_type {
++                // An opening bracket after other punctuation, as in `（「` or `、「`.
++                CharType::Open => previous != CharType::Other,
++                // A closing bracket or dot before another one or a middle dot, as in `」）`.
++                CharType::Close => matches!(next, CharType::Close | CharType::Middle),
++                CharType::Middle | CharType::Other => false,
++            };
++            if trim {
++                trimmed.push(offset);
++            }
++            previous = char_type;
++        }
++        trimmed
++    }
++}
+diff --git a/components/fonts/lib.rs b/components/fonts/lib.rs
+index 6904a5f9a7e..39dcb8c2c59 100644
+--- a/components/fonts/lib.rs
++++ b/components/fonts/lib.rs
+@@ -8,6 +8,7 @@ mod font;
+ mod font_context;
+ mod font_store;
+ mod glyph;
++mod han_kerning;
+ #[expect(unsafe_code)]
+ pub mod platform; // Public because integration tests need this
+ mod shapers;
+diff --git a/components/fonts/platform/mod.rs b/components/fonts/platform/mod.rs
+index b35e0f05906..0043d4284a4 100644
+--- a/components/fonts/platform/mod.rs
++++ b/components/fonts/platform/mod.rs
+@@ -279,3 +279,66 @@ pub(crate) fn add_noto_fallback_families(
+     families.push("Noto Sans Symbols");
+     families.push("Noto Sans Symbols2");
+ }
++
++/// The CJK font that stands in for the generic family `generic` (`None` being the standard font,
++/// i.e. the initial `font-family`) in content written in `language`.
++///
++/// Chrome replaces a generic family whose font lacks a common ideograph (U+4E00, or U+AC00 for
++/// Korean) with the system's fallback font for that character in the content language
++/// (`FontCache::GetGenericFamilyNameForScript`), so that all `lang=ja` text, Latin and punctuation
++/// included, renders in the Japanese font. Its default generic fonts (Arial, Times New Roman and
++/// their metric-compatible stand-ins) never have ideographs. On Linux that fallback is what
++/// fontconfig sorts first for e.g. `sans-serif:lang=ja`: the Noto CJK face for the language.
++#[cfg(all(
++    any(target_os = "linux", target_os = "freebsd"),
++    not(target_os = "android"),
++    not(target_env = "ohos")
++))]
++pub(crate) fn han_generic_font_family(
++    language: &icu_locid::LanguageIdentifier,
++    generic: style::values::computed::font::GenericFontFamily,
++) -> Option<&'static str> {
++    use icu_locid::subtags::{language, region, script};
++    use style::values::computed::font::GenericFontFamily;
++
++    let serif = match generic {
++        GenericFontFamily::Serif => true,
++        GenericFontFamily::None |
++        GenericFontFamily::SansSerif |
++        GenericFontFamily::Cursive |
++        GenericFontFamily::Fantasy => false,
++        GenericFontFamily::Monospace | GenericFontFamily::SystemUi => return None,
++    };
++    let (sans_family, serif_family) = match language.language {
++        lang if lang == language!("ja") => ("Noto Sans CJK JP", "Noto Serif CJK JP"),
++        lang if lang == language!("ko") => ("Noto Sans CJK KR", "Noto Serif CJK KR"),
++        lang if lang == language!("zh") => match (language.region, language.script) {
++            (Some(region), _) if region == region!("HK") || region == region!("MO") => {
++                ("Noto Sans CJK HK", "Noto Serif CJK HK")
++            },
++            (Some(region), _) if region == region!("TW") => {
++                ("Noto Sans CJK TC", "Noto Serif CJK TC")
++            },
++            (None, Some(han_script)) if han_script == script!("Hant") => {
++                ("Noto Sans CJK TC", "Noto Serif CJK TC")
++            },
++            _ => ("Noto Sans CJK SC", "Noto Serif CJK SC"),
++        },
++        _ => return None,
++    };
++    Some(if serif { serif_family } else { sans_family })
++}
++
++/// Other platforms' Chrome resolves generic families per script through its own font settings,
++/// which these platforms' font lists don't model.
++#[cfg(not(all(
++    any(target_os = "linux", target_os = "freebsd"),
++    not(target_os = "android"),
++    not(target_env = "ohos")
++)))]
++pub(crate) fn han_generic_font_family(
++    _: &icu_locid::LanguageIdentifier,
++    _: style::values::computed::font::GenericFontFamily,
++) -> Option<&'static str> {
++    None
++}
+diff --git a/components/fonts/shapers/harfbuzz.rs b/components/fonts/shapers/harfbuzz.rs
+index cdf6a474e3a..7833a556c29 100644
+--- a/components/fonts/shapers/harfbuzz.rs
++++ b/components/fonts/shapers/harfbuzz.rs
+@@ -30,6 +30,7 @@ use num_traits::Zero;
+ use read_fonts::types::Tag;
+ 
+ use super::{GlyphShapingResult, ShapedGlyph, unicode_script_to_iso15924_tag};
++use crate::han_kerning::HALT;
+ use crate::platform::font::FontTable;
+ use crate::{
+     BASE, Font, FontBaseline, FontTableMethods, GlyphId, ShapedText, ShapingFlags, ShapingOptions,
+@@ -287,6 +288,19 @@ impl Shaper {
+                     end: hb_buffer_get_length(hb_buffer),
+                 })
+                 .collect();
++            // Feature ranges are in clusters, which are the UTF-8 byte offsets added above.
++            features.extend(options.trimmed_punctuation.iter().map(|offset| {
++                let character = text[*offset..]
++                    .chars()
++                    .next()
++                    .expect("Trimmed punctuation offsets are character boundaries");
++                hb_feature_t {
++                    tag: u32::from_be_bytes(HALT.to_be_bytes()),
++                    value: 1,
++                    start: *offset as c_uint,
++                    end: (*offset + character.len_utf8()) as c_uint,
++                }
++            }));
+             hb_shape(
+                 self.hb_font,
+                 hb_buffer,
+diff --git a/components/fonts/tests/font.rs b/components/fonts/tests/font.rs
+index 4b6e766dbb8..816190059d6 100644
+--- a/components/fonts/tests/font.rs
++++ b/components/fonts/tests/font.rs
+@@ -89,6 +89,7 @@ fn test_font_can_do_fast_shaping() {
+         east_asian: FontVariantEastAsian::NORMAL,
+         feature_settings: FontFeatureSettings::normal(),
+         position: FontVariantPosition::Normal,
++        trimmed_punctuation: Vec::new(),
+     };
+     assert!(!dejavu_sans.can_do_fast_shaping("WAVE", &shaping_options));
+     assert!(dejavu_sans_fast_shapeable.can_do_fast_shaping("WAVE", &shaping_options));
+@@ -105,6 +106,7 @@ fn test_font_can_do_fast_shaping() {
+         east_asian: FontVariantEastAsian::NORMAL,
+         feature_settings: FontFeatureSettings::normal(),
+         position: FontVariantPosition::Normal,
++        trimmed_punctuation: Vec::new(),
+     };
+     assert!(!dejavu_sans.can_do_fast_shaping("WAVE", &shaping_options));
+     assert!(!dejavu_sans_fast_shapeable.can_do_fast_shaping("WAVE", &shaping_options));
+@@ -121,6 +123,7 @@ fn test_font_can_do_fast_shaping() {
+         east_asian: FontVariantEastAsian::NORMAL,
+         feature_settings: FontFeatureSettings::normal(),
+         position: FontVariantPosition::Normal,
++        trimmed_punctuation: Vec::new(),
+     };
+     assert!(!dejavu_sans.can_do_fast_shaping("WAVE", &shaping_options));
+     assert!(!dejavu_sans_fast_shapeable.can_do_fast_shaping("WAVE", &shaping_options));
+diff --git a/components/layout/flow/inline/line_breaker.rs b/components/layout/flow/inline/line_breaker.rs
+index 894ca8ce2ff..733e7779ae9 100644
+--- a/components/layout/flow/inline/line_breaker.rs
++++ b/components/layout/flow/inline/line_breaker.rs
+@@ -4,7 +4,7 @@
+ 
+ use std::ops::Range;
+ 
+-use icu_segmenter::{LineBreakOptions, LineSegmenter};
++use icu_segmenter::{LineBreakOptions, LineBreakStrictness, LineBreakWordOption, LineSegmenter};
+ 
+ pub(crate) struct LineBreaker {
+     linebreaks: Vec<usize>,
+@@ -14,14 +14,22 @@ pub(crate) struct LineBreaker {
+ impl LineBreaker {
+     pub(crate) fn new(string: &str, options: LineBreakOptions) -> Self {
+         let line_segmenter = LineSegmenter::new_auto_with_options(options);
++        // From https://docs.rs/icu_segmenter/1.5.0/icu_segmenter/struct.LineSegmenter.html
++        // > For consistency with the grapheme, word, and sentence segmenters, there is always a
++        // > breakpoint returned at index 0, but this breakpoint is not a meaningful line break
++        // > opportunity.
++        //
++        // Skip this first line break opportunity, as it isn't interesting to us.
++        let mut linebreaks: Vec<usize> = line_segmenter.segment_str(string).skip(1).collect();
++        // `word-break: break-all` and `line-break: anywhere` already break between almost every
++        // pair of characters, so the table below would only take opportunities away.
++        if options.word_option != LineBreakWordOption::BreakAll &&
++            options.strictness != LineBreakStrictness::Anywhere
++        {
++            linebreaks = apply_ascii_pair_breaks(string, linebreaks);
++        }
+         Self {
+-            // From https://docs.rs/icu_segmenter/1.5.0/icu_segmenter/struct.LineSegmenter.html
+-            // > For consistency with the grapheme, word, and sentence segmenters, there is always a
+-            // > breakpoint returned at index 0, but this breakpoint is not a meaningful line break
+-            // > opportunity.
+-            //
+-            // Skip this first line break opportunity, as it isn't interesting to us.
+-            linebreaks: line_segmenter.segment_str(string).skip(1).collect(),
++            linebreaks,
+             current_offset: 0,
+         }
+     }
+@@ -54,6 +62,61 @@ impl LineBreaker {
+     }
+ }
+ 
++/// Replaces the UAX #14 decision between two adjacent printable ASCII characters with the one
++/// from Blink's `kAsciiLineBreakTable` (third_party/blink/renderer/platform/text/
++/// text_break_iterator.cc), which every Chromium-based browser uses instead of UAX #14 for such
++/// pairs. The visible difference is in URLs and paths: UAX #14 allows a break after every `/`,
++/// while Chrome keeps `https://example.com/very/long/path` together and only breaks after `-`
++/// and `?`, and before an opening bracket that follows closing punctuation.
++fn apply_ascii_pair_breaks(string: &str, icu_linebreaks: Vec<usize>) -> Vec<usize> {
++    let mut linebreaks = Vec::with_capacity(icu_linebreaks.len());
++    let mut icu_linebreaks = icu_linebreaks.into_iter().peekable();
++    let mut before_previous = None;
++    let mut previous = None;
++    for (index, character) in string.char_indices() {
++        let icu_allows_break = icu_linebreaks.next_if_eq(&index).is_some();
++        let allows_break = match previous {
++            Some(previous)
++                if is_in_ascii_pair_table(previous) && is_in_ascii_pair_table(character) =>
++            {
++                ascii_pair_allows_break(before_previous, previous, character)
++            },
++            _ => icu_allows_break,
++        };
++        if allows_break {
++            linebreaks.push(index);
++        }
++        before_previous = previous;
++        previous = Some(character);
++    }
++    // The opportunity at the end of the text.
++    linebreaks.extend(icu_linebreaks);
++    linebreaks
++}
++
++fn is_in_ascii_pair_table(character: char) -> bool {
++    ('!'..='\u{7f}').contains(&character)
++}
++
++fn ascii_pair_allows_break(before_previous: Option<char>, previous: char, next: char) -> bool {
++    match previous {
++        // A `-` before a digit may be a minus sign, so only break where it reads as a hyphen,
++        // like in `ABCD-1234` or `1234-5678`.
++        '-' if next.is_ascii_digit() => before_previous.is_some_and(|c| c.is_ascii_alphanumeric()),
++        '-' => !matches!(
++            next,
++            '!' | '$' | ')' | ',' | '.' | '/' | ':' | ';' | '?' | ']' | '}'
++        ),
++        '?' => !matches!(
++            next,
++            '!' | '"' | '\'' | ')' | ',' | '.' | '/' | ':' | ';' | '?' | ']' | '}'
++        ),
++        '!' | '"' | '#' | '%' | '&' | ')' | '*' | '+' | ',' | '.' | ':' | ';' | '=' | '>' |
++        '\\' | ']' | '|' | '}' | '~' => matches!(next, '(' | '<' | '[' | '{'),
++        _ => false,
++    }
++}
++
+ #[cfg(test)]
+ mod test {
+     use super::*;
+diff --git a/components/layout/flow/inline/mod.rs b/components/layout/flow/inline/mod.rs
+index fd0d0f38069..2e376cba6a5 100644
+--- a/components/layout/flow/inline/mod.rs
++++ b/components/layout/flow/inline/mod.rs
+@@ -108,7 +108,7 @@ use style::context::{QuirksMode, SharedStyleContext};
+ use style::dom::OpaqueNode;
+ use style::properties::ComputedValues;
+ use style::selector_parser::PseudoElement;
+-use style::values::computed::Overflow;
++use style::values::computed::{Overflow, OverflowWrap};
+ use style::values::specified::box_::{Display as StyloDisplay, DisplayInside};
+ use style::values::specified::text::TextOverflowSide;
+ use style::properties::style_structs::InheritedText;
+@@ -2106,6 +2106,41 @@ impl InlineFormattingContextLayout<'_> {
+         !padding.is_zero() || !border.is_zero() || !margin.is_zero()
+     }
+ 
++    /// Whether adding `inline_size` more content to the current unbreakable segment would make
++    /// it overflow the current line.
++    fn unbreakable_segment_would_overflow(&self, inline_size: Au) -> bool {
++        let available_inline_size = self
++            .current_line
++            .placement_among_floats
++            .get()
++            .map_or(self.containing_block().size.inline, |placement| {
++                placement.size.inline
++            });
++        self.current_line.inline_position + self.current_line_segment.inline_size + inline_size >
++            available_inline_size
++    }
++
++    /// Process a soft wrap opportunity inside a word from `overflow-wrap: anywhere | break-word`
++    /// before content of size `next_inline_size`. Per
++    /// <https://drafts.csswg.org/css-text-3/#overflow-wrap-property> it is only taken if there are
++    /// no otherwise-acceptable break points in the line: when the word does not fit even after
++    /// moving it to a line of its own.
++    fn process_overflow_wrap_opportunity(&mut self, next_inline_size: Au) {
++        if self.text_wrap_mode == TextWrapMode::Nowrap ||
++            !self.current_line_segment.has_content ||
++            !self.unbreakable_segment_would_overflow(next_inline_size)
++        {
++            return;
++        }
++        if self.current_line.has_content {
++            self.process_line_break(false /* forced_line_break */);
++            if !self.unbreakable_segment_would_overflow(next_inline_size) {
++                return;
++            }
++        }
++        self.process_soft_wrap_opportunity();
++    }
++
+     /// Commit the current unbrekable segment to the current line. In addition, this will
+     /// place all floats in the unbreakable segment and expand the line dimensions.
+     fn commit_current_segment_to_line(&mut self) {
+@@ -3421,7 +3456,21 @@ impl<'layout_data> ContentSizesComputation<'layout_data> {
+             }
+ 
+             self.commit_pending_whitespace();
+-            self.add_inline_size(advance);
++            // Unlike `break-word`, the opportunities `overflow-wrap: anywhere` introduces count
++            // for the min-content size.
++            if can_wrap &&
++                style_text.overflow_wrap == OverflowWrap::Anywhere &&
++                style_text.word_break != WordBreak::BreakAll
++            {
++                for (cluster_index, cluster) in run.split_into_clusters().iter().enumerate() {
++                    if cluster_index != 0 {
++                        self.line_break_opportunity();
++                    }
++                    self.add_inline_size(cluster.total_advance());
++                }
++            } else {
++                self.add_inline_size(advance);
++            }
+ 
+             // Typically whitespace glyphs are placed in a separate store,
+             // but for `white-space: break-spaces` we place the first whitespace
+diff --git a/components/layout/flow/inline/text_run.rs b/components/layout/flow/inline/text_run.rs
+index 79f190786eb..3bd9f79658c 100644
+--- a/components/layout/flow/inline/text_run.rs
++++ b/components/layout/flow/inline/text_run.rs
+@@ -20,6 +20,7 @@ use style::Zero;
+ use style::computed_values::font_kerning::T as FontKerning;
+ use style::computed_values::font_variant_position::T as FontVariantPosition;
+ use style::computed_values::text_rendering::T as TextRendering;
++use style::computed_values::text_spacing_trim::T as TextSpacingTrim;
+ use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
+ use style::computed_values::word_break::T as WordBreak;
+ use style::dom::OpaqueNode;
+@@ -150,6 +151,7 @@ impl From<&FontAndScriptInfo> for ShapingOptions {
+             feature_settings: info.feature_settings.clone(),
+             position: info.position,
+             flags,
++            trimmed_punctuation: Vec::new(),
+         }
+     }
+ }
+@@ -174,6 +176,9 @@ pub(crate) struct TextRunSegment {
+     /// The shaped runs within this segment.
+     #[conditional_malloc_size_of]
+     pub runs: Vec<Arc<ShapedTextSlice>>,
++
++    /// The [`ShapingOptions::trimmed_punctuation`] the runs were shaped with.
++    pub trimmed_punctuation: Vec<usize>,
+ }
+ 
+ impl TextRunSegment {
+@@ -188,6 +193,7 @@ impl TextRunSegment {
+             character_range,
+             runs: Vec::new(),
+             break_at_start: false,
++            trimmed_punctuation: Vec::new(),
+         }
+     }
+ 
+@@ -238,6 +244,15 @@ impl TextRunSegment {
+             soft_wrap_policy = SegmentStartSoftWrapPolicy::Force;
+         }
+ 
++        let overflow_wrap_breaks_words = {
++            let style = text_run.inline_styles.style.borrow();
++            let text_style = style.get_inherited_text();
++            text_style.word_break != WordBreak::BreakAll &&
++                matches!(
++                    text_style.overflow_wrap,
++                    OverflowWrap::Anywhere | OverflowWrap::BreakWord
++                )
++        };
+         let mut character_range_start = self.character_range.start;
+         for (run_index, run) in self.runs.iter().enumerate() {
+             let new_character_range_end = character_range_start + run.character_count();
+@@ -254,13 +269,38 @@ impl TextRunSegment {
+                 ifc.process_soft_wrap_opportunity();
+             }
+ 
+-            ifc.push_glyph_store_to_unbreakable_segment(
+-                run.clone(),
+-                text_run,
+-                &self.info,
+-                offsets,
+-                character_range_start,
+-            );
++            // `overflow-wrap` only breaks inside a word that does not fit on a line of its own,
++            // so the word is split into clusters only when it would overflow.
++            if overflow_wrap_breaks_words &&
++                !run.is_whitespace() &&
++                ifc.unbreakable_segment_would_overflow(run.total_advance())
++            {
++                let mut cluster_character_start = character_range_start;
++                for cluster in run.split_into_clusters() {
++                    let cluster_character_end = cluster_character_start + cluster.character_count();
++                    let offsets = offsets.as_ref().map(|offsets| TextRunOffsets {
++                        shared_selection: offsets.shared_selection.clone(),
++                        character_range: cluster_character_start..cluster_character_end,
++                    });
++                    ifc.process_overflow_wrap_opportunity(cluster.total_advance());
++                    ifc.push_glyph_store_to_unbreakable_segment(
++                        cluster,
++                        text_run,
++                        &self.info,
++                        offsets,
++                        cluster_character_start,
++                    );
++                    cluster_character_start = cluster_character_end;
++                }
++            } else {
++                ifc.push_glyph_store_to_unbreakable_segment(
++                    run.clone(),
++                    text_run,
++                    &self.info,
++                    offsets,
++                    character_range_start,
++                );
++            }
+             character_range_start = new_character_range_end;
+         }
+     }
+@@ -282,7 +322,14 @@ impl TextRunSegment {
+         let linebreaks = linebreaker.advance_to_linebreaks_in_range(self.byte_range.clone());
+         let linebreak_iter = linebreaks.iter().chain(std::iter::once(&range.end));
+ 
+-        let options: ShapingOptions = (&*self.info).into();
++        let mut options: ShapingOptions = (&*self.info).into();
++        if parent_style.get_inherited_text().text_spacing_trim == TextSpacingTrim::Normal {
++            options.trimmed_punctuation = self
++                .info
++                .font
++                .trimmed_punctuation(formatting_context_text, range.clone());
++        }
++        self.trimmed_punctuation = options.trimmed_punctuation.clone();
+         let shaped_text = old_text_run_item
+             .and_then(|old_text_run_item| {
+                 let TextRunItem::TextSegment(old_text_segment) = old_text_run_item else {
+@@ -398,7 +445,10 @@ impl TextRunSegment {
+     }
+ 
+     fn is_compatible_with_old_shaping_result(&self, old_segment: &Self) -> bool {
+-        *old_segment.info == *self.info && self.byte_range == old_segment.byte_range
++        // Which punctuation is trimmed also depends on the text around the segment.
++        *old_segment.info == *self.info &&
++            self.byte_range == old_segment.byte_range &&
++            self.trimmed_punctuation == old_segment.trimmed_punctuation
+     }
+ }
+ 
+diff --git a/components/layout/stylesheets/servo.css b/components/layout/stylesheets/servo.css
+index f3343635f09..f1a883fac07 100644
+--- a/components/layout/stylesheets/servo.css
++++ b/components/layout/stylesheets/servo.css
+@@ -36,9 +36,10 @@ button,
+ input,
+ select,
+ textarea {
+-  font-family: sans-serif;
+-  /* Chrome's small-control size, fixed rather than relative: controls don't scale with the
+-     page's font size there. */
++  /* Chrome's control font (`-webkit-small-control`) is Arial, a named family, so the content
++     language doesn't replace it with a CJK font the way it does the generic families. Its
++     size is fixed rather than relative: controls don't scale with the page's font size. */
++  font-family: Arial;
+   font-size: 13.333px;
+   appearance: auto;
+   letter-spacing: initial;
+diff --git a/components/script/dom/canvas/2d/canvas_state.rs b/components/script/dom/canvas/2d/canvas_state.rs
+index 329dda0ba39..2f7f72a5c0f 100644
+--- a/components/script/dom/canvas/2d/canvas_state.rs
++++ b/components/script/dom/canvas/2d/canvas_state.rs
+@@ -2584,6 +2584,7 @@ impl UnshapedTextRun<'_> {
+             east_asian: FontVariantEastAsian::NORMAL,
+             feature_settings: FontFeatureSettings::normal(),
+             position: FontVariantPosition::Normal,
++            trimmed_punctuation: Vec::new(),
+         };
+ 
+         let glyphs = font.shape_text(self.string, &options);
+-- 
+2.43.0
+

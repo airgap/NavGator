@@ -1,0 +1,43 @@
+From eeaec82a9e4da41becf9cf6f47d4210aab2889e4 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 05:35:33 -0400
+Subject: [PATCH] script: release the moved node's old document before
+ post-connection steps
+
+Node::insert blocks script on both the node's old document and the parent's
+document, and queues the post-connection steps as a delayed task on the
+parent's document. It released the parent's blocker first, which ran those
+steps while the old document was still blocked. An iframe inserted from a
+child frame fires `load` synchronously during its post-connection steps, and
+when the listener came from the child's realm, call_setup found that realm's
+document blocked and panicked ("DOM not in a stable state"). dailymotion.com
+hit this on most loads.
+
+Release the old document first, as Node::adopt already does, so the document
+holding the delayed task is the last one released.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/node/node.rs | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/components/script/dom/node/node.rs b/components/script/dom/node/node.rs
+index 16c3aed821a..247083d278c 100644
+--- a/components/script/dom/node/node.rs
++++ b/components/script/dom/node/node.rs
+@@ -2676,8 +2676,11 @@ impl Node {
+             }),
+         );
+ 
+-        parent_document.remove_script_and_layout_blocker(cx);
++        // The post-connection steps can run script in any realm (an inserted iframe fires `load`
++        // synchronously, possibly at a listener from the node's old document), so the document
++        // that holds them must be the last one released.
+         from_document.remove_script_and_layout_blocker(cx);
++        parent_document.remove_script_and_layout_blocker(cx);
+     }
+ 
+     /// <https://dom.spec.whatwg.org/#concept-node-replace-all>
+-- 
+2.43.0
+

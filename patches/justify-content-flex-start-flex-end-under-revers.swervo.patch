@@ -1,0 +1,55 @@
+From ba018fddbffe2291da8dac8f7d8837b39f672cc8 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 04:41:43 -0400
+Subject: [PATCH] layout: justify-content flex-start/flex-end under reversed
+ flex directions
+
+Main-axis positions are flex-relative: zero is already the main-start edge
+of a reversed direction. flex-start and flex-end were flipped a second
+time, so row-reverse with flex-end packed items at the visual end like
+flex-start (Yahoo Japan's category list). start and end follow the writing
+mode rather than the flex direction, so they are the values that flip.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/flexbox/layout.rs | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/components/layout/flexbox/layout.rs b/components/layout/flexbox/layout.rs
+index 43ca6f39deb..88718c0c5bf 100644
+--- a/components/layout/flexbox/layout.rs
++++ b/components/layout/flexbox/layout.rs
+@@ -1613,23 +1613,26 @@ impl InitialFlexLineLayout<'_> {
+         };
+ 
+         // Implement "unsafe" alignment. "safe" alignment is handled by the fallback process above.
++        // Positions here are flex-relative: zero is the main-start edge, which a reversed
++        // direction has already moved to the other side. `start` and `end` follow the
++        // writing mode instead, so they are the ones that flip.
+         let main_start_position = match resolved_justify_content {
+-            AlignFlags::START => Au::zero(),
+-            AlignFlags::FLEX_START => {
++            AlignFlags::START => {
+                 if flex_context.config.flex_direction_is_reversed {
+                     free_space_in_main_axis
+                 } else {
+                     Au::zero()
+                 }
+             },
+-            AlignFlags::END => free_space_in_main_axis,
+-            AlignFlags::FLEX_END => {
++            AlignFlags::FLEX_START => Au::zero(),
++            AlignFlags::END => {
+                 if flex_context.config.flex_direction_is_reversed {
+                     Au::zero()
+                 } else {
+                     free_space_in_main_axis
+                 }
+             },
++            AlignFlags::FLEX_END => free_space_in_main_axis,
+             AlignFlags::CENTER => free_space_in_main_axis / 2,
+             AlignFlags::STRETCH => Au::zero(),
+             AlignFlags::SPACE_BETWEEN => Au::zero(),
+-- 
+2.43.0
+

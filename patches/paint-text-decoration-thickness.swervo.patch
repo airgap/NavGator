@@ -1,0 +1,132 @@
+From a48f39bb4af22232bcdd704532a95815a04ada34 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 05:10:22 -0400
+Subject: [PATCH] layout: paint text-decoration-thickness
+
+An author thickness length, resolved against the decorating box's font
+size, replaces the font's underline or strikeout thickness; auto and
+from-font keep the font metric.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/display_list/mod.rs         | 24 ++++++++++++++-----
+ .../layout/display_list/paint_traversal.rs    |  2 ++
+ .../layout/display_list/stacking_context.rs   | 16 +++++++++++++
+ 3 files changed, 36 insertions(+), 6 deletions(-)
+
+diff --git a/components/layout/display_list/mod.rs b/components/layout/display_list/mod.rs
+index 83098a6980b..8ba36ca2851 100644
+--- a/components/layout/display_list/mod.rs
++++ b/components/layout/display_list/mod.rs
+@@ -1154,8 +1154,12 @@ impl Fragment {
+             if text_decoration.line.contains(TextDecorationLine::UNDERLINE) {
+                 let mut rect = rect;
+                 rect.origin.y += font_metrics.ascent - font_metrics.underline_offset;
+-                rect.size.height =
+-                    decoration_thickness(font_metrics.underline_size, dppx);
++                rect.size.height = decoration_thickness(
++                    text_decoration
++                        .thickness
++                        .unwrap_or(font_metrics.underline_size),
++                    dppx,
++                );
+ 
+                 Self::build_display_list_for_text_decoration(
+                     state,
+@@ -1171,8 +1175,12 @@ impl Fragment {
+         for text_decoration in state.text_decorations.iter() {
+             if text_decoration.line.contains(TextDecorationLine::OVERLINE) {
+                 let mut rect = rect;
+-                rect.size.height =
+-                    decoration_thickness(font_metrics.underline_size, dppx);
++                rect.size.height = decoration_thickness(
++                    text_decoration
++                        .thickness
++                        .unwrap_or(font_metrics.underline_size),
++                    dppx,
++                );
+                 Self::build_display_list_for_text_decoration(
+                     state,
+                     &parent_style,
+@@ -1223,8 +1231,12 @@ impl Fragment {
+             {
+                 let mut rect = rect;
+                 rect.origin.y += font_metrics.ascent - font_metrics.strikeout_offset;
+-                rect.size.height =
+-                    decoration_thickness(font_metrics.strikeout_size, dppx);
++                rect.size.height = decoration_thickness(
++                    text_decoration
++                        .thickness
++                        .unwrap_or(font_metrics.strikeout_size),
++                    dppx,
++                );
+                 Self::build_display_list_for_text_decoration(
+                     state,
+                     &parent_style,
+diff --git a/components/layout/display_list/paint_traversal.rs b/components/layout/display_list/paint_traversal.rs
+index f89c191c9a1..a8ddf1376e8 100644
+--- a/components/layout/display_list/paint_traversal.rs
++++ b/components/layout/display_list/paint_traversal.rs
+@@ -11,6 +11,7 @@ use style::values::computed::TextDecorationLine;
+ 
+ use crate::display_list::{
+     ClipId, FragmentTextDecoration, StackingContext, StackingContextFragments,
++    decoration_thickness_override,
+ };
+ use crate::fragment_tree::{
+     BoxFragment, BoxFragmentWithStyle, Fragment, FragmentFlags, IFrameFragment, ImageFragment,
+@@ -576,6 +577,7 @@ impl TraversalState {
+                         .clone_text_decoration_color()
+                         .resolve_to_absolute(color),
+                     style: style.clone_text_decoration_style(),
++                    thickness: decoration_thickness_override(style),
+                 });
+                 Rc::new(new_vector)
+             },
+diff --git a/components/layout/display_list/stacking_context.rs b/components/layout/display_list/stacking_context.rs
+index 3f212e77e8b..efb331ce46b 100644
+--- a/components/layout/display_list/stacking_context.rs
++++ b/components/layout/display_list/stacking_context.rs
+@@ -23,9 +23,11 @@ use style::color::AbsoluteColor;
+ use style::computed_values::overflow_x::T as ComputedOverflow;
+ use style::computed_values::position::T as ComputedPosition;
+ use style::computed_values::text_decoration_style::T as TextDecorationStyle;
++use style::properties::ComputedValues;
+ use style::values::computed::angle::Angle;
+ use style::values::computed::{ClipRectOrAuto, Length, TextDecorationLine};
+ use style::values::generics::box_::{OverflowClipMarginBox, Perspective};
++use style::values::generics::text::GenericTextDecorationLength;
+ use style::values::generics::transform::{
+     self, GenericRotate, GenericScale, GenericTranslate, get_normalized_vector_and_angle,
+ };
+@@ -357,6 +359,19 @@ pub(crate) struct FragmentTextDecoration {
+     pub line: TextDecorationLine,
+     pub color: AbsoluteColor,
+     pub style: TextDecorationStyle,
++    /// An author `text-decoration-thickness` length, resolved against the decorating box's
++    /// font size; `None` uses the font's own underline or strikeout thickness.
++    pub thickness: Option<Au>,
++}
++
++/// <https://drafts.csswg.org/css-text-decor-4/#text-decoration-width-property>
++pub(crate) fn decoration_thickness_override(style: &ComputedValues) -> Option<Au> {
++    match style.clone_text_decoration_thickness() {
++        GenericTextDecorationLength::LengthPercentage(length) => {
++            Some(length.to_used_value(style.get_font().font_size.computed_size().into()))
++        },
++        GenericTextDecorationLength::Auto | GenericTextDecorationLength::FromFont => None,
++    }
+ }
+ 
+ #[derive(Clone, Copy, Debug, Eq, MallocSizeOf, PartialEq)]
+@@ -958,6 +973,7 @@ impl BoxFragmentWithStyle<'_> {
+                         .clone_text_decoration_color()
+                         .resolve_to_absolute(color),
+                     style: style.clone_text_decoration_style(),
++                    thickness: decoration_thickness_override(style),
+                 });
+                 new_text_decoration = Rc::new(new_vector);
+                 &new_text_decoration
+-- 
+2.43.0
+

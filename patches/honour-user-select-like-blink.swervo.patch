@@ -1,0 +1,590 @@
+From c9f82a60ef612320a84787b4beb881b8a7932d4f Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 18:41:53 -0400
+Subject: [PATCH] selection: honour user-select like Blink
+
+Presses in user-select: none content neither start nor clear a selection,
+drags and Shift-extension stop at the nearest selectable position,
+user-select: all selects its outermost element as a whole, and none text
+is neither painted as selected nor included in Selection.toString().
+Editable content stays selectable. Sites set user-select: none on buttons
+and navigation, which clicking used to select.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/display_list/mod.rs         |   4 +-
+ components/layout/flow/inline/construct.rs    |   2 +
+ components/layout/flow/inline/mod.rs          |  21 ++-
+ components/layout/query.rs                    |   3 +
+ components/script/dom/document/document.rs    |   2 +-
+ .../dom/document/document_event_handler.rs    |  12 +-
+ components/script/dom/range/range.rs          | 116 ++++++------
+ components/script/dom/selection.rs            | 169 +++++++++++++++++-
+ components/script/dom/window/window.rs        |  11 +-
+ components/shared/layout/lib.rs               |   2 +
+ 10 files changed, 272 insertions(+), 70 deletions(-)
+
+diff --git a/components/layout/display_list/mod.rs b/components/layout/display_list/mod.rs
+index fb459ebf448..911536a14a2 100644
+--- a/components/layout/display_list/mod.rs
++++ b/components/layout/display_list/mod.rs
+@@ -1542,7 +1542,9 @@ impl Fragment {
+             return Some((caret..caret, true));
+         }
+ 
+-        if builder.selected_text.is_empty() {
++        if builder.selected_text.is_empty() ||
++            !text_origins.is_selectable(character_range, &fragment.base.style())
++        {
+             return None;
+         }
+         let mut selected: Option<std::ops::Range<usize>> = None;
+diff --git a/components/layout/flow/inline/construct.rs b/components/layout/flow/inline/construct.rs
+index c6878b95236..7319ccb40b8 100644
+--- a/components/layout/flow/inline/construct.rs
++++ b/components/layout/flow/inline/construct.rs
+@@ -438,6 +438,7 @@ impl InlineFormattingContextBuilder {
+                 kind,
+                 character_start: new_character_range.start,
+                 dom_offsets,
++                is_editable: info.node.is_editable(),
+             });
+         }
+ 
+@@ -597,6 +598,7 @@ impl InlineFormattingContextBuilder {
+             kind: TextOriginKind::EmptyEditingHost,
+             character_start: self.current_character_offset,
+             dom_offsets: vec![0],
++            is_editable: true,
+         });
+     }
+ 
+diff --git a/components/layout/flow/inline/mod.rs b/components/layout/flow/inline/mod.rs
+index ab2f82e835a..9e93c5d62fc 100644
+--- a/components/layout/flow/inline/mod.rs
++++ b/components/layout/flow/inline/mod.rs
+@@ -108,7 +108,7 @@ use style::context::{QuirksMode, SharedStyleContext};
+ use style::dom::OpaqueNode;
+ use style::properties::ComputedValues;
+ use style::selector_parser::PseudoElement;
+-use style::values::computed::{Overflow, OverflowWrap};
++use style::values::computed::{Overflow, OverflowWrap, UserSelect};
+ use style::values::specified::box_::{Display as StyloDisplay, DisplayInside};
+ use style::values::specified::text::TextOverflowSide;
+ use style::properties::style_structs::InheritedText;
+@@ -224,6 +224,8 @@ pub(crate) struct TextOrigin {
+     /// offsets need not be contiguous, and `text-transform` can produce several characters
+     /// from one, which then share its offset.
+     pub dom_offsets: Vec<u32>,
++    /// Whether the node is editable, which makes its text selectable whatever `user-select`.
++    pub is_editable: bool,
+ }
+ 
+ #[derive(Clone, Copy, Debug, MallocSizeOf, PartialEq)]
+@@ -311,6 +313,23 @@ impl TextOrigins {
+         )
+     }
+ 
++    /// Whether the characters in `character_range`, all with the parent style `style`, can be
++    /// selected. As in Blink, `user-select: none` text cannot be, unless it is editable.
++    /// <https://drafts.csswg.org/css-ui-4/#content-selection>
++    pub(crate) fn is_selectable(
++        &self,
++        character_range: &std::ops::Range<usize>,
++        style: &ComputedValues,
++    ) -> bool {
++        style.clone_user_select() != UserSelect::None ||
++            self.sources_in(character_range)
++                .filter(|source| {
++                    source.character_end() > character_range.start &&
++                        source.character_start < character_range.end
++                })
++                .any(|source| source.is_editable)
++    }
++
+     /// The sources of the characters in the given range, including those touching its ends.
+     pub(crate) fn sources_in(
+         &self,
+diff --git a/components/layout/query.rs b/components/layout/query.rs
+index 830cc89586a..4335f8e0ad5 100644
+--- a/components/layout/query.rs
++++ b/components/layout/query.rs
+@@ -1776,6 +1776,8 @@ pub fn process_caret_stops_query(
+             .as_ref()
+             .expect("Only collected fragments with editable text");
+ 
++        let selectable =
++            text_origins.is_selectable(&offsets.character_range, &text_fragment.base.style());
+         let mut stops = Vec::new();
+         let mut push_stop = |character: usize, x: Au| {
+             if let Some((node, offset)) = text_origins.dom_position(character) {
+@@ -1783,6 +1785,7 @@ pub fn process_caret_stops_query(
+                     node: node.into(),
+                     offset,
+                     x,
++                    selectable,
+                 });
+             }
+         };
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index d8c7e369a86..1cff11d5e32 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -5388,7 +5388,7 @@ impl Document {
+         // Step 5. Otherwise, return a caret position where the caret range is collapsed at the
+         // insertion point of the text insertion point indicator, here the closest caret position
+         // in laid out text.
+-        let lines = caret_stops_around(&self.window, node);
++        let lines = caret_stops_around(&self.window, node, false);
+         let Some((line, stop)) = closest_caret_stop(&lines, point) else {
+             return Some((DomRoot::from_ref(node), 0, None));
+         };
+diff --git a/components/script/dom/document/document_event_handler.rs b/components/script/dom/document/document_event_handler.rs
+index b4fd855d722..5d12c375403 100644
+--- a/components/script/dom/document/document_event_handler.rs
++++ b/components/script/dom/document/document_event_handler.rs
+@@ -76,7 +76,7 @@ use crate::dom::keyboardevent::KeyboardEvent;
+ use crate::dom::node::{self, Node, NodeTraits};
+ use crate::dom::pointerevent::{PointerEvent, PointerId};
+ use crate::dom::scrolling_box::{ScrollAxisState, ScrollRequirement, ScrollingBoxAxis};
+-use crate::dom::selection::{CaretMovement, PointerSelection};
++use crate::dom::selection::{CaretMovement, PointerSelection, can_start_selection};
+ use crate::dom::types::{
+     ClipboardEvent, CompositionEvent, DataTransfer, Element, Event, EventTarget, GlobalScope,
+     HTMLAnchorElement, HTMLButtonElement, HTMLElement, HTMLInputElement,
+@@ -1242,9 +1242,10 @@ impl DocumentEventHandler {
+     }
+ 
+     /// Changes the selection for a press of the primary button like other browsers: text controls
+-    /// keep their own selection, buttons and draggable elements are pressed or dragged rather than
+-    /// selected from, and anywhere else the press selects, by characters, words or paragraphs
+-    /// depending on the click count, and starts selecting with the mouse.
++    /// keep their own selection, buttons, draggable elements and `user-select: none` content are
++    /// pressed or dragged rather than selected from, and anywhere else the press selects, by
++    /// characters, words or paragraphs depending on the click count, and starts selecting with
++    /// the mouse.
+     fn select_for_primary_button_press(
+         &self,
+         cx: &mut JSContext,
+@@ -1276,6 +1277,9 @@ impl DocumentEventHandler {
+                 return;
+             }
+         }
++        if !can_start_selection(hit_node) {
++            return;
++        }
+ 
+         let granularity = match click_count {
+             1 => PointerSelection::Character,
+diff --git a/components/script/dom/range/range.rs b/components/script/dom/range/range.rs
+index 4dbb8157065..c06c13d0de3 100644
+--- a/components/script/dom/range/range.rs
++++ b/components/script/dom/range/range.rs
+@@ -68,6 +68,68 @@ pub(crate) struct ContainedChildren {
+ }
+ 
+ impl Range {
++    /// <https://dom.spec.whatwg.org/#dom-range-stringifier>, leaving out the data of the
++    /// `Text` nodes that `include` rejects.
++    pub(crate) fn stringify(&self, no_gc: &NoGC, include: impl Fn(&Node) -> bool) -> DOMString {
++        let start_node = self.start_container();
++        let end_node = self.end_container();
++
++        // Step 1. Let string be the empty string.
++        let mut s = DOMString::new();
++
++        if let Some(text_node) = start_node.downcast::<Text>() &&
++            include(&start_node)
++        {
++            let char_data = text_node.upcast::<CharacterData>();
++
++            // Step 2. If this’s start node is this’s end node and it is a Text node,
++            // then return the substring of that Text node’s data beginning at
++            // this’s start offset and ending at this’s end offset.
++            if start_node == end_node {
++                return char_data
++                    .SubstringData(self.start_offset(), self.end_offset() - self.start_offset())
++                    .unwrap();
++            }
++
++            // Step 3. If this’s start node is a Text node, then append the substring of
++            // that node’s data from this’s start offset until the end to string.
++            s.push_str(
++                &char_data
++                    .SubstringData(
++                        self.start_offset(),
++                        char_data.Length() - self.start_offset(),
++                    )
++                    .unwrap()
++                    .str(),
++            );
++        }
++
++        // Step 4. Append the concatenation of the data of all Text nodes that are contained in this,
++        // in tree order, to string.
++        let ancestor = self.CommonAncestorContainer();
++        let iter = start_node
++            .following_nodes_unrooted(no_gc, &ancestor, ShadowIncluding::No)
++            .filter_map(UnrootedDom::downcast::<Text>);
++
++        for child in iter {
++            if self.contains(child.upcast()) && include(child.upcast()) {
++                s.push_str(&child.upcast::<CharacterData>().Data().str());
++            }
++        }
++
++        // Step 5. If this’s end node is a Text node, then append the substring of
++        // that node’s data from its start until this’s end offset to string.
++        if let Some(text_node) = end_node.downcast::<Text>() &&
++            include(&end_node)
++        {
++            let char_data = text_node.upcast::<CharacterData>();
++            s.push_str(&char_data.SubstringData(0, self.end_offset()).unwrap().str());
++        }
++
++        // Step 6. Return string.
++        s
++    }
++
+     fn new_inherited(
+         start_container: &Node,
+         start_offset: u32,
+@@ -1143,59 +1205,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
+ 
+     /// <https://dom.spec.whatwg.org/#dom-range-stringifier>
+     fn Stringifier(&self, no_gc: &NoGC) -> DOMString {
+-        let start_node = self.start_container();
+-        let end_node = self.end_container();
+-
+-        // Step 1. Let string be the empty string.
+-        let mut s = DOMString::new();
+-
+-        if let Some(text_node) = start_node.downcast::<Text>() {
+-            let char_data = text_node.upcast::<CharacterData>();
+-
+-            // Step 2. If this’s start node is this’s end node and it is a Text node,
+-            // then return the substring of that Text node’s data beginning at
+-            // this’s start offset and ending at this’s end offset.
+-            if start_node == end_node {
+-                return char_data
+-                    .SubstringData(self.start_offset(), self.end_offset() - self.start_offset())
+-                    .unwrap();
+-            }
+-
+-            // Step 3. If this’s start node is a Text node, then append the substring of
+-            // that node’s data from this’s start offset until the end to string.
+-            s.push_str(
+-                &char_data
+-                    .SubstringData(
+-                        self.start_offset(),
+-                        char_data.Length() - self.start_offset(),
+-                    )
+-                    .unwrap()
+-                    .str(),
+-            );
+-        }
+-
+-        // Step 4. Append the concatenation of the data of all Text nodes that are contained in this,
+-        // in tree order, to string.
+-        let ancestor = self.CommonAncestorContainer();
+-        let iter = start_node
+-            .following_nodes_unrooted(no_gc, &ancestor, ShadowIncluding::No)
+-            .filter_map(UnrootedDom::downcast::<Text>);
+-
+-        for child in iter {
+-            if self.contains(child.upcast()) {
+-                s.push_str(&child.upcast::<CharacterData>().Data().str());
+-            }
+-        }
+-
+-        // Step 5. If this’s end node is a Text node, then append the substring of
+-        // that node’s data from its start until this’s end offset to string.
+-        if let Some(text_node) = end_node.downcast::<Text>() {
+-            let char_data = text_node.upcast::<CharacterData>();
+-            s.push_str(&char_data.SubstringData(0, self.end_offset()).unwrap().str());
+-        }
+-
+-        // Step 6. Return string.
+-        s
++        self.stringify(no_gc, |_| true)
+     }
+ 
+     /// <https://html.spec.whatwg.org/multipage/#dom-range-createcontextualfragment>
+diff --git a/components/script/dom/selection.rs b/components/script/dom/selection.rs
+index 04e4a365e35..50927f80b36 100644
+--- a/components/script/dom/selection.rs
++++ b/components/script/dom/selection.rs
+@@ -9,9 +9,10 @@ use app_units::Au;
+ use dom_struct::dom_struct;
+ use euclid::Point2D;
+ use js::context::{JSContext, NoGC};
+-use layout_api::RestyleReason;
++use layout_api::{QueryMsg, RestyleReason};
+ use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+ use style::Zero;
++use style::values::computed::UserSelect;
+ use style_traits::CSSPixel;
+ 
+ use crate::dom::abstractrange::bp_position;
+@@ -247,6 +248,37 @@ impl Selection {
+         extend: bool,
+     ) {
+         let extend = extend && self.range.get().is_some();
++        let window = self.document.window();
++        // As in Blink, `user-select: all` content is selected as a whole: a press in it selects
++        // all of it and dragging from there leaves that selection alone.
++        if extend &&
++            self.anchor_node()
++                .is_some_and(|anchor| user_select_all_root(&anchor).is_some())
++        {
++            return;
++        }
++        if !extend && let Some(root) = user_select_all_root(hit_node) {
++            let lines = selectable_lines(window.caret_stops_query(root.upcast()));
++            let result = match (lines.first(), lines.last()) {
++                (Some(first), Some(last)) => {
++                    let (start, start_offset) = first_position_in(root.upcast(), &first.stops[0]);
++                    let end = &last.stops[last.stops.len() - 1];
++                    self.SetBaseAndExtent(cx, &start, start_offset, &end.node, end.offset)
++                },
++                // Without text, such as for an image, the element itself is selected.
++                _ => {
++                    let parent = root
++                        .upcast::<Node>()
++                        .GetParentNode()
++                        .expect("Laid out elements have a parent");
++                    let index = root.upcast::<Node>().index();
++                    self.SetBaseAndExtent(cx, &parent, index, &parent, index + 1)
++                },
++            };
++            result.expect("Laid out caret positions are valid boundary points");
++            return;
++        }
++
+         // Like in other browsers, a selection stays in the editing host it starts in, and one
+         // that starts outside editing hosts does not enter them.
+         let editing_host = if extend {
+@@ -254,10 +286,9 @@ impl Selection {
+         } else {
+             hit_node.editing_host_of()
+         };
+-        let window = self.document.window();
+         let lines = match &editing_host {
+-            Some(editing_host) => window.caret_stops_query(editing_host),
+-            None => caret_stops_around(window, hit_node),
++            Some(editing_host) => selectable_lines(window.caret_stops_query(editing_host)),
++            None => caret_stops_around(window, hit_node, true),
+         };
+         let Some((_, mut stop)) = closest_caret_stop(&lines, point) else {
+             return;
+@@ -281,6 +312,28 @@ impl Selection {
+                 } else {
+                     (stop.node.clone(), stop.offset)
+                 };
++                // A selection extended into `user-select: all` content takes in all of it.
++                let (node, offset) = match user_select_all_root(&node) {
++                    Some(root) if extend => {
++                        let lines = selectable_lines(window.caret_stops_query(root.upcast()));
++                        let forward = self.anchor_node().is_some_and(|anchor| {
++                            bp_position(&anchor, self.anchor_offset(), &node, offset) ==
++                                Some(Ordering::Less)
++                        });
++                        if forward {
++                            match lines.last().and_then(|line| line.stops.last()) {
++                                Some(stop) => (stop.node.clone(), stop.offset),
++                                None => (node, offset),
++                            }
++                        } else {
++                            match lines.first().and_then(|line| line.stops.first()) {
++                                Some(stop) => first_position_in(root.upcast(), stop),
++                                None => (node, offset),
++                            }
++                        }
++                    },
++                    _ => (node, offset),
++                };
+                 if extend {
+                     self.Extend(cx, &node, offset)
+                 } else {
+@@ -522,11 +575,19 @@ fn character_before(stop: &LaidOutCaretStop) -> Option<char> {
+         .ok()
+ }
+ 
+-/// The caret positions, by line, of the nearest block around `node` that has laid out text.
+-pub(crate) fn caret_stops_around(window: &Window, node: &Node) -> Vec<LaidOutCaretLine> {
++/// The caret positions, by line, of the nearest block around `node` that has laid out text, or
++/// with `selectable_only`, laid out text that can be selected.
++pub(crate) fn caret_stops_around(
++    window: &Window,
++    node: &Node,
++    selectable_only: bool,
++) -> Vec<LaidOutCaretLine> {
+     let mut block = node.block_node_of();
+     while let Some(current) = block.filter(|block| block.is::<Element>()) {
+-        let lines = window.caret_stops_query(&current);
++        let mut lines = window.caret_stops_query(&current);
++        if selectable_only {
++            lines = selectable_lines(lines);
++        }
+         if !lines.is_empty() {
+             return lines;
+         }
+@@ -537,6 +598,96 @@ pub(crate) fn caret_stops_around(window: &Window, node: &Node) -> Vec<LaidOutCar
+     Vec::new()
+ }
+ 
++/// The lines with only their caret positions where a selection can end, leaving out lines
++/// without any.
++fn selectable_lines(lines: Vec<LaidOutCaretLine>) -> Vec<LaidOutCaretLine> {
++    lines
++        .into_iter()
++        .filter_map(|mut line| {
++            line.stops.retain(|stop| stop.selectable);
++            (!line.stops.is_empty()).then_some(line)
++        })
++        .collect()
++}
++
++/// The `user-select` of an element, or of the parent element of another node, which inherits
++/// it. `None` for nodes that are not styled.
++fn user_select(node: &Node) -> Option<UserSelect> {
++    let element = match node.downcast::<Element>() {
++        Some(element) => DomRoot::from_ref(element),
++        None => node.GetParentElement()?,
++    };
++    Some(element.style()?.clone_user_select())
++}
++
++/// Whether pressing the primary button over `node` can start a selection: as in Blink, not in
++/// `user-select: none` content unless it is editable, where `text` and `all` override the
++/// value of an ancestor. <https://drafts.csswg.org/css-ui-4/#content-selection>
++pub(crate) fn can_start_selection(node: &Node) -> bool {
++    for ancestor in node.inclusive_ancestors(ShadowIncluding::Yes) {
++        if ancestor.is_editable_or_editing_host() {
++            return true;
++        }
++        if !ancestor.is::<Element>() {
++            continue;
++        }
++        match user_select(&ancestor) {
++            Some(UserSelect::None) => return false,
++            Some(UserSelect::Text | UserSelect::All) => return true,
++            Some(UserSelect::Auto) | None => {},
++        }
++    }
++    true
++}
++
++/// The outermost of the elements with `user-select: all` that `node` is in without other
++/// `user-select` values between them, which is selected as a whole.
++fn user_select_all_root(node: &Node) -> Option<DomRoot<Element>> {
++    if node.is_editable_or_editing_host() {
++        return None;
++    }
++    let mut root = None;
++    for ancestor in node.inclusive_ancestors(ShadowIncluding::Yes) {
++        let Some(element) = ancestor.downcast::<Element>() else {
++            continue;
++        };
++        if user_select(&ancestor) != Some(UserSelect::All) {
++            break;
++        }
++        root = Some(DomRoot::from_ref(element));
++    }
++    root
++}
++
++/// The position of the first caret position `stop` of the text of `root` in `root`. Laid out
++/// positions where two nodes meet are at the end of the first, which for the first position of
++/// `root` is before it; the start of the first text in `root` that is not only white space is
++/// the same place.
++fn first_position_in(root: &Node, stop: &LaidOutCaretStop) -> (DomRoot<Node>, u32) {
++    if root.is_inclusive_ancestor_of(&stop.node) {
++        return (stop.node.clone(), stop.offset);
++    }
++    root.traverse_preorder(ShadowIncluding::No)
++        .find(|node| {
++            node.downcast::<Text>().is_some_and(|text| {
++                !text
++                    .data()
++                    .chars()
++                    .all(|character| character.is_ascii_whitespace())
++            })
++        })
++        .map_or((stop.node.clone(), stop.offset), |text| (text, 0))
++}
++
++/// Whether text in `text` can be part of what a selection stringifies to: as in Blink, text
++/// with `user-select: none` cannot, unless it is editable. Styles must be up to date.
++pub(crate) fn is_selectable_text(text: &Node) -> bool {
++    text.is_editable_or_editing_host() ||
++        text.GetParentElement()
++            .and_then(|parent| parent.style_from_last_restyle())
++            .is_none_or(|style| style.clone_user_select() != UserSelect::None)
++}
++
+ /// The caret position closest to `point` (in the viewport) and its line: on the closest line,
+ /// or at the end of the line past either end of it, like in other browsers.
+ pub(crate) fn closest_caret_stop(
+@@ -1279,7 +1430,9 @@ impl SelectionMethods<crate::DomTypeHolder> for Selection {
+         // into account `display: none`. The case for textarea and input elements is
+         // completely unhandled here.
+         if let Some(range) = self.range.get() {
+-            range.Stringifier(no_gc)
++            // As in Blink, text that cannot be selected is left out.
++            self.document.window().layout_reflow(QueryMsg::StyleQuery);
++            range.stringify(no_gc, is_selectable_text)
+         } else {
+             DOMString::from("")
+         }
+diff --git a/components/script/dom/window/window.rs b/components/script/dom/window/window.rs
+index f6148554eea..1109559f628 100644
+--- a/components/script/dom/window/window.rs
++++ b/components/script/dom/window/window.rs
+@@ -283,6 +283,8 @@ pub(crate) struct LaidOutCaretStop {
+     pub(crate) offset: u32,
+     /// The horizontal position of the caret in the viewport.
+     pub(crate) x: Au,
++    /// Whether a selection made with the mouse can end here, as `user-select` decides.
++    pub(crate) selectable: bool,
+ }
+ 
+ /// The caret positions of a line box, left to right, and its vertical extent in the viewport.
+@@ -3509,14 +3511,19 @@ impl Window {
+                         (node, stop.offset)
+                     };
+                     // Positions at the same place, such as the end of one text node and the start
+-                    // of the next, or inside a cluster of zero-width glyphs, are one stop.
+-                    if stops.last().is_some_and(|last| last.x == stop.x) {
++                    // of the next, or inside a cluster of zero-width glyphs, are one stop, which
++                    // is selectable if the text on either side is.
++                    if let Some(last) = stops.last_mut() &&
++                        last.x == stop.x
++                    {
++                        last.selectable |= stop.selectable;
+                         continue;
+                     }
+                     stops.push(LaidOutCaretStop {
+                         node,
+                         offset,
+                         x: stop.x,
++                        selectable: stop.selectable,
+                     });
+                 }
+                 (!stops.is_empty()).then_some(LaidOutCaretLine {
+diff --git a/components/shared/layout/lib.rs b/components/shared/layout/lib.rs
+index a5e55070b6b..c3b5f8f1af1 100644
+--- a/components/shared/layout/lib.rs
++++ b/components/shared/layout/lib.rs
+@@ -181,6 +181,8 @@ pub struct CaretStop {
+     pub offset: u32,
+     /// The horizontal position of the caret in the viewport.
+     pub x: Au,
++    /// Whether the text around this position can be selected, as `user-select` decides.
++    pub selectable: bool,
+ }
+ 
+ /// The caret positions of one line box, in visual order.
+-- 
+2.43.0
+

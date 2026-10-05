@@ -1,0 +1,309 @@
+From 58a703566d2983d96cef5657b9cbf4cabf622daa Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 18:41:55 -0400
+Subject: [PATCH] layout: paint a selected line break as a selected space
+
+Like Blink, when a selection continues past the end of a line (a <br>, a
+preserved newline, a soft wrap or the end of a paragraph), the highlight
+extends by the width of a space.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/display_list/mod.rs      | 77 ++++++++++++++++------
+ components/layout/flow/inline/line.rs      | 18 ++++-
+ components/layout/flow/inline/mod.rs       |  1 +
+ components/layout/flow/inline/text_run.rs  |  2 +
+ components/script/dom/document/document.rs | 14 +++-
+ components/shared/layout/lib.rs            |  5 +-
+ 6 files changed, 93 insertions(+), 24 deletions(-)
+
+diff --git a/components/layout/display_list/mod.rs b/components/layout/display_list/mod.rs
+index 911536a14a2..0304c8fcb03 100644
+--- a/components/layout/display_list/mod.rs
++++ b/components/layout/display_list/mod.rs
+@@ -65,6 +65,7 @@ use crate::display_list::conversions::FilterToWebRender;
+ pub(crate) use crate::display_list::conversions::ToWebRender;
+ use crate::display_list::paint_traversal::{PaintTraversal, PaintTraversalHandler, TraversalState};
+ use crate::flow::inline::TextOrigins;
++use crate::flow::inline::line::TextRunOffsets;
+ use crate::fragment_tree::{
+     BackgroundMode, BaseFragment, BoxFragment, BoxFragmentWithStyle, ContainingBlockCalculation,
+     Fragment, FragmentFlags, FragmentStatus, FragmentTree, IFrameFragment, ImageFragment,
+@@ -157,6 +158,9 @@ pub(crate) struct DisplayListBuilder<'a> {
+ 
+     /// The selected UTF-16 range of each text node in a non-collapsed selection of the document.
+     selected_text: FxHashMap<OpaqueNode, std::ops::Range<u32>>,
++
++    /// The node that a non-collapsed selection of the document ends in.
++    selection_end_node: Option<OpaqueNode>,
+ }
+ 
+ struct InspectorHighlight {
+@@ -246,6 +250,7 @@ impl<'a> DisplayListBuilder<'a> {
+             selected_text: document_selection
+                 .map(|selection| selection.selected_text.iter().cloned().collect())
+                 .unwrap_or_default(),
++            selection_end_node: document_selection.and_then(|selection| selection.end_node),
+         };
+ 
+         // Clear any caret color from previous display list constructions.
+@@ -1512,13 +1517,15 @@ impl Fragment {
+     }
+ 
+     /// The part of the selection of the document that falls in this text fragment, as character
+-    /// offsets of its inline formatting context, and whether it is a caret.
++    /// offsets of its inline formatting context, whether it is a caret, and whether the selection
++    /// goes on past the end of the line that the fragment ends.
+     fn document_selection_in_text_fragment(
+         builder: &DisplayListBuilder,
+         fragment: &TextFragment,
+-        character_range: &std::ops::Range<usize>,
++        offsets: &TextRunOffsets,
+         text_origins: &TextOrigins,
+-    ) -> Option<(std::ops::Range<usize>, bool)> {
++    ) -> Option<(std::ops::Range<usize>, bool, bool)> {
++        let character_range = &offsets.character_range;
+         if let Some((node, offset)) = builder.caret {
+             if !text_origins.is_editable {
+                 return None;
+@@ -1539,7 +1546,7 @@ impl Fragment {
+             {
+                 return None;
+             }
+-            return Some((caret..caret, true));
++            return Some((caret..caret, true, false));
+         }
+ 
+         if builder.selected_text.is_empty() ||
+@@ -1547,17 +1554,36 @@ impl Fragment {
+         {
+             return None;
+         }
++        // White space where a line wraps is not laid out, so the line ends before it.
++        let line_end = character_range.start +
++            fragment
++                .glyphs
++                .iter()
++                .map(|glyph_store| glyph_store.character_count())
++                .sum::<usize>();
+         let mut selected: Option<std::ops::Range<usize>> = None;
++        let mut selects_line_break = false;
+         for source in text_origins.sources_in(character_range) {
+             let Some(dom_range) = builder.selected_text.get(&source.node) else {
+                 continue;
+             };
+-            let start = source
+-                .character_offset(dom_range.start)
+-                .max(character_range.start);
+-            let end = source
+-                .character_offset(dom_range.end)
+-                .min(character_range.end);
++            let source_start = source.character_offset(dom_range.start);
++            let source_end = source.character_offset(dom_range.end);
++            // The selection goes on past the line when it goes on to the next character (a
++            // line break, or white space where the line wraps), or past the end of the last
++            // text of the inline formatting context.
++            selects_line_break |= offsets.ends_line &&
++                source_start <= line_end &&
++                (source_end > line_end ||
++                    (source_end == line_end &&
++                        dom_range.end == *source.dom_offsets.last().expect("Has an end offset") &&
++                        text_origins
++                            .sources
++                            .last()
++                            .is_some_and(|last| std::ptr::eq(last, source)) &&
++                        builder.selection_end_node != Some(source.node)));
++            let start = source_start.max(character_range.start);
++            let end = source_end.min(character_range.end);
+             if start >= end {
+                 continue;
+             }
+@@ -1566,7 +1592,12 @@ impl Fragment {
+                 None => start..end,
+             });
+         }
+-        Some((selected?, false))
++        match selected {
++            Some(selected) => Some((selected, false, selects_line_break)),
++            // The selection starts at the end of the line, so only its line break is selected.
++            None if selects_line_break => Some((line_end..line_end, false, true)),
++            None => None,
++        }
+     }
+ 
+     // TODO: This caret/text selection implementation currently does not account for vertical text
+@@ -1581,8 +1612,12 @@ impl Fragment {
+     ) -> Option<(units::LayoutRect, wr::ColorF)> {
+         let offsets = fragment.offsets.as_ref()?;
+ 
+-        // The selected characters of the inline formatting context, and whether they are a caret.
+-        let (selection, is_caret) = match (&offsets.shared_selection, &offsets.text_origins) {
++        // The selected characters of the inline formatting context, whether they are a caret, and
++        // whether the line break ending the line is selected.
++        let (selection, is_caret, selects_line_break) = match (
++            &offsets.shared_selection,
++            &offsets.text_origins,
++        ) {
+             (Some(shared_selection), _) => {
+                 let shared_selection = shared_selection.borrow();
+                 if !shared_selection.enabled {
+@@ -1591,14 +1626,12 @@ impl Fragment {
+                 (
+                     shared_selection.character_range.clone(),
+                     shared_selection.range.is_empty(),
++                    false,
+                 )
+             },
+-            (None, Some(text_origins)) => Self::document_selection_in_text_fragment(
+-                builder,
+-                fragment,
+-                &offsets.character_range,
+-                text_origins,
+-            )?,
++            (None, Some(text_origins)) => {
++                Self::document_selection_in_text_fragment(builder, fragment, offsets, text_origins)?
++            },
+             (None, None) => return None,
+         };
+ 
+@@ -1657,7 +1690,11 @@ impl Fragment {
+         }
+ 
+         let start_x = start_advance.unwrap_or(current_advance);
+-        let end_x = end_advance.unwrap_or(current_advance);
++        let mut end_x = end_advance.unwrap_or(current_advance);
++        // Like Blink, show a selected line break as a selected space at the end of the line.
++        if selects_line_break {
++            end_x += fragment.font_metrics.space_advance;
++        }
+ 
+         let parent_style = fragment.base.style();
+         if !is_caret {
+diff --git a/components/layout/flow/inline/line.rs b/components/layout/flow/inline/line.rs
+index e8ec61b5e92..400e636a9f8 100644
+--- a/components/layout/flow/inline/line.rs
++++ b/components/layout/flow/inline/line.rs
+@@ -276,7 +276,20 @@ impl LineItemLayout<'_, '_> {
+         iterator(line_items)
+     }
+ 
+-    pub(super) fn layout(&mut self, line_items: Vec<LineItem>) -> Vec<Fragment> {
++    pub(super) fn layout(&mut self, mut line_items: Vec<LineItem>) -> Vec<Fragment> {
++        // White space trimmed at the end of the line leaves text runs without glyphs, which
++        // produce no fragments.
++        if let Some(LineItem::TextRun(_, text_run)) =
++            line_items.iter_mut().rev().find(|line_item| match line_item {
++                LineItem::TextRun(_, text_run) => {
++                    !text_run.text.is_empty() || text_run.is_empty_for_text_cursor
++                },
++                _ => line_item.is_in_flow_content(),
++            }) &&
++            let Some(offsets) = text_run.offsets.as_mut()
++        {
++            offsets.ends_line = true;
++        }
+         let line_item_iterator = self.reorder_line_items_for_bidi(line_items);
+         for item in line_item_iterator.into_iter().by_ref() {
+             // When preparing to lay out a new line item, start and end inline boxes, so that the current
+@@ -888,6 +901,9 @@ pub(crate) struct TextRunOffsets {
+     /// of the line box, which selected text is highlighted over. Set when the line is laid out.
+     pub line_block_start: Au,
+     pub line_block_size: Au,
++    /// Whether this text is the last content of its line, so that the line break after it,
++    /// which has no glyphs, is painted at its end when selected.
++    pub ends_line: bool,
+ }
+ 
+ pub(super) struct TextRunLineItem {
+diff --git a/components/layout/flow/inline/mod.rs b/components/layout/flow/inline/mod.rs
+index 9e93c5d62fc..214a293e620 100644
+--- a/components/layout/flow/inline/mod.rs
++++ b/components/layout/flow/inline/mod.rs
+@@ -1993,6 +1993,7 @@ impl InlineFormattingContextLayout<'_> {
+             character_range: line_start_offset..line_start_offset + 1,
+             line_block_start: Au::zero(),
+             line_block_size: Au::zero(),
++            ends_line: false,
+         };
+ 
+         // If the last content line item is a text item, then the placeholder for the text caret is not necessary.
+diff --git a/components/layout/flow/inline/text_run.rs b/components/layout/flow/inline/text_run.rs
+index 690e992869d..85fa2da3623 100644
+--- a/components/layout/flow/inline/text_run.rs
++++ b/components/layout/flow/inline/text_run.rs
+@@ -262,6 +262,7 @@ impl TextRunSegment {
+                     character_range: character_range_start..new_character_range_end,
+                     line_block_start: Au::zero(),
+                     line_block_size: Au::zero(),
++                    ends_line: false,
+                 });
+ 
+             // Break before each unbreakable run in this TextRun, except the first unless the
+@@ -285,6 +286,7 @@ impl TextRunSegment {
+                         character_range: cluster_character_start..cluster_character_end,
+                         line_block_start: Au::zero(),
+                         line_block_size: Au::zero(),
++                        ends_line: false,
+                     });
+                     ifc.process_overflow_wrap_opportunity(cluster.total_advance());
+                     ifc.push_glyph_store_to_unbreakable_segment(
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index 1cff11d5e32..b4d6e25f925 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -5415,6 +5415,7 @@ impl Document {
+             return Some(DocumentSelection {
+                 caret: Some((node.to_opaque(), offset)),
+                 selected_text: Vec::new(),
++                end_node: None,
+             });
+         }
+ 
+@@ -5441,9 +5442,17 @@ impl Document {
+             if is_end && *current != *end {
+                 break;
+             }
+-            if current.is::<Text>() {
++            // A `<br>` is selected to paint its line break as selected.
++            let length = if current.is::<Text>() {
++                Some(current.len())
++            } else if current.is::<HTMLBRElement>() {
++                Some(1)
++            } else {
++                None
++            };
++            if let Some(length) = length {
+                 let selected_start = if current == start { start_offset } else { 0 };
+-                let selected_end = if is_end { end_offset } else { current.len() };
++                let selected_end = if is_end { end_offset } else { length };
+                 if selected_start < selected_end {
+                     selected_text.push((current.to_opaque(), selected_start..selected_end));
+                 }
+@@ -5458,6 +5467,7 @@ impl Document {
+         Some(DocumentSelection {
+             caret: None,
+             selected_text,
++            end_node: Some(end.to_opaque()),
+         })
+     }
+ 
+diff --git a/components/shared/layout/lib.rs b/components/shared/layout/lib.rs
+index c3b5f8f1af1..d42ca7215d6 100644
+--- a/components/shared/layout/lib.rs
++++ b/components/shared/layout/lib.rs
+@@ -168,8 +168,11 @@ pub struct DocumentSelection {
+     /// The insertion point of a selection collapsed in the focused editing host: a text node, a
+     /// `<br>` or an empty editing host and a UTF-16 offset in it (0 or 1 for a `<br>`).
+     pub caret: Option<(OpaqueNode, u32)>,
+-    /// The selected UTF-16 range of every text node in a non-collapsed selection.
++    /// The selected UTF-16 range of every text node in a non-collapsed selection, and the range
++    /// 0..1 of every `<br>` in it.
+     pub selected_text: Vec<(OpaqueNode, Range<u32>)>,
++    /// The node that a non-collapsed selection ends in.
++    pub end_node: Option<OpaqueNode>,
+ }
+ 
+ /// A position where a caret can be placed in text, as laid out.
+-- 
+2.43.0
+
