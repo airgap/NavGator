@@ -1,0 +1,100 @@
+From 8b429643d32f28f36b9180727e2ae3ccc7f8f465 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sat, 3 Oct 2026 04:48:14 -0400
+Subject: [PATCH] servo: parse @container, container units and the container
+ shorthand
+
+Servo's layout now evaluates container queries. CascadeData exposes
+whether it has any @container rule.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ style/properties/shorthands.rs   |  1 -
+ style/properties/shorthands.toml |  2 +-
+ style/stylesheets/rule_parser.rs |  2 +-
+ style/stylist.rs                 |  7 +++++++
+ style/values/specified/length.rs | 12 ++++++------
+ 5 files changed, 15 insertions(+), 9 deletions(-)
+
+diff --git a/style/properties/shorthands.rs b/style/properties/shorthands.rs
+index 340233a00..6772c9c44 100644
+--- a/style/properties/shorthands.rs
++++ b/style/properties/shorthands.rs
+@@ -547,7 +547,6 @@ pub mod border {
+     }
+ }
+ 
+-#[cfg(feature = "gecko")]
+ pub mod container {
+     use super::*;
+     pub use crate::properties::generated::shorthands::container::*;
+diff --git a/style/properties/shorthands.toml b/style/properties/shorthands.toml
+index 529b60a3a..a780db99f 100644
+--- a/style/properties/shorthands.toml
++++ b/style/properties/shorthands.toml
+@@ -208,7 +208,7 @@ spec = "https://wicg.github.io/overscroll-behavior/#overscroll-behavior-properti
+ kind = "two_properties"
+ 
+ [container]
+-engine = "gecko"
++servo_pref = "layout.container-queries.enabled"
+ sub_properties = ["container-name", "container-type"]
+ spec = "https://drafts.csswg.org/css-contain-3/#container-shorthand"
+ 
+diff --git a/style/stylesheets/rule_parser.rs b/style/stylesheets/rule_parser.rs
+index 929b8578e..45a39f1d3 100644
+--- a/style/stylesheets/rule_parser.rs
++++ b/style/stylesheets/rule_parser.rs
+@@ -719,7 +719,7 @@ impl<'a, 'i> AtRuleParser<'i> for NestedRuleParser<'a, 'i> {
+             "font-face" => {
+                 AtRulePrelude::FontFace
+             },
+-            "container" if cfg!(feature = "gecko") => {
++            "container" => {
+                 let conditions = input.parse_comma_separated(|input| {
+                     ContainerCondition::parse(&self.context, input)
+                 })?;
+diff --git a/style/stylist.rs b/style/stylist.rs
+index 30bd8d1f0..3e67964a2 100644
+--- a/style/stylist.rs
++++ b/style/stylist.rs
+@@ -3408,6 +3408,13 @@ pub fn replace_parent_selector_with_implicit_scope(
+ }
+ 
+ impl CascadeData {
++    /// Whether these stylesheets have any `@container` rule, whose matching depends on the
++    /// layout of the containers.
++    pub fn has_container_queries(&self) -> bool {
++        // The first condition is the "no condition" placeholder.
++        self.container_conditions.len() > 1
++    }
++
+     /// Creates an empty `CascadeData`.
+     pub fn new() -> Self {
+         Self {
+diff --git a/style/values/specified/length.rs b/style/values/specified/length.rs
+index a0627257b..7abc33c07 100644
+--- a/style/values/specified/length.rs
++++ b/style/values/specified/length.rs
+@@ -546,12 +546,12 @@ impl NoCalcLength {
+             "dvi" if !in_page_rule => LengthUnit::Dvi,
+             // Container query lengths. Inherit the limitation from viewport units since
+             // we may fall back to them.
+-            "cqw" if !in_page_rule && cfg!(feature = "gecko") => LengthUnit::Cqw,
+-            "cqh" if !in_page_rule && cfg!(feature = "gecko") => LengthUnit::Cqh,
+-            "cqi" if !in_page_rule && cfg!(feature = "gecko") => LengthUnit::Cqi,
+-            "cqb" if !in_page_rule && cfg!(feature = "gecko") => LengthUnit::Cqb,
+-            "cqmin" if !in_page_rule && cfg!(feature = "gecko") => LengthUnit::Cqmin,
+-            "cqmax" if !in_page_rule && cfg!(feature = "gecko") => LengthUnit::Cqmax,
++            "cqw" if !in_page_rule => LengthUnit::Cqw,
++            "cqh" if !in_page_rule => LengthUnit::Cqh,
++            "cqi" if !in_page_rule => LengthUnit::Cqi,
++            "cqb" if !in_page_rule => LengthUnit::Cqb,
++            "cqmin" if !in_page_rule => LengthUnit::Cqmin,
++            "cqmax" if !in_page_rule => LengthUnit::Cqmax,
+             _ => return Err(()),
+         };
+         Ok(Self::new(length_unit, value))
+-- 
+2.43.0
+

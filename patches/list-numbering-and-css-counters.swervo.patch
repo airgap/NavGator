@@ -1,0 +1,422 @@
+From 81477ca05483368edd1ca8b3938d8f276cc78c36 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sat, 3 Oct 2026 03:59:01 -0400
+Subject: [PATCH] layout: list numbering and CSS counters
+
+Every ordered-list marker and counter() rendered 0. List items now get
+their HTML ordinal (the list's start and reversed, each li's value), and
+decimal, alphabetic, roman, greek and the decimal-digit scripts format
+it. counter() and counters() take named counters from counter-reset and
+counter-increment on elements and their ::before/::after, found by
+walking the document in tree order to the pseudo-element (stylo parses
+both properties for Servo now).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/dom_traversal.rs |  29 ++-
+ components/layout/lists.rs         | 307 ++++++++++++++++++++++++++++-
+ 2 files changed, 327 insertions(+), 9 deletions(-)
+
+diff --git a/components/layout/dom_traversal.rs b/components/layout/dom_traversal.rs
+index db516d85148..95b8aa254d9 100644
+--- a/components/layout/dom_traversal.rs
++++ b/components/layout/dom_traversal.rs
+@@ -19,7 +19,7 @@ use web_atoms::LocalName;
+ use crate::context::LayoutContext;
+ use crate::dom::{BoxSlot, LayoutBox, NodeExt};
+ use crate::flow::inline::SharedInlineStyles;
+-use crate::lists::generate_counter_representation;
++use crate::lists::{counter_values, generate_counter_representation, list_item_ordinal};
+ use crate::quotes::quotes_for_lang;
+ use crate::replaced::ReplacedContents;
+ use crate::style_ext::{Display, DisplayGeneratingBox, DisplayInside, DisplayOutside};
+@@ -424,12 +424,33 @@ pub(crate) fn generate_pseudo_element_content(
+                             vec.push(PseudoElementContentItem::Text(quote));
+                         }
+                     },
+-                    ContentItem::Counter(_, style) | ContentItem::Counters(_, _, style) => {
+-                        // TODO: Add support for counters, this assumes a value of 0.
++                    ContentItem::Counter(name, style) => {
++                        let value = if &*name.0 == "list-item" {
++                            list_item_ordinal(context, pseudo_element_info.node)
++                        } else {
++                            *counter_values(context, pseudo_element_info.node, name)
++                                .last()
++                                .expect("A counter always has a value")
++                        };
+                         vec.push(PseudoElementContentItem::Text(
+-                            generate_counter_representation(style).to_string(),
++                            generate_counter_representation(style, value),
+                         ));
+                     },
++                    ContentItem::Counters(name, separator, style) => {
++                        // Nested `list-item` numbering (`counters(list-item, ".")`) only
++                        // shows the innermost list's ordinal.
++                        let values = if &*name.0 == "list-item" {
++                            vec![list_item_ordinal(context, pseudo_element_info.node)]
++                        } else {
++                            counter_values(context, pseudo_element_info.node, name)
++                        };
++                        let text = values
++                            .into_iter()
++                            .map(|value| generate_counter_representation(style, value))
++                            .collect::<Vec<_>>()
++                            .join(separator);
++                        vec.push(PseudoElementContentItem::Text(text));
++                    },
+                     ContentItem::NoOpenQuote | ContentItem::NoCloseQuote => {},
+                 }
+             }
+diff --git a/components/layout/lists.rs b/components/layout/lists.rs
+index 4abd340d548..85862b1ff5c 100644
+--- a/components/layout/lists.rs
++++ b/components/layout/lists.rs
+@@ -2,11 +2,19 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
++use layout_api::{DangerousStyleElement, LayoutElement, LayoutNode};
++use script::layout_dom::{ServoDangerousStyleElement, ServoLayoutNode};
++use selectors::Element as _;
+ use style::counter_style::{CounterStyle, Symbol, SymbolsType};
++use style::dom::{OpaqueNode, TElement};
++use style::properties::ComputedValues;
+ use style::properties::longhands::list_style_type::computed_value::T as ListStyleType;
++use style::selector_parser::PseudoElement;
++use style::values::CustomIdent;
+ use style::values::computed::Image;
+ use style::values::generics::counters::Content;
+ use stylo_atoms::atom;
++use web_atoms::{local_name, ns};
+ 
+ use crate::context::LayoutContext;
+ use crate::dom_traversal::{
+@@ -50,6 +58,7 @@ pub(crate) fn make_marker<'dom>(
+         Content::Normal => marker_image().or_else(|| {
+             Some(vec![PseudoElementContentItem::Text(marker_string(
+                 &list_style.list_style_type,
++                list_item_ordinal(context, info.node),
+             )?)])
+         })?,
+     };
+@@ -64,10 +73,181 @@ fn symbol_to_string(symbol: &Symbol) -> &str {
+     }
+ }
+ 
++/// The value of the `list-item` counter for the list item `node`, following HTML's ordinal-value
++/// rules (<https://html.spec.whatwg.org/multipage/#ordinal-value>): the list owner's `start`
++/// and `reversed`, each item's `value`. General CSS counters (`counter-reset`,
++/// `counter-increment`) aren't implemented; this covers the list numbering pages rely on.
++#[expect(unsafe_code)]
++pub(crate) fn list_item_ordinal(context: &LayoutContext, node: ServoLayoutNode<'_>) -> i32 {
++    let Some(element) = node.as_element() else {
++        return 1;
++    };
++    let element = unsafe { element.dangerous_style_element() };
++    let is_list_item = |element: &ServoDangerousStyleElement<'_>| {
++        element
++            .layout_element()
++            .style(&context.style_context)
++            .get_box()
++            .display
++            .is_list_item()
++    };
++    let integer_attribute = |element: &ServoDangerousStyleElement<'_>, name| {
++        element
++            .layout_element()
++            .attribute_as_str(&ns!(), &name)
++            .and_then(|value| value.trim().parse::<i32>().ok())
++    };
++
++    let mut items = vec![element];
++    let mut sibling = element.prev_sibling_element();
++    while let Some(previous) = sibling {
++        sibling = previous.prev_sibling_element();
++        if is_list_item(&previous) {
++            items.push(previous);
++        }
++    }
++    items.reverse();
++
++    let owner = element.traversal_parent();
++    let owner_is_ol = owner.is_some_and(|owner| {
++        owner.layout_element().is_html_element_in_html_document() &&
++            *owner.layout_element().local_name() == local_name!("ol")
++    });
++    let reversed = owner_is_ol &&
++        owner.is_some_and(|owner| {
++            owner
++                .layout_element()
++                .attribute(&ns!(), &local_name!("reversed"))
++                .is_some()
++        });
++    let step = if reversed { -1 } else { 1 };
++    let start = owner
++        .filter(|_| owner_is_ol)
++        .and_then(|owner| integer_attribute(&owner, local_name!("start")))
++        .unwrap_or_else(|| {
++            if !reversed {
++                return 1;
++            }
++            // A reversed list counts down from its number of items.
++            let mut count = 0;
++            let mut child = owner.and_then(|owner| owner.first_element_child());
++            while let Some(item) = child {
++                if is_list_item(&item) {
++                    count += 1;
++                }
++                child = item.next_sibling_element();
++            }
++            count
++        });
++
++    let mut ordinal = start - step;
++    for item in items {
++        ordinal = match integer_attribute(&item, local_name!("value")) {
++            Some(value) if *item.layout_element().local_name() == local_name!("li") => value,
++            _ => ordinal + step,
++        };
++    }
++    ordinal
++}
++
+ /// <https://drafts.csswg.org/css-counter-styles-3/#generate-a-counter>
+-pub(crate) fn generate_counter_representation(counter_style: &CounterStyle) -> &str {
+-    // TODO: Most counter styles produce different results depending on the counter value.
+-    // Since we don't support counter properties yet, assume a value of 0 for now.
++pub(crate) fn generate_counter_representation(counter_style: &CounterStyle, value: i32) -> String {
++    if let Some(representation) = numeric_counter_representation(counter_style, value) {
++        return representation;
++    }
++    // Other counter styles are drawn for a value of 0.
++    zero_counter_representation(counter_style).to_owned()
++}
++
++/// The predefined counter styles whose representation depends on the value: decimal and the
++/// other decimal-digit scripts, alphabetic, roman and greek.
++fn numeric_counter_representation(counter_style: &CounterStyle, value: i32) -> Option<String> {
++    let CounterStyle::Name(name) = counter_style else {
++        return None;
++    };
++    let digits = |zero: char| -> String {
++        let mut representation: String = value
++            .unsigned_abs()
++            .to_string()
++            .chars()
++            .map(|digit| char::from_u32(zero as u32 + digit.to_digit(10).unwrap()).unwrap())
++            .collect();
++        if value < 0 {
++            representation.insert(0, '-');
++        }
++        representation
++    };
++    let alphabetic = |symbols: &[char]| -> Option<String> {
++        if value < 1 {
++            return None;
++        }
++        let mut remaining = value as usize;
++        let mut representation = vec![];
++        while remaining > 0 {
++            remaining -= 1;
++            representation.push(symbols[remaining % symbols.len()]);
++            remaining /= symbols.len();
++        }
++        Some(representation.into_iter().rev().collect())
++    };
++    let roman = |upper: bool| -> Option<String> {
++        if !(1..=3999).contains(&value) {
++            return None;
++        }
++        const NUMERALS: [(i32, &str); 13] = [
++            (1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"),
++            (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"),
++        ];
++        let mut remaining = value;
++        let mut representation = String::new();
++        for (amount, numeral) in NUMERALS {
++            while remaining >= amount {
++                representation.push_str(numeral);
++                remaining -= amount;
++            }
++        }
++        Some(if upper { representation.to_uppercase() } else { representation })
++    };
++    let lower_latin: Vec<char> = ('a'..='z').collect();
++    let upper_latin: Vec<char> = ('A'..='Z').collect();
++    let lower_greek: Vec<char> = "αβγδεζηθικλμνξοπρστυφχψω".chars().collect();
++    let representation = match name.0 {
++        atom!("decimal") => digits('0'),
++        atom!("decimal-leading-zero") => {
++            if (0..10).contains(&value) {
++                format!("0{value}")
++            } else {
++                digits('0')
++            }
++        },
++        atom!("lower-alpha") | atom!("lower-latin") => alphabetic(&lower_latin)?,
++        atom!("upper-alpha") | atom!("upper-latin") => alphabetic(&upper_latin)?,
++        atom!("lower-greek") => alphabetic(&lower_greek)?,
++        atom!("lower-roman") => roman(false)?,
++        atom!("upper-roman") => roman(true)?,
++        atom!("arabic-indic") => digits('\u{660}'),
++        atom!("bengali") => digits('\u{9E6}'),
++        atom!("cambodian") | atom!("khmer") => digits('\u{17E0}'),
++        atom!("devanagari") => digits('\u{966}'),
++        atom!("gujarati") => digits('\u{AE6}'),
++        atom!("gurmukhi") => digits('\u{A66}'),
++        atom!("kannada") => digits('\u{CE6}'),
++        atom!("lao") => digits('\u{ED0}'),
++        atom!("malayalam") => digits('\u{D66}'),
++        atom!("mongolian") => digits('\u{1810}'),
++        atom!("myanmar") => digits('\u{1040}'),
++        atom!("oriya") => digits('\u{B66}'),
++        atom!("persian") => digits('\u{6F0}'),
++        atom!("tamil") => digits('\u{BE6}'),
++        atom!("telugu") => digits('\u{C66}'),
++        atom!("thai") => digits('\u{E50}'),
++        atom!("tibetan") => digits('\u{F20}'),
++        _ => return None,
++    };
++    Some(representation)
++}
++
++fn zero_counter_representation(counter_style: &CounterStyle) -> &str {
+     match counter_style {
+         CounterStyle::None | CounterStyle::String(_) => unreachable!("Invalid counter style"),
+         CounterStyle::Name(name) => match name.0 {
+@@ -129,7 +309,7 @@ pub(crate) fn generate_counter_representation(counter_style: &CounterStyle) -> &
+ }
+ 
+ /// <https://drafts.csswg.org/css-lists/#marker-string>
+-pub(crate) fn marker_string(list_style_type: &ListStyleType) -> Option<String> {
++pub(crate) fn marker_string(list_style_type: &ListStyleType, ordinal: i32) -> Option<String> {
+     let suffix = match &list_style_type.0 {
+         CounterStyle::None => return None,
+         CounterStyle::String(string) => return Some(string.to_string()),
+@@ -161,5 +341,122 @@ pub(crate) fn marker_string(list_style_type: &ListStyleType) -> Option<String> {
+         },
+         CounterStyle::Symbols { .. } => " ",
+     };
+-    Some(generate_counter_representation(&list_style_type.0).to_string() + suffix)
++    Some(generate_counter_representation(&list_style_type.0, ordinal) + suffix)
++}
++
++/// The values of the instances of counter `name` in scope at the pseudo-element `node`
++/// (outermost first), as `counters()` lists them; `counter()` takes the last.
++/// <https://drafts.csswg.org/css-lists/#auto-numbering>: walks the document in tree order up to
++/// `node`, applying each rendered element's and `::before`/`::after`'s `counter-reset` and
++/// `counter-increment`. An instance lives on its creator's following siblings and their
++/// descendants; a reset on a sibling of its creator replaces it. Without an instance in scope
++/// the value is 0, as `counter()` instantiates one.
++#[expect(unsafe_code)]
++pub(crate) fn counter_values(
++    context: &LayoutContext,
++    node: ServoLayoutNode<'_>,
++    name: &CustomIdent,
++) -> Vec<i32> {
++    let mut root = node;
++    while let Some(parent) = unsafe { root.dangerous_flat_tree_parent() } {
++        root = parent;
++    }
++    let mut walk = CounterWalk {
++        context,
++        name,
++        target: node.opaque(),
++        target_pseudo: node.pseudo_element_chain().primary,
++        instances: Vec::new(),
++    };
++    for child in root.flat_tree_children() {
++        if let Some(values) = walk.visit(child, 0) {
++            return values;
++        }
++    }
++    vec![0]
++}
++
++struct CounterWalk<'a> {
++    context: &'a LayoutContext<'a>,
++    name: &'a CustomIdent,
++    target: OpaqueNode,
++    target_pseudo: Option<PseudoElement>,
++    /// The instances in scope, innermost last, with the tree depth of their creator.
++    instances: Vec<(usize, i32)>,
++}
++
++impl CounterWalk<'_> {
++    fn apply(&mut self, style: &ComputedValues, depth: usize) {
++        let counters = style.get_counters();
++        for pair in counters.counter_reset.iter().filter(|pair| pair.name == *self.name) {
++            match self.instances.last_mut() {
++                Some((creator_depth, value)) if *creator_depth == depth => *value = pair.value,
++                _ => self.instances.push((depth, pair.value)),
++            }
++        }
++        for pair in counters
++            .counter_increment
++            .iter()
++            .filter(|pair| pair.name == *self.name)
++        {
++            if self.instances.is_empty() {
++                self.instances.push((depth, 0));
++            }
++            let (_, value) = self.instances.last_mut().expect("Pushed above");
++            *value = value.wrapping_add(pair.value);
++        }
++    }
++
++    fn values(&self) -> Vec<i32> {
++        if self.instances.is_empty() {
++            return vec![0];
++        }
++        self.instances.iter().map(|(_, value)| *value).collect()
++    }
++
++    fn pseudo_style(
++        &self,
++        node: ServoLayoutNode<'_>,
++        pseudo: PseudoElement,
++    ) -> Option<servo_arc::Arc<ComputedValues>> {
++        let style = node
++            .as_element()?
++            .with_pseudo(pseudo)?
++            .style(&self.context.style_context);
++        (!style.ineffective_content_property()).then_some(style)
++    }
++
++    /// Returns the values at the target once reached.
++    fn visit(&mut self, node: ServoLayoutNode<'_>, depth: usize) -> Option<Vec<i32>> {
++        node.as_element()?;
++        let style = node.style(&self.context.style_context);
++        if style.get_box().display.is_none() {
++            return None;
++        }
++        self.apply(&style, depth);
++        let is_target = node.opaque() == self.target;
++        if is_target && self.target_pseudo == Some(PseudoElement::Marker) {
++            return Some(self.values());
++        }
++        if let Some(before) = self.pseudo_style(node, PseudoElement::Before) {
++            self.apply(&before, depth + 1);
++        }
++        if is_target && self.target_pseudo == Some(PseudoElement::Before) {
++            return Some(self.values());
++        }
++        for child in node.flat_tree_children() {
++            if let Some(values) = self.visit(child, depth + 1) {
++                return Some(values);
++            }
++        }
++        if let Some(after) = self.pseudo_style(node, PseudoElement::After) {
++            self.apply(&after, depth + 1);
++        }
++        if is_target {
++            return Some(self.values());
++        }
++        // The instances its children and pseudo-elements created end with this element.
++        self.instances.retain(|(creator_depth, _)| *creator_depth <= depth);
++        None
++    }
+ }
+-- 
+2.43.0
+

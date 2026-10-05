@@ -1,0 +1,224 @@
+From 8fc22d1fa9228159885a094d81f7aeb2b2f68647 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sat, 3 Oct 2026 05:12:20 -0400
+Subject: [PATCH] script: focusin/focusout, change on blur and Enter, default
+ <button> submits
+
+- focus and blur on elements are followed by the bubbling, composed
+  focusin and focusout (UI Events). React 17+ builds onFocus/onBlur on
+  them, so they never ran.
+- A text control edited while focused fires change when it loses focus
+  (HTML focus update step 2.2) or when Enter commits it. Text inputs and
+  textareas never fired change, breaking jQuery .change, v-model.lazy and
+  validate-on-change forms.
+- Implicit submission clicks the form's default button, the first submit
+  button in tree order, which is usually a <button>. Only
+  <input type=submit> counted, so Enter did nothing in most forms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/document/focus.rs       | 91 ++++++++++++++++++-
+ .../script/dom/html/input_element/mod.rs      | 31 +++++--
+ 2 files changed, 111 insertions(+), 11 deletions(-)
+
+diff --git a/components/script/dom/document/focus.rs b/components/script/dom/document/focus.rs
+index 0c40fb62ea8..36f481f5cb5 100644
+--- a/components/script/dom/document/focus.rs
++++ b/components/script/dom/document/focus.rs
+@@ -24,8 +24,12 @@ use crate::dom::bindings::root::MutNullableDom;
+ use crate::dom::focusevent::FocusEventType;
+ use crate::dom::node::focus::FocusNavigationScopeOwner;
+ use crate::dom::types::{
+-    Element, EventTarget, FocusEvent, HTMLElement, HTMLIFrameElement, KeyboardEvent, Window,
++    Element, EventTarget, FocusEvent, HTMLElement, HTMLIFrameElement, HTMLInputElement,
++    HTMLTextAreaElement, KeyboardEvent, Window,
+ };
++use crate::dom::bindings::codegen::Bindings::HTMLInputElementBinding::HTMLInputElementMethods;
++use crate::dom::bindings::codegen::Bindings::HTMLTextAreaElementBinding::HTMLTextAreaElementMethods;
++use crate::dom::bindings::str::DOMString;
+ use crate::dom::{Document, Event, EventBubbles, EventCancelable, Node, NodeTraits};
+ use crate::realms::enter_auto_realm;
+ 
+@@ -153,6 +157,10 @@ pub(crate) struct DocumentFocusHandler {
+     has_focus: Cell<bool>,
+     /// <https://html.spec.whatwg.org/multipage/#sequential-focus-navigation-starting-point>
+     sequential_focus_navigation_starting_point: MutNullableDom<Node>,
++    /// The focused text control and its value when focused, so blurring it after an edit
++    /// fires `change`.
++    focused_text_control: MutNullableDom<Element>,
++    focused_text_control_value: DomRefCell<Option<DOMString>>,
+ }
+ 
+ impl DocumentFocusHandler {
+@@ -163,6 +171,8 @@ impl DocumentFocusHandler {
+             focus_sequence: Cell::new(FocusSequenceNumber::default()),
+             has_focus: Cell::new(has_focus),
+             sequential_focus_navigation_starting_point: Default::default(),
++            focused_text_control: Default::default(),
++            focused_text_control_value: Default::default(),
+         }
+     }
+ 
+@@ -389,6 +399,16 @@ impl DocumentFocusHandler {
+                 _ => None,
+             };
+ 
++            // Step 2.2: If entry is an input element, and the change event applies to the
++            // element, and the element does not have a defined activation behavior, and the
++            // user has changed the element's value or its list of selected files while the
++            // control was focused without committing that change, then fire an event named
++            // change at the element, with the bubbles attribute initialized to true.
++            if let Some(element) = blur_event_target.and_then(|target| target.downcast::<Element>())
++            {
++                self.fire_change_if_edited_since_focus(cx, element);
++            }
++
+             // Step 2.4: If blur event target is not null, fire a focus event named blur at
+             // blur event target, with related blur target as the related target.
+             if let Some(blur_event_target) = blur_event_target {
+@@ -479,7 +499,42 @@ impl DocumentFocusHandler {
+         }
+     }
+ 
+-    /// <https://html.spec.whatwg.org/multipage/#fire-a-focus-event>
++    /// The value of `element` if it is a text control (`<textarea>`, or an `<input>` taking
++    /// text), whose edits commit on blur.
++    fn text_control_value(element: &Element) -> Option<DOMString> {
++        if let Some(input) = element.downcast::<HTMLInputElement>() {
++            return input.is_textual_or_password().then(|| input.Value());
++        }
++        element
++            .downcast::<HTMLTextAreaElement>()
++            .map(|textarea| textarea.Value())
++    }
++
++    /// Fires `change` at `element` if it is the focused text control and its value changed
++    /// since it was focused. Also called when Enter commits an edit.
++    pub(crate) fn fire_change_if_edited_since_focus(&self, cx: &mut JSContext, element: &Element) {
++        if self.focused_text_control.get().as_deref() != Some(element) {
++            return;
++        }
++        let Some(value) = Self::text_control_value(element) else {
++            return;
++        };
++        let edited = self
++            .focused_text_control_value
++            .borrow()
++            .as_ref()
++            .is_some_and(|value_at_focus| *value_at_focus != value);
++        *self.focused_text_control_value.borrow_mut() = Some(value);
++        if edited {
++            element
++                .upcast::<EventTarget>()
++                .fire_bubbling_event(cx, atom!("change"));
++        }
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#fire-a-focus-event>, followed for elements by
++    /// the bubbling `focusin`/`focusout` of <https://w3c.github.io/uievents/#event-type-focusin>,
++    /// which React's `onFocus`/`onBlur` listen for.
+     pub(crate) fn fire_focus_event(
+         &self,
+         cx: &mut JSContext,
+@@ -505,6 +560,38 @@ impl DocumentFocusHandler {
+         let event = event.upcast::<Event>();
+         event.set_trusted(true);
+         event.fire(cx, event_target);
++
++        let Some(element) = event_target.downcast::<Element>() else {
++            return;
++        };
++        match focus_event_type {
++            FocusEventType::Focus => {
++                self.focused_text_control.set(Some(element));
++                *self.focused_text_control_value.borrow_mut() = Self::text_control_value(element);
++            },
++            FocusEventType::Blur => {
++                self.focused_text_control.set(None);
++                *self.focused_text_control_value.borrow_mut() = None;
++            },
++        }
++        let bubbling_name = match focus_event_type {
++            FocusEventType::Focus => "focusin".into(),
++            FocusEventType::Blur => "focusout".into(),
++        };
++        let bubbling_event = FocusEvent::new(
++            cx,
++            &self.window,
++            bubbling_name,
++            EventBubbles::Bubbles,
++            EventCancelable::NotCancelable,
++            Some(&self.window),
++            0i32,
++            related_target,
++        );
++        let bubbling_event = bubbling_event.upcast::<Event>();
++        bubbling_event.set_trusted(true);
++        bubbling_event.set_composed(true);
++        bubbling_event.fire(cx, event_target);
+     }
+ 
+     /// <https://html.spec.whatwg.org/multipage/#focus-fixup-rule>
+diff --git a/components/script/dom/html/input_element/mod.rs b/components/script/dom/html/input_element/mod.rs
+index 2cc494a9da5..6c2b8f430cb 100644
+--- a/components/script/dom/html/input_element/mod.rs
++++ b/components/script/dom/html/input_element/mod.rs
+@@ -55,6 +55,7 @@ use crate::dom::event::Event;
+ use crate::dom::event::event::{EventBubbles, EventCancelable, EventComposed};
+ use crate::dom::eventtarget::EventTarget;
+ use crate::dom::filelist::FileList;
++use crate::dom::html::htmlbuttonelement::HTMLButtonElement;
+ use crate::dom::html::htmldatalistelement::HTMLDataListElement;
+ use crate::dom::html::htmlelement::HTMLElement;
+ use crate::dom::html::htmlfieldsetelement::HTMLFieldSetElement;
+@@ -868,6 +869,11 @@ impl HTMLInputElement {
+     fn handle_key_reaction(&self, cx: &mut JSContext, action: KeyReaction, event: &Event) {
+         match action {
+             KeyReaction::TriggerDefaultAction => {
++                // Enter commits an edit like blurring does (browsers fire `change` before
++                // submitting).
++                self.owner_document()
++                    .focus_handler()
++                    .fire_change_if_edited_since_focus(cx, self.upcast());
+                 self.implicit_submission(cx);
+                 event.mark_as_handled();
+             },
+@@ -1855,19 +1861,26 @@ impl HTMLInputElement {
+         if self.upcast::<Element>().click_in_progress() {
+             return;
+         }
+-        let submit_button = node
++        // <https://html.spec.whatwg.org/multipage/#default-button>: the form's first submit
++        // button in tree order, which is usually a `<button>` (default type submit).
++        let default_button = node
+             .traverse_preorder(ShadowIncluding::No)
+-            .filter_map(DomRoot::downcast::<HTMLInputElement>)
+-            .filter(|input| matches!(*input.input_type(), InputType::Submit(_)))
+-            .find(|r| r.form_owner() == owner);
+-        match submit_button {
++            .find(|node| {
++                if let Some(input) = node.downcast::<HTMLInputElement>() {
++                    matches!(*input.input_type(), InputType::Submit(_) | InputType::Image(_)) &&
++                        input.form_owner() == owner
++                } else if let Some(button) = node.downcast::<HTMLButtonElement>() {
++                    button.is_submit_button() && button.form_owner() == owner
++                } else {
++                    false
++                }
++            });
++        match default_button {
+             Some(ref button) => {
+-                if button.is_instance_activatable() {
++                if !button.downcast::<Element>().unwrap().is_actually_disabled() {
+                     // spec does not actually say to set the not trusted flag,
+                     // but we can get here from synthetic keydown events
+-                    button
+-                        .upcast::<Node>()
+-                        .fire_synthetic_pointer_event_not_trusted(cx, atom!("click"));
++                    button.fire_synthetic_pointer_event_not_trusted(cx, atom!("click"));
+                 }
+             },
+             None => {
+-- 
+2.43.0
+

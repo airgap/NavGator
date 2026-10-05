@@ -1,0 +1,32 @@
+From c0a4fa6a74028b113291507a2ff8f0c232ecd7d0 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sat, 3 Oct 2026 05:47:19 -0400
+Subject: [PATCH] layout: no ellipsis pass on an empty clamped line
+
+A -webkit-line-clamp line can hold no items (an empty preserved line in
+pre-wrap); indexing its items panicked layout, which crashed bsky.app
+profiles.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/flow/inline/mod.rs | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/components/layout/flow/inline/mod.rs b/components/layout/flow/inline/mod.rs
+index 32bf38868ad..3429d2bb204 100644
+--- a/components/layout/flow/inline/mod.rs
++++ b/components/layout/flow/inline/mod.rs
+@@ -1317,7 +1317,9 @@ impl InlineFormattingContextLayout<'_> {
+             LineItem::BlockLevel(..) => true,
+             _ => false,
+         });
+-        if editable_or_block_level ||
++        // A clamped line can hold no items (an empty preserved line in `pre-wrap`).
++        if line_items.is_empty() ||
++            editable_or_block_level ||
+             (!clamped && line_items.iter().map(width).sum::<Au>() <= available)
+         {
+             return;
+-- 
+2.43.0
+

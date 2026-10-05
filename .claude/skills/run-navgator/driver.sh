@@ -25,7 +25,7 @@ set -uo pipefail
 DISP="${NAVG_DISPLAY:-:99}"
 W=1280; H=800
 BIN="${NAVG_BIN:-./target/debug/navgator}"
-STATE="/tmp/navgator-run"
+STATE="${NAVG_STATE:-/tmp/navgator-run}"
 mkdir -p "$STATE"
 
 find_wid() { DISPLAY="$DISP" xdotool search --name NavGator 2>/dev/null | head -1; }

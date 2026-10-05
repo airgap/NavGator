@@ -10,8 +10,8 @@
 //! this crate, not the app.
 
 pub use servo::{
-    CreateNewWebViewRequest, DeviceIntRect, DeviceIntSize, DevicePoint, InputEvent, InputEventId,
-    InputEventResult, Key, KeyState,
+    Code, CreateNewWebViewRequest, DeviceIntRect, DeviceIntSize, DevicePoint, InputEvent,
+    InputEventId, InputEventResult, Key, KeyState, Location,
     KeyboardEvent, LoadStatus, Modifiers,
     MouseButton, MouseButtonAction,
     MouseButtonEvent, MouseMoveEvent, NamedKey, NavigationRequest, OffscreenRenderingContext,
@@ -41,7 +41,9 @@ pub use servo::{
 // callers and don't need to be named.
 pub use servo::{WebResourceLoad, WebResourceResponse};
 
-pub use embedder_traits::{ConsoleLogLevel, Cursor, EventLoopWaker, JSValue, Theme};
+pub use embedder_traits::{
+    ConsoleLogLevel, Cursor, EventLoopWaker, JSValue, ScreenGeometry, Theme,
+};
 
 // `http` types (HeaderMap/StatusCode/HeaderValue), version-matched to the engine, for building
 // the WebResourceResponse served to gator:// loads.

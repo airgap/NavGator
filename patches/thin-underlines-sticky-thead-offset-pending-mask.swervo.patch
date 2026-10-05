@@ -1,0 +1,213 @@
+From 3995c0118aef50fb218d3f678abe683ae3fe57e2 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sat, 3 Oct 2026 05:47:20 -0400
+Subject: [PATCH] fix: thin underlines, sticky thead offset, pending masks,
+ scrollIntoViewIfNeeded
+
+- Text decorations are at least one device pixel thick; Open Sans's thin
+  underline rounded to zero below 20px (kubernetes.io links).
+- A sticky <thead>/<tr> is no longer also offset as if relatively
+  positioned (docs.github.com table headers vanished).
+- An element whose mask-image is loading or failed is hidden, as
+  css-masking treats such a layer as transparent; it painted as a solid
+  box (MDN's icons).
+- Element.scrollIntoViewIfNeeded(), which Tailwind's docs use when present.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/display_list/mod.rs         | 37 +++++++++++++++++--
+ components/layout/table/layout.rs             | 11 +++++-
+ components/script/dom/element/element.rs      | 20 +++++++++-
+ .../script_bindings/codegen/Bindings.conf     |  2 +-
+ .../script_bindings/webidls/Element.webidl    |  2 +
+ 5 files changed, 64 insertions(+), 8 deletions(-)
+
+diff --git a/components/layout/display_list/mod.rs b/components/layout/display_list/mod.rs
+index fbe5852d127..2510533678b 100644
+--- a/components/layout/display_list/mod.rs
++++ b/components/layout/display_list/mod.rs
+@@ -1139,7 +1139,7 @@ impl Fragment {
+                 let mut rect = rect;
+                 rect.origin.y += font_metrics.ascent - font_metrics.underline_offset;
+                 rect.size.height =
+-                    Au::from_f32_px(font_metrics.underline_size.to_nearest_pixel(dppx));
++                    decoration_thickness(font_metrics.underline_size, dppx);
+ 
+                 Self::build_display_list_for_text_decoration(
+                     state,
+@@ -1156,7 +1156,7 @@ impl Fragment {
+             if text_decoration.line.contains(TextDecorationLine::OVERLINE) {
+                 let mut rect = rect;
+                 rect.size.height =
+-                    Au::from_f32_px(font_metrics.underline_size.to_nearest_pixel(dppx));
++                    decoration_thickness(font_metrics.underline_size, dppx);
+                 Self::build_display_list_for_text_decoration(
+                     state,
+                     &parent_style,
+@@ -1208,7 +1208,7 @@ impl Fragment {
+                 let mut rect = rect;
+                 rect.origin.y += font_metrics.ascent - font_metrics.strikeout_offset;
+                 rect.size.height =
+-                    Au::from_f32_px(font_metrics.strikeout_size.to_nearest_pixel(dppx));
++                    decoration_thickness(font_metrics.strikeout_size, dppx);
+                 Self::build_display_list_for_text_decoration(
+                     state,
+                     &parent_style,
+@@ -1594,13 +1594,19 @@ impl<'a> BuilderForBoxFragment<'a> {
+     ) -> Option<ClipChainId> {
+         let style = self.fragment.style();
+         let node = self.fragment.base.tag.map(|tag| tag.node);
++        // <https://drafts.fxtf.org/css-masking/#the-mask-image>: an image layer that is still
++        // loading or failed counts as a transparent black mask, hiding the element. Painting it
++        // unmasked showed solid boxes in place of MDN's icons.
++        let mut unready_image_layer = false;
+         for image in style.get_svg().mask_image.0.iter() {
++            let is_image_layer = matches!(image, style::values::computed::Image::Url(..));
+             let Ok(ResolvedImage::Image {
+                 image: cached,
+                 size,
+             }) = builder.image_resolver.resolve_image(node, image)
+             else {
+-                // `none`, gradients/colors (deferred), and pending/errored layers are skipped.
++                // `none` and gradients/colors (deferred) are skipped.
++                unready_image_layer |= is_image_layer;
+                 continue;
+             };
+             let image_key = match cached {
+@@ -1624,6 +1630,7 @@ impl<'a> BuilderForBoxFragment<'a> {
+             };
+             let Some(image_key) = image_key else {
+                 // Vector image not rasterized yet; reflow will repaint when it is ready.
++                unready_image_layer = true;
+                 continue;
+             };
+             // mask-clip / mask-origin: border-box (the MVP default).
+@@ -1634,6 +1641,17 @@ impl<'a> BuilderForBoxFragment<'a> {
+                 self.border_rect,
+             ));
+         }
++        if unready_image_layer {
++            let spatial_id = builder.spatial_id(spatial_id);
++            let empty_clip = builder
++                .wr()
++                .define_clip_rect(spatial_id, units::LayoutRect::zero());
++            return Some(
++                builder
++                    .wr()
++                    .define_clip_chain(parent_clip_chain_id, [empty_clip]),
++            );
++        }
+         None
+     }
+ 
+@@ -2876,3 +2894,14 @@ impl BaseFragment {
+         }
+     }
+ }
++
++/// A text decoration's thickness from the font's metric, snapped to device pixels but at least
++/// one: thin metrics (Open Sans's underline is 0.39px at 16px) rounded to zero and the
++/// decoration vanished. Blink clamps the same way.
++fn decoration_thickness(metric: Au, device_pixel_ratio: f32) -> Au {
++    Au::from_f32_px(
++        metric
++            .to_nearest_pixel(device_pixel_ratio)
++            .max(1.0 / device_pixel_ratio),
++    )
++}
+diff --git a/components/layout/table/layout.rs b/components/layout/table/layout.rs
+index 150c49e47aa..f7516f434da 100644
+--- a/components/layout/table/layout.rs
++++ b/components/layout/table/layout.rs
+@@ -2315,7 +2315,11 @@ impl<'a> RowFragmentLayout<'a> {
+         containing_block_for_children: &ContainingBlock,
+         row_group_fragment_layout: &mut Option<RowGroupFragmentLayout>,
+     ) -> Fragment {
+-        if self.positioning_context.is_some() {
++        // Sticky rows also get a positioning context, but only relative positioning offsets
++        // the box here; sticky offsets apply when scrolling.
++        if self.positioning_context.is_some() &&
++            self.row.base.style.clone_position() == Position::Relative
++        {
+             self.rect.start_corner +=
+                 relative_adjustement(&self.row.base.style, containing_block_for_children);
+         }
+@@ -2407,7 +2411,10 @@ impl RowGroupFragmentLayout {
+         containing_block_for_children: &ContainingBlock,
+     ) -> Fragment {
+         let row_group = self.row_group.borrow();
+-        if self.positioning_context.is_some() {
++        // As for rows: a sticky `<thead>` isn't offset as if relatively positioned.
++        if self.positioning_context.is_some() &&
++            row_group.base.style.clone_position() == Position::Relative
++        {
+             self.rect.start_corner +=
+                 relative_adjustement(&row_group.base.style, containing_block_for_children);
+         }
+diff --git a/components/script/dom/element/element.rs b/components/script/dom/element/element.rs
+index fa0b6e49cab..9aba609f3fa 100644
+--- a/components/script/dom/element/element.rs
++++ b/components/script/dom/element/element.rs
+@@ -169,7 +169,7 @@ use crate::dom::promise::Promise;
+ use crate::dom::range::Range;
+ use crate::dom::raredata::ElementRareData;
+ use crate::dom::sanitizer::Sanitizer;
+-use crate::dom::scrolling_box::{ScrollAxisState, ScrollingBox};
++use crate::dom::scrolling_box::{ScrollAxisState, ScrollRequirement, ScrollingBox};
+ use crate::dom::servoparser::ServoParser;
+ use crate::dom::shadowroot::{IsUserAgentWidget, ShadowRoot};
+ use crate::dom::svg::svgsvgelement::SVGSVGElement;
+@@ -3718,6 +3718,24 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
+         // element to the user’s attention.
+     }
+ 
++    /// Blink's `scrollIntoViewIfNeeded()`: scroll only an element that is out of view, to the
++    /// center of the scrollport (or the nearest edge without `centerIfNeeded`).
++    fn ScrollIntoViewIfNeeded(&self, cx: &mut JSContext, center_if_needed: bool) {
++        if !self.has_css_layout_box() {
++            return;
++        }
++        let position = if center_if_needed {
++            ScrollLogicalPosition::Center
++        } else {
++            ScrollLogicalPosition::Nearest
++        };
++        let axis = ScrollAxisState {
++            position,
++            requirement: ScrollRequirement::IfNotVisible,
++        };
++        self.scroll_into_view_with_options(cx, ScrollBehavior::Auto, axis, axis, None, None);
++    }
++
+     /// <https://drafts.csswg.org/cssom-view/#dom-element-scrollwidth>
+     fn ScrollWidth(&self) -> i32 {
+         self.upcast::<Node>().scroll_area().size.width
+diff --git a/components/script_bindings/codegen/Bindings.conf b/components/script_bindings/codegen/Bindings.conf
+index 7bb070f7563..369e467b386 100644
+--- a/components/script_bindings/codegen/Bindings.conf
++++ b/components/script_bindings/codegen/Bindings.conf
+@@ -397,7 +397,7 @@ DOMInterfaces = {
+         'Scroll',
+         'ScrollBy',
+         'ScrollBy_',
+-        'ScrollIntoView',
++        'ScrollIntoView', 'ScrollIntoViewIfNeeded',
+         'ScrollTo',
+         'ScrollTo_',
+         'Scroll_',
+diff --git a/components/script_bindings/webidls/Element.webidl b/components/script_bindings/webidls/Element.webidl
+index 1b2daa36c35..fecaa89b51e 100644
+--- a/components/script_bindings/webidls/Element.webidl
++++ b/components/script_bindings/webidls/Element.webidl
+@@ -105,6 +105,8 @@ partial interface Element {
+   DOMRect getBoundingClientRect();
+ 
+   undefined scrollIntoView(optional (boolean or ScrollIntoViewOptions) arg = {});
++  // Non-standard, but in every browser engine except Gecko; sites use it when present.
++  undefined scrollIntoViewIfNeeded(optional boolean centerIfNeeded = true);
+   undefined scroll(optional ScrollToOptions options = {});
+   undefined scroll(unrestricted double x, unrestricted double y);
+ 
+-- 
+2.43.0
+

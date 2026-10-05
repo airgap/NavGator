@@ -22,14 +22,14 @@ lto = "thin"
 # + fill/stroke and the other SVG paint properties for Servo (inline-SVG serialization copies them in);
 # Cargo honours these workspace-root patches across the entire (swervo-transitive) graph.
 [patch."https://github.com/servo/stylo"]
-selectors            = { git = "https://github.com/airgap/stylo", rev = "23a4897b8769339a7eefdab7fc01e7ca3a438662" }
-servo_arc            = { git = "https://github.com/airgap/stylo", rev = "23a4897b8769339a7eefdab7fc01e7ca3a438662" }
-stylo                = { git = "https://github.com/airgap/stylo", rev = "23a4897b8769339a7eefdab7fc01e7ca3a438662" }
-stylo_atoms          = { git = "https://github.com/airgap/stylo", rev = "23a4897b8769339a7eefdab7fc01e7ca3a438662" }
-stylo_dom            = { git = "https://github.com/airgap/stylo", rev = "23a4897b8769339a7eefdab7fc01e7ca3a438662" }
-stylo_malloc_size_of = { git = "https://github.com/airgap/stylo", rev = "23a4897b8769339a7eefdab7fc01e7ca3a438662" }
-stylo_static_prefs   = { git = "https://github.com/airgap/stylo", rev = "23a4897b8769339a7eefdab7fc01e7ca3a438662" }
-stylo_traits         = { git = "https://github.com/airgap/stylo", rev = "23a4897b8769339a7eefdab7fc01e7ca3a438662" }
+selectors            = { git = "https://github.com/airgap/stylo", rev = "759cfb769e142c986e921e663f30c20b16adfe0d" }
+servo_arc            = { git = "https://github.com/airgap/stylo", rev = "759cfb769e142c986e921e663f30c20b16adfe0d" }
+stylo                = { git = "https://github.com/airgap/stylo", rev = "759cfb769e142c986e921e663f30c20b16adfe0d" }
+stylo_atoms          = { git = "https://github.com/airgap/stylo", rev = "759cfb769e142c986e921e663f30c20b16adfe0d" }
+stylo_dom            = { git = "https://github.com/airgap/stylo", rev = "759cfb769e142c986e921e663f30c20b16adfe0d" }
+stylo_malloc_size_of = { git = "https://github.com/airgap/stylo", rev = "759cfb769e142c986e921e663f30c20b16adfe0d" }
+stylo_static_prefs   = { git = "https://github.com/airgap/stylo", rev = "759cfb769e142c986e921e663f30c20b16adfe0d" }
+stylo_traits         = { git = "https://github.com/airgap/stylo", rev = "759cfb769e142c986e921e663f30c20b16adfe0d" }
 
 # webrender is consumed from crates.io (0.69 / 0.2.2); redirect to our fork's 0.69-branch HEAD.
 [patch.crates-io]

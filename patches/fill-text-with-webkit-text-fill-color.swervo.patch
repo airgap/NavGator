@@ -1,0 +1,43 @@
+From 0583cd6604a5286626059e2de76ba234c9b9edab Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sat, 3 Oct 2026 05:12:20 -0400
+Subject: [PATCH] layout: fill text with -webkit-text-fill-color
+
+Glyphs were always painted in color, so the gradient-heading idiom
+(background-clip: text with a transparent -webkit-text-fill-color)
+showed solid text over the gradient. Shadows and decorations keep color.
+-webkit-text-stroke is not drawn: WebRender has no stroked text.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/display_list/mod.rs | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/components/layout/display_list/mod.rs b/components/layout/display_list/mod.rs
+index 71f33709cc5..fbe5852d127 100644
+--- a/components/layout/display_list/mod.rs
++++ b/components/layout/display_list/mod.rs
+@@ -1177,12 +1177,19 @@ impl Fragment {
+             fragment.justification_adjustment,
+         );
+ 
++        // <https://compat.spec.whatwg.org/#the-webkit-text-fill-color>: glyphs are filled with
++        // `-webkit-text-fill-color` (`currentcolor` by default); shadows and decorations keep
++        // `color`. Gradient headings set it transparent over `background-clip: text`.
++        let fill_color = parent_style
++            .get_inherited_text()
++            .clone__webkit_text_fill_color()
++            .resolve_to_absolute(&color);
+         builder.wr().push_text(
+             &common,
+             glyph_bounds,
+             &glyphs,
+             fragment.font_key,
+-            rgba(color),
++            rgba(fill_color),
+             None,
+         );
+ 
+-- 
+2.43.0
+

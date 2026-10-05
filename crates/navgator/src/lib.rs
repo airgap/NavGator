@@ -48,11 +48,11 @@ use euclid::default::{Point2D, Rect, Size2D};
 // Everything from the engine comes through navgator-engine, the only crate that touches
 // the Servo fork (ROADMAP §R2; docs/FORK.md). IPC wire types come from navgator-protocol.
 use navgator_engine::{
-    AuthenticationRequest, ColorPicker, ConsoleLogLevel, CreateNewWebViewRequest, Cursor, DeviceIntRect,
-    DeviceIntSize, DevicePoint, EmbedderControl,
+    AuthenticationRequest, Code, ColorPicker, ConsoleLogLevel, CreateNewWebViewRequest, Cursor, DeviceIntRect,
+    DeviceIntSize, DevicePoint, EmbedderControl, ScreenGeometry,
     EmbedderControlId, EventLoopWaker, FilePicker, FilterPattern, Image, InputEvent, InputEventId,
     InputEventResult, JSValue, Key,
-    KeyState, KeyboardEvent, LoadStatus, MediaSessionEvent, MediaSessionPlaybackState, Modifiers,
+    KeyState, KeyboardEvent, LoadStatus, Location, MediaSessionEvent, MediaSessionPlaybackState, Modifiers,
     MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
     NamedKey as ServoNamedKey, NavigationRequest, OffscreenRenderingContext, Opts, PermissionRequest,
     PixelFormat, Preferences, RenderingContext, run_content_process,
@@ -159,6 +159,22 @@ pub fn desktop_main() -> Result<(), Box<dyn Error>> {
                     log::error!("{info}");
                     default_hook(info);
                 }));
+                // A content process outlives a browser that dies without shutting it down (a
+                // crash, SIGKILL): its script thread never notices the dead IPC peer and the
+                // process sleeps on forever (hundreds piled up, ~5 MB each, after test runs).
+                // Exit once reparented. Polling `getppid` instead of PR_SET_PDEATHSIG, which fires
+                // when the *thread* that forked us exits rather than the process. Spawned before
+                // the sandbox, whose seccomp policy allows getppid and nanosleep.
+                let browser_pid = std::os::unix::process::parent_id();
+                std::thread::Builder::new()
+                    .name("ParentWatch".into())
+                    .spawn(move || loop {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        if std::os::unix::process::parent_id() != browser_pid {
+                            std::process::exit(0);
+                        }
+                    })
+                    .expect("Failed to spawn the parent watchdog thread");
                 run_content_process(token);
                 return Ok(());
             }
@@ -2078,9 +2094,12 @@ fn navgator_preferences() -> Preferences {
     // Enablement audit (LYK-1383): default-OFF stock prefs whose swervo impls are complete +
     // additive. `cookiestore.rs` is a full 746-line Get/Set/Delete impl over the cookie jar;
     // `wakelock.rs` is a spec-compliant Screen Wake Lock (permission-gated, rejects cleanly when
-    // denied). (Excluded: webvtt — vttcue::GetCueAsHTML is a `todo!()` panic; sharedworker/
-    // abort_controller/resize_observer/mutation_observer/crypto_subtle are already default-on.)
+    // denied). (sharedworker/abort_controller/resize_observer/mutation_observer/crypto_subtle
+    // are already default-on.)
     p.dom_cookiestore_enabled = true;
+    // WebVTT (VTTCue, TextTrack): Reddit's player subclasses `window.VTTCue` at load, and its
+    // post pages fail ("Request failed", no comments) when the class is missing.
+    p.dom_webvtt_enabled = true;
     // Native <foreignObject> layout (LYK-136 stage 3): real boxes for the HTML content —
     // live, hit-testable, in the a11y tree — composited through the svg mask via the
     // WR image-mask stacking context (phase 2). ON by default; NAVGATOR_NATIVE_FO=0
@@ -2113,7 +2132,9 @@ fn navgator_preferences() -> Preferences {
     p.layout_container_queries_enabled = true; // `@container` (ubiquitous on modern responsive sites)
     p.layout_columns_enabled = true; // CSS multi-column (`column-count`/`column-width`)
     p.layout_variable_fonts_enabled = true; // variable fonts (weight/width axes)
-    p.layout_writing_mode_enabled = true; // `writing-mode: vertical-*` (CJK + vertical layouts)
+    // Not `layout_writing_mode_enabled`: layout still asserts that writing modes never mix
+    // (flow/mod.rs, positioned.rs), so a vertical block panicked the whole browser. Ignoring
+    // `writing-mode` lays such text out horizontally instead.
     // Accessibility tree (LYK-1378): gate for the layout-built AccessKit tree of page content.
     // Off by default (it costs a tree walk per reflow); we opt in and expose it to the OS a11y
     // layer via the chrome's AccessKit adapter (see WebViewDelegate::notify_accessibility_tree_update).
@@ -3575,24 +3596,46 @@ var f=document.querySelector('span[data-ngf]');if(f)f.scrollIntoView({block:'cen
 return count;
 }"#;
 
-/// Minimal winit→Servo key mapping (printable + editing/nav keys).
-fn winit_key_to_servo(key: &WinitKey) -> Option<Key> {
-    Some(match key {
-        WinitKey::Character(s) => Key::Character(s.to_string()),
+/// A DOM keyboard event for a winit key event: `key`, `code`, `location` and `repeat` as the
+/// page expects them (`code` drives Space activation of buttons and checkboxes, and pages read
+/// it for shortcuts and games). winit's `NamedKey`/`KeyCode` variants carry the W3C key and
+/// code names, except that it calls Meta "Super".
+fn keyboard_event_from_winit(key_event: &winit::event::KeyEvent, modifiers: Modifiers) -> KeyboardEvent {
+    let state = match key_event.state {
+        ElementState::Pressed => KeyState::Down,
+        ElementState::Released => KeyState::Up,
+    };
+    let key = match &key_event.logical_key {
+        WinitKey::Character(text) => Key::Character(text.to_string()),
         WinitKey::Named(NamedKey::Space) => Key::Character(" ".to_string()),
-        WinitKey::Named(NamedKey::Enter) => Key::Named(ServoNamedKey::Enter),
-        WinitKey::Named(NamedKey::Backspace) => Key::Named(ServoNamedKey::Backspace),
-        WinitKey::Named(NamedKey::Delete) => Key::Named(ServoNamedKey::Delete),
-        WinitKey::Named(NamedKey::Tab) => Key::Named(ServoNamedKey::Tab),
-        WinitKey::Named(NamedKey::Escape) => Key::Named(ServoNamedKey::Escape),
-        WinitKey::Named(NamedKey::ArrowLeft) => Key::Named(ServoNamedKey::ArrowLeft),
-        WinitKey::Named(NamedKey::ArrowRight) => Key::Named(ServoNamedKey::ArrowRight),
-        WinitKey::Named(NamedKey::ArrowUp) => Key::Named(ServoNamedKey::ArrowUp),
-        WinitKey::Named(NamedKey::ArrowDown) => Key::Named(ServoNamedKey::ArrowDown),
-        WinitKey::Named(NamedKey::Home) => Key::Named(ServoNamedKey::Home),
-        WinitKey::Named(NamedKey::End) => Key::Named(ServoNamedKey::End),
-        _ => return None,
-    })
+        WinitKey::Named(named) => format!("{named:?}")
+            .replace("Super", "Meta")
+            .parse::<ServoNamedKey>()
+            .map_or(Key::Named(ServoNamedKey::Unidentified), Key::Named),
+        WinitKey::Unidentified(_) | WinitKey::Dead(_) => Key::Named(ServoNamedKey::Unidentified),
+    };
+    let code = match key_event.physical_key {
+        winit::keyboard::PhysicalKey::Code(code) => format!("{code:?}")
+            .replace("Super", "Meta")
+            .parse()
+            .unwrap_or(Code::Unidentified),
+        winit::keyboard::PhysicalKey::Unidentified(_) => Code::Unidentified,
+    };
+    let location = match key_event.location {
+        winit::keyboard::KeyLocation::Standard => Location::Standard,
+        winit::keyboard::KeyLocation::Left => Location::Left,
+        winit::keyboard::KeyLocation::Right => Location::Right,
+        winit::keyboard::KeyLocation::Numpad => Location::Numpad,
+    };
+    KeyboardEvent::new_without_event(
+        state,
+        key,
+        code,
+        location,
+        modifiers,
+        key_event.repeat,
+        false,
+    )
 }
 
 /// One browser tab: a content webview plus the state egui mirrors into the chrome.
@@ -4013,6 +4056,8 @@ struct AppState {
     ctrl: Cell<bool>,
     shift: Cell<bool>,
     alt: Cell<bool>,
+    /// The Super/Windows/Command key, which the page sees as Meta.
+    meta: Cell<bool>,
     /// Overridable (tier-2) keyboard shortcuts awaiting the page's verdict: `InputEventId` of the
     /// forwarded key → the shortcut to run if the page doesn't consume it. Drained in
     /// `notify_input_event_handled`. See [`KeyShortcut`].
@@ -10567,6 +10612,30 @@ impl WebViewDelegate for AppState {
         self.window.request_redraw();
     }
 
+    /// `window.screen`, `outerWidth`, `screenX` and friends. Without this they all read 0, and
+    /// sites sizing popups or picking a layout from `screen.width` broke.
+    fn screen_geometry(&self, _webview: WebView) -> Option<ScreenGeometry> {
+        let monitor = self.window.current_monitor()?;
+        let screen = monitor.size();
+        let screen = DeviceIntSize::new(screen.width as i32, screen.height as i32);
+        // Wayland doesn't reveal window positions to clients; browsers report 0 there.
+        let position = match self.window.outer_position() {
+            Ok(position) => position,
+            Err(_) => winit::dpi::PhysicalPosition::new(0, 0),
+        };
+        let outer = self.window.outer_size();
+        Some(ScreenGeometry {
+            size: screen,
+            // winit has no work-area query; the whole screen is what Chrome reports on X11
+            // without a panel-aware window manager.
+            available_size: screen,
+            window_rect: DeviceIntRect::from_origin_and_size(
+                euclid::point2(position.x, position.y),
+                DeviceIntSize::new(outer.width as i32, outer.height as i32),
+            ),
+        })
+    }
+
     /// Servo produced a new accessibility-tree update for a page. Queue it off the frame; it's
     /// drained into the chrome's AccessKit adapter in `update()`, grafted under the page's host
     /// node (LYK-1378).
@@ -11433,6 +11502,16 @@ impl WebViewDelegate for AppState {
                     handle: Some(picker),
                 });
             }
+            EmbedderControl::ContextMenu(menu) => {
+                // The page didn't cancel `contextmenu`: show our own menu, which builds its items
+                // from the page under the cursor, in place of the engine's.
+                menu.dismiss();
+                let (x, y) = self.cursor.get();
+                let scale = self.scale.get();
+                self.push_dialog(Dialog::ContextMenu {
+                    pos: egui::pos2((x / scale) as f32, (y / scale) as f32),
+                });
+            }
             // IME: not yet implemented.
             _ => {}
         }
@@ -11840,6 +11919,7 @@ fn open_window(
         ctrl: Cell::new(false),
         shift: Cell::new(false),
         alt: Cell::new(false),
+        meta: Cell::new(false),
         pending_shortcuts: RefCell::new(HashMap::new()),
         weak_self: RefCell::new(Weak::new()),
         archive: archive::ResourceArchive::from_env(),
@@ -12264,12 +12344,27 @@ impl ApplicationHandler<WakeUp> for App {
                 state.ctrl.set(m.state().control_key());
                 state.shift.set(m.state().shift_key());
                 state.alt.set(m.state().alt_key());
+                state.meta.set(m.state().super_key());
             }
             _ => {}
         }
 
-        // Feed egui, then decide whether the event also goes to the page.
-        let resp = state.egui.borrow_mut().on_window_event(&state.window, &event);
+        // Feed egui, then decide whether the event also goes to the page. Tab is kept from egui
+        // when no chrome widget wants the keyboard: egui always consumes it to cycle its own
+        // widget focus, which stole Tab from pages and left later typing in the toolbar.
+        let page_owns_tab = matches!(
+            &event,
+            WindowEvent::KeyboardInput { event, .. }
+                if event.logical_key == WinitKey::Named(NamedKey::Tab)
+        ) && !state.egui.borrow().egui_ctx.wants_keyboard_input();
+        let resp = if page_owns_tab {
+            egui_winit::EventResponse {
+                consumed: false,
+                repaint: false,
+            }
+        } else {
+            state.egui.borrow_mut().on_window_event(&state.window, &event)
+        };
         if resp.repaint {
             state.window.request_redraw();
         }
@@ -12344,17 +12439,9 @@ impl ApplicationHandler<WakeUp> for App {
                         return;
                     }
                 }
-                // Right-click over the page → native context menu.
-                if button == MouseButton::Right
-                    && bs == ElementState::Pressed
-                    && !over_chrome
-                    && !dialog_open
-                {
-                    state.push_dialog(Dialog::ContextMenu {
-                        pos: egui::pos2((cx / scale) as f32, (cy / scale) as f32),
-                    });
-                    return;
-                }
+                // Right-clicks go to the page like any button: it gets mousedown/up and a
+                // cancelable `contextmenu`. Our menu opens from `show_embedder_control` when the
+                // page doesn't cancel it, so sites can show their own menus.
                 // Drag the window ONLY from the reserved drag handle (left of the window controls).
                 // Nothing else is draggable — not the omnibar, not other toolbar space, not widgets.
                 let over_drag = state
@@ -12442,8 +12529,11 @@ impl ApplicationHandler<WakeUp> for App {
                 let over_focused = !state.split.get() || ((foc == 0) == (cx < mid_dev));
                 if !(resp.consumed || over_chrome || dialog_open) && over_focused {
                     let (dx, dy, mode) = match delta {
+                        // Converted to pixels here, so the page sees DOM_DELTA_PIXEL like
+                        // Chrome; reporting these values as lines made libraries that scale line
+                        // deltas (maps, custom scrollers) scroll ~40x too far.
                         MouseScrollDelta::LineDelta(lx, ly) => {
-                            ((lx * 76.0) as f64, (ly * 76.0) as f64, WheelMode::DeltaLine)
+                            ((lx * 76.0) as f64, (ly * 76.0) as f64, WheelMode::DeltaPixel)
                         }
                         MouseScrollDelta::PixelDelta(p) => (p.x, p.y, WheelMode::DeltaPixel),
                     };
@@ -12477,6 +12567,9 @@ impl ApplicationHandler<WakeUp> for App {
                     }
                     if state.alt.get() {
                         m |= Modifiers::ALT;
+                    }
+                    if state.meta.get() {
+                        m |= Modifiers::META;
                     }
                     m
                 };
@@ -12615,11 +12708,9 @@ impl ApplicationHandler<WakeUp> for App {
                         let forwarded = if resp.consumed || dialog_open {
                             None
                         } else {
-                            winit_key_to_servo(&key_event.logical_key).and_then(|key| {
-                                let mut ke = KeyboardEvent::from_state_and_key(KeyState::Down, key);
-                                ke.event.modifiers = modifiers;
-                                state.forward_to_page(InputEvent::Keyboard(ke))
-                            })
+                            state.forward_to_page(InputEvent::Keyboard(keyboard_event_from_winit(
+                                &key_event, modifiers,
+                            )))
                         };
                         match forwarded {
                             Some(id) => {
@@ -12663,15 +12754,9 @@ impl ApplicationHandler<WakeUp> for App {
                 }
                 // Everything else → the page (both key-down and key-up).
                 if !(resp.consumed || dialog_open) {
-                    if let Some(key) = winit_key_to_servo(&key_event.logical_key) {
-                        let key_state = match key_event.state {
-                            ElementState::Pressed => KeyState::Down,
-                            ElementState::Released => KeyState::Up,
-                        };
-                        let mut keyboard_event = KeyboardEvent::from_state_and_key(key_state, key);
-                        keyboard_event.event.modifiers = modifiers;
-                        state.forward_to_page(InputEvent::Keyboard(keyboard_event));
-                    }
+                    state.forward_to_page(InputEvent::Keyboard(keyboard_event_from_winit(
+                        &key_event, modifiers,
+                    )));
                 }
             }
 

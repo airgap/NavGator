@@ -1,0 +1,339 @@
+From edc793362851327be55285beb1ef78039c870da8 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sat, 3 Oct 2026 03:58:48 -0400
+Subject: [PATCH] script: Level 1 performance.timing with epoch times;
+ timeOrigin on the Unix epoch
+
+performance.timing returned the Level 2 PerformanceNavigationTiming entry,
+which has no navigationStart, so loadEventEnd - navigationStart was NaN.
+LinkedIn aborts its startup on that and never loads its icons. It is now
+the Level 1 PerformanceTiming interface with milliseconds since the Unix
+epoch. timeOrigin was offset from the platform's monotonic epoch (boot
+time on Linux) rather than the Unix epoch; both now convert through the
+wall clock. fetchStart, the DNS/connect attributes, requestStart,
+responseStart and domLoading are filled in, so performance.measure()
+accepts them instead of throwing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/document/document.rs    |  34 ++++-
+ components/script/dom/performance/mod.rs      |   1 +
+ .../script/dom/performance/performance.rs     |  25 ++--
+ .../dom/performance/performancetiming.rs      | 134 ++++++++++++++++++
+ .../webidls/Performance.webidl                |   2 +-
+ .../webidls/PerformanceTiming.webidl          |  33 +++++
+ 6 files changed, 209 insertions(+), 20 deletions(-)
+ create mode 100644 components/script/dom/performance/performancetiming.rs
+ create mode 100644 components/script_bindings/webidls/PerformanceTiming.webidl
+
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index ad9ad6ebfed..0e0ec86c08f 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -4121,15 +4121,35 @@ impl Document {
+             "domComplete" => self.navigation_timing().dom_complete.get(),
+             "loadEventStart" => self.navigation_timing().load_event_start.get(),
+             "loadEventEnd" => self.navigation_timing().load_event_end.get(),
+-            "redirectStart" | "redirectEnd" | "secureConnectionStart" | "responseEnd" => self
++            "redirectStart" | "redirectEnd" | "fetchStart" | "domainLookupStart" |
++            "domainLookupEnd" | "connectStart" | "connectEnd" | "secureConnectionStart" |
++            "requestStart" | "responseStart" | "responseEnd" | "domLoading" => self
+                 .resource_fetch_timing()
+                 .as_ref()
+-                .and_then(|resource_fetch_timing| match name {
+-                    "redirectStart" => resource_fetch_timing.redirect_start,
+-                    "redirectEnd" => resource_fetch_timing.redirect_end,
+-                    "secureConnectionStart" => resource_fetch_timing.secure_connection_start,
+-                    "responseEnd" => resource_fetch_timing.response_end,
+-                    _ => None,
++                .and_then(|timing| {
++                    // <https://w3c.github.io/navigation-timing/#dom-performancetiming-domainlookupstart>
++                    // and its siblings: with no DNS lookup or new connection (a reused
++                    // connection, a cached response) these equal fetchStart.
++                    let fetch_start = timing.fetch_start;
++                    let connect_start = timing.connect_start.or(fetch_start);
++                    match name {
++                        "redirectStart" => timing.redirect_start,
++                        "redirectEnd" => timing.redirect_end,
++                        "fetchStart" => fetch_start,
++                        "domainLookupStart" => timing.domain_lookup_start.or(fetch_start),
++                        // The network layer doesn't record the end of the lookup; the
++                        // connection starts right after it.
++                        "domainLookupEnd" => connect_start,
++                        "connectStart" => connect_start,
++                        "connectEnd" => timing.connect_end.or(connect_start),
++                        "secureConnectionStart" => timing.secure_connection_start,
++                        "requestStart" => timing.request_start,
++                        "responseStart" => timing.response_start,
++                        "responseEnd" => timing.response_end,
++                        // The document is created, and starts loading, as its response arrives.
++                        "domLoading" => timing.response_start,
++                        _ => unreachable!(),
++                    }
+                 }),
+             _ => {
+                 return Err(Error::Operation(Some(format!(
+diff --git a/components/script/dom/performance/mod.rs b/components/script/dom/performance/mod.rs
+index 753db5dc9d9..a7139861c95 100644
+--- a/components/script/dom/performance/mod.rs
++++ b/components/script/dom/performance/mod.rs
+@@ -16,6 +16,7 @@ pub(crate) mod performanceobserver;
+ pub(crate) mod performanceobserverentrylist;
+ pub(crate) mod performancepainttiming;
+ pub(crate) mod performanceresourcetiming;
++pub(crate) mod performancetiming;
+ pub(crate) use self::performance::Performance;
+ 
+ /// <https://w3c.github.io/navigation-timing/#the-performancetiming-interface>
+diff --git a/components/script/dom/performance/performance.rs b/components/script/dom/performance/performance.rs
+index 44cfccadaaf..f710d5b74ff 100644
+--- a/components/script/dom/performance/performance.rs
++++ b/components/script/dom/performance/performance.rs
+@@ -23,7 +23,7 @@ use super::performanceentry::{EntryType, PerformanceEntry};
+ use super::performancemark::PerformanceMark;
+ use super::performancemeasure::PerformanceMeasure;
+ use super::performancenavigation::PerformanceNavigation;
+-use super::performancenavigationtiming::PerformanceNavigationTiming;
++use super::performancetiming::PerformanceTiming;
+ use super::performanceobserver::PerformanceObserver as DOMPerformanceObserver;
+ use crate::dom::PERFORMANCE_TIMING_ATTRIBUTES;
+ use crate::dom::bindings::codegen::Bindings::PerformanceBinding::{
+@@ -535,16 +535,8 @@ impl Performance {
+ 
+ impl PerformanceMethods<crate::DomTypeHolder> for Performance {
+     /// <https://w3c.github.io/navigation-timing/#dom-performance-timing>
+-    fn Timing(&self) -> DomRoot<PerformanceNavigationTiming> {
+-        let entries = self.GetEntriesByType(DOMString::from("navigation"));
+-        if !entries.is_empty() {
+-            return DomRoot::from_ref(
+-                entries[0]
+-                    .downcast::<PerformanceNavigationTiming>()
+-                    .unwrap(),
+-            );
+-        }
+-        unreachable!("Are we trying to expose Performance.timing in workers?");
++    fn Timing(&self) -> DomRoot<PerformanceTiming> {
++        PerformanceTiming::new(&self.global(), CanGc::deprecated_note())
+     }
+ 
+     /// <https://w3c.github.io/navigation-timing/#dom-performance-navigation>
+@@ -559,7 +551,7 @@ impl PerformanceMethods<crate::DomTypeHolder> for Performance {
+ 
+     /// <https://www.w3.org/TR/hr-time-2/#dom-performance-timeorigin>
+     fn TimeOrigin(&self) -> DOMHighResTimeStamp {
+-        (self.time_origin - CrossProcessInstant::epoch()).to_dom_high_res_time_stamp()
++        unix_epoch_time_stamp(self.time_origin)
+     }
+ 
+     /// <https://www.w3.org/TR/performance-timeline-2/#dom-performance-getentries>
+@@ -817,6 +809,15 @@ impl PerformanceMethods<crate::DomTypeHolder> for Performance {
+     );
+ }
+ 
++/// `instant` in milliseconds since the Unix epoch. `CrossProcessInstant`'s own epoch is
++/// platform-specific (boot time on Linux), but `timeOrigin` and the legacy `performance.timing`
++/// are wall-clock times that pages compare with `Date.now()`.
++/// <https://w3c.github.io/hr-time/#dfn-estimated-monotonic-time-of-the-unix-epoch>
++pub(crate) fn unix_epoch_time_stamp(instant: CrossProcessInstant) -> DOMHighResTimeStamp {
++    let since_unix_epoch = time::OffsetDateTime::now_utc() - time::OffsetDateTime::UNIX_EPOCH;
++    (since_unix_epoch - (CrossProcessInstant::now() - instant)).to_dom_high_res_time_stamp()
++}
++
+ pub(crate) trait ToDOMHighResTimeStamp {
+     fn to_dom_high_res_time_stamp(&self) -> DOMHighResTimeStamp;
+ }
+diff --git a/components/script/dom/performance/performancetiming.rs b/components/script/dom/performance/performancetiming.rs
+new file mode 100644
+index 00000000000..faec625e7ca
+--- /dev/null
++++ b/components/script/dom/performance/performancetiming.rs
+@@ -0,0 +1,134 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++use dom_struct::dom_struct;
++use script_bindings::reflector::{Reflector, reflect_dom_object};
++
++use super::performance::unix_epoch_time_stamp;
++use crate::dom::bindings::codegen::Bindings::PerformanceTimingBinding::PerformanceTimingMethods;
++use crate::dom::bindings::codegen::Bindings::WindowBinding::Window_Binding::WindowMethods;
++use crate::dom::bindings::reflector::DomGlobal;
++use crate::dom::bindings::root::DomRoot;
++use crate::dom::globalscope::GlobalScope;
++use crate::script_runtime::CanGc;
++
++/// The legacy (Level 1) `performance.timing`: every attribute is an absolute time in
++/// milliseconds since the Unix epoch, or 0 if it hasn't happened. Pages still compute
++/// `loadEventEnd - navigationStart` from it (LinkedIn aborts its startup on a NaN there).
++#[dom_struct]
++pub(crate) struct PerformanceTiming {
++    reflector_: Reflector,
++}
++
++impl PerformanceTiming {
++    fn new_inherited() -> PerformanceTiming {
++        PerformanceTiming {
++            reflector_: Reflector::new(),
++        }
++    }
++
++    pub(crate) fn new(global: &GlobalScope, can_gc: CanGc) -> DomRoot<PerformanceTiming> {
++        reflect_dom_object(Box::new(PerformanceTiming::new_inherited()), global, can_gc)
++    }
++
++    fn epoch_milliseconds(&self, name: &str) -> u64 {
++        let window = self.global();
++        let window = window.as_window();
++        let instant = if name == "navigationStart" {
++            Some(window.Performance().time_origin())
++        } else {
++            window
++                .Document()
++                .performance_timing_attribute(name)
++                .expect("PerformanceTiming only asks for attributes the document records")
++        };
++        instant.map_or(0, |instant| unix_epoch_time_stamp(instant).floor() as u64)
++    }
++}
++
++impl PerformanceTimingMethods<crate::DomTypeHolder> for PerformanceTiming {
++    fn NavigationStart(&self) -> u64 {
++        self.epoch_milliseconds("navigationStart")
++    }
++
++    fn UnloadEventStart(&self) -> u64 {
++        self.epoch_milliseconds("unloadEventStart")
++    }
++
++    fn UnloadEventEnd(&self) -> u64 {
++        self.epoch_milliseconds("unloadEventEnd")
++    }
++
++    fn RedirectStart(&self) -> u64 {
++        self.epoch_milliseconds("redirectStart")
++    }
++
++    fn RedirectEnd(&self) -> u64 {
++        self.epoch_milliseconds("redirectEnd")
++    }
++
++    fn FetchStart(&self) -> u64 {
++        self.epoch_milliseconds("fetchStart")
++    }
++
++    fn DomainLookupStart(&self) -> u64 {
++        self.epoch_milliseconds("domainLookupStart")
++    }
++
++    fn DomainLookupEnd(&self) -> u64 {
++        self.epoch_milliseconds("domainLookupEnd")
++    }
++
++    fn ConnectStart(&self) -> u64 {
++        self.epoch_milliseconds("connectStart")
++    }
++
++    fn ConnectEnd(&self) -> u64 {
++        self.epoch_milliseconds("connectEnd")
++    }
++
++    fn SecureConnectionStart(&self) -> u64 {
++        self.epoch_milliseconds("secureConnectionStart")
++    }
++
++    fn RequestStart(&self) -> u64 {
++        self.epoch_milliseconds("requestStart")
++    }
++
++    fn ResponseStart(&self) -> u64 {
++        self.epoch_milliseconds("responseStart")
++    }
++
++    fn ResponseEnd(&self) -> u64 {
++        self.epoch_milliseconds("responseEnd")
++    }
++
++    fn DomLoading(&self) -> u64 {
++        self.epoch_milliseconds("domLoading")
++    }
++
++    fn DomInteractive(&self) -> u64 {
++        self.epoch_milliseconds("domInteractive")
++    }
++
++    fn DomContentLoadedEventStart(&self) -> u64 {
++        self.epoch_milliseconds("domContentLoadedEventStart")
++    }
++
++    fn DomContentLoadedEventEnd(&self) -> u64 {
++        self.epoch_milliseconds("domContentLoadedEventEnd")
++    }
++
++    fn DomComplete(&self) -> u64 {
++        self.epoch_milliseconds("domComplete")
++    }
++
++    fn LoadEventStart(&self) -> u64 {
++        self.epoch_milliseconds("loadEventStart")
++    }
++
++    fn LoadEventEnd(&self) -> u64 {
++        self.epoch_milliseconds("loadEventEnd")
++    }
++}
+diff --git a/components/script_bindings/webidls/Performance.webidl b/components/script_bindings/webidls/Performance.webidl
+index 5dd633ffe29..05ff1d0acaa 100644
+--- a/components/script_bindings/webidls/Performance.webidl
++++ b/components/script_bindings/webidls/Performance.webidl
+@@ -59,7 +59,7 @@ partial interface Performance {
+ [Exposed=Window]
+ partial interface Performance {
+   [SameObject]
+-  readonly attribute PerformanceNavigationTiming timing;
++  readonly attribute PerformanceTiming timing;
+   [SameObject]
+   readonly attribute PerformanceNavigation navigation;
+ };
+diff --git a/components/script_bindings/webidls/PerformanceTiming.webidl b/components/script_bindings/webidls/PerformanceTiming.webidl
+new file mode 100644
+index 00000000000..d41fddc9e5c
+--- /dev/null
++++ b/components/script_bindings/webidls/PerformanceTiming.webidl
+@@ -0,0 +1,33 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++/*
++ * The origin of this IDL file is
++ * https://w3c.github.io/navigation-timing/#the-performancetiming-interface
++ */
++
++[Exposed=Window]
++interface PerformanceTiming {
++  readonly attribute unsigned long long navigationStart;
++  readonly attribute unsigned long long unloadEventStart;
++  readonly attribute unsigned long long unloadEventEnd;
++  readonly attribute unsigned long long redirectStart;
++  readonly attribute unsigned long long redirectEnd;
++  readonly attribute unsigned long long fetchStart;
++  readonly attribute unsigned long long domainLookupStart;
++  readonly attribute unsigned long long domainLookupEnd;
++  readonly attribute unsigned long long connectStart;
++  readonly attribute unsigned long long connectEnd;
++  readonly attribute unsigned long long secureConnectionStart;
++  readonly attribute unsigned long long requestStart;
++  readonly attribute unsigned long long responseStart;
++  readonly attribute unsigned long long responseEnd;
++  readonly attribute unsigned long long domLoading;
++  readonly attribute unsigned long long domInteractive;
++  readonly attribute unsigned long long domContentLoadedEventStart;
++  readonly attribute unsigned long long domContentLoadedEventEnd;
++  readonly attribute unsigned long long domComplete;
++  readonly attribute unsigned long long loadEventStart;
++  readonly attribute unsigned long long loadEventEnd;
++  [Default] object toJSON();
++};
+-- 
+2.43.0
+

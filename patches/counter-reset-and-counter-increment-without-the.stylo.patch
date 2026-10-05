@@ -1,0 +1,36 @@
+From 36c548b147a1a12d16977b3828a053616cba1b80 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sat, 3 Oct 2026 03:59:38 -0400
+Subject: [PATCH] servo: counter-reset and counter-increment without the
+ unimplemented pref
+
+Servo's layout gives counter() and counters() values from them now.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ style/properties/longhands.toml | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/style/properties/longhands.toml b/style/properties/longhands.toml
+index 7063fc975..85ac34b75 100644
+--- a/style/properties/longhands.toml
++++ b/style/properties/longhands.toml
+@@ -708,7 +708,6 @@ affects = "layout"
+ type = "CounterIncrement"
+ initial = "Default::default()"
+ struct = "counters"
+-servo_pref = "layout.unimplemented"
+ animation_type = "discrete"
+ spec = "https://drafts.csswg.org/css-lists/#propdef-counter-increment"
+ servo_restyle_damage = "rebuild_box"
+@@ -718,7 +717,6 @@ affects = "layout"
+ type = "CounterReset"
+ initial = "Default::default()"
+ struct = "counters"
+-servo_pref = "layout.unimplemented"
+ animation_type = "discrete"
+ spec = "https://drafts.csswg.org/css-lists-3/#propdef-counter-reset"
+ servo_restyle_damage = "rebuild_box"
+-- 
+2.43.0
+

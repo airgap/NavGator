@@ -1,0 +1,187 @@
+From a15266e025f0dee24a4ef320f9e38f84122ed160 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sat, 3 Oct 2026 03:59:38 -0400
+Subject: [PATCH] servo: text-overflow, -webkit-box with -webkit-line-clamp,
+ and <br> display
+
+- text-overflow parses without the unimplemented pref; layout draws the
+  ellipsis.
+- display: -webkit-box/-webkit-inline-box parse for Servo, with a
+  Servo-only -webkit-box-orient (Gecko's is an alias in the XUL struct).
+  The adjuster lays a vertical box out as a block, as Blink does, keeping
+  -webkit-box as the original display so layout applies
+  -webkit-line-clamp (now parsed for Servo); a horizontal box becomes the
+  row flexbox it emulates.
+- An HTML <br> computes to display: inline whatever its author display
+  other than none, as browsers lay it out: with display: block its
+  newline became a blank line, and with display: flex its ::before was
+  blockified into one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ style/properties/longhands.toml | 12 +++++--
+ style/style_adjuster.rs         | 58 +++++++++++++++++++++++++++++++++
+ style/values/specified/box.rs   |  6 ----
+ 3 files changed, 68 insertions(+), 8 deletions(-)
+
+diff --git a/style/properties/longhands.toml b/style/properties/longhands.toml
+index 85ac34b75..6f0ca6e55 100644
+--- a/style/properties/longhands.toml
++++ b/style/properties/longhands.toml
+@@ -100,10 +100,19 @@ affects = "layout"
+ type = "LineClamp"
+ initial = "computed::LineClamp::none()"
+ struct = "box"
+-engine = "gecko"
+ spec = "https://drafts.csswg.org/css-overflow-3/#line-clamp"
+ affects = "layout"
+ 
++# Servo's `-webkit-box-orient`: Gecko's is an alias of `-moz-box-orient` in its XUL struct,
++# which Servo doesn't have. Only `display: -webkit-box` reads it, see StyleAdjuster.
++[-webkit-box-orient]
++struct = "box"
++engine = "servo"
++spec = "Nonstandard (https://developer.mozilla.org/en-US/docs/Web/CSS/box-orient)"
++animation_type = "discrete"
++affects = "layout"
++keyword = { values = ["horizontal", "vertical"] }
++
+ [-x-lang]
+ type = "XLang"
+ initial = "computed::XLang::get_initial_value()"
+@@ -2731,7 +2740,6 @@ affects = "paint"
+ type = "TextOverflow"
+ initial = "computed::TextOverflow::get_initial_value()"
+ struct = "text"
+-servo_pref = "layout.unimplemented"
+ animation_type = "discrete"
+ boxed = true
+ spec = "https://drafts.csswg.org/css-ui/#propdef-text-overflow"
+diff --git a/style/style_adjuster.rs b/style/style_adjuster.rs
+index 1756b77b9..c6d2fb94d 100644
+--- a/style/style_adjuster.rs
++++ b/style/style_adjuster.rs
+@@ -187,6 +187,34 @@ impl<'a, 'b: 'a> StyleAdjuster<'a, 'b> {
+             .set_adjusted_display(new_display, false);
+     }
+ 
++    /// Servo has no layout for the legacy `display: -webkit-box`, which pages mostly use for
++    /// `-webkit-line-clamp`. A vertical box becomes a block container, as in Blink (whose
++    /// clamped boxes are blocks, and which renders unclamped vertical ones the same way);
++    /// layout clamps its lines, seeing `-webkit-box` as the original display. A horizontal box
++    /// is laid out as the row flexbox it emulates.
++    #[cfg(feature = "servo")]
++    fn adjust_for_webkit_box(&mut self) {
++        use crate::properties::longhands::_webkit_box_orient::computed_value::T as BoxOrient;
++        use crate::values::specified::box_::{DisplayInside, DisplayOutside};
++        let box_style = self.style.get_box();
++        let display = box_style.clone_display();
++        if display.inside() != DisplayInside::WebkitBox {
++            return;
++        }
++        let vertical = box_style.clone__webkit_box_orient() == BoxOrient::Vertical;
++        // Servo has no `flow-root`; clamped boxes are `overflow: hidden` in practice, which
++        // makes them a formatting context root anyway.
++        let new_display = match (display.outside() == DisplayOutside::Block, vertical) {
++            (true, true) => Display::Block,
++            (false, true) => Display::InlineBlock,
++            (true, false) => Display::Flex,
++            (false, false) => Display::InlineFlex,
++        };
++        self.style
++            .mutate_box()
++            .set_adjusted_display(new_display, false);
++    }
++
+     /// CSS 2.1 section 9.7:
+     ///
+     ///    If 'position' has the value 'absolute' or 'fixed', [...] the computed
+@@ -211,6 +239,32 @@ impl<'a, 'b: 'a> StyleAdjuster<'a, 'b> {
+         element.is_some_and(|e| e.skip_item_display_fixup())
+     }
+ 
++    /// Browsers lay `<br>` out as a line break whatever its `display` other than `none`
++    /// (Gecko special-cases it in frame construction). As a block its "\A" `::before` became a
++    /// blank line, and a flex `<br>` blockified that `::before` into one.
++    #[cfg(feature = "servo")]
++    fn adjust_for_br<E>(&mut self, element: Option<E>)
++    where
++        E: TElement,
++    {
++        if self.style.pseudo.is_some() {
++            return;
++        }
++        let Some(element) = element else {
++            return;
++        };
++        if !element.is_html_element() || element.local_name() != &**local_name!("br") {
++            return;
++        }
++        let display = self.style.get_box().clone_display();
++        if display.is_none() || display == Display::Inline {
++            return;
++        }
++        self.style
++            .mutate_box()
++            .set_adjusted_display(Display::Inline, false);
++    }
++
+     /// Apply the blockification rules based on the table in CSS 2.2 section 9.7.
+     /// <https://drafts.csswg.org/css2/visuren.html#dis-pos-flo>
+     /// A ::marker pseudo-element with 'list-style-position:outside' needs to
+@@ -1061,6 +1115,10 @@ impl<'a, 'b: 'a> StyleAdjuster<'a, 'b> {
+             self.adjust_for_text_control_editing_root();
+         }
+         self.adjust_for_top_layer();
++        #[cfg(feature = "servo")]
++        self.adjust_for_br(element);
++        #[cfg(feature = "servo")]
++        self.adjust_for_webkit_box();
+         self.blockify_if_necessary(layout_parent_style, element);
+         #[cfg(feature = "gecko")]
+         self.adjust_for_webkit_line_clamp();
+diff --git a/style/values/specified/box.rs b/style/values/specified/box.rs
+index d95aa98ef..11b79aaf4 100644
+--- a/style/values/specified/box.rs
++++ b/style/values/specified/box.rs
+@@ -123,7 +123,6 @@ pub enum DisplayInside {
+     RubyText,
+     #[cfg(feature = "gecko")]
+     RubyTextContainer,
+-    #[cfg(feature = "gecko")]
+     WebkitBox,
+ }
+ 
+@@ -213,11 +212,9 @@ impl Display {
+     #[cfg(feature = "gecko")]
+     pub const Ruby: Self =
+         Self(((DisplayOutside::Inline as u16) << Self::OUTSIDE_SHIFT) | DisplayInside::Ruby as u16);
+-    #[cfg(feature = "gecko")]
+     pub const WebkitBox: Self = Self(
+         ((DisplayOutside::Block as u16) << Self::OUTSIDE_SHIFT) | DisplayInside::WebkitBox as u16,
+     );
+-    #[cfg(feature = "gecko")]
+     pub const WebkitInlineBox: Self = Self(
+         ((DisplayOutside::Inline as u16) << Self::OUTSIDE_SHIFT) | DisplayInside::WebkitBox as u16,
+     );
+@@ -470,9 +467,7 @@ impl DisplayKeyword {
+             "ruby-text" => Full(Display::RubyText),
+             #[cfg(feature = "gecko")]
+             "ruby-text-container" => Full(Display::RubyTextContainer),
+-            #[cfg(feature = "gecko")]
+             "-webkit-box" => Full(Display::WebkitBox),
+-            #[cfg(feature = "gecko")]
+             "-webkit-inline-box" => Full(Display::WebkitInlineBox),
+ 
+             /// <display-outside> = block | inline | run-in
+@@ -505,7 +500,6 @@ impl ToCss for Display {
+         match *self {
+             Display::Block | Display::Inline => outside.to_css(dest),
+             Display::InlineBlock => dest.write_str("inline-block"),
+-            #[cfg(feature = "gecko")]
+             Display::WebkitInlineBox => dest.write_str("-webkit-inline-box"),
+             Display::TableCaption => dest.write_str("table-caption"),
+             _ => match (outside, inside) {
+-- 
+2.43.0
+

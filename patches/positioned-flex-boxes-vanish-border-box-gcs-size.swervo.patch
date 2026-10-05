@@ -1,0 +1,148 @@
+From e90f6c25f561b1469bbf526cf64f9f1417d5bcca Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sat, 3 Oct 2026 05:47:20 -0400
+Subject: [PATCH] fix: positioned flex boxes vanish, border-box gCS sizes, IDB
+ multiEntry, inline custom props in SVG
+
+- A flex/grid/overflow box that became position: fixed/absolute (sticky
+  sidebars) was rebuilt in place as in-flow and never laid out; it now
+  gets a new out-of-flow box (X's sign-up column).
+- getComputedStyle width/height include padding and border under
+  box-sizing: border-box, as the used value is of that box.
+- multiEntry indexes no longer hit unimplemented!(): array values become
+  array keys of their unique subkeys, which the backend indexes one by
+  one (Mastodon crashed).
+- Inline SVG serialization drops custom properties and var() uses from
+  the inline style and avoids a leading ';': resvg's CSS parser gave up
+  at either and lost the appended computed paint (Spotify's logo).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/dom.rs                   |  8 ++++++++
+ components/layout/query.rs                 | 21 +++++++++++++++++++--
+ components/script/dom/svg/svgsvgelement.rs | 16 +++++++++++++++-
+ components/script/indexeddb.rs             | 18 +++++++++++++++---
+ 4 files changed, 57 insertions(+), 6 deletions(-)
+
+diff --git a/components/layout/dom.rs b/components/layout/dom.rs
+index 457797b0f09..0fe8ab71042 100644
+--- a/components/layout/dom.rs
++++ b/components/layout/dom.rs
+@@ -679,6 +679,14 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
+                         else {
+                             return false;
+                         };
++                        // A box that became absolutely positioned or floated needs a new
++                        // out-of-flow box built by its parent; rebuilt in place as in-flow it
++                        // was never laid out, so it vanished.
++                        if info.style.clone_position().is_absolutely_positioned() ||
++                            info.style.clone_float().is_floating()
++                        {
++                            return false;
++                        }
+                         if !matches!(
+                             BlockLevelCreator::new_for_inflow_block_level_element(
+                                 &info,
+diff --git a/components/layout/query.rs b/components/layout/query.rs
+index c62814cbf2d..cab5a4c3690 100644
+--- a/components/layout/query.rs
++++ b/components/layout/query.rs
+@@ -21,6 +21,7 @@ use script::layout_dom::ServoLayoutNode;
+ use servo_arc::Arc as ServoArc;
+ use servo_geometry::{FastLayoutTransform, au_rect_to_f32_rect, f32_rect_to_au_rect};
+ use servo_url::ServoUrl;
++use style::computed_values::box_sizing::T as BoxSizing;
+ use style::computed_values::display::T as Display;
+ use style::computed_values::position::T as Position;
+ use style::computed_values::visibility::T as Visibility;
+@@ -400,12 +401,28 @@ pub fn process_resolved_style_request(
+                 .map(|fragment| fragment.padding)
+                 .unwrap_or_default()
+         });
++        // The used `width`/`height` are of the box `box-sizing` names.
++        let border_box_sizing = style.clone_box_sizing() == BoxSizing::BorderBox;
++        let border = LazyCell::new(|| {
++            fragment
++                .retrieve_box_fragment()
++                .map(|fragment| fragment.border)
++                .unwrap_or_default()
++        });
+         match longhand_id {
+             LonghandId::Width if resolved_size_should_be_used_value(fragment) => {
+-                content_rect.size.width
++                let mut width = content_rect.size.width;
++                if border_box_sizing {
++                    width += padding.left + padding.right + border.left + border.right;
++                }
++                width
+             },
+             LonghandId::Height if resolved_size_should_be_used_value(fragment) => {
+-                content_rect.size.height
++                let mut height = content_rect.size.height;
++                if border_box_sizing {
++                    height += padding.top + padding.bottom + border.top + border.bottom;
++                }
++                height
+             },
+             LonghandId::MarginBottom => margins.bottom,
+             LonghandId::MarginTop => margins.top,
+diff --git a/components/script/dom/svg/svgsvgelement.rs b/components/script/dom/svg/svgsvgelement.rs
+index 87dc7c40c54..2789374a90c 100644
+--- a/components/script/dom/svg/svgsvgelement.rs
++++ b/components/script/dom/svg/svgsvgelement.rs
+@@ -653,8 +653,22 @@ impl SVGSVGElement {
+             // Appended, so they win over the inline text they were computed from: the computed
+             // values already include it, in a form the consumer understands (inline text can hold
+             // `var()` or `currentcolor` that a standalone SVG renderer can't resolve).
++            // Custom properties and `var()` uses are dropped from the inline text: resvg's CSS
++            // parser stops at a `--name` and discards every later declaration, the appended
++            // ones included, and their computed results are what gets appended.
+             Some((_, value)) => {
+-                *value = AttrValue::String(format!("{};{declarations}", &**value));
++                // Joined without empty entries: resvg also gives up on a leading `;`.
++                let kept: Vec<&str> = value
++                    .split(';')
++                    .map(str::trim)
++                    .filter(|declaration| {
++                        !declaration.is_empty() &&
++                            !declaration.starts_with("--") &&
++                            !declaration.contains("var(")
++                    })
++                    .chain(std::iter::once(declarations.as_str()))
++                    .collect();
++                *value = AttrValue::String(kept.join(";"));
+             },
+             None => attributes.push((style_name, AttrValue::String(declarations))),
+         }
+diff --git a/components/script/indexeddb.rs b/components/script/indexeddb.rs
+index 810b4963729..db974d7de70 100644
+--- a/components/script/indexeddb.rs
++++ b/components/script/indexeddb.rs
+@@ -820,9 +820,21 @@ pub(crate) fn extract_key(
+     // multiEntry flag is unset, and the result of running the steps to convert a value to a
+     // multiEntry key with r otherwise. Rethrow any exceptions.
+     let key = match multi_entry {
+-        Some(true) => {
+-            // TODO: implement convert_value_to_multientry_key
+-            unimplemented!("multiEntry keys are not yet supported");
++        // <https://w3c.github.io/IndexedDB/#convert-a-value-to-a-multientry-key>, approximated:
++        // an array becomes the array key of its unique subkeys (the backend indexes each one),
++        // but an invalid subkey makes the whole value invalid instead of being skipped.
++        Some(true) => match convert_value_to_key(cx, r.handle(), None)? {
++            ConversionResult::Valid(IndexedDBKeyType::Array(subkeys)) => {
++                let mut unique: Vec<IndexedDBKeyType> = Vec::with_capacity(subkeys.len());
++                for subkey in subkeys {
++                    if !unique.contains(&subkey) {
++                        unique.push(subkey);
++                    }
++                }
++                IndexedDBKeyType::Array(unique)
++            },
++            ConversionResult::Valid(key) => key,
++            ConversionResult::Invalid => return Ok(ExtractionResult::Invalid),
+         },
+         _ => match convert_value_to_key(cx, r.handle(), None)? {
+             ConversionResult::Valid(key) => key,
+-- 
+2.43.0
+

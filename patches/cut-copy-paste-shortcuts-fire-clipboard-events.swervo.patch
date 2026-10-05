@@ -1,0 +1,115 @@
+From 0a1c7dcf7c20f1710a5b0d79ab78e8e883494c8c Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sat, 3 Oct 2026 05:12:20 -0400
+Subject: [PATCH] script: cut/copy/paste shortcuts fire clipboard events
+
+Ctrl+X/C/V (Command on macOS) edited text controls directly on keydown,
+so the page never saw cut, copy or paste events (paste sanitizers, image
+paste). An unprevented keydown now runs the clipboard action, which
+fires the event at the focus; its default action edits the control.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../dom/document/document_event_handler.rs    | 33 +++++++++++++++++
+ components/script/textinput.rs                | 37 ++++---------------
+ 2 files changed, 40 insertions(+), 30 deletions(-)
+
+diff --git a/components/script/dom/document/document_event_handler.rs b/components/script/dom/document/document_event_handler.rs
+index c11e664bcc4..e35be91758f 100644
+--- a/components/script/dom/document/document_event_handler.rs
++++ b/components/script/dom/document/document_event_handler.rs
+@@ -1537,6 +1537,15 @@ impl DocumentEventHandler {
+             return flags.into();
+         }
+ 
++        // <https://w3c.github.io/clipboard-apis/#clipboard-actions>: the platform's cut, copy and
++        // paste shortcuts run the clipboard actions, firing cut/copy/paste at the focus, whose
++        // default action edits text controls.
++        if keyboard_event.event.state == KeyState::Down &&
++            let Some(action) = clipboard_action_for_shortcut(&keyboard_event.event)
++        {
++            return self.handle_editing_action(cx, None, action);
++        }
++
+         // https://w3c.github.io/uievents/#keys-cancelable-keys
+         // it MUST prevent the respective beforeinput and input
+         // (and keypress if supported) events from being generated
+@@ -3025,3 +3034,27 @@ impl Element {
+             .inclusive_ancestor_element_in_non_ua_shadow_root()
+     }
+ }
++
++/// The clipboard action of a cut, copy or paste shortcut: Ctrl (Command on macOS) with X, C or V.
++fn clipboard_action_for_shortcut(
++    event: &keyboard_types::KeyboardEvent,
++) -> Option<EditingActionEvent> {
++    let command = if cfg!(target_os = "macos") {
++        keyboard_types::Modifiers::META
++    } else {
++        keyboard_types::Modifiers::CONTROL
++    };
++    if !event.modifiers.contains(command) || event.modifiers.contains(keyboard_types::Modifiers::ALT)
++    {
++        return None;
++    }
++    let Key::Character(character) = &event.key else {
++        return None;
++    };
++    match character.to_ascii_lowercase().as_str() {
++        "x" => Some(EditingActionEvent::Cut),
++        "c" => Some(EditingActionEvent::Copy),
++        "v" => Some(EditingActionEvent::Paste),
++        _ => None,
++    }
++}
+diff --git a/components/script/textinput.rs b/components/script/textinput.rs
+index 4425c501b4f..18858e81ec4 100644
+--- a/components/script/textinput.rs
++++ b/components/script/textinput.rs
+@@ -635,36 +635,13 @@ impl<T: ClipboardProvider> TextInput<T> {
+                 self.select_all();
+                 KeyReaction::RedrawSelection
+             })
+-            .shortcut(CMD_OR_CONTROL, 'X', || {
+-                if let Some(text) = self.get_selection_text() {
+-                    self.clipboard_provider.set_text(text);
+-                    self.delete_selection();
+-                }
+-                KeyReaction::DispatchInput(None, IsComposing::NotComposing, InputType::DeleteByCut)
+-            })
+-            .shortcut(CMD_OR_CONTROL, 'C', || {
+-                // TODO(stevennovaryo): we should not provide text to clipboard for type=password
+-                if let Some(text) = self.get_selection_text() {
+-                    self.clipboard_provider.set_text(text);
+-                }
+-                KeyReaction::DispatchInput(None, IsComposing::NotComposing, InputType::Nothing)
+-            })
+-            .shortcut(CMD_OR_CONTROL, 'V', || {
+-                if let Ok(text_content) = self.clipboard_provider.get_text() {
+-                    self.insert(&text_content);
+-                    KeyReaction::DispatchInput(
+-                        Some(text_content),
+-                        IsComposing::NotComposing,
+-                        InputType::InsertFromPaste,
+-                    )
+-                } else {
+-                    KeyReaction::DispatchInput(
+-                        Some("".to_string()),
+-                        IsComposing::NotComposing,
+-                        InputType::InsertFromPaste,
+-                    )
+-                }
+-            })
++            // Cut, copy and paste run after the keydown, as the cut/copy/paste clipboard events
++            // whose default action edits the text (see `DocumentEventHandler::
++            // handle_keyboard_event`), so pages see those events. Matched here so the key
++            // isn't inserted as text.
++            .shortcut(CMD_OR_CONTROL, 'X', || KeyReaction::Nothing)
++            .shortcut(CMD_OR_CONTROL, 'C', || KeyReaction::Nothing)
++            .shortcut(CMD_OR_CONTROL, 'V', || KeyReaction::Nothing)
+             .shortcut(Modifiers::empty(), Key::Named(NamedKey::Delete), || {
+                 if self.delete_unit_or_selection(RopeMovement::Grapheme, Direction::Forward) {
+                     KeyReaction::DispatchInput(
+-- 
+2.43.0
+

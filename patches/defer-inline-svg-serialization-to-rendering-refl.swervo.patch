@@ -1,0 +1,114 @@
+From eccf8b1d9a5936058b1d1c247e44ed7d3ff91d15 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sat, 3 Oct 2026 03:58:16 -0400
+Subject: [PATCH] script: defer inline SVG serialization to rendering reflows;
+ skip userscripts in sandboxed docs
+
+Serializing SVGs from layout queries (ResizeObserver gathering, scripts
+reading geometry) mutated the DOM mid-query and hit a RefCell already
+mutably borrowed panic. Pending serializations now drain only in
+UpdateTheRendering reflows. Userscripts no longer run in documents that
+can't run script (sandboxed iframes), which panicked.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/userscripts.rs   |  6 +++++
+ components/script/dom/window/window.rs | 33 +++++++++++++++++++++++++-
+ 2 files changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/components/script/dom/userscripts.rs b/components/script/dom/userscripts.rs
+index fc84f54542f..44eb726d15e 100644
+--- a/components/script/dom/userscripts.rs
++++ b/components/script/dom/userscripts.rs
+@@ -18,6 +18,12 @@ pub(crate) fn load_script(head: &HTMLHeadElement) {
+     let win = DomRoot::from_ref(doc.window());
+     doc.add_delayed_task(task!(UserScriptExecute: |cx, win: DomRoot<Window>| {
+         let global_scope = win.as_global_scope();
++        // Userscripts are script like the page's own: a document that can't run script
++        // (sandboxed without allow-scripts, or no longer fully active by the time this task
++        // runs) mustn't run them, and evaluation asserts as much.
++        if !global_scope.can_run_script() {
++            return;
++        }
+         let mut realm = enter_auto_realm(cx, global_scope);
+         let cx = &mut realm.current_realm();
+ 
+diff --git a/components/script/dom/window/window.rs b/components/script/dom/window/window.rs
+index 7f958e498dc..ea26a188ae1 100644
+--- a/components/script/dom/window/window.rs
++++ b/components/script/dom/window/window.rs
+@@ -408,6 +408,11 @@ pub(crate) struct Window {
+         HashMapTracedValues<PendingImageRasterizationKey, Vec<Dom<Node>>, FxBuildHasher>,
+     >,
+ 
++    /// Inline `<svg>`s layout asked to have serialized. Serializing creates DOM nodes, which can
++    /// trigger a GC, so it waits for a rendering reflow: query reflows run while callers (e.g.
++    /// ResizeObserver) hold DOM borrows that tracing would then trip over.
++    pending_svg_serialization: DomRefCell<Vec<Dom<SVGSVGElement>>>,
++
+     /// Directory to store unminified css for this window if unminify-css
+     /// opt is enabled.
+     unminified_css_dir: DomRefCell<Option<String>>,
+@@ -2595,6 +2600,7 @@ impl Window {
+         }
+ 
+         debug!("script: performing reflow for goal {reflow_goal:?}");
++        let updates_the_rendering = reflow_goal == ReflowGoal::UpdateTheRendering;
+         let marker = if self.need_emit_timeline_marker(TimelineMarkerType::Reflow) {
+             Some(TimelineMarker::start("Reflow".to_owned()))
+         } else {
+@@ -2668,6 +2674,7 @@ impl Window {
+             reflow_result.pending_rasterization_images,
+             reflow_result.pending_svg_elements_for_serialization,
+         );
++        self.serialize_pending_svgs(cx, updates_the_rendering);
+ 
+         if let Some(iframe_sizes) = reflow_result.iframe_sizes {
+             document
+@@ -3643,11 +3650,34 @@ impl Window {
+             }
+         }
+ 
++        let mut pending_svgs = self.pending_svg_serialization.borrow_mut();
+         for node in pending_svg_element_for_serialization.into_iter() {
+             let node = unsafe { from_untrusted_node_address(node) };
+             let svg = node.downcast::<SVGSVGElement>().unwrap();
++            if !pending_svgs.iter().any(|pending| std::ptr::eq(&**pending, svg)) {
++                pending_svgs.push(Dom::from_ref(svg));
++            }
++        }
++    }
++
++    /// Serialize the inline `<svg>`s layout queued, if this reflow updates the rendering;
++    /// otherwise make sure a rendering update follows to do it.
++    fn serialize_pending_svgs(&self, cx: &mut JSContext, updates_the_rendering: bool) {
++        if !updates_the_rendering {
++            for svg in self.pending_svg_serialization.borrow().iter() {
++                svg.upcast::<Node>().dirty(NodeDamage::Other);
++            }
++            return;
++        }
++        let pending_svgs: Vec<DomRoot<SVGSVGElement>> = self
++            .pending_svg_serialization
++            .borrow_mut()
++            .drain(..)
++            .map(|svg| DomRoot::from_ref(&*svg))
++            .collect();
++        for svg in pending_svgs {
+             svg.serialize_and_cache_subtree(cx);
+-            node.dirty(NodeDamage::Other);
++            svg.upcast::<Node>().dirty(NodeDamage::Other);
+         }
+     }
+ 
+@@ -3807,6 +3837,7 @@ impl Window {
+             pending_image_callbacks: Default::default(),
+             pending_layout_images: Default::default(),
+             pending_images_for_rasterization: Default::default(),
++            pending_svg_serialization: Default::default(),
+             unminified_css_dir: DomRefCell::new(if unminify_css {
+                 Some(unminified_path("unminified-css"))
+             } else {
+-- 
+2.43.0
+

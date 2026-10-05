@@ -1,0 +1,134 @@
+From a8da3e7a9319f0c3b0a926b9ad8c3ff920e1345a Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sat, 3 Oct 2026 05:47:20 -0400
+Subject: [PATCH] layout: align-content on block containers; buttons are
+ inline-block again
+
+align-content center/end moves a block container's content within a
+taller box. The UA sheet centers button labels with it, as Chrome lays
+buttons out as inline-blocks. The fork's display: inline-flex leaked
+centering into pages that set display or align-items on buttons and put
+block children side by side (Mastodon, Pinterest). Button padding is
+Chrome's 1px 6px.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/formatting_contexts.rs | 48 +++++++++++++++++++++---
+ components/layout/stylesheets/servo.css  | 17 ++++-----
+ 2 files changed, 51 insertions(+), 14 deletions(-)
+
+diff --git a/components/layout/formatting_contexts.rs b/components/layout/formatting_contexts.rs
+index 2236028064d..dbc24680b1c 100644
+--- a/components/layout/formatting_contexts.rs
++++ b/components/layout/formatting_contexts.rs
+@@ -12,6 +12,7 @@ use style::context::SharedStyleContext;
+ use style::logical_geometry::Direction;
+ use style::properties::ComputedValues;
+ use style::selector_parser::PseudoElement;
++use style::values::specified::align::AlignFlags;
+ 
+ use crate::context::LayoutContext;
+ use crate::dom::WeakLayoutBox;
+@@ -19,6 +20,7 @@ use crate::dom_traversal::{Contents, NodeAndStyleInfo, NonReplacedContents};
+ use crate::flexbox::FlexContainer;
+ use crate::flow::BlockFormattingContext;
+ use crate::fragment_tree::{BaseFragmentInfo, FragmentFlags};
++use crate::geom::PhysicalSize;
+ use crate::layout_box_base::{IndependentFormattingContextLayoutResult, LayoutBoxBase};
+ use crate::positioned::{LayoutRootLayoutInputs, PositioningContext};
+ use crate::replaced::ReplacedContents;
+@@ -494,11 +496,12 @@ impl IndependentFormattingContext {
+                 }
+                 replaced_layout
+             },
+-            IndependentFormattingContextContents::Flow(bfc) => bfc.layout(
+-                layout_context,
+-                positioning_context,
+-                containing_block_for_children,
+-            ),
++            IndependentFormattingContextContents::Flow(bfc) => {
++                let mut result =
++                    bfc.layout(layout_context, positioning_context, containing_block_for_children);
++                align_block_container_content(self.style(), lazy_block_size, &mut result);
++                result
++            },
+             IndependentFormattingContextContents::Flex(fc) => fc.layout(
+                 layout_context,
+                 positioning_context,
+@@ -662,3 +665,38 @@ impl ComputeInlineContentSizes for IndependentFormattingContextContents {
+         }
+     }
+ }
++
++/// <https://drafts.csswg.org/css-align/#distribution-block>: `align-content` on a block container
++/// taller than its content moves the content to the center or end. Buttons center their label
++/// this way (see servo.css), like Chrome. Horizontal writing modes only.
++fn align_block_container_content(
++    style: &ComputedValues,
++    lazy_block_size: &LazySize,
++    result: &mut IndependentFormattingContextLayoutResult,
++) {
++    let alignment = style.get_position().align_content.primary().value();
++    if !matches!(
++        alignment,
++        AlignFlags::CENTER | AlignFlags::END | AlignFlags::FLEX_END
++    ) || !style.writing_mode.is_horizontal()
++    {
++        return;
++    }
++    let content_block_size = result.content_block_size;
++    let free_space = lazy_block_size.resolve(|| content_block_size) - content_block_size;
++    if free_space <= Au(0) {
++        return;
++    }
++    let offset = if alignment == AlignFlags::CENTER {
++        free_space / 2
++    } else {
++        free_space
++    };
++    for fragment in &result.fragments {
++        if let Some(base) = fragment.base() {
++            base.translate_rect(PhysicalSize::new(Au(0), offset));
++        }
++    }
++    result.baselines.first = result.baselines.first.map(|baseline| baseline + offset);
++    result.baselines.last = result.baselines.last.map(|baseline| baseline + offset);
++}
+diff --git a/components/layout/stylesheets/servo.css b/components/layout/stylesheets/servo.css
+index b752b6f2c45..1917f471a03 100644
+--- a/components/layout/stylesheets/servo.css
++++ b/components/layout/stylesheets/servo.css
+@@ -126,7 +126,7 @@ input[type="file"]::file-selector-button {
+   background: ButtonFace;
+   border-radius: 2px;
+   border: 1px solid ButtonBorder;
+-  padding: 4px;
++  padding: 1px 6px; /* Chrome's button padding */
+   color: black;
+ }
+ 
+@@ -136,14 +136,13 @@ input[type="submit"],
+ input[type="reset"],
+ input[type="file"]::file-selector-button {
+   text-align: center;
+-  /* Vertically center button content for Chrome parity. Without this the single text line is
+-     top-aligned in the content box, so a button taller than its text (an explicit height, common
+-     on real sites like Google's search buttons) shows the label sitting too high. Servo has no
+-     align-content-on-block yet (see the FIXME near the text-control inner container above), so
+-     center via inline-flex — the same flex approach <input> text controls already use. */
+-  display: inline-flex;
+-  align-items: center;
+-  justify-content: center;
++  /* Vertically center button content for Chrome parity: a button taller than its text (an
++     explicit height, common on real sites like Google's search buttons) keeps its label in the
++     middle. Chrome lays buttons out as inline-blocks, so pages that set display, align-items or
++     justify-content on a button get what they get there; inline-flex leaked centering into them
++     and put block children side by side. */
++  display: inline-block;
++  align-content: safe center;
+ }
+ 
+ button:hover,
+-- 
+2.43.0
+

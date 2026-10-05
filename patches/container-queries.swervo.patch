@@ -1,0 +1,625 @@
+From d4f1475c0ecac417b4fe208644a8389259bc3370 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sat, 3 Oct 2026 04:48:13 -0400
+Subject: [PATCH] layout: container queries
+
+Container queries evaluate against each container's content box from the
+last layout (query_container_size was todo!()). After layout, if styling
+used a container, layout compares the containers' sizes with the previous
+layout's and, where one changed, restyles that container's descendants
+and lays out once more. Size containers get inline-size containment, so
+their intrinsic inline size is that of an empty box. CSSContainerRule
+replaces an unimplemented!() that crashed pages reading cssRules (stylo
+now parses @container, container units and the container shorthand for
+Servo).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/dom.rs                      |  13 ++
+ components/layout/layout_box_base.rs          |  20 ++-
+ components/layout/layout_impl.rs              | 169 +++++++++++++++++-
+ components/script/dom/css/cssconditionrule.rs |   3 +
+ components/script/dom/css/csscontainerrule.rs | 114 ++++++++++++
+ components/script/dom/css/cssrule.rs          |  13 +-
+ components/script/dom/css/mod.rs              |   1 +
+ .../servo_dangerous_style_element.rs          |  15 +-
+ .../webidls/CSSContainerRule.webidl           |  10 ++
+ components/shared/layout/lib.rs               |  10 ++
+ 10 files changed, 357 insertions(+), 11 deletions(-)
+ create mode 100644 components/script/dom/css/csscontainerrule.rs
+ create mode 100644 components/script_bindings/webidls/CSSContainerRule.webidl
+
+diff --git a/components/layout/dom.rs b/components/layout/dom.rs
+index 3df38809514..457797b0f09 100644
+--- a/components/layout/dom.rs
++++ b/components/layout/dom.rs
+@@ -278,6 +278,19 @@ impl GenericLayoutDataTrait for DOMLayoutData {
+     fn as_any(&self) -> &dyn std::any::Any {
+         self
+     }
++
++    fn content_box_size(&self) -> Option<euclid::default::Size2D<app_units::Au>> {
++        self.0
++            .borrow()
++            .fragments()
++            .iter()
++            .find_map(|fragment| match fragment {
++                Fragment::Box(box_fragment) | Fragment::Float(box_fragment) => {
++                    Some(box_fragment.content_rect().size.to_untyped())
++                },
++                _ => None,
++            })
++    }
+ }
+ 
+ pub struct BoxSlot<'dom> {
+diff --git a/components/layout/layout_box_base.rs b/components/layout/layout_box_base.rs
+index 1c5dc664a4c..d2f5327dadb 100644
+--- a/components/layout/layout_box_base.rs
++++ b/components/layout/layout_box_base.rs
+@@ -12,9 +12,11 @@ use euclid::Point2D;
+ use layout_api::LayoutDamage;
+ use malloc_size_of_derive::MallocSizeOf;
+ use servo_arc::Arc as ServoArc;
++use style::Zero;
+ use style::computed_values::position::T as Position;
+ use style::logical_geometry::WritingMode;
+ use style::properties::ComputedValues;
++use style::values::computed::ContainerType;
+ use style::values::specified::align::AlignFlags;
+ use style_traits::CSSPixel;
+ 
+@@ -28,7 +30,9 @@ use crate::fragment_tree::{
+ };
+ use crate::geom::LogicalSides1D;
+ use crate::positioned::{PositioningContext, relative_adjustement};
+-use crate::sizing::{ComputeInlineContentSizes, InlineContentSizesResult, SizeConstraint};
++use crate::sizing::{
++    ComputeInlineContentSizes, ContentSizes, InlineContentSizesResult, SizeConstraint,
++};
+ use crate::traversal::ElementDamageSet;
+ use crate::{ConstraintSpace, ContainingBlock, ContainingBlockSize};
+ 
+@@ -111,8 +115,18 @@ impl LayoutBoxBase {
+             // TODO: Should we keep multiple caches for various block sizes?
+         }
+ 
+-        let result =
+-            layout_box.compute_inline_content_sizes_with_fixup(layout_context, constraint_space);
++        // <https://drafts.csswg.org/css-conditional-5/#container-type>: a size container has
++        // inline-size containment, so its intrinsic inline size is that of an empty box.
++        let result = if self.style.clone_container_type().intersects(
++            ContainerType::INLINE_SIZE | ContainerType::SIZE,
++        ) {
++            InlineContentSizesResult {
++                sizes: ContentSizes::zero(),
++                depends_on_block_constraints: false,
++            }
++        } else {
++            layout_box.compute_inline_content_sizes_with_fixup(layout_context, constraint_space)
++        };
+         *cache = Some(Box::new((constraint_space.block_size, result)));
+         result
+     }
+diff --git a/components/layout/layout_impl.rs b/components/layout/layout_impl.rs
+index 42c431b84cc..149d7a3e1ce 100644
+--- a/components/layout/layout_impl.rs
++++ b/components/layout/layout_impl.rs
+@@ -6,6 +6,7 @@
+ 
+ use std::cell::{Cell, OnceCell, RefCell};
+ use std::collections::HashMap;
++use std::sync::atomic::Ordering;
+ use std::fmt::Debug;
+ use std::rc::Rc;
+ use std::sync::{Arc, LazyLock};
+@@ -37,7 +38,7 @@ use profile_traits::time::{
+     self as profile_time, TimerMetadata, TimerMetadataFrameType, TimerMetadataReflowType,
+ };
+ use profile_traits::{path, time_profile};
+-use rustc_hash::FxHashMap;
++use rustc_hash::{FxHashMap, FxHashSet};
+ use script::layout_dom::{
+     ServoDangerousStyleDocument, ServoDangerousStyleElement, ServoLayoutElement, ServoLayoutNode,
+ };
+@@ -60,6 +61,7 @@ use style::font_metrics::FontMetrics;
+ use style::global_style_data::GLOBAL_STYLE_DATA;
+ use style::invalidation::element::restyle_hints::RestyleHint;
+ use style::invalidation::stylesheets::StylesheetInvalidationSet;
++use style::values::computed::ContainerType;
+ use style::media_queries::{MediaList, MediaType};
+ use style::properties::style_structs::Font;
+ use style::properties::{ComputedValues, LonghandId, NonCustomPropertyId, PropertyId, ShorthandId};
+@@ -96,6 +98,7 @@ use crate::query::{
+     process_resolved_font_style_query, process_resolved_style_request,
+     process_scroll_container_query,
+ };
++use crate::fragment_tree::Fragment;
+ use crate::traversal::{RecalcStyle, compute_damage_and_rebuild_box_tree};
+ use crate::{BoxTree, FragmentTree};
+ 
+@@ -179,6 +182,14 @@ pub struct LayoutThread {
+     /// layout trees remain the same.
+     need_new_display_list: Cell<bool>,
+ 
++    /// The content box sizes of the `container-type` boxes in the last layout. Container
++    /// queries were evaluated against these, see [`Self::relayout_if_container_sizes_changed`].
++    container_sizes: RefCell<FxHashMap<OpaqueNode, euclid::default::Size2D<Au>>>,
++
++    /// Whether this document's styles have evaluated container queries or units against a
++    /// container. Until then layout doesn't look for containers.
++    uses_container_queries: Cell<bool>,
++
+     /// Whether or not cumulative containing blocks offsets have been set into the
+     /// [`FragmentTree`]. This typically happens during [`StackingContextTree`]
+     /// construction, but if a layout query needs these value beforehand, they are
+@@ -835,6 +846,8 @@ impl LayoutThread {
+             device_has_changed: false,
+             need_containing_block_calculation: Cell::new(false),
+             need_new_display_list: Cell::new(false),
++            container_sizes: Default::default(),
++            uses_container_queries: Cell::new(false),
+             need_new_stacking_context_tree: Cell::new(false),
+             box_tree: Default::default(),
+             fragment_tree: Default::default(),
+@@ -1154,6 +1167,116 @@ impl LayoutThread {
+         self.stylist.flush(guards)
+     }
+ 
++    /// Container queries match against each container's size from the previous layout. When
++    /// this layout changed a container's size, its descendants are restyled and the page is
++    /// laid out once more, so the styles shown match the containers' final sizes (Blink and
++    /// Gecko also lay out again). One extra pass: a query that resizes its own container
++    /// settles on the next layout.
++    fn relayout_if_container_sizes_changed(
++        &self,
++        layout_context: &LayoutContext,
++        root_element: ServoDangerousStyleElement<'_>,
++        root_node: ServoLayoutNode<'_>,
++        rayon_pool: Option<&rayon::ThreadPool>,
++    ) {
++        // The flag is process-wide; a document that didn't query may take it, which only
++        // costs it the container walk below.
++        if layout_api::CONTAINER_QUERIED.swap(false, Ordering::Relaxed) ||
++            self.stylist
++                .iter_origins()
++                .any(|(data, _)| data.has_container_queries())
++        {
++            self.uses_container_queries.set(true);
++        }
++        if !self.uses_container_queries.get() {
++            return;
++        }
++        let sizes = self.container_box_sizes();
++        let changed: FxHashSet<OpaqueNode> = {
++            let previous = self.container_sizes.borrow();
++            sizes
++                .iter()
++                .filter(|(node, size)| previous.get(*node) != Some(*size))
++                .map(|(node, _)| *node)
++                .collect()
++        };
++        *self.container_sizes.borrow_mut() = sizes;
++        if changed.is_empty() || !mark_container_descendants_for_restyle(root_element, &changed) {
++            return;
++        }
++
++        let traversal = RecalcStyle::new(layout_context);
++        let token = {
++            let shared =
++                DomTraversal::<ServoDangerousStyleElement>::shared_context(&traversal);
++            RecalcStyle::pre_traverse(root_element, shared)
++        };
++        if !token.should_traverse() {
++            return;
++        }
++        let dirty_root = driver::traverse_dom(&traversal, token, rayon_pool).as_node();
++
++        let mut box_tree = self.box_tree.borrow_mut();
++        let mut layout_roots = Vec::new();
++        let damage = {
++            let box_tree = &mut *box_tree;
++            let mut compute_damage_and_build_box_tree = || {
++                compute_damage_and_rebuild_box_tree(
++                    box_tree,
++                    layout_context,
++                    dirty_root.layout_node(),
++                    root_node,
++                    LayoutDamage::empty(),
++                    &mut layout_roots,
++                )
++            };
++            if let Some(pool) = rayon_pool {
++                pool.install(compute_damage_and_build_box_tree)
++            } else {
++                compute_damage_and_build_box_tree()
++            }
++        };
++        if damage.is_empty() {
++            return;
++        }
++        self.need_new_stacking_context_tree.set(true);
++        self.need_new_display_list.set(true);
++
++        let box_tree = &*box_tree;
++        let viewport_size = self.stylist.device().au_viewport_size();
++        let run_layout = || {
++            box_tree
++                .as_ref()
++                .unwrap()
++                .layout(layout_context, viewport_size)
++        };
++        let fragment_tree = Rc::new(if let Some(pool) = rayon_pool {
++            pool.install(run_layout)
++        } else {
++            run_layout()
++        });
++        *self.fragment_tree.borrow_mut() = Some(fragment_tree);
++        *self.container_sizes.borrow_mut() = self.container_box_sizes();
++    }
++
++    /// The content box sizes of the `container-type` boxes in the current fragment tree.
++    fn container_box_sizes(&self) -> FxHashMap<OpaqueNode, euclid::default::Size2D<Au>> {
++        let mut sizes = FxHashMap::default();
++        if let Some(fragment_tree) = &*self.fragment_tree.borrow() {
++            fragment_tree.find(|fragment, _, _| {
++                if let Fragment::Box(box_fragment) | Fragment::Float(box_fragment) = fragment &&
++                    let Some(tag) = box_fragment.base.tag &&
++                    tag.pseudo_element_chain.primary.is_none() &&
++                    box_fragment.style().clone_container_type() != ContainerType::NORMAL
++                {
++                    sizes.insert(tag.node, box_fragment.content_rect().size.to_untyped());
++                }
++                None::<()>
++            });
++        }
++        sizes
++    }
++
+     #[servo_tracing::instrument(skip_all)]
+     fn restyle_and_build_trees(
+         &mut self,
+@@ -1313,6 +1436,13 @@ impl LayoutThread {
+                 .into_iter()
+                 .all(|layout_root| layout_root.try_layout(&layout_context))
+             {
++                drop(box_tree);
++                self.relayout_if_container_sizes_changed(
++                    &layout_context,
++                    dangerous_root_element,
++                    root_node,
++                    rayon_pool,
++                );
+                 return (
+                     ReflowPhasesRun::RanLayout,
+                     std::mem::take(&mut *layout_context.iframe_sizes.lock()),
+@@ -1320,10 +1450,10 @@ impl LayoutThread {
+             }
+         }
+ 
+-        let box_tree = &*box_tree;
++        let box_tree_ref = &*box_tree;
+         let viewport_size = self.stylist.device().au_viewport_size();
+         let run_layout = || {
+-            box_tree
++            box_tree_ref
+                 .as_ref()
+                 .unwrap()
+                 .layout(recalc_style_traversal.context(), viewport_size)
+@@ -1335,6 +1465,13 @@ impl LayoutThread {
+         });
+ 
+         *self.fragment_tree.borrow_mut() = Some(fragment_tree);
++        drop(box_tree);
++        self.relayout_if_container_sizes_changed(
++            &layout_context,
++            dangerous_root_element,
++            root_node,
++            rayon_pool,
++        );
+ 
+         if self.debug.is_enabled(DiagnosticsLoggingOption::StyleTree) {
+             println!(
+@@ -1934,3 +2071,29 @@ impl ReflowPhases {
+         }
+     }
+ }
++
++/// Marks the descendants of the elements in `containers` for restyle, and their ancestors as
++/// having dirty descendants so the style traversal reaches them. Returns whether any container
++/// was found under `element`.
++#[expect(unsafe_code)]
++fn mark_container_descendants_for_restyle(
++    element: ServoDangerousStyleElement<'_>,
++    containers: &FxHashSet<OpaqueNode>,
++) -> bool {
++    let mut marked = false;
++    if containers.contains(&element.as_node().opaque()) &&
++        let Some(mut data) = element.mutate_data()
++    {
++        data.hint.insert(RestyleHint::RESTYLE_DESCENDANTS);
++        marked = true;
++    }
++    for child in element.traversal_children() {
++        if let Some(child) = child.as_element() &&
++            mark_container_descendants_for_restyle(child, containers)
++        {
++            unsafe { element.set_dirty_descendants() };
++            marked = true;
++        }
++    }
++    marked
++}
+diff --git a/components/script/dom/css/cssconditionrule.rs b/components/script/dom/css/cssconditionrule.rs
+index 051d0daee0b..453d95f19c4 100644
+--- a/components/script/dom/css/cssconditionrule.rs
++++ b/components/script/dom/css/cssconditionrule.rs
+@@ -9,6 +9,7 @@ use servo_arc::Arc;
+ use style::shared_lock::{Locked, SharedRwLock, SharedRwLockReadGuard};
+ use style::stylesheets::CssRules as StyleCssRules;
+ 
++use super::csscontainerrule::CSSContainerRule;
+ use super::cssgroupingrule::CSSGroupingRule;
+ use super::cssmediarule::CSSMediaRule;
+ use super::cssstylesheet::CSSStyleSheet;
+@@ -65,6 +66,8 @@ impl CSSConditionRuleMethods<crate::DomTypeHolder> for CSSConditionRule {
+             rule.get_condition_text()
+         } else if let Some(rule) = self.downcast::<CSSSupportsRule>() {
+             rule.get_condition_text()
++        } else if let Some(rule) = self.downcast::<CSSContainerRule>() {
++            rule.get_condition_text()
+         } else {
+             unreachable!()
+         }
+diff --git a/components/script/dom/css/csscontainerrule.rs b/components/script/dom/css/csscontainerrule.rs
+new file mode 100644
+index 00000000000..32f8aa8f506
+--- /dev/null
++++ b/components/script/dom/css/csscontainerrule.rs
+@@ -0,0 +1,114 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++use std::cell::RefCell;
++
++use dom_struct::dom_struct;
++use js::context::JSContext;
++use script_bindings::reflector::reflect_dom_object_with_cx;
++use servo_arc::Arc;
++use style::shared_lock::{SharedRwLockReadGuard, ToCssWithGuard};
++use style::stylesheets::{ContainerRule, CssRuleType};
++use style_traits::ToCss;
++
++use super::cssconditionrule::CSSConditionRule;
++use super::cssrule::SpecificCSSRule;
++use super::cssstylesheet::CSSStyleSheet;
++use crate::dom::bindings::codegen::Bindings::CSSContainerRuleBinding::CSSContainerRuleMethods;
++use crate::dom::bindings::root::DomRoot;
++use crate::dom::bindings::str::DOMString;
++use crate::dom::window::Window;
++
++/// <https://drafts.csswg.org/css-conditional-5/#the-csscontainerrule-interface>
++#[dom_struct]
++pub(crate) struct CSSContainerRule {
++    css_condition_rule: CSSConditionRule,
++    #[ignore_malloc_size_of = "Stylo"]
++    #[no_trace]
++    container_rule: RefCell<Arc<ContainerRule>>,
++}
++
++impl CSSContainerRule {
++    fn new_inherited(
++        parent_stylesheet: &CSSStyleSheet,
++        container_rule: Arc<ContainerRule>,
++    ) -> CSSContainerRule {
++        let rules = container_rule.rules.clone();
++        CSSContainerRule {
++            css_condition_rule: CSSConditionRule::new_inherited(parent_stylesheet, rules),
++            container_rule: RefCell::new(container_rule),
++        }
++    }
++
++    pub(crate) fn new(
++        cx: &mut JSContext,
++        window: &Window,
++        parent_stylesheet: &CSSStyleSheet,
++        container_rule: Arc<ContainerRule>,
++    ) -> DomRoot<CSSContainerRule> {
++        reflect_dom_object_with_cx(
++            Box::new(CSSContainerRule::new_inherited(
++                parent_stylesheet,
++                container_rule,
++            )),
++            window,
++            cx,
++        )
++    }
++
++    /// <https://drafts.csswg.org/css-conditional-5/#dom-cssconditionrule-conditiontext>
++    pub(crate) fn get_condition_text(&self) -> DOMString {
++        self.container_rule
++            .borrow()
++            .conditions
++            .to_css_string()
++            .into()
++    }
++
++    pub(crate) fn update_rule(
++        &self,
++        container_rule: Arc<ContainerRule>,
++        guard: &SharedRwLockReadGuard,
++    ) {
++        self.css_condition_rule
++            .update_rules(container_rule.rules.clone(), guard);
++        *self.container_rule.borrow_mut() = container_rule;
++    }
++}
++
++impl SpecificCSSRule for CSSContainerRule {
++    fn ty(&self) -> CssRuleType {
++        CssRuleType::Container
++    }
++
++    fn get_css(&self) -> DOMString {
++        let guard = self.css_condition_rule.shared_lock().read();
++        self.container_rule.borrow().to_css_string(&guard).into()
++    }
++}
++
++impl CSSContainerRuleMethods<crate::DomTypeHolder> for CSSContainerRule {
++    /// <https://drafts.csswg.org/css-conditional-5/#dom-csscontainerrule-containername>
++    fn ContainerName(&self) -> DOMString {
++        let rule = self.container_rule.borrow();
++        match rule.conditions.0.first() {
++            Some(condition) => condition.name().to_css_string().into(),
++            None => DOMString::new(),
++        }
++    }
++
++    /// <https://drafts.csswg.org/css-conditional-5/#dom-csscontainerrule-containerquery>
++    fn ContainerQuery(&self) -> DOMString {
++        let rule = self.container_rule.borrow();
++        match rule
++            .conditions
++            .0
++            .first()
++            .and_then(|condition| condition.query_condition())
++        {
++            Some(query) => query.to_css_string().into(),
++            None => DOMString::new(),
++        }
++    }
++}
+diff --git a/components/script/dom/css/cssrule.rs b/components/script/dom/css/cssrule.rs
+index f91716a983e..890411a037c 100644
+--- a/components/script/dom/css/cssrule.rs
++++ b/components/script/dom/css/cssrule.rs
+@@ -16,6 +16,7 @@ use super::csskeyframerule::CSSKeyframeRule;
+ use super::csskeyframesrule::CSSKeyframesRule;
+ use super::csslayerblockrule::CSSLayerBlockRule;
+ use super::csslayerstatementrule::CSSLayerStatementRule;
++use super::csscontainerrule::CSSContainerRule;
+ use super::cssmediarule::CSSMediaRule;
+ use super::cssnamespacerule::CSSNamespaceRule;
+ use super::cssnesteddeclarations::CSSNestedDeclarations;
+@@ -74,6 +75,8 @@ impl CSSRule {
+             rule as &dyn SpecificCSSRule
+         } else if let Some(rule) = self.downcast::<CSSPropertyRule>() {
+             rule as &dyn SpecificCSSRule
++        } else if let Some(rule) = self.downcast::<CSSContainerRule>() {
++            rule as &dyn SpecificCSSRule
+         } else {
+             unreachable!()
+         }
+@@ -113,7 +116,9 @@ impl CSSRule {
+                 DomRoot::upcast(CSSSupportsRule::new(cx, window, parent_stylesheet, s))
+             },
+             StyleCssRule::Page(_) => unreachable!(),
+-            StyleCssRule::Container(_) => unimplemented!(), // TODO
++            StyleCssRule::Container(s) => {
++                DomRoot::upcast(CSSContainerRule::new(cx, window, parent_stylesheet, s))
++            },
+             StyleCssRule::Document(_) => unimplemented!(),  // TODO
+             StyleCssRule::LayerBlock(s) => {
+                 DomRoot::upcast(CSSLayerBlockRule::new(cx, window, parent_stylesheet, s))
+@@ -201,7 +206,11 @@ impl CSSRule {
+                 }
+             },
+             StyleCssRule::Page(_) => unreachable!(),
+-            StyleCssRule::Container(_) => unimplemented!(), // TODO
++            StyleCssRule::Container(s) => {
++                if let Some(rule) = self.downcast::<CSSContainerRule>() {
++                    rule.update_rule(s.clone(), guard);
++                }
++            },
+             StyleCssRule::Document(_) => unimplemented!(),  // TODO
+             StyleCssRule::LayerBlock(s) => {
+                 if let Some(rule) = self.downcast::<CSSLayerBlockRule>() {
+diff --git a/components/script/dom/css/mod.rs b/components/script/dom/css/mod.rs
+index 8eb16969319..25485b04466 100644
+--- a/components/script/dom/css/mod.rs
++++ b/components/script/dom/css/mod.rs
+@@ -5,6 +5,7 @@
+ #[allow(clippy::module_inception, reason = "The interface name is CSS")]
+ pub(crate) mod css;
+ pub(crate) mod cssconditionrule;
++pub(crate) mod csscontainerrule;
+ pub(crate) mod cssfontfacerule;
+ pub(crate) mod cssgroupingrule;
+ pub(crate) mod cssimportrule;
+diff --git a/components/script/layout_dom/servo_dangerous_style_element.rs b/components/script/layout_dom/servo_dangerous_style_element.rs
+index 3f609283c84..eb68cd4f9b4 100644
+--- a/components/script/layout_dom/servo_dangerous_style_element.rs
++++ b/components/script/layout_dom/servo_dangerous_style_element.rs
+@@ -13,7 +13,7 @@ use embedder_traits::UntrustedNodeAddress;
+ use euclid::default::Size2D;
+ use html5ever::{LocalName, Namespace, local_name, ns};
+ use js::jsapi::JSObject;
+-use layout_api::{DangerousStyleElement, LayoutDamage, LayoutNode};
++use layout_api::{DangerousStyleElement, LayoutDamage, LayoutElement, LayoutNode};
+ use script_bindings::root::DomRoot;
+ use selectors::Element as _;
+ use selectors::attr::{AttrSelectorOperation, CaseSensitivity, NamespaceConstraint};
+@@ -465,8 +465,17 @@ impl<'dom> style::dom::TElement for ServoDangerousStyleElement<'dom> {
+         self.element.namespace()
+     }
+ 
+-    fn query_container_size(&self, _display: &Display) -> Size2D<Option<app_units::Au>> {
+-        todo!();
++    /// The container's content box from the last layout. Layout lays the page out again
++    /// when a container's size changes, so queries see its final size.
++    fn query_container_size(&self, display: &Display) -> Size2D<Option<app_units::Au>> {
++        layout_api::CONTAINER_QUERIED.store(true, Ordering::Relaxed);
++        let size = (!display.is_none())
++            .then(|| self.layout_element().as_node().layout_data()?.content_box_size())
++            .flatten();
++        Size2D::new(
++            size.map(|size| size.width),
++            size.map(|size| size.height),
++        )
+     }
+ 
+     fn has_selector_flags(&self, flags: ElementSelectorFlags) -> bool {
+diff --git a/components/script_bindings/webidls/CSSContainerRule.webidl b/components/script_bindings/webidls/CSSContainerRule.webidl
+new file mode 100644
+index 00000000000..e981ff80f37
+--- /dev/null
++++ b/components/script_bindings/webidls/CSSContainerRule.webidl
+@@ -0,0 +1,10 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++// https://drafts.csswg.org/css-conditional-5/#the-csscontainerrule-interface
++[Exposed=Window]
++interface CSSContainerRule : CSSConditionRule {
++  readonly attribute CSSOMString containerName;
++  readonly attribute CSSOMString containerQuery;
++};
+diff --git a/components/shared/layout/lib.rs b/components/shared/layout/lib.rs
+index d9f56f0b226..ca68ac25878 100644
+--- a/components/shared/layout/lib.rs
++++ b/components/shared/layout/lib.rs
+@@ -76,8 +76,18 @@ use style_traits::CSSPixel;
+ use webrender_api::units::{DeviceIntSize, LayoutPoint, LayoutVector2D};
+ use webrender_api::{ExternalScrollId, ImageKey};
+ 
++/// Set when styling evaluated a container query or container-relative unit against a container,
++/// which happens only when a page has containers. Layout then checks after each layout whether
++/// a container changed size, see `LayoutThread::relayout_if_container_sizes_changed`.
++pub static CONTAINER_QUERIED: std::sync::atomic::AtomicBool =
++    std::sync::atomic::AtomicBool::new(false);
++
+ pub trait GenericLayoutDataTrait: Any + MallocSizeOfTrait + Send + Sync + 'static {
+     fn as_any(&self) -> &dyn Any;
++
++    /// The physical size of the content box of the node's first box in the most recent
++    /// layout, if it has one. Container queries evaluate against it.
++    fn content_box_size(&self) -> Option<euclid::default::Size2D<Au>>;
+ }
+ 
+ pub trait LayoutDataTrait: GenericLayoutDataTrait + Default {}
+-- 
+2.43.0
+

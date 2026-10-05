@@ -1,0 +1,461 @@
+From b06c85e708be142b1475f88a6dd665c23b15f7dd Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sat, 3 Oct 2026 03:58:16 -0400
+Subject: [PATCH] svg: presentation attributes in the cascade; root sizing from
+ the viewBox
+
+Presentation attributes (fill="white") are parsed as their CSS property
+when set and enter the cascade as presentational hints, so an author rule
+overrides them even when it sets the value the element would inherit
+(The Verge's logo). var() keeps working in them.
+
+The serializer hook becomes an attribute rewrite. With a viewBox it drops
+the root's width/height, whose partial presence (width without height)
+gave the rasterizer the wrong natural size and shrank icons (Booking).
+Declarations are appended to inline style, and inline-named paint
+properties re-emitted computed. viewBox parsing accepts decimals.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/element/element.rs   | 17 ++++-
+ components/script/dom/node/node.rs         | 12 ++--
+ components/script/dom/servoparser/html.rs  | 34 ++++------
+ components/script/dom/svg/svgelement.rs    | 63 ++++++++++++++++++
+ components/script/dom/svg/svgsvgelement.rs | 74 ++++++++++++++++++----
+ components/shared/layout/lib.rs            | 40 +++++++-----
+ 6 files changed, 183 insertions(+), 57 deletions(-)
+
+diff --git a/components/script/dom/element/element.rs b/components/script/dom/element/element.rs
+index 240d3ccdf50..152d480dc8c 100644
+--- a/components/script/dom/element/element.rs
++++ b/components/script/dom/element/element.rs
+@@ -25,7 +25,10 @@ use js::jsapi::{Heap, JSObject};
+ use js::jsval::JSVal;
+ use js::realm::CurrentRealm;
+ use js::rust::HandleObject;
+-use layout_api::{LayoutDamage, QueryMsg, ScrollContainerQueryFlags, StyleData, with_layout_state};
++use layout_api::{
++    LayoutDamage, QueryMsg, SVG_PAINT_PROPERTIES, ScrollContainerQueryFlags, StyleData,
++    with_layout_state,
++};
+ use net_traits::ReferrerPolicy;
+ use net_traits::request::{CorsSettings, CredentialsMode};
+ use script_bindings::cell::{DomRefCell, Ref, RefMut};
+@@ -1323,6 +1326,18 @@ impl<'dom> LayoutDom<'dom, Element> {
+             }
+         }
+ 
++        if *self.namespace() == ns!(svg) {
++            for property in SVG_PAINT_PROPERTIES {
++                if let Some(AttrValue::Declaration { block, lock, .. }) =
++                    self.get_attr_for_layout(&ns!(), &LocalName::from(property.name()))
++                {
++                    for declaration in block.read_with(&lock.read()).declarations() {
++                        push(declaration.clone());
++                    }
++                }
++            }
++        }
++
+         // TODO(xiaochengh): This is probably not enough. When the root element doesn't have a `lang`,
+         // we should check the browser settings and system locale.
+         if let Some(lang) = self.get_lang_attr_val_for_layout() {
+diff --git a/components/script/dom/node/node.rs b/components/script/dom/node/node.rs
+index 5e22b90b4f8..16c3aed821a 100644
+--- a/components/script/dom/node/node.rs
++++ b/components/script/dom/node/node.rs
+@@ -114,7 +114,7 @@ use crate::dom::node::virtualmethods::{VirtualMethods, vtable_for};
+ use crate::dom::pointerevent::{PointerEvent, PointerId};
+ use crate::dom::range::WeakRangeVec;
+ use crate::dom::raredata::NodeRareData;
+-use crate::dom::servoparser::html::{HtmlSerialize, StylePrefix};
++use crate::dom::servoparser::html::{AttributeRewrite, HtmlSerialize};
+ use crate::dom::servoparser::serialize_html_fragment;
+ use crate::dom::shadowroot::{IsUserAgentWidget, ShadowRoot};
+ use crate::dom::text::Text;
+@@ -3233,16 +3233,16 @@ impl Node {
+         self.xml_serialize_inner(traversal_scope, HtmlSerialize::new(self))
+     }
+ 
+-    /// [`Self::xml_serialize`], with `style_prefix`'s declarations merged into each element's
+-    /// `style` attribute in the output.
+-    pub(crate) fn xml_serialize_with_style_prefix(
++    /// [`Self::xml_serialize`], with each element's attributes rewritten in the output by
++    /// `attribute_rewrite`.
++    pub(crate) fn xml_serialize_with_attribute_rewrite(
+         &self,
+         traversal_scope: xml_serialize::TraversalScope,
+-        style_prefix: StylePrefix<'_>,
++        attribute_rewrite: AttributeRewrite<'_>,
+     ) -> Fallible<DOMString> {
+         self.xml_serialize_inner(
+             traversal_scope,
+-            HtmlSerialize::with_style_prefix(self, style_prefix),
++            HtmlSerialize::with_attribute_rewrite(self, attribute_rewrite),
+         )
+     }
+ 
+diff --git a/components/script/dom/servoparser/html.rs b/components/script/dom/servoparser/html.rs
+index 650941db63b..2b8765fa829 100644
+--- a/components/script/dom/servoparser/html.rs
++++ b/components/script/dom/servoparser/html.rs
+@@ -128,14 +128,13 @@ impl Tokenizer {
+ }
+ 
+ /// <https://html.spec.whatwg.org/multipage/#html-fragment-serialisation-algorithm>
+-/// Supplies CSS declarations (`;`-terminated) to prepend to an element's `style` attribute as
+-/// it is serialized, without mutating the DOM.
+-pub(crate) type StylePrefix<'a> = &'a dyn Fn(&Element) -> Option<String>;
++/// Rewrites an element's attributes as it is serialized, without mutating the DOM.
++pub(crate) type AttributeRewrite<'a> = &'a dyn Fn(&Element, &mut Vec<(QualName, AttrValue)>);
+ 
+ fn start_element<S: Serializer>(
+     element: &Element,
+     serializer: &mut S,
+-    style_prefix: Option<StylePrefix<'_>>,
++    attribute_rewrite: Option<AttributeRewrite<'_>>,
+ ) -> io::Result<()> {
+     let name = QualName::new(
+         None,
+@@ -162,15 +161,8 @@ fn start_element<S: Serializer>(
+         (qname, value)
+     }));
+ 
+-    if let Some(declarations) = style_prefix.and_then(|style_prefix| style_prefix(element)) {
+-        let style_name = QualName::new(None, ns!(), local_name!("style"));
+-        match attributes.iter_mut().find(|(name, _)| *name == style_name) {
+-            // Prepended, so the element's own inline declarations still win.
+-            Some((_, value)) => {
+-                *value = AttrValue::String(format!("{declarations}{}", &**value));
+-            },
+-            None => attributes.push((style_name, AttrValue::String(declarations))),
+-        }
++    if let Some(attribute_rewrite) = attribute_rewrite {
++        attribute_rewrite(element, &mut attributes);
+     }
+ 
+     let attr_refs = attributes.iter().map(|(qname, value)| {
+@@ -309,7 +301,7 @@ pub(crate) fn serialize_html_fragment<S: Serializer>(
+     traversal_scope: TraversalScope,
+     serialize_shadow_roots: bool,
+     shadow_roots: Vec<DomRoot<ShadowRoot>>,
+-    style_prefix: Option<StylePrefix<'_>>,
++    attribute_rewrite: Option<AttributeRewrite<'_>>,
+ ) -> io::Result<()> {
+     let iter = SerializationIterator::new(
+         cx,
+@@ -322,7 +314,7 @@ pub(crate) fn serialize_html_fragment<S: Serializer>(
+     for cmd in iter {
+         match cmd {
+             SerializationCommand::OpenElement(n) => {
+-                start_element(&n, serializer, style_prefix)?;
++                start_element(&n, serializer, attribute_rewrite)?;
+             },
+             SerializationCommand::CloseElement(name) => {
+                 serializer.end_elem(name)?;
+@@ -394,24 +386,24 @@ pub(crate) fn serialize_html_fragment<S: Serializer>(
+ 
+ pub(crate) struct HtmlSerialize<'a> {
+     node: &'a Node,
+-    style_prefix: Option<StylePrefix<'a>>,
++    attribute_rewrite: Option<AttributeRewrite<'a>>,
+ }
+ 
+ impl<'a> HtmlSerialize<'a> {
+     pub(crate) fn new(node: &'a Node) -> HtmlSerialize<'a> {
+         HtmlSerialize {
+             node,
+-            style_prefix: None,
++            attribute_rewrite: None,
+         }
+     }
+ 
+-    pub(crate) fn with_style_prefix(
++    pub(crate) fn with_attribute_rewrite(
+         node: &'a Node,
+-        style_prefix: StylePrefix<'a>,
++        attribute_rewrite: AttributeRewrite<'a>,
+     ) -> HtmlSerialize<'a> {
+         HtmlSerialize {
+             node,
+-            style_prefix: Some(style_prefix),
++            attribute_rewrite: Some(attribute_rewrite),
+         }
+     }
+ }
+@@ -432,7 +424,7 @@ impl Serialize for HtmlSerialize<'_> {
+             traversal_scope,
+             false,
+             vec![],
+-            self.style_prefix,
++            self.attribute_rewrite,
+         )
+     }
+ }
+diff --git a/components/script/dom/svg/svgelement.rs b/components/script/dom/svg/svgelement.rs
+index 25b3cbbb263..f387d0d50d9 100644
+--- a/components/script/dom/svg/svgelement.rs
++++ b/components/script/dom/svg/svgelement.rs
+@@ -3,6 +3,15 @@
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+ use dom_struct::dom_struct;
++use layout_api::SVG_PAINT_PROPERTIES;
++use servo_arc::Arc as ServoArc;
++use style::attr::AttrValue;
++use style::properties::{
++    Importance, LonghandId, PropertyDeclarationBlock, PropertyId, SourcePropertyDeclaration,
++    parse_one_declaration_into,
++};
++use style::stylesheets::{CssRuleType, Origin, UrlExtraData};
++use style_traits::ParsingMode;
+ use html5ever::{LocalName, Prefix, local_name, ns};
+ use js::context::JSContext;
+ use js::rust::HandleObject;
+@@ -120,11 +129,65 @@ impl<'dom> crate::dom::bindings::root::LayoutDom<'dom, SVGElement> {
+     }
+ }
+ 
++/// The paint property an SVG presentation attribute named `name` sets, if any.
++pub(crate) fn presentation_attribute_property(name: &LocalName) -> Option<LonghandId> {
++    SVG_PAINT_PROPERTIES
++        .into_iter()
++        .find(|property| property.name() == &**name)
++}
++
+ impl VirtualMethods for SVGElement {
+     fn super_type(&self) -> Option<&dyn VirtualMethods> {
+         Some(self.as_element() as &dyn VirtualMethods)
+     }
+ 
++    fn attribute_affects_presentational_hints(&self, attr: AttrRef<'_>) -> bool {
++        if attr.namespace() == &ns!() && presentation_attribute_property(attr.local_name()).is_some()
++        {
++            return true;
++        }
++        self.super_type()
++            .unwrap()
++            .attribute_affects_presentational_hints(attr)
++    }
++
++    /// Presentation attributes (`fill="white"`) are parsed as their CSS property and enter the
++    /// cascade as presentational hints, below every author rule and above inheritance.
++    /// <https://svgwg.org/svg2-draft/styling.html#PresentationAttributes>. Browsers accept
++    /// `var()` in them, which Discord relies on; the value can't smuggle in other declarations.
++    fn parse_plain_attribute(&self, name: &LocalName, value: DOMString) -> AttrValue {
++        let Some(property) = presentation_attribute_property(name) else {
++            return self
++                .super_type()
++                .unwrap()
++                .parse_plain_attribute(name, value);
++        };
++        let document = self.owner_document();
++        let mut declarations = SourcePropertyDeclaration::default();
++        let parsed = parse_one_declaration_into(
++            &mut declarations,
++            PropertyId::NonCustom(property.into()),
++            &value.str(),
++            Origin::Author,
++            &UrlExtraData(document.base_url().get_arc()),
++            None,
++            // `stroke-width="2"`: presentation attributes take unitless lengths.
++            ParsingMode::ALLOW_UNITLESS_LENGTH,
++            document.quirks_mode(),
++            CssRuleType::Style,
++        );
++        let mut block = PropertyDeclarationBlock::new();
++        if parsed.is_ok() {
++            block.extend(declarations.drain(), Importance::Normal);
++        }
++        let lock = document.style_shared_author_lock();
++        AttrValue::Declaration {
++            serialization: String::from(value).into(),
++            block: ServoArc::new(lock.wrap(block)),
++            lock: lock.clone(),
++        }
++    }
++
+     fn attribute_mutated(
+         &self,
+         cx: &mut js::context::JSContext,
+diff --git a/components/script/dom/svg/svgsvgelement.rs b/components/script/dom/svg/svgsvgelement.rs
+index 7fee1896136..87dc7c40c54 100644
+--- a/components/script/dom/svg/svgsvgelement.rs
++++ b/components/script/dom/svg/svgsvgelement.rs
+@@ -10,7 +10,7 @@ use dom_struct::dom_struct;
+ use html5ever::{LocalName, Prefix, QualName, local_name, ns};
+ use js::context::JSContext;
+ use js::rust::HandleObject;
+-use layout_api::{SVG_PAINT_PROPERTIES, SVGElementData, svg_paint_signature};
++use layout_api::{SVG_PAINT_PROPERTIES, SVGElementData, parse_view_box, svg_paint_signature};
+ use percent_encoding::percent_decode_str;
+ use pixels::EncodedImageType;
+ use script_bindings::cell::DomRefCell;
+@@ -110,10 +110,12 @@ impl SVGSVGElement {
+         cloned_nodes.extend(self.process_image_elements(cx));
+         cloned_nodes.extend(self.process_external_references(cx));
+ 
+-        let paint_declarations = |element: &Element| self.paint_declarations(element);
++        let rewrite_attributes = |element: &Element, attributes: &mut Vec<(QualName, AttrValue)>| {
++            self.rewrite_serialized_attributes(element, attributes)
++        };
+         let serialize_result = self
+             .upcast::<Node>()
+-            .xml_serialize_with_style_prefix(TraversalScope::IncludeNode, &paint_declarations);
++            .xml_serialize_with_attribute_rewrite(TraversalScope::IncludeNode, &rewrite_attributes);
+ 
+         self.cleanup_cloned_nodes(cx, &cloned_nodes);
+         *self.cached_paint_signature.borrow_mut() = paint_signature;
+@@ -621,16 +623,54 @@ impl SVGSVGElement {
+         }
+     }
+ 
++    /// Adjust `element`'s attributes for the standalone serialization the rasterizer reads.
++    fn rewrite_serialized_attributes(
++        &self,
++        element: &Element,
++        attributes: &mut Vec<(QualName, AttrValue)>,
++    ) {
++        // With a viewBox, layout sizes the root's box and fits the viewBox into it; the
++        // rasterizer only needs the viewBox's aspect ratio as the image's natural size. Left in,
++        // `width`/`height` made that size wrong whenever CSS overrode one of them: `width="50"`
++        // without `height` reads as 50x100 to the rasterizer (the missing height defaults to
++        // 100%), so the icon was fitted into its box at half size.
++        if std::ptr::eq(element, self.upcast::<Element>()) &&
++            element
++                .get_attribute_string_value_with_namespace(&ns!(), &local_name!("viewBox"))
++                .is_some_and(|view_box| parse_view_box(&view_box).is_some())
++        {
++            attributes.retain(|(name, _)| {
++                name.ns != ns!() ||
++                    (name.local != local_name!("width") && name.local != local_name!("height"))
++            });
++        }
++
++        let Some(declarations) = self.paint_declarations(element) else {
++            return;
++        };
++        let style_name = QualName::new(None, ns!(), local_name!("style"));
++        match attributes.iter_mut().find(|(name, _)| *name == style_name) {
++            // Appended, so they win over the inline text they were computed from: the computed
++            // values already include it, in a form the consumer understands (inline text can hold
++            // `var()` or `currentcolor` that a standalone SVG renderer can't resolve).
++            Some((_, value)) => {
++                *value = AttrValue::String(format!("{};{declarations}", &**value));
++            },
++            None => attributes.push((style_name, AttrValue::String(declarations))),
++        }
++    }
++
+     /// CSS declarations that carry `element`'s cascaded paint properties (see
+     /// `SVG_PAINT_PROPERTIES`) into the standalone serialization, which otherwise sees none of
+     /// the page's stylesheets, inherited values or custom properties. A property is copied where
+-    /// a rule set it, i.e. where it differs from the flat-tree parent's value. The root `<svg>`
+-    /// also gets the inherited properties it merely inherits from the page, since the standalone
+-    /// document has no ancestors, unless a presentation attribute of the same name sets the
+-    /// property there (in the cascade a presentation attribute beats inheritance but loses to a
+-    /// rule). Presentation attributes using `var()` get the custom properties substituted, as
+-    /// browsers parse them as CSS. Unstyled elements (inside `display: none` subtrees, clones
+-    /// made for serialization) inherit from the serialized parent like the cascade would.
++    /// a rule set it, i.e. where it differs from the flat-tree parent's value, and wherever a
++    /// presentation attribute names it: those are in the cascade (see `SVGElement`'s
++    /// `parse_plain_attribute`), so the computed value says whether a rule overrode the
++    /// attribute, even with a value equal to the inherited one. The root `<svg>` also gets the
++    /// inherited properties it merely inherits from the page, since the standalone document has
++    /// no ancestors. Unstyled elements (inside `display: none` subtrees, clones made for
++    /// serialization) inherit from the serialized parent like the cascade would, with the
++    /// custom properties in their `var()` presentation attributes substituted.
+     fn paint_declarations(&self, element: &Element) -> Option<String> {
+         let style = element.style_from_last_restyle();
+         let parent_style = element
+@@ -646,6 +686,12 @@ impl SVGSVGElement {
+                 .find_map(|ancestor| ancestor.style_from_last_restyle())
+         });
+         let is_root = std::ptr::eq(element, self.upcast::<Element>());
++        // Inline declarations are serialized too, and resvg can't read all of them (`var()`,
++        // lowercase `currentcolor`), so every paint property they name is re-emitted computed.
++        let inline_style = element.get_attribute_string_value_with_namespace(
++            &ns!(),
++            &local_name!("style"),
++        );
+ 
+         let mut declarations = String::new();
+         for property in SVG_PAINT_PROPERTIES {
+@@ -658,8 +704,12 @@ impl SVGSVGElement {
+                 let set_by_a_rule = parent_style
+                     .as_ref()
+                     .is_none_or(|parent| rasterizer_value(parent, property) != value);
+-                let inherited_into_root = is_root && property.inherited() && attribute.is_none();
+-                (set_by_a_rule || inherited_into_root).then_some(value)
++                let inherited_into_root = is_root && property.inherited();
++                let named_inline = inline_style
++                    .as_deref()
++                    .is_some_and(|style| style.contains(property.name()));
++                (set_by_a_rule || inherited_into_root || attribute.is_some() || named_inline)
++                    .then_some(value)
+             });
+             let value = from_cascade.or_else(|| {
+                 let attribute = attribute.filter(|attribute| attribute.contains("var("))?;
+diff --git a/components/shared/layout/lib.rs b/components/shared/layout/lib.rs
+index 5bbc8f6a6e1..d9f56f0b226 100644
+--- a/components/shared/layout/lib.rs
++++ b/components/shared/layout/lib.rs
+@@ -57,7 +57,7 @@ use servo_base::id::{BrowsingContextId, PipelineId, WebViewId};
+ use servo_url::{ImmutableOrigin, ServoUrl};
+ use style::Atom;
+ use style::animation::DocumentAnimationSet;
+-use style::attr::{AttrValue, parse_integer, parse_unsigned_integer};
++use style::attr::AttrValue;
+ use style::context::QuirksMode;
+ use style::data::ElementDataWrapper;
+ use style::device::Device;
+@@ -203,24 +203,30 @@ pub struct SVGElementData<'dom> {
+     pub view_box: Option<&'dom AttrValue>,
+ }
+ 
++/// A valid `viewBox` value as `[min_x, min_y, width, height]`.
++/// <https://svgwg.org/svg2-draft/coords.html#ViewBoxAttribute>: four numbers (decimals
++/// included, e.g. `0 0 40 19.3`) separated by whitespace and/or a comma, with a positive size.
++pub fn parse_view_box(value: &str) -> Option<[f32; 4]> {
++    let mut numbers = value
++        .split(|c: char| char_is_whitespace(c) || c == ',')
++        .filter(|number| !number.is_empty())
++        .map(str::parse::<f32>);
++    let view_box = [
++        numbers.next()?.ok()?,
++        numbers.next()?.ok()?,
++        numbers.next()?.ok()?,
++        numbers.next()?.ok()?,
++    ];
++    if numbers.next().is_some() || !(view_box[2] > 0.0) || !(view_box[3] > 0.0) {
++        return None;
++    }
++    Some(view_box)
++}
++
+ impl SVGElementData<'_> {
+     pub fn ratio_from_view_box(&self) -> Option<f32> {
+-        let mut iter = self.view_box?.chars();
+-        let _min_x = parse_integer(&mut iter).ok()?;
+-        let _min_y = parse_integer(&mut iter).ok()?;
+-
+-        let width = parse_unsigned_integer(&mut iter).ok()?;
+-        if width == 0 {
+-            return None;
+-        }
+-
+-        let height = parse_unsigned_integer(&mut iter).ok()?;
+-        if height == 0 {
+-            return None;
+-        }
+-
+-        let mut iter = iter.skip_while(|c| char_is_whitespace(*c));
+-        iter.next().is_none().then(|| width as f32 / height as f32)
++        let [_, _, width, height] = parse_view_box(self.view_box?)?;
++        Some(width / height)
+     }
+ }
+ 
+-- 
+2.43.0
+
