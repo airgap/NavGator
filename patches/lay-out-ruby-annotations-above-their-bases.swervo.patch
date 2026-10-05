@@ -1,0 +1,471 @@
+From 93ad43f15262b168e23463d9de7ed122a62d7061 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 04:24:31 -0400
+Subject: [PATCH] layout: lay out ruby annotations above their bases
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+<ruby> rendered its annotations inline ("漢かん字じ") because Servo
+dropped display: ruby and display: ruby-text, where Chrome stacks each
+reading above its base, which Japanese news and education pages rely on.
+
+With Stylo parsing both values, the block container builder turns a ruby
+into an inline box (or, when blockified, a block) holding one atomic
+inline per ruby column. ruby_items pairs each ruby-text child with the
+content before it, skips display: none children such as <rp>, and keeps
+white space between columns as a space. A column is a block container,
+styled by the new ::-servo-ruby-column pseudo-element, with the annotation
+as a block above the base, so it is as wide as the wider of the two,
+centers both, and takes its baseline from the base. Its anonymous base
+block nests under the column pseudo-element so that it inherits the
+column's text-align and line-height. Inline layout leaves the annotation
+out of the column's line height contribution, so it overflows upwards
+into the leading like in Chrome instead of growing the line. The UA sheet
+sizes annotations like Chrome's.
+
+Ruby text containers, nested rubies and Chrome's extra line spacing for
+annotations that do not fit above a line are not handled.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/dom_traversal.rs            | 92 +++++++++++++++++++
+ components/layout/flow/construct.rs           | 92 ++++++++++++++++++-
+ components/layout/flow/inline/mod.rs          | 32 ++++++-
+ components/layout/style_ext.rs                | 12 ++-
+ components/layout/stylesheets/servo.css       | 11 +++
+ components/layout/stylesheets/user-agent.css  |  5 +
+ .../shared/layout/pseudo_element_chain.rs     | 17 ++--
+ 7 files changed, 245 insertions(+), 16 deletions(-)
+
+diff --git a/components/layout/dom_traversal.rs b/components/layout/dom_traversal.rs
+index bd320c66c3d..ef717986e60 100644
+--- a/components/layout/dom_traversal.rs
++++ b/components/layout/dom_traversal.rs
+@@ -12,8 +12,10 @@ use servo_arc::Arc as ServoArc;
+ use style::dom::NodeInfo;
+ use style::properties::ComputedValues;
+ use style::selector_parser::PseudoElement;
++use style::str::char_is_whitespace;
+ use style::values::generics::counters::{Content, ContentItem};
+ use style::values::specified::Quotes;
++use style::values::specified::box_::Display as StyloDisplay;
+ use web_atoms::LocalName;
+ 
+ use crate::context::LayoutContext;
+@@ -238,6 +240,96 @@ fn traverse_backdrop_pseudo_element<'dom>(
+     );
+ }
+ 
++/// A ruby base and the annotation paired with it, the unit that ruby layout stacks.
++/// <https://drafts.csswg.org/css-ruby/#ruby-pairing>
++pub(crate) struct RubyColumn<'dom> {
++    base: Vec<ServoLayoutNode<'dom>>,
++    annotation: Option<ServoLayoutNode<'dom>>,
++}
++
++/// The contents of a `display: ruby` element, in order.
++pub(crate) enum RubyItem<'dom> {
++    Column(RubyColumn<'dom>),
++    /// White space between two columns, or after the last one, which separates them like a
++    /// space in the surrounding text, as in Chrome.
++    WhiteSpace,
++}
++
++/// Pairs the children of a `display: ruby` element into columns: each `display: ruby-text`
++/// child annotates the content since the previous annotation. This covers the common
++/// `<ruby>base<rt>text</rt>base<rt>text</rt></ruby>` markup but neither ruby text containers
++/// nor nested rubies. `display: none` children such as `<rp>` produce no boxes.
++pub(crate) fn ruby_items<'dom>(
++    ruby_info: &NodeAndStyleInfo<'dom>,
++    context: &LayoutContext,
++) -> Vec<RubyItem<'dom>> {
++    let mut items = Vec::new();
++    let mut base: Vec<ServoLayoutNode<'dom>> = Vec::new();
++    let push_column = |items: &mut Vec<RubyItem<'dom>>,
++                       base: Vec<ServoLayoutNode<'dom>>,
++                       annotation: Option<ServoLayoutNode<'dom>>| {
++        let starts_with_white_space = base.first().is_some_and(|node| {
++            node.is_text_node() && node.text_content().starts_with(char_is_whitespace)
++        });
++        if starts_with_white_space && !items.is_empty() {
++            items.push(RubyItem::WhiteSpace);
++        }
++        items.push(RubyItem::Column(RubyColumn { base, annotation }));
++    };
++    for child in ruby_info.node.flat_tree_children() {
++        if child.is_text_node() {
++            base.push(child);
++            continue;
++        }
++        if !child.is_element() {
++            continue;
++        }
++        let display = child.style(&context.style_context).get_box().display;
++        if display == StyloDisplay::RubyText {
++            push_column(&mut items, std::mem::take(&mut base), Some(child));
++        } else if Display::from(display) != Display::None {
++            base.push(child);
++        }
++    }
++    let base_is_white_space = base
++        .iter()
++        .all(|node| node.is_text_node() && node.text_content().chars().all(char_is_whitespace));
++    if !base_is_white_space {
++        push_column(&mut items, base, None);
++    } else if !base.is_empty() && !items.is_empty() {
++        items.push(RubyItem::WhiteSpace);
++    }
++    items
++}
++
++/// Feeds a ruby column to `handler`: the annotation first, as a block so that it stacks
++/// above the base, and then the base content.
++pub(crate) fn traverse_ruby_column<'dom>(
++    column: &RubyColumn<'dom>,
++    context: &LayoutContext,
++    handler: &mut impl TraversalHandler<'dom>,
++) {
++    if let Some(annotation) = column.annotation {
++        let info = NodeAndStyleInfo::new(annotation, annotation.style(&context.style_context));
++        let contents = Contents::for_element(annotation, context);
++        let display = DisplayGeneratingBox::OutsideInside {
++            outside: DisplayOutside::Block,
++            inside: DisplayInside::Flow {
++                is_list_item: false,
++            },
++        };
++        handler.handle_element(&info, display, contents, annotation.box_slot());
++    }
++    for &node in &column.base {
++        if node.is_text_node() {
++            let info = NodeAndStyleInfo::new(node, node.style(&context.style_context));
++            handler.handle_text(&info, node.text_content());
++        } else {
++            traverse_element(node, context, handler);
++        }
++    }
++}
++
+ fn traverse_eager_pseudo_element<'dom>(
+     pseudo_element_type: PseudoElement,
+     node_info: &NodeAndStyleInfo<'dom>,
+diff --git a/components/layout/flow/construct.rs b/components/layout/flow/construct.rs
+index 7662817d59e..9312310160c 100644
+--- a/components/layout/flow/construct.rs
++++ b/components/layout/flow/construct.rs
+@@ -11,7 +11,9 @@ use style::properties::ComputedValues;
+ use style::properties::longhands::list_style_position::computed_value::T as ListStylePosition;
+ use style::selector_parser::PseudoElement;
+ use style::str::char_is_whitespace;
+-use style::values::specified::box_::DisplayOutside as StyloDisplayOutside;
++use style::values::specified::box_::{
++    DisplayInside as StyloDisplayInside, DisplayOutside as StyloDisplayOutside,
++};
+ 
+ use super::OutsideMarker;
+ use super::inline::construct::InlineFormattingContextBuilder;
+@@ -22,7 +24,8 @@ use crate::cell::ArcRefCell;
+ use crate::context::LayoutContext;
+ use crate::dom::{BoxSlot, LayoutBox, NodeExt};
+ use crate::dom_traversal::{
+-    Contents, NodeAndStyleInfo, NonReplacedContents, PseudoElementContentItem, TraversalHandler,
++    Contents, NodeAndStyleInfo, NonReplacedContents, PseudoElementContentItem, RubyItem,
++    TraversalHandler, ruby_items, traverse_ruby_column,
+ };
+ use crate::flow::float::FloatBox;
+ use crate::flow::same_formatting_context_block::SameFormattingContextBlock;
+@@ -30,7 +33,7 @@ use crate::flow::{BlockContainer, BlockFormattingContext, BlockLevelBox};
+ use crate::formatting_contexts::{
+     IndependentFormattingContext, IndependentFormattingContextContents,
+ };
+-use crate::fragment_tree::FragmentFlags;
++use crate::fragment_tree::{BaseFragmentInfo, FragmentFlags};
+ use crate::layout_box_base::LayoutBoxBase;
+ use crate::positioned::AbsolutelyPositionedBox;
+ use crate::style_ext::{ComputedValuesExt, DisplayGeneratingBox, DisplayInside, DisplayOutside};
+@@ -226,7 +229,16 @@ impl BlockContainer {
+             }
+         }
+ 
+-        contents.traverse(context, info, &mut builder);
++        match contents {
++            // A blockified ruby is a block box around the ruby's columns.
++            // <https://drafts.csswg.org/css-ruby/#block-ruby>
++            NonReplacedContents::OfElement
++                if info.style.get_box().display.inside() == StyloDisplayInside::Ruby =>
++            {
++                builder.push_ruby_columns(info)
++            },
++            contents => contents.traverse(context, info, &mut builder),
++        }
+         builder.finish()
+     }
+ }
+@@ -520,6 +532,15 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
+     ) {
+         let context = self.context;
+         let old_layout_box = box_slot.take_layout_box();
++        if info.style.get_box().display.inside() == StyloDisplayInside::Ruby &&
++            matches!(
++                contents,
++                Contents::NonReplaced(NonReplacedContents::OfElement)
++            )
++        {
++            self.handle_ruby(info, box_slot, old_layout_box);
++            return;
++        }
+         let (is_list_item, non_replaced_contents) = match (display_inside, contents) {
+             (
+                 DisplayInside::Flow { is_list_item },
+@@ -577,6 +598,69 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
+             .end_inline_box();
+     }
+ 
++    /// Lays out an inline `display: ruby` element as an inline box holding one atomic inline
++    /// per ruby column, with the annotation stacked over its base. The column is as wide as
++    /// the wider of the two and centers both, and its baseline is the base's. Inline layout
++    /// lets the annotation overflow the line box upwards. This is how Chrome lays out the
++    /// common cases of <https://drafts.csswg.org/css-ruby/#ruby-layout>, except that Chrome
++    /// also grows a line whose annotations do not fit in the space above it.
++    fn handle_ruby(
++        &mut self,
++        info: &NodeAndStyleInfo<'dom>,
++        box_slot: BoxSlot<'dom>,
++        old_layout_box: Option<LayoutBox>,
++    ) {
++        let context = self.context;
++        let inline_item = self
++            .ensure_inline_formatting_context_builder()
++            .start_inline_box(
++                || ArcRefCell::new(InlineBox::new(info, context)),
++                old_layout_box,
++            );
++        box_slot.set(LayoutBox::InlineLevel(inline_item));
++        self.push_ruby_columns(info);
++        self.inline_formatting_context_builder
++            .as_mut()
++            .expect("Should be building an InlineFormattingContext")
++            .end_inline_box();
++    }
++
++    /// Pushes one atomic inline per column of the ruby `info`, with the annotation stacked
++    /// over the base, see [`Self::handle_ruby`].
++    fn push_ruby_columns(&mut self, info: &NodeAndStyleInfo<'dom>) {
++        let context = self.context;
++        let column_info = info
++            .with_pseudo_element(context, PseudoElement::ServoRubyColumn)
++            .expect("Should never fail to create ruby column info");
++        for item in ruby_items(info, context) {
++            let column = match item {
++                RubyItem::Column(column) => column,
++                RubyItem::WhiteSpace => {
++                    self.ensure_inline_formatting_context_builder()
++                        .push_text(" ".into(), info);
++                    continue;
++                },
++            };
++            // Each column gets its own slot, which must exist before the column's anonymous
++            // base block, nested under it, asks for one.
++            let column_box_slot = column_info.node.box_slot();
++            let mut builder =
++                BlockContainerBuilder::new(context, &column_info, self.propagated_data);
++            traverse_ruby_column(&column, context, &mut builder);
++            let column_box = ArcRefCell::new(IndependentFormattingContext::new(
++                LayoutBoxBase::new(BaseFragmentInfo::anonymous(), column_info.style.clone()),
++                IndependentFormattingContextContents::Flow(
++                    BlockFormattingContext::from_block_container(builder.finish()),
++                ),
++                self.propagated_data,
++            ));
++            let column_item = self
++                .ensure_inline_formatting_context_builder()
++                .push_atomic(|| column_box, None);
++            column_box_slot.set(LayoutBox::InlineLevel(column_item));
++        }
++    }
++
+     fn handle_block_level_element(
+         &mut self,
+         info: &NodeAndStyleInfo<'dom>,
+diff --git a/components/layout/flow/inline/mod.rs b/components/layout/flow/inline/mod.rs
+index cabca7c4884..fd0d0f38069 100644
+--- a/components/layout/flow/inline/mod.rs
++++ b/components/layout/flow/inline/mod.rs
+@@ -107,8 +107,9 @@ use style::computed_values::word_break::T as WordBreak;
+ use style::context::{QuirksMode, SharedStyleContext};
+ use style::dom::OpaqueNode;
+ use style::properties::ComputedValues;
++use style::selector_parser::PseudoElement;
+ use style::values::computed::Overflow;
+-use style::values::specified::box_::DisplayInside;
++use style::values::specified::box_::{Display as StyloDisplay, DisplayInside};
+ use style::values::specified::text::TextOverflowSide;
+ use style::properties::style_structs::InheritedText;
+ use style::values::computed::BaselineShift;
+@@ -137,7 +138,7 @@ use crate::formatting_contexts::{Baselines, IndependentFormattingContext};
+ use crate::fragment_tree::{
+     BaseFragmentInfo, BoxFragment, CollapsedMargin, Fragment, FragmentFlags, PositioningFragment,
+ };
+-use crate::geom::{LogicalRect, LogicalSides1D, LogicalVec2, ToLogical};
++use crate::geom::{LogicalRect, LogicalSides1D, LogicalVec2, PhysicalSize, ToLogical};
+ use crate::layout_box_base::LayoutBoxBase;
+ use crate::positioned::{AbsolutelyPositionedBox, PositioningContext};
+ use crate::sizing::{ComputeInlineContentSizes, ContentSizes, InlineContentSizesResult};
+@@ -2985,8 +2986,15 @@ impl IndependentFormattingContext {
+             .map(|baseline| pbm_sums.block_start + baseline)
+             .unwrap_or(size.block);
+ 
+-        let (block_sizes, baseline_offset_in_parent) =
+-            self.get_block_sizes_and_baseline_offset(layout, size.block, baseline_offset);
++        // The annotation of a ruby column overflows the line box instead of growing it, as in
++        // Chrome, where it sits in the leading above the line or above the first line.
++        let annotation_block_size =
++            ruby_annotation_block_size(&fragment).to_logical(container_writing_mode).block;
++        let (block_sizes, baseline_offset_in_parent) = self.get_block_sizes_and_baseline_offset(
++            layout,
++            size.block - annotation_block_size,
++            baseline_offset - annotation_block_size,
++        );
+         layout.update_unbreakable_segment_for_new_content(
+             &block_sizes,
+             size.inline,
+@@ -3068,6 +3076,22 @@ impl IndependentFormattingContext {
+     }
+ }
+ 
++/// The size of the annotation stacked over the base of a ruby column, see
++/// `BlockContainerBuilder::handle_ruby`, or zero for any other atomic inline.
++fn ruby_annotation_block_size(fragment: &BoxFragment) -> PhysicalSize<Au> {
++    if fragment.style().pseudo() != Some(PseudoElement::ServoRubyColumn) {
++        return PhysicalSize::zero();
++    }
++    match fragment.children.first() {
++        Some(Fragment::Box(annotation))
++            if annotation.style().get_box().display == StyloDisplay::RubyText =>
++        {
++            annotation.margin_rect().size
++        },
++        _ => PhysicalSize::zero(),
++    }
++}
++
+ impl FloatBox {
+     fn layout_into_line_items(&self, layout: &mut InlineFormattingContextLayout) {
+         let fragment = Arc::new(self.layout(
+diff --git a/components/layout/style_ext.rs b/components/layout/style_ext.rs
+index cdf9635f82c..fbfbff46b07 100644
+--- a/components/layout/style_ext.rs
++++ b/components/layout/style_ext.rs
+@@ -140,7 +140,6 @@ pub(crate) enum DisplayLayoutInternal {
+ impl DisplayLayoutInternal {
+     /// <https://drafts.csswg.org/css-display-3/#layout-specific-displa>
+     pub(crate) fn display_inside(&self) -> DisplayInside {
+-        // When we add ruby, the display_inside of ruby must be Flow.
+         // TODO: this should be unreachable for everything but
+         // table cell and caption, once we have box tree fixups.
+         DisplayInside::FlowRoot {
+@@ -594,7 +593,9 @@ impl ComputedValuesExt for ComputedValues {
+     }
+ 
+     fn is_inline_box(&self, fragment_flags: FragmentFlags) -> bool {
+-        (self.get_box().display.is_inline_flow() &&
++        let display = self.get_box().display;
++        // An inline ruby is laid out as an inline box, see `BlockContainerBuilder::handle_ruby`.
++        ((display.is_inline_flow() || display == stylo::Display::Ruby) &&
+             !fragment_flags.intersects(
+                 FragmentFlags::IS_REPLACED |
+                     FragmentFlags::IS_WIDGET |
+@@ -1401,6 +1402,9 @@ impl From<stylo::Display> for Display {
+         let outside = match outside {
+             stylo::DisplayOutside::Block => DisplayOutside::Block,
+             stylo::DisplayOutside::Inline => DisplayOutside::Inline,
++            // The style adjuster leaves `display: ruby-text` only on the children of rubies,
++            // which lay them out themselves, see `BlockContainerBuilder::push_ruby_columns`.
++            stylo::DisplayOutside::InternalRuby => DisplayOutside::Inline,
+             stylo::DisplayOutside::TableCaption => {
+                 return Display::GeneratingBox(DisplayGeneratingBox::LayoutInternal(
+                     DisplayLayoutInternal::TableCaption,
+@@ -1443,6 +1447,10 @@ impl From<stylo::Display> for Display {
+             stylo::DisplayInside::Flex => DisplayInside::Flex,
+             stylo::DisplayInside::Grid => DisplayInside::Grid,
+             stylo::DisplayInside::Table => DisplayInside::Table,
++            // The block container builder recognizes a ruby from its stylo display.
++            stylo::DisplayInside::Ruby | stylo::DisplayInside::RubyText => DisplayInside::Flow {
++                is_list_item: false,
++            },
+ 
+             // These should not be values of DisplayInside, but oh well
+             stylo::DisplayInside::None => return Display::None,
+diff --git a/components/layout/stylesheets/servo.css b/components/layout/stylesheets/servo.css
+index e11679aff29..f3343635f09 100644
+--- a/components/layout/stylesheets/servo.css
++++ b/components/layout/stylesheets/servo.css
+@@ -565,6 +565,17 @@ details[open]::details-content {
+   writing-mode: inherit;
+ }
+ 
++/* A ruby base with its annotation, see `BlockContainerBuilder::handle_ruby`. With
++   `line-height: 1` the base's line starts at its em box, whatever the line height of the text
++   around it, so the annotation sits right above the base glyphs as in Chrome. */
++*|*::-servo-ruby-column {
++  display: inline-block;
++  text-align: center;
++  text-indent: 0;
++  line-height: 1;
++  text-wrap-mode: nowrap;
++}
++
+ *|*::-servo-anonymous-table {
+     display: table;
+ }
+diff --git a/components/layout/stylesheets/user-agent.css b/components/layout/stylesheets/user-agent.css
+index 4aada8187bb..f6de7335ae6 100644
+--- a/components/layout/stylesheets/user-agent.css
++++ b/components/layout/stylesheets/user-agent.css
+@@ -123,6 +123,11 @@ sub, sup { line-height: normal; font-size: smaller; }
+ 
+ ruby { display: ruby; }
+ rt { display: ruby-text; }
++/* Chrome's sizing of annotations. Their centering over the base comes from text-align here,
++   since Servo lays a ruby column out as a block container. */
++ruby, rt { text-indent: 0; }
++rt { line-height: normal; }
++ruby > rt { font-size: 50%; text-align: center; }
+ 
+ /*
+  * All tag names that can be links are listed here, because applying pseudo-class selectors
+diff --git a/components/shared/layout/pseudo_element_chain.rs b/components/shared/layout/pseudo_element_chain.rs
+index 9a94d1b16b1..d7a9bf3d4fc 100644
+--- a/components/shared/layout/pseudo_element_chain.rs
++++ b/components/shared/layout/pseudo_element_chain.rs
+@@ -31,15 +31,20 @@ impl PseudoElementChain {
+         self.secondary.or(self.primary)
+     }
+ 
+-    /// Return a possibly nested [`PseudoElementChain`]. Currently only `::before` and
+-    /// `::after` only support nesting. If the primary [`PseudoElement`] on the chain is
+-    /// not `::before` or `::after` a single element chain is returned for the given
++    /// Return a possibly nested [`PseudoElementChain`]. Currently only `::before`,
++    /// `::after` and ruby columns support nesting, the latter so that the anonymous block
++    /// around a ruby base inherits from its column. If the primary [`PseudoElement`] on the
++    /// chain is none of those a single element chain is returned for the given
+     /// [`PseudoElement`].
+     pub fn with_pseudo(&self, pseudo_element: PseudoElement) -> Self {
+         match self.primary {
+-            Some(primary) if primary.is_before_or_after() => Self {
+-                primary: self.primary,
+-                secondary: Some(pseudo_element),
++            Some(primary)
++                if primary.is_before_or_after() || primary == PseudoElement::ServoRubyColumn =>
++            {
++                Self {
++                    primary: self.primary,
++                    secondary: Some(pseudo_element),
++                }
+             },
+             _ => {
+                 assert!(self.secondary.is_none());
+-- 
+2.43.0
+

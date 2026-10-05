@@ -1,0 +1,3021 @@
+From 7dfede434152ca39a2e04613ff9ed8b6c185a70a Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 01:22:53 -0400
+Subject: [PATCH] dialog, popover: top layer, close watchers and the Popover
+ API
+
+The document now keeps a top layer, the showing auto popover list, the open
+dialogs list and a close watcher manager (document/top_layer.rs).
+
+Dialogs: showModal() adds the dialog to the top layer and close() removes
+it; open dialogs get a close watcher, so an Escape keydown the page does not
+cancel fires cancel and then close on the topmost modal dialog, as in
+Chrome. requestClose(), closedBy and the request-close command are
+implemented, and closedby=any dialogs close on a click outside of them.
+Content outside the topmost modal dialog is inert: it is not focusable and
+gets no mouse events.
+
+Popovers: showPopover(), hidePopover(), togglePopover(), the popover
+attribute, popovertarget/popovertargetaction on buttons and inputs, the
+toggle-/show-/hide-popover commands, beforetoggle and coalesced toggle
+events, auto popover stacking and light dismiss (click outside, Escape).
+Hint popovers share the auto stack instead of a separate hint list.
+
+History-action activation is tracked on the window so that a close request
+may only be cancelled once per user activation.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/document/document.rs    |    8 +
+ .../dom/document/document_event_handler.rs    |   40 +-
+ components/script/dom/document/mod.rs         |    1 +
+ components/script/dom/document/top_layer.rs   |  552 ++++++++
+ components/script/dom/element/focus.rs        |   26 +-
+ .../script/dom/html/htmlbuttonelement.rs      |   75 +-
+ .../script/dom/html/htmldialogelement.rs      |  356 +++++-
+ components/script/dom/html/htmlelement.rs     |   77 +-
+ .../script/dom/html/input_element/mod.rs      |   33 +
+ components/script/dom/html/mod.rs             |    1 +
+ components/script/dom/html/popover.rs         | 1120 +++++++++++++++++
+ components/script/dom/raredata.rs             |   19 +
+ components/script/dom/useractivation.rs       |    3 +-
+ components/script/dom/window/window.rs        |   44 +-
+ .../script_bindings/codegen/Bindings.conf     |    8 +-
+ .../webidls/HTMLButtonElement.webidl          |    1 +
+ .../webidls/HTMLDialogElement.webidl          |    6 +-
+ .../webidls/HTMLElement.webidl                |   22 +-
+ .../webidls/HTMLInputElement.webidl           |    1 +
+ .../webidls/PopoverInvokerElement.webidl      |    9 +
+ 20 files changed, 2341 insertions(+), 61 deletions(-)
+ create mode 100644 components/script/dom/document/top_layer.rs
+ create mode 100644 components/script/dom/html/popover.rs
+ create mode 100644 components/script_bindings/webidls/PopoverInvokerElement.webidl
+
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index fcb2119c056..1604672cce3 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -134,6 +134,7 @@ use crate::dom::customelementregistry::{
+ use crate::dom::customevent::CustomEvent;
+ use crate::dom::document::accessibility_data::AccessibilityData;
+ use crate::dom::document::focus::{DocumentFocusHandler, FocusableArea};
++use crate::dom::document::top_layer::DocumentTopLayer;
+ use crate::dom::document::tree_ordered_index_map::TreeOrderedIndexMap;
+ use crate::dom::document_embedder_controls::DocumentEmbedderControls;
+ use crate::dom::document_event_handler::DocumentEventHandler;
+@@ -398,6 +399,8 @@ pub(crate) struct Document {
+     event_handler: DocumentEventHandler,
+     /// A helper used to process and store data related to focus handling.
+     focus_handler: DocumentFocusHandler,
++    /// The top layer and the popover, dialog and close watcher state that feeds it.
++    top_layer: DocumentTopLayer,
+     /// A helper to handle showing and hiding user interface controls in the embedding layer.
+     embedder_controls: DocumentEmbedderControls,
+     id_map: TreeOrderedIndexMap,
+@@ -3751,6 +3754,7 @@ impl Document {
+             quirks_mode: Cell::new(QuirksMode::NoQuirks),
+             event_handler: DocumentEventHandler::new(window),
+             focus_handler: DocumentFocusHandler::new(window, has_focus),
++            top_layer: Default::default(),
+             embedder_controls: DocumentEmbedderControls::new(window),
+             id_map: TreeOrderedIndexMap::id(),
+             name_map: TreeOrderedIndexMap::name(),
+@@ -3907,6 +3911,10 @@ impl Document {
+         &self.focus_handler
+     }
+ 
++    pub(crate) fn top_layer(&self) -> &DocumentTopLayer {
++        &self.top_layer
++    }
++
+     /// Get the [`Document`]'s [`DocumentEmbedderControls`].
+     pub(crate) fn embedder_controls(&self) -> &DocumentEmbedderControls {
+         &self.embedder_controls
+diff --git a/components/script/dom/document/document_event_handler.rs b/components/script/dom/document/document_event_handler.rs
+index 19436075726..ae7f0b7a35b 100644
+--- a/components/script/dom/document/document_event_handler.rs
++++ b/components/script/dom/document/document_event_handler.rs
+@@ -58,6 +58,7 @@ use crate::dom::bindings::trace::NoTrace;
+ use crate::dom::clipboardevent::ClipboardEventType;
+ use crate::dom::document::FireMouseEventType;
+ use crate::dom::document::focus::FocusableArea;
++use crate::dom::document::top_layer::LightDismissEventType;
+ use crate::dom::event::{EventBubbles, EventCancelable, EventComposed, EventFlags};
+ #[cfg(feature = "gamepad")]
+ use crate::dom::gamepad::gamepad::{Gamepad, contains_user_gesture};
+@@ -918,9 +919,8 @@ impl DocumentEventHandler {
+         }
+ 
+         // https://w3c.github.io/uievents/#hit-test
+-        // Prevent mouse event if element is disabled.
+-        // TODO: also inert.
+-        if element.is_actually_disabled() {
++        // Prevent mouse event if element is disabled or inert.
++        if element.is_actually_disabled() || element.is_inert() {
+             return;
+         }
+ 
+@@ -992,6 +992,18 @@ impl DocumentEventHandler {
+                 self.mouse_buttons_down.set(mouse_buttons_down + 1);
+ 
+                 pointer_event.upcast::<Event>().fire(cx, &pointer_target);
++                // <https://html.spec.whatwg.org/multipage/#run-light-dismiss-activities> for
++                // pointerdown and pointerup closes popovers and dialogs clicked outside of.
++                if mouse_buttons_down == 0 &&
++                    let Some(target) = pointer_target.downcast::<Node>()
++                {
++                    document.top_layer().run_light_dismiss_activities(
++                        cx,
++                        &mouse_event,
++                        LightDismissEventType::PointerDown,
++                        target,
++                    );
++                }
+ 
+                 // Process pending pointer capture after firing event, but skip if we just
+                 // released a disconnected capture to avoid immediately re-capturing.
+@@ -1063,6 +1075,16 @@ impl DocumentEventHandler {
+                     .unwrap_or_else(|| DomRoot::from_ref(node.upcast::<EventTarget>()));
+ 
+                 pointer_event.upcast::<Event>().fire(cx, &pointer_target);
++                if mouse_buttons_down == 1 &&
++                    let Some(target) = pointer_target.downcast::<Node>()
++                {
++                    document.top_layer().run_light_dismiss_activities(
++                        cx,
++                        &mouse_event,
++                        LightDismissEventType::PointerUp,
++                        target,
++                    );
++                }
+ 
+                 // Decrement button count after firing event, so setPointerCapture/releasePointerCapture
+                 // work during the pointerup handler (pointer is still "active").
+@@ -1561,6 +1583,18 @@ impl DocumentEventHandler {
+             return flags.into();
+         }
+ 
++        // <https://html.spec.whatwg.org/multipage/#close-requests>: an Escape keydown that the
++        // page did not cancel is a close request, which closes the topmost modal dialog or auto
++        // popover.
++        if keyboard_event.event.state == KeyState::Down &&
++            keyboard_event.event.key == Key::Named(NamedKey::Escape)
++        {
++            self.window
++                .Document()
++                .top_layer()
++                .process_close_watchers(cx);
++        }
++
+         // <https://w3c.github.io/clipboard-apis/#clipboard-actions>: the platform's cut, copy and
+         // paste shortcuts run the clipboard actions, firing cut/copy/paste at the focus, whose
+         // default action edits text controls.
+diff --git a/components/script/dom/document/mod.rs b/components/script/dom/document/mod.rs
+index 66f6b17c6d2..2f30d767729 100644
+--- a/components/script/dom/document/mod.rs
++++ b/components/script/dom/document/mod.rs
+@@ -11,6 +11,7 @@ pub(crate) mod documentfragment;
+ pub(crate) mod documentorshadowroot;
+ pub(crate) mod documenttype;
+ pub(crate) mod focus;
++pub(crate) mod top_layer;
+ mod tree_ordered_index_map;
+ pub(crate) mod visibilitystateentry;
+ 
+diff --git a/components/script/dom/document/top_layer.rs b/components/script/dom/document/top_layer.rs
+new file mode 100644
+index 00000000000..381806e4f58
+--- /dev/null
++++ b/components/script/dom/document/top_layer.rs
+@@ -0,0 +1,552 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++use std::cell::Cell;
++
++use js::context::JSContext;
++use script_bindings::cell::DomRefCell;
++use script_bindings::codegen::GenericBindings::MouseEventBinding::MouseEventMethods;
++use script_bindings::inheritance::Castable;
++use script_bindings::root::{Dom, DomRoot};
++use stylo_dom::ElementState;
++
++use crate::dom::bindings::root::MutNullableDom;
++use crate::dom::html::htmldialogelement::ClosedByState;
++use crate::dom::node::Node;
++use crate::dom::types::{Element, HTMLDialogElement, HTMLElement, MouseEvent};
++
++/// The kind of pointer event that runs the light dismiss activities.
++#[derive(Clone, Copy, PartialEq)]
++pub(crate) enum LightDismissEventType {
++    PointerDown,
++    PointerUp,
++}
++
++/// The [`DocumentTopLayer`] holds a `Document`'s top layer together with the bookkeeping that
++/// decides what enters and leaves it: the showing auto popover list, the open dialogs list, the
++/// light dismiss pointerdown targets and the window's close watcher manager.
++#[derive(JSTraceable, MallocSizeOf)]
++#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
++pub(crate) struct DocumentTopLayer {
++    /// <https://drafts.csswg.org/css-position-4/#document-top-layer>
++    top_layer: DomRefCell<Vec<Dom<Element>>>,
++    /// <https://html.spec.whatwg.org/multipage/#showing-auto-popover-list>
++    showing_auto_popover_list: DomRefCell<Vec<Dom<HTMLElement>>>,
++    /// <https://html.spec.whatwg.org/multipage/#open-dialogs-list>
++    open_dialogs_list: DomRefCell<Vec<Dom<HTMLDialogElement>>>,
++    /// <https://html.spec.whatwg.org/multipage/#popover-pointerdown-target>
++    popover_pointerdown_target: MutNullableDom<HTMLElement>,
++    /// <https://html.spec.whatwg.org/multipage/#dialog-pointerdown-target>
++    dialog_pointerdown_target: MutNullableDom<HTMLDialogElement>,
++    /// <https://html.spec.whatwg.org/multipage/#close-watcher-manager-groups>
++    ///
++    /// A close watcher is represented by the dialog or popover element that established it.
++    close_watcher_groups: DomRefCell<Vec<Vec<Dom<HTMLElement>>>>,
++    /// <https://html.spec.whatwg.org/multipage/#allowed-number-of-groups>
++    allowed_number_of_groups: Cell<usize>,
++    /// <https://html.spec.whatwg.org/multipage/#next-user-interaction-allows-a-new-group>
++    next_user_interaction_allows_a_new_group: Cell<bool>,
++}
++
++impl Default for DocumentTopLayer {
++    fn default() -> Self {
++        Self {
++            top_layer: Default::default(),
++            showing_auto_popover_list: Default::default(),
++            open_dialogs_list: Default::default(),
++            popover_pointerdown_target: Default::default(),
++            dialog_pointerdown_target: Default::default(),
++            close_watcher_groups: Default::default(),
++            allowed_number_of_groups: Cell::new(1),
++            next_user_interaction_allows_a_new_group: Cell::new(true),
++        }
++    }
++}
++
++impl DocumentTopLayer {
++    pub(crate) fn contains(&self, element: &Element) -> bool {
++        self.top_layer
++            .borrow()
++            .iter()
++            .any(|item| &**item == element)
++    }
++
++    /// <https://drafts.csswg.org/css-position-4/#add-an-element-to-the-top-layer>
++    pub(crate) fn add(&self, element: &Element) {
++        // > If el is already contained in top layer, remove it first, then append it.
++        self.remove(element);
++        self.top_layer.borrow_mut().push(Dom::from_ref(element));
++    }
++
++    /// <https://drafts.csswg.org/css-position-4/#remove-an-element-from-the-top-layer-immediately>
++    ///
++    /// Overlay transitions are not supported, so a removal request takes effect immediately.
++    pub(crate) fn remove(&self, element: &Element) {
++        self.top_layer
++            .borrow_mut()
++            .retain(|item| &**item != element);
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#blocked-by-a-modal-dialog>: the topmost modal
++    /// dialog in the top layer, which makes everything outside of it inert.
++    pub(crate) fn blocking_modal_dialog(&self) -> Option<DomRoot<HTMLDialogElement>> {
++        self.top_layer.borrow().iter().rev().find_map(|element| {
++            if !element.state().contains(ElementState::MODAL) {
++                return None;
++            }
++            element
++                .downcast::<HTMLDialogElement>()
++                .map(DomRoot::from_ref)
++        })
++    }
++
++    pub(crate) fn showing_auto_popover_list(&self) -> Vec<DomRoot<HTMLElement>> {
++        self.showing_auto_popover_list
++            .borrow()
++            .iter()
++            .map(|popover| DomRoot::from_ref(&**popover))
++            .collect()
++    }
++
++    pub(crate) fn push_showing_auto_popover(&self, popover: &HTMLElement) {
++        debug_assert!(!self.showing_auto_popover_list_contains(popover));
++        self.showing_auto_popover_list
++            .borrow_mut()
++            .push(Dom::from_ref(popover));
++    }
++
++    pub(crate) fn remove_showing_auto_popover(&self, popover: &HTMLElement) {
++        self.showing_auto_popover_list
++            .borrow_mut()
++            .retain(|item| &**item != popover);
++    }
++
++    pub(crate) fn showing_auto_popover_list_contains(&self, popover: &HTMLElement) -> bool {
++        self.showing_auto_popover_list
++            .borrow()
++            .iter()
++            .any(|item| &**item == popover)
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#topmost-auto-popover>
++    pub(crate) fn topmost_auto_popover(&self) -> Option<DomRoot<HTMLElement>> {
++        self.showing_auto_popover_list
++            .borrow()
++            .last()
++            .map(|popover| DomRoot::from_ref(&**popover))
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#popover-stack-position>: one more than the index
++    /// of `popover` in the showing auto popover list, or zero when it is not in that list.
++    pub(crate) fn popover_stack_position(&self, popover: Option<&HTMLElement>) -> usize {
++        let Some(popover) = popover else {
++            return 0;
++        };
++        self.showing_auto_popover_list
++            .borrow()
++            .iter()
++            .position(|item| &**item == popover)
++            .map_or(0, |index| index + 1)
++    }
++
++    pub(crate) fn add_open_dialog(&self, dialog: &HTMLDialogElement) {
++        if self
++            .open_dialogs_list
++            .borrow()
++            .iter()
++            .any(|item| &**item == dialog)
++        {
++            return;
++        }
++        self.open_dialogs_list
++            .borrow_mut()
++            .push(Dom::from_ref(dialog));
++    }
++
++    pub(crate) fn remove_open_dialog(&self, dialog: &HTMLDialogElement) {
++        self.open_dialogs_list
++            .borrow_mut()
++            .retain(|item| &**item != dialog);
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#establish-a-close-watcher>
++    pub(crate) fn establish_close_watcher(&self, close_watcher: &HTMLElement) {
++        self.destroy_close_watcher(close_watcher);
++        let mut groups = self.close_watcher_groups.borrow_mut();
++        // > 4. If manager's groups's size is less than manager's allowed number of groups, then
++        // >    append « closeWatcher » to manager's groups.
++        // > 5. Otherwise: Assert: manager's groups's size is at least 1 in this branch, since
++        // >    manager's allowed number of groups is always at least 1. Append closeWatcher to
++        // >    manager's groups's last item.
++        if groups.len() < self.allowed_number_of_groups.get() {
++            groups.push(vec![Dom::from_ref(close_watcher)]);
++        } else {
++            groups
++                .last_mut()
++                .expect("There is always at least one allowed group")
++                .push(Dom::from_ref(close_watcher));
++        }
++        // > 6. Set manager's next user interaction allows a new group to true.
++        self.next_user_interaction_allows_a_new_group.set(true);
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#close-watcher-destroy>
++    pub(crate) fn destroy_close_watcher(&self, close_watcher: &HTMLElement) {
++        let mut groups = self.close_watcher_groups.borrow_mut();
++        for group in groups.iter_mut() {
++            group.retain(|item| &**item != close_watcher);
++        }
++        groups.retain(|group| !group.is_empty());
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#close-watcher-active>
++    pub(crate) fn is_close_watcher_active(&self, close_watcher: &HTMLElement) -> bool {
++        self.close_watcher_groups
++            .borrow()
++            .iter()
++            .flatten()
++            .any(|item| &**item == close_watcher)
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#notify-the-close-watcher-manager-about-user-activation>
++    pub(crate) fn notify_about_user_activation(&self) {
++        // > 2. If manager's next user interaction allows a new group is true, then increment
++        // >    manager's allowed number of groups.
++        // > 3. Set manager's next user interaction allows a new group to false.
++        if self.next_user_interaction_allows_a_new_group.get() {
++            self.allowed_number_of_groups
++                .set(self.allowed_number_of_groups.get() + 1);
++        }
++        self.next_user_interaction_allows_a_new_group.set(false);
++    }
++
++    /// Part of <https://html.spec.whatwg.org/multipage/#close-watcher-request-close>:
++    /// whether a close request may be cancelled without consuming more than the available groups.
++    fn groups_below_allowed_number(&self) -> bool {
++        self.close_watcher_groups.borrow().len() < self.allowed_number_of_groups.get()
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#process-close-watchers>
++    pub(crate) fn process_close_watchers(&self, cx: &mut JSContext) -> bool {
++        // > 1. Let processedACloseWatcher be false.
++        let mut processed_a_close_watcher = false;
++
++        // > 2. If window's close watcher manager's groups is not empty:
++        // > 2.1. Let group be the last item in window's close watcher manager's groups.
++        let group: Vec<DomRoot<HTMLElement>> = self
++            .close_watcher_groups
++            .borrow()
++            .last()
++            .map(|group| {
++                group
++                    .iter()
++                    .map(|item| DomRoot::from_ref(&**item))
++                    .collect()
++            })
++            .unwrap_or_default();
++
++        // > 2.2. For each closeWatcher of group, in reverse order:
++        for close_watcher in group.iter().rev() {
++            // > 2.2.1. If the result of running closeWatcher's get enabled state is true, set
++            // >        processedACloseWatcher to true.
++            if close_watcher_enabled_state(close_watcher) {
++                processed_a_close_watcher = true;
++            }
++            // > 2.2.2. Let shouldProceed be the result of requesting to close closeWatcher with
++            // >        true.
++            // > 2.2.3. If shouldProceed is false, then break.
++            if !self.request_to_close(cx, close_watcher, true) {
++                break;
++            }
++        }
++
++        // > 3. If window's close watcher manager's allowed number of groups is greater than 1,
++        // >    decrement it by 1.
++        if self.allowed_number_of_groups.get() > 1 {
++            self.allowed_number_of_groups
++                .set(self.allowed_number_of_groups.get() - 1);
++        }
++
++        // > 4. Return processedACloseWatcher.
++        processed_a_close_watcher
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#close-watcher-request-close>
++    pub(crate) fn request_to_close(
++        &self,
++        cx: &mut JSContext,
++        close_watcher: &HTMLElement,
++        require_history_action_activation: bool,
++    ) -> bool {
++        // > 1. If closeWatcher is not active, then return true.
++        if !self.is_close_watcher_active(close_watcher) {
++            return true;
++        }
++        // > 2. If the result of running closeWatcher's get enabled state is false, then return
++        // >    true.
++        if !close_watcher_enabled_state(close_watcher) {
++            return true;
++        }
++        // > 3. If closeWatcher's is running cancel action is true, then return true.
++        let dialog = close_watcher.downcast::<HTMLDialogElement>();
++        if dialog.is_some_and(HTMLDialogElement::is_running_cancel_action) {
++            return true;
++        }
++        // > 4. Let window be closeWatcher's window.
++        // > 5. If window's associated Document is not fully active, then return true.
++        let document = close_watcher.upcast::<Node>().owner_doc();
++        if !document.is_fully_active() {
++            return true;
++        }
++        let window = document.window();
++
++        // > 6. Let canPreventClose be true if requireHistoryActionActivation is false, or if
++        // >    window's close watcher manager's groups's size is less than window's close watcher
++        // >    manager's allowed number of groups, and window has history-action activation;
++        // >    otherwise false.
++        let can_prevent_close = !require_history_action_activation ||
++            (self.groups_below_allowed_number() && window.has_history_action_activation());
++
++        // > 7. Set closeWatcher's is running cancel action to true.
++        // > 8. Let shouldContinue be the result of running closeWatcher's cancel action given
++        // >    canPreventClose.
++        // > 9. Set closeWatcher's is running cancel action to false.
++        //
++        // Popovers have no cancel action, so they always continue.
++        let should_continue = match dialog {
++            Some(dialog) => dialog.run_close_watcher_cancel_action(cx, can_prevent_close),
++            None => true,
++        };
++
++        // > 10. If shouldContinue is false, then:
++        if !should_continue {
++            // > 10.1. Assert: canPreventClose is true.
++            debug_assert!(can_prevent_close);
++            // > 10.2. Consume history-action user activation given window.
++            window.consume_history_action_user_activation();
++            // > 10.3. Return false.
++            return false;
++        }
++
++        // > 11. If closeWatcher is not active, then return true.
++        // > 12. If window's associated Document is not fully active, then return true.
++        // > 13. Close closeWatcher.
++        self.close(cx, close_watcher);
++
++        // > 14. Return true.
++        true
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#close-watcher-close>
++    fn close(&self, cx: &mut JSContext, close_watcher: &HTMLElement) {
++        // > 1. If closeWatcher is not active, then return.
++        if !self.is_close_watcher_active(close_watcher) {
++            return;
++        }
++        // > 2. If closeWatcher's window's associated Document is not fully active, then return.
++        if !close_watcher.upcast::<Node>().owner_doc().is_fully_active() {
++            return;
++        }
++        // > 3. Destroy closeWatcher.
++        self.destroy_close_watcher(close_watcher);
++        // > 4. Run closeWatcher's close action.
++        match close_watcher.downcast::<HTMLDialogElement>() {
++            // Close the dialog given dialog, dialog's request close return value, and dialog's
++            // request close source element.
++            Some(dialog) => dialog.run_close_watcher_close_action(cx),
++            // Hide popover given element, true, true, false, and null.
++            None => close_watcher
++                .hide_popover(cx, true, true, false, false, None)
++                .unwrap(),
++        }
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#run-light-dismiss-activities>
++    pub(crate) fn run_light_dismiss_activities(
++        &self,
++        cx: &mut JSContext,
++        event: &MouseEvent,
++        event_type: LightDismissEventType,
++        target: &Node,
++    ) {
++        // > 1. Run light dismiss open popovers with event.
++        self.light_dismiss_open_popovers(cx, event_type, target);
++        // > 2. Run light dismiss open dialogs with event.
++        self.light_dismiss_open_dialogs(cx, event, event_type, target);
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#light-dismiss-open-popovers>
++    fn light_dismiss_open_popovers(
++        &self,
++        cx: &mut JSContext,
++        event_type: LightDismissEventType,
++        target: &Node,
++    ) {
++        // > 4. Let topmostPopover be the result of running topmost auto popover given document.
++        // > 5. If topmostPopover is null, then return.
++        if self.topmost_auto_popover().is_none() {
++            return;
++        }
++
++        match event_type {
++            // > 6. If event is a PointerEvent and event's type is "pointerdown", then: set
++            // >    document's popover pointerdown target to the result of running topmost clicked
++            // >    popover given target.
++            LightDismissEventType::PointerDown => {
++                self.popover_pointerdown_target
++                    .set(self.topmost_clicked_popover(cx, target).as_deref());
++            },
++            // > 7. If event is a PointerEvent and event's type is "pointerup", then:
++            LightDismissEventType::PointerUp => {
++                // > 7.1. Let ancestor be the result of running topmost clicked popover given
++                // >      target.
++                let ancestor = self.topmost_clicked_popover(cx, target);
++                // > 7.2. Let sameTarget be true if ancestor is document's popover pointerdown
++                // >      target.
++                let same_target =
++                    ancestor.as_deref() == self.popover_pointerdown_target.get().as_deref();
++                // > 7.3. Set document's popover pointerdown target to null.
++                self.popover_pointerdown_target.set(None);
++                // > 7.4. If ancestor is null, then set ancestor to document.
++                // > 7.5. If sameTarget is true, then run hide all popovers until given ancestor,
++                // >      false, and true.
++                if same_target {
++                    HTMLElement::hide_all_popovers_until(
++                        cx,
++                        &target.owner_doc(),
++                        ancestor.as_deref(),
++                        false,
++                        true,
++                    );
++                }
++            },
++        }
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#topmost-clicked-popover>
++    fn topmost_clicked_popover(&self, cx: &JSContext, node: &Node) -> Option<DomRoot<HTMLElement>> {
++        // > 1. Let clickedPopover be the result of running nearest inclusive open popover given
++        // >    node.
++        let clicked_popover = HTMLElement::nearest_inclusive_open_popover(node);
++        // > 2. Let invokerPopover be the result of running nearest inclusive target popover for
++        // >    invoker given node.
++        let invoker_popover = HTMLElement::nearest_inclusive_target_popover_for_invoker(cx, node);
++        // > 3. If the result of getting the popover stack position given clickedPopover is
++        // >    greater than the result of getting the popover stack position given
++        // >    invokerPopover, then return clickedPopover.
++        // > 4. Return invokerPopover.
++        if self.popover_stack_position(clicked_popover.as_deref()) >
++            self.popover_stack_position(invoker_popover.as_deref())
++        {
++            return clicked_popover;
++        }
++        invoker_popover
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#light-dismiss-open-dialogs>
++    fn light_dismiss_open_dialogs(
++        &self,
++        cx: &mut JSContext,
++        event: &MouseEvent,
++        event_type: LightDismissEventType,
++        target: &Node,
++    ) {
++        // > 3. If document's open dialogs list is empty, then return.
++        if self.open_dialogs_list.borrow().is_empty() {
++            return;
++        }
++
++        // > 4. Let ancestor be the result of running nearest clicked dialog given event.
++        let ancestor = nearest_clicked_dialog(event, target);
++
++        match event_type {
++            // > 5. If event's type is "pointerdown", then set document's dialog pointerdown target
++            // >    to ancestor.
++            LightDismissEventType::PointerDown => {
++                self.dialog_pointerdown_target.set(ancestor.as_deref());
++            },
++            // > 6. If event's type is "pointerup", then:
++            LightDismissEventType::PointerUp => {
++                // > 6.1. Let sameTarget be true if ancestor is document's dialog pointerdown
++                // >      target.
++                let same_target =
++                    ancestor.as_deref() == self.dialog_pointerdown_target.get().as_deref();
++                // > 6.2. Set document's dialog pointerdown target to null.
++                self.dialog_pointerdown_target.set(None);
++                // > 6.3. If sameTarget is false, then return.
++                if !same_target {
++                    return;
++                }
++                // > 6.4. Let topmostDialog be the last element of document's open dialogs list.
++                let Some(topmost_dialog) = self
++                    .open_dialogs_list
++                    .borrow()
++                    .last()
++                    .map(|dialog| DomRoot::from_ref(&**dialog))
++                else {
++                    return;
++                };
++                // > 6.5. If ancestor is topmostDialog, then return.
++                if ancestor.as_deref() == Some(&*topmost_dialog) {
++                    return;
++                }
++                // > 6.6. If topmostDialog's computed closed-by state is not Any, then return.
++                if topmost_dialog.computed_closed_by_state() != ClosedByState::Any {
++                    return;
++                }
++                // > 6.7. Assert: topmostDialog's close watcher is not null.
++                // > 6.8. Request to close topmostDialog's close watcher with false.
++                self.request_to_close(cx, topmost_dialog.upcast(), false);
++            },
++        }
++    }
++}
++
++/// <https://html.spec.whatwg.org/multipage/#close-watcher-get-enabled-state>
++fn close_watcher_enabled_state(close_watcher: &HTMLElement) -> bool {
++    match close_watcher.downcast::<HTMLDialogElement>() {
++        Some(dialog) => dialog.close_watcher_enabled_state(),
++        // Popover close watchers are always enabled.
++        None => true,
++    }
++}
++
++/// <https://html.spec.whatwg.org/multipage/#nearest-clicked-dialog>
++fn nearest_clicked_dialog(event: &MouseEvent, target: &Node) -> Option<DomRoot<HTMLDialogElement>> {
++    // > 2. If target is a dialog element, target has an open attribute, target's is modal is true,
++    // >    and event's clientX and clientY are outside the bounds of target, then return null.
++    if let Some(dialog) = target.downcast::<HTMLDialogElement>() {
++        let element = dialog.upcast::<Element>();
++        if element.has_attribute(&html5ever::local_name!("open")) &&
++            element.state().contains(ElementState::MODAL)
++        {
++            // A dialog without a box has empty bounds, so every point is outside of it.
++            let rect = element.upcast::<Node>().border_box().unwrap_or_default();
++            let x = event.ClientX() as f64;
++            let y = event.ClientY() as f64;
++            if x < rect.min_x().to_f64_px() ||
++                x > rect.max_x().to_f64_px() ||
++                y < rect.min_y().to_f64_px() ||
++                y > rect.max_y().to_f64_px()
++            {
++                return None;
++            }
++        }
++    }
++
++    // > 3. Let currentNode be target.
++    // > 4. While currentNode is not null:
++    // > 4.1. If currentNode is a dialog element and currentNode has an open attribute, then return
++    // >      currentNode.
++    // > 4.2. Set currentNode to currentNode's parent in the flat tree.
++    // > 5. Return null.
++    target
++        .inclusive_ancestors_in_flat_tree()
++        .filter_map(DomRoot::downcast::<HTMLDialogElement>)
++        .find(|dialog| {
++            dialog
++                .upcast::<Element>()
++                .has_attribute(&html5ever::local_name!("open"))
++        })
++}
+diff --git a/components/script/dom/element/focus.rs b/components/script/dom/element/focus.rs
+index 0b25b5d0bf0..dce46add4be 100644
+--- a/components/script/dom/element/focus.rs
++++ b/components/script/dom/element/focus.rs
+@@ -12,9 +12,27 @@ use xml5ever::local_name;
+ 
+ use crate::dom::Node;
+ use crate::dom::document::focus::FocusableAreaKind;
++use crate::dom::node::NodeTraits;
+ use crate::dom::types::{Element, HTMLElement};
+ 
+ impl Element {
++    /// <https://html.spec.whatwg.org/multipage/#inert>
++    ///
++    /// Only inertness from <https://html.spec.whatwg.org/multipage/#blocked-by-a-modal-dialog> is
++    /// supported: the `inert` attribute is not implemented.
++    pub(crate) fn is_inert(&self) -> bool {
++        // > While document is blocked by a modal dialog subject, every node that is connected to
++        // > document, with the exception of the subject element and its flat tree descendants,
++        // > must become inert.
++        let Some(dialog) = self.owner_document().top_layer().blocking_modal_dialog() else {
++            return false;
++        };
++        !self
++            .upcast::<Node>()
++            .inclusive_ancestors_in_flat_tree()
++            .any(|ancestor| &*ancestor == dialog.upcast::<Node>())
++    }
++
+     /// <https://html.spec.whatwg.org/multipage/#focusable-area>
+     ///
+     /// The list of focusable areas at this point in the specification is both incomplete and leaves
+@@ -28,7 +46,11 @@ impl Element {
+     pub(crate) fn focusable_area_kind(&self) -> FocusableAreaKind {
+         // Do not allow unrendered, disconnected, or disabled nodes to be focusable areas ever.
+         let node: &Node = self.upcast();
+-        if !node.is_connected() || !self.has_css_layout_box() || self.is_actually_disabled() {
++        if !node.is_connected() ||
++            !self.has_css_layout_box() ||
++            self.is_actually_disabled() ||
++            self.is_inert()
++        {
+             return Default::default();
+         }
+ 
+@@ -56,7 +78,7 @@ impl Element {
+         // > the element is not actually disabled;
+         // Note: Checked above
+         // > the element is not inert;
+-        // TODO: Handle this.
++        // Note: Checked above
+         // > the element is either being rendered, delegating its rendering to its children, or
+         // > being used as relevant canvas fallback content.
+         // Note: Checked above
+diff --git a/components/script/dom/html/htmlbuttonelement.rs b/components/script/dom/html/htmlbuttonelement.rs
+index 0777b6fe7cf..055c543dc19 100644
+--- a/components/script/dom/html/htmlbuttonelement.rs
++++ b/components/script/dom/html/htmlbuttonelement.rs
+@@ -34,6 +34,9 @@ use crate::dom::html::htmlformelement::{
+     FormControl, FormDatum, FormDatumValue, FormSubmitterElement, HTMLFormElement, ResetFrom,
+     SubmittedFrom,
+ };
++use crate::dom::html::popover::{
++    popover_target_action_getter, popovertarget_associated_element, set_popover_target_element,
++};
+ use crate::dom::node::virtualmethods::{VirtualMethods, vtable_for};
+ use crate::dom::node::{BindContext, Node, NodeTraits, UnbindContext};
+ use crate::dom::nodelist::NodeList;
+@@ -115,9 +118,37 @@ impl HTMLButtonElementMethods<crate::DomTypeHolder> for HTMLButtonElement {
+             // Step 4. Return the keyword corresponding to the value of command.
+             CommandState::Close => DOMString::from("close"),
+             CommandState::ShowModal => DOMString::from("show-modal"),
++            CommandState::RequestClose => DOMString::from("request-close"),
++            CommandState::TogglePopover => DOMString::from("toggle-popover"),
++            CommandState::ShowPopover => DOMString::from("show-popover"),
++            CommandState::HidePopover => DOMString::from("hide-popover"),
+         }
+     }
+ 
++    /// <https://html.spec.whatwg.org/multipage/#dom-popovertargetelement>
++    fn GetPopoverTargetElement(&self, cx: &mut JSContext) -> Option<DomRoot<Element>> {
++        popovertarget_associated_element(cx, self.upcast())
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-popovertargetelement>
++    fn SetPopoverTargetElement(&self, cx: &mut JSContext, value: Option<&Element>) {
++        set_popover_target_element(cx, self.upcast(), value);
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-popovertargetaction>
++    fn PopoverTargetAction(&self) -> DOMString {
++        popover_target_action_getter(self.upcast())
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-popovertargetaction>
++    fn SetPopoverTargetAction(&self, cx: &mut JSContext, value: DOMString) {
++        self.upcast::<Element>().set_string_attribute(
++            cx,
++            &local_name!("popovertargetaction"),
++            value,
++        );
++    }
++
+     // https://html.spec.whatwg.org/multipage/#dom-button-command
+     make_setter!(cx, SetCommand, "command");
+ 
+@@ -318,6 +349,18 @@ impl HTMLButtonElement {
+         if value == "show-modal" {
+             return CommandState::ShowModal;
+         }
++        if value == "request-close" {
++            return CommandState::RequestClose;
++        }
++        if value == "toggle-popover" {
++            return CommandState::TogglePopover;
++        }
++        if value == "show-popover" {
++            return CommandState::ShowPopover;
++        }
++        if value == "hide-popover" {
++            return CommandState::HidePopover;
++        }
+ 
+         CommandState::Unknown
+     }
+@@ -339,11 +382,17 @@ impl HTMLButtonElement {
+         if !target.is_html_element() {
+             return false;
+         }
+-        // TODO Step 4. If command is in any of the following states:
++        // Step 4. If command is in any of the following states:
+         // - Toggle Popover
+         // - Show Popover
+         // - Hide Popover
+         // then return true.
++        if matches!(
++            command,
++            CommandState::TogglePopover | CommandState::ShowPopover | CommandState::HidePopover
++        ) {
++            return true;
++        }
+         // Step 5. If this standard does not define is valid command steps for target's local name, then return false.
+         // Step 6. Otherwise, return the result of running target's corresponding is valid command steps given command.
+         vtable_for(target.upcast::<Node>()).is_valid_command_steps(command)
+@@ -578,13 +627,29 @@ impl Activatable for HTMLButtonElement {
+             if command == CommandState::Custom {
+                 return;
+             }
+-            // TODO Steps 5.7, 5.8, 5.9
++            // Steps 5.7 to 5.9: the popover commands.
++            let target_html_element = target.downcast::<HTMLElement>();
++            if let Some(target_html_element) = target_html_element {
++                let (show, hide) = match command {
++                    CommandState::HidePopover => (false, true),
++                    CommandState::TogglePopover => (true, true),
++                    CommandState::ShowPopover => (true, false),
++                    _ => (false, false),
++                };
++                if show || hide {
++                    target_html_element.run_popover_command(cx, self.upcast(), show, hide);
++                    return;
++                }
++            }
+             // Step 5.10 Otherwise, if this standard defines command steps for target's local name,
+             // then run the corresponding command steps given target, element, and command.
+             let _ = vtable_for(target_node).command_steps(cx, DomRoot::from_ref(self), command);
++            return;
+         }
+-        // TODO Step 6 Otherwise, run the popover target attribute activation behavior given element
++        // Step 6 Otherwise, run the popover target attribute activation behavior given element
+         // and event's target.
++        self.upcast::<HTMLElement>()
++            .popover_target_attribute_activation_behavior(cx, target);
+     }
+ }
+ 
+@@ -594,4 +659,8 @@ pub(crate) enum CommandState {
+     Custom,
+     ShowModal,
+     Close,
++    RequestClose,
++    TogglePopover,
++    ShowPopover,
++    HidePopover,
+ }
+diff --git a/components/script/dom/html/htmldialogelement.rs b/components/script/dom/html/htmldialogelement.rs
+index 385d67dea9c..ce0bb5bea7b 100644
+--- a/components/script/dom/html/htmldialogelement.rs
++++ b/components/script/dom/html/htmldialogelement.rs
+@@ -2,6 +2,7 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ use std::borrow::Borrow;
++use std::cell::Cell;
+ 
+ use dom_struct::dom_struct;
+ use html5ever::{LocalName, Prefix, local_name, ns};
+@@ -15,23 +16,40 @@ use stylo_dom::ElementState;
+ use crate::dom::bindings::codegen::Bindings::HTMLDialogElementBinding::HTMLDialogElementMethods;
+ use crate::dom::bindings::inheritance::Castable;
+ use crate::dom::bindings::refcounted::Trusted;
+-use crate::dom::bindings::root::DomRoot;
++use crate::dom::bindings::root::{DomRoot, MutNullableDom};
+ use crate::dom::bindings::str::DOMString;
+ use crate::dom::document::Document;
+-use crate::dom::element::Element;
++use crate::dom::element::attributes::storage::AttrRef;
++use crate::dom::element::{AttributeMutation, Element};
+ use crate::dom::event::{Event, EventBubbles, EventCancelable};
+ use crate::dom::eventtarget::EventTarget;
+ use crate::dom::html::htmlelement::HTMLElement;
+ use crate::dom::htmlbuttonelement::{CommandState, HTMLButtonElement};
+ use crate::dom::iterators::ShadowIncluding;
+ use crate::dom::node::virtualmethods::VirtualMethods;
+-use crate::dom::node::{Node, NodeTraits};
++use crate::dom::node::{BindContext, Node, NodeTraits, UnbindContext};
+ use crate::dom::toggleevent::ToggleEvent;
+ 
++/// <https://html.spec.whatwg.org/multipage/#attr-dialog-closedby>
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) enum ClosedByState {
++    Any,
++    CloseRequest,
++    None,
++}
++
+ #[dom_struct]
+ pub(crate) struct HTMLDialogElement {
+     htmlelement: HTMLElement,
+     return_value: DomRefCell<DOMString>,
++    /// <https://html.spec.whatwg.org/multipage/#enable-close-watcher-for-requestclose()>
++    enable_close_watcher_for_request_close: Cell<bool>,
++    /// <https://html.spec.whatwg.org/multipage/#dialog-request-close-return-value>
++    request_close_return_value: DomRefCell<Option<DOMString>>,
++    /// <https://html.spec.whatwg.org/multipage/#dialog-request-close-source-element>
++    request_close_source_element: MutNullableDom<Element>,
++    /// <https://html.spec.whatwg.org/multipage/#close-watcher-is-running-cancel-action>
++    is_running_cancel_action: Cell<bool>,
+ }
+ 
+ impl HTMLDialogElement {
+@@ -43,6 +61,10 @@ impl HTMLDialogElement {
+         HTMLDialogElement {
+             htmlelement: HTMLElement::new_inherited(local_name, prefix, document),
+             return_value: DomRefCell::new(DOMString::new()),
++            enable_close_watcher_for_request_close: Cell::new(false),
++            request_close_return_value: DomRefCell::new(None),
++            request_close_source_element: Default::default(),
++            is_running_cancel_action: Cell::new(false),
+         }
+     }
+ 
+@@ -98,7 +120,12 @@ impl HTMLDialogElement {
+             )));
+         }
+ 
+-        // TODO: Step 5. If subject is in the popover showing state, then throw an "InvalidStateError" DOMException.
++        // Step 5. If subject is in the popover showing state, then throw an "InvalidStateError" DOMException.
++        if self.upcast::<HTMLElement>().is_popover_showing() {
++            return Err(Error::InvalidState(Some(
++                "Cannot call showModal() on a dialog that is showing as a popover.".into(),
++            )));
++        }
+ 
+         // Step 6. If the result of firing an event named beforetoggle, using ToggleEvent, with the cancelable attribute initialized to true, the oldState attribute initialized to "closed", the newState attribute initialized to "open", and the source attribute initialized to source at subject is false, then return.
+         let event = ToggleEvent::new(
+@@ -126,7 +153,10 @@ impl HTMLDialogElement {
+             return Ok(());
+         }
+ 
+-        // TODO: Step 9. If subject is in the popover showing state, then return.
++        // Step 9. If subject is in the popover showing state, then return.
++        if self.upcast::<HTMLElement>().is_popover_showing() {
++            return Ok(());
++        }
+ 
+         // Step 10. Queue a dialog toggle event task given subject, "closed", "open", and source.
+         self.queue_dialog_toggle_event_task("closed", "open", source);
+@@ -135,14 +165,24 @@ impl HTMLDialogElement {
+         subject.set_bool_attribute(cx, &local_name!("open"), true);
+         subject.set_open_state(true);
+ 
+-        // TODO: Step 12. Assert: subject's close watcher is not null.
++        // Step 12. Assert: subject's close watcher is not null.
++        let document = self.owner_document();
++        debug_assert!(
++            document
++                .top_layer()
++                .is_close_watcher_active(self.upcast::<HTMLElement>())
++        );
+ 
+         // Step 13. Set is modal of subject to true.
+         self.upcast::<Element>().set_modal_state(true);
+ 
+-        // TODO: Step 14. Set subject's node document to be blocked by the modal dialog subject.
++        // Step 14. Set subject's node document to be blocked by the modal dialog subject.
++        // Being blocked is derived from the topmost modal dialog in the top layer.
+ 
+-        // TODO: Step 15. If subject's node document's top layer does not already contain subject, then add an element to the top layer given subject.
++        // Step 15. If subject's node document's top layer does not already contain subject, then add an element to the top layer given subject.
++        if !document.top_layer().contains(subject) {
++            document.top_layer().add(subject);
++        }
+ 
+         // Step 16. Set subject's previously focused element to the focused element.
+         self.upcast::<HTMLElement>().set_previously_focused_element(
+@@ -152,15 +192,12 @@ impl HTMLDialogElement {
+                 .element(),
+         );
+ 
+-        // TODO: Step 17. Let document be subject's node document.
+-
+-        // TODO: Step 18. Let hideUntil be the result of running topmost popover ancestor given subject, document's showing hint popover list, null, and false.
+-
+-        // TODO: Step 19. If hideUntil is null, then set hideUntil to the result of running topmost popover ancestor given subject, document's showing auto popover list, null, and false.
+-
+-        // TODO: Step 20. If hideUntil is null, then set hideUntil to document.
+-
+-        // TODO: Step 21. Run hide all popovers until given hideUntil, false, and true.
++        // Step 17. Let document be subject's node document.
++        // Step 18. Let hideUntil be the result of running topmost popover ancestor given subject, document's showing hint popover list, null, and false.
++        // Step 19. If hideUntil is null, then set hideUntil to the result of running topmost popover ancestor given subject, document's showing auto popover list, null, and false.
++        // Step 20. If hideUntil is null, then set hideUntil to document.
++        // Step 21. Run hide all popovers until given hideUntil, false, and true.
++        self.hide_popovers_not_containing_self(cx);
+ 
+         // Step 22. Run the dialog focusing steps given subject.
+         self.run_dialog_focusing_steps(cx);
+@@ -206,10 +243,12 @@ impl HTMLDialogElement {
+         subject.remove_attribute(cx, &ns!(), &local_name!("open"));
+         subject.set_open_state(false);
+ 
+-        // TODO: Step 6. If is modal of subject is true, then request an element to be removed from the top layer given subject.
+-
++        // Step 6. If is modal of subject is true, then request an element to be removed from the top layer given subject.
+         // Step 7. Let wasModal be the value of subject's is modal flag.
+         let was_modal = subject.state().contains(ElementState::MODAL);
++        if was_modal {
++            subject.owner_document().top_layer().remove(subject);
++        }
+ 
+         // Step 8. Set is modal of subject to false.
+         self.upcast::<Element>().set_modal_state(false);
+@@ -219,9 +258,11 @@ impl HTMLDialogElement {
+             *self.return_value.borrow_mut() = new_value;
+         }
+ 
+-        // TODO: Step 10. Set subject's request close return value to null.
++        // Step 10. Set subject's request close return value to null.
++        *self.request_close_return_value.borrow_mut() = None;
+ 
+-        // TODO: Step 11. Set subject's request close source element to null.
++        // Step 11. Set subject's request close source element to null.
++        self.request_close_source_element.set(None);
+ 
+         // Step 12. If subject's previously focused element is not null, then:
+         if let Some(element) = self.upcast::<HTMLElement>().previously_focused_element() {
+@@ -255,6 +296,153 @@ impl HTMLDialogElement {
+             .queue_simple_event(target, atom!("close"));
+     }
+ 
++    /// Steps 17 to 21 of showing a modal dialog and steps 8 to 12 of show(): hide every popover
++    /// that is not an ancestor of this dialog.
++    fn hide_popovers_not_containing_self(&self, cx: &mut JSContext) {
++        let document = self.owner_document();
++        let hide_until = HTMLElement::topmost_popover_ancestor(
++            self.upcast(),
++            &document.top_layer().showing_auto_popover_list(),
++            None,
++            false,
++        );
++        HTMLElement::hide_all_popovers_until(cx, &document, hide_until.as_deref(), false, true);
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#computed-closed-by-state>
++    pub(crate) fn computed_closed_by_state(&self) -> ClosedByState {
++        let element = self.upcast::<Element>();
++        // > 1. If dialog's closedby attribute is in the Auto state, then: if dialog's is modal is
++        // >    true, return Close Request; otherwise return None.
++        // > 2. Return the state of dialog's closedby attribute.
++        match element
++            .get_attribute_string_value(&local_name!("closedby"))
++            .map(|value| value.to_ascii_lowercase())
++            .as_deref()
++        {
++            Some("any") => ClosedByState::Any,
++            Some("closerequest") => ClosedByState::CloseRequest,
++            Some("none") => ClosedByState::None,
++            _ if element.state().contains(ElementState::MODAL) => ClosedByState::CloseRequest,
++            _ => ClosedByState::None,
++        }
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dialog-setup-steps>
++    fn run_dialog_setup_steps(&self) {
++        // > 1. Assert: subject has an open attribute.
++        // > 2. Assert: subject is connected.
++        // > 3. Assert: subject's node document's open dialogs list does not contain subject.
++        // > 4. Add subject to subject's node document's open dialogs list.
++        let document = self.owner_document();
++        document.top_layer().add_open_dialog(self);
++        // > 5. Set subject's close watcher to the result of establishing a close watcher given
++        // >    subject's relevant global object, with cancelAction, closeAction and
++        // >    getEnabledState as defined by the close watcher methods on this element.
++        document
++            .top_layer()
++            .establish_close_watcher(self.upcast::<HTMLElement>());
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dialog-cleanup-steps>
++    fn run_dialog_cleanup_steps(&self) {
++        let document = self.owner_document();
++        // > 1. Remove subject from subject's node document's open dialogs list.
++        document.top_layer().remove_open_dialog(self);
++        // > 2. If subject's close watcher is not null, then destroy subject's close watcher and
++        // >    set subject's close watcher to null.
++        document
++            .top_layer()
++            .destroy_close_watcher(self.upcast::<HTMLElement>());
++    }
++
++    /// The getEnabledState of the dialog's close watcher, set up in the
++    /// <https://html.spec.whatwg.org/multipage/#dialog-setup-steps>.
++    pub(crate) fn close_watcher_enabled_state(&self) -> bool {
++        // > 1. If dialog's enable close watcher for request close is true, then return true.
++        // > 2. If dialog's computed closed-by state is not None, then return true.
++        // > 3. Return false.
++        self.enable_close_watcher_for_request_close.get() ||
++            self.computed_closed_by_state() != ClosedByState::None
++    }
++
++    pub(crate) fn is_running_cancel_action(&self) -> bool {
++        self.is_running_cancel_action.get()
++    }
++
++    /// The cancelAction of the dialog's close watcher, run as steps 7 to 9 of
++    /// <https://html.spec.whatwg.org/multipage/#close-watcher-request-close>.
++    pub(crate) fn run_close_watcher_cancel_action(
++        &self,
++        cx: &mut JSContext,
++        can_prevent_close: bool,
++    ) -> bool {
++        self.is_running_cancel_action.set(true);
++        // > Return the result of firing an event named cancel at dialog, with the cancelable
++        // > attribute initialized to canPreventClose.
++        let event = Event::new(
++            cx,
++            self.owner_window().upcast(),
++            atom!("cancel"),
++            EventBubbles::DoesNotBubble,
++            if can_prevent_close {
++                EventCancelable::Cancelable
++            } else {
++                EventCancelable::NotCancelable
++            },
++        );
++        let should_continue = event.fire(cx, self.upcast::<EventTarget>());
++        self.is_running_cancel_action.set(false);
++        should_continue
++    }
++
++    /// The closeAction of the dialog's close watcher.
++    pub(crate) fn run_close_watcher_close_action(&self, cx: &mut JSContext) {
++        // > Close the dialog given dialog, dialog's request close return value, and dialog's
++        // > request close source element.
++        let result = self.request_close_return_value.borrow().clone();
++        let source = self.request_close_source_element.get();
++        self.close_the_dialog(cx, result, source);
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dialog-request-close>
++    fn request_close(
++        &self,
++        cx: &mut JSContext,
++        return_value: Option<DOMString>,
++        source: Option<DomRoot<Element>>,
++    ) {
++        let subject = self.upcast::<Element>();
++        // > 1. If subject does not have an open attribute, then return.
++        if !subject.has_attribute(&local_name!("open")) {
++            return;
++        }
++        // > 2. If subject is not connected or subject's node document is not fully active, then
++        // >    return.
++        let document = self.owner_document();
++        if !subject.is_connected() || !document.is_fully_active() {
++            return;
++        }
++        // > 3. Assert: subject's close watcher is not null.
++        debug_assert!(
++            document
++                .top_layer()
++                .is_close_watcher_active(self.upcast::<HTMLElement>())
++        );
++        // > 4. Set subject's enable close watcher for request close to true.
++        self.enable_close_watcher_for_request_close.set(true);
++        // > 5. Set subject's request close return value to returnValue.
++        *self.request_close_return_value.borrow_mut() = return_value;
++        // > 6. Set subject's request close source element to source.
++        self.request_close_source_element.set(source.as_deref());
++        // > 7. Request to close subject's close watcher with false.
++        document
++            .top_layer()
++            .request_to_close(cx, self.upcast::<HTMLElement>(), false);
++        // > 8. Set subject's enable close watcher for request close to false.
++        self.enable_close_watcher_for_request_close.set(false);
++    }
++
+     /// <https://html.spec.whatwg.org/multipage/#queue-a-dialog-toggle-event-task>
+     pub fn queue_dialog_toggle_event_task(
+         &self,
+@@ -305,7 +493,7 @@ impl HTMLDialogElement {
+     }
+ 
+     /// <https://html.spec.whatwg.org/multipage/#dialog-focusing-steps>
+-    fn run_dialog_focusing_steps(&self, cx: &mut JSContext) {
++    pub(crate) fn run_dialog_focusing_steps(&self, cx: &mut JSContext) {
+         // TODO: Step 1. If the allow focus steps given subject's node document return false, then return.
+ 
+         // Step 2. Let control be null.
+@@ -375,6 +563,13 @@ impl HTMLDialogElementMethods<crate::DomTypeHolder> for HTMLDialogElement {
+             )));
+         }
+ 
++        // Chrome throws for a dialog showing as a popover too, like showModal() does in step 5.
++        if self.upcast::<HTMLElement>().is_popover_showing() {
++            return Err(Error::InvalidState(Some(
++                "Cannot call show() on a dialog that is showing as a popover.".into(),
++            )));
++        }
++
+         // Step 3. If the result of firing an event named beforetoggle, using ToggleEvent, with the cancelable attribute initialized to true, the oldState attribute initialized to "closed", and the newState attribute initialized to "open" at this is false, then return.
+         let event = ToggleEvent::new(
+             cx,
+@@ -411,15 +606,12 @@ impl HTMLDialogElementMethods<crate::DomTypeHolder> for HTMLDialogElement {
+                 .element(),
+         );
+ 
+-        // TODO: Step 8. Let document be this's node document.
+-
+-        // TODO: Step 9. Let hideUntil be the result of running topmost popover ancestor given this, document's showing hint popover list, null, and false.
+-
+-        // TODO: Step 10. If hideUntil is null, then set hideUntil to the result of running topmost popover ancestor given this, document's showing auto popover list, null, and false.
+-
+-        // TODO: Step 11. If hideUntil is null, then set hideUntil to document.
+-
+-        // TODO: Step 12. Run hide all popovers until given hideUntil, false, and true.
++        // Step 8. Let document be this's node document.
++        // Step 9. Let hideUntil be the result of running topmost popover ancestor given this, document's showing hint popover list, null, and false.
++        // Step 10. If hideUntil is null, then set hideUntil to the result of running topmost popover ancestor given this, document's showing auto popover list, null, and false.
++        // Step 11. If hideUntil is null, then set hideUntil to document.
++        // Step 12. Run hide all popovers until given hideUntil, false, and true.
++        self.hide_popovers_not_containing_self(cx);
+ 
+         // Step 13. Run the dialog focusing steps given this.
+         self.run_dialog_focusing_steps(cx);
+@@ -438,6 +630,30 @@ impl HTMLDialogElementMethods<crate::DomTypeHolder> for HTMLDialogElement {
+         // Step 2. Close the dialog this with returnValue and null.
+         self.close_the_dialog(cx, return_value, None);
+     }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-dialog-requestclose>
++    fn RequestClose(&self, cx: &mut JSContext, return_value: Option<DOMString>) {
++        // Step 1. If returnValue is not given, then set it to null.
++        // Step 2. Request to close the dialog this with returnValue and null.
++        self.request_close(cx, return_value, None);
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-dialog-closedby>
++    fn ClosedBy(&self) -> DOMString {
++        // > The closedBy getter steps are to return the keyword corresponding to the computed
++        // > closed-by state given this.
++        DOMString::from(match self.computed_closed_by_state() {
++            ClosedByState::Any => "any",
++            ClosedByState::CloseRequest => "closerequest",
++            ClosedByState::None => "none",
++        })
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-dialog-closedby>
++    fn SetClosedBy(&self, cx: &mut JSContext, value: DOMString) {
++        self.upcast::<Element>()
++            .set_string_attribute(cx, &local_name!("closedby"), value);
++    }
+ }
+ 
+ impl VirtualMethods for HTMLDialogElement {
+@@ -445,11 +661,73 @@ impl VirtualMethods for HTMLDialogElement {
+         Some(self.upcast::<HTMLElement>() as &dyn VirtualMethods)
+     }
+ 
++    /// <https://html.spec.whatwg.org/multipage/#the-dialog-element:concept-element-attributes-change-ext>
++    fn attribute_mutated(
++        &self,
++        cx: &mut JSContext,
++        attr: AttrRef<'_>,
++        mutation: AttributeMutation,
++    ) {
++        self.super_type()
++            .unwrap()
++            .attribute_mutated(cx, attr, mutation);
++        // > 2. If localName is not open, then return.
++        if attr.local_name() != &local_name!("open") || !self.upcast::<Node>().is_connected() {
++            return;
++        }
++        match mutation {
++            // > 4. If value is null and oldValue is not null, then run the dialog cleanup steps
++            // >    given element.
++            AttributeMutation::Removed => self.run_dialog_cleanup_steps(),
++            // > 5. If value is not null and oldValue is null, then run the dialog setup steps
++            // >    given element.
++            AttributeMutation::Set(None, _) => self.run_dialog_setup_steps(),
++            AttributeMutation::Set(Some(_), _) => {},
++        }
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#the-dialog-element:html-element-insertion-steps>
++    fn bind_to_tree(&self, cx: &mut JSContext, context: &BindContext) {
++        if let Some(super_type) = self.super_type() {
++            super_type.bind_to_tree(cx, context);
++        }
++        // > 1. If insertedNode's node document is not fully active, then return.
++        // > 2. If insertedNode has an open attribute and is connected, then run the dialog setup
++        // >    steps given insertedNode.
++        if context.tree_connected &&
++            self.owner_document().is_fully_active() &&
++            self.upcast::<Element>().has_attribute(&local_name!("open"))
++        {
++            self.run_dialog_setup_steps();
++        }
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#the-dialog-element:html-element-removing-steps>
++    fn unbind_from_tree(&self, cx: &mut JSContext, context: &UnbindContext) {
++        if let Some(super_type) = self.super_type() {
++            super_type.unbind_from_tree(cx, context);
++        }
++        let element = self.upcast::<Element>();
++        // > 1. If removedNode has an open attribute, then run the dialog cleanup steps given
++        // >    removedNode.
++        if element.has_attribute(&local_name!("open")) {
++            self.run_dialog_cleanup_steps();
++        }
++        // > 2. If removedNode's node document's top layer contains removedNode, then remove an
++        // >    element from the top layer immediately given removedNode.
++        self.owner_document().top_layer().remove(element);
++        // > 3. Set is modal of removedNode to false.
++        element.set_modal_state(false);
++    }
++
+     /// <https://html.spec.whatwg.org/multipage/#the-dialog-element:is-valid-command-steps>
+     fn is_valid_command_steps(&self, command: CommandState) -> bool {
+-        // Step 1. If command is in the Close state, the Request Close state (TODO), or the
++        // Step 1. If command is in the Close state, the Request Close state, or the
+         // ShowModal state, then return true.
+-        if command == CommandState::Close || command == CommandState::ShowModal {
++        if matches!(
++            command,
++            CommandState::Close | CommandState::RequestClose | CommandState::ShowModal
++        ) {
+             return true;
+         }
+         // Step 2. Return false.
+@@ -471,7 +749,10 @@ impl VirtualMethods for HTMLDialogElement {
+             return true;
+         }
+ 
+-        // TODO Step 1. If element is in the popover showing state, then return.
++        // Step 1. If element is in the popover showing state, then return.
++        if self.upcast::<HTMLElement>().is_popover_showing() {
++            return false;
++        }
+         let element = self.upcast::<Element>();
+ 
+         // Step 2. If command is in the Close state and element has an open attribute, then
+@@ -482,8 +763,13 @@ impl VirtualMethods for HTMLDialogElement {
+             return true;
+         }
+ 
+-        // TODO Step 3. If command is in the Request Close state and element has an open attribute,
++        // Step 3. If command is in the Request Close state and element has an open attribute,
+         // then request to close the dialog element with source's optional value and source.
++        if command == CommandState::RequestClose && element.has_attribute(&local_name!("open")) {
++            let button_element = DomRoot::from_ref(source.upcast::<Element>());
++            self.request_close(cx, source.optional_value(), Some(button_element));
++            return true;
++        }
+ 
+         // Step 4. If command is the Show Modal state and element does not have an open attribute,
+         // then show a modal dialog given element and source.
+diff --git a/components/script/dom/html/htmlelement.rs b/components/script/dom/html/htmlelement.rs
+index 0065a819d4e..461f4847783 100644
+--- a/components/script/dom/html/htmlelement.rs
++++ b/components/script/dom/html/htmlelement.rs
+@@ -22,12 +22,15 @@ use crate::dom::bindings::codegen::Bindings::CharacterDataBinding::CharacterData
+ use crate::dom::bindings::codegen::Bindings::EventHandlerBinding::{
+     EventHandlerNonNull, OnErrorEventHandlerNonNull,
+ };
+-use crate::dom::bindings::codegen::Bindings::HTMLElementBinding::HTMLElementMethods;
++use crate::dom::bindings::codegen::Bindings::HTMLElementBinding::{
++    HTMLElementMethods, ShowPopoverOptions,
++};
+ use crate::dom::bindings::codegen::Bindings::HTMLLabelElementBinding::HTMLLabelElementMethods;
+ use crate::dom::bindings::codegen::Bindings::HTMLOrSVGElementBinding::FocusOptions;
+ use crate::dom::bindings::codegen::Bindings::NodeBinding::Node_Binding::NodeMethods;
+ use crate::dom::bindings::codegen::Bindings::ShadowRootBinding::ShadowRoot_Binding::ShadowRootMethods;
+ use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
++use crate::dom::bindings::codegen::UnionTypes::TogglePopoverOptionsOrBoolean;
+ use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
+ use crate::dom::bindings::inheritance::{Castable, ElementTypeId, HTMLElementTypeId, NodeTypeId};
+ use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
+@@ -58,6 +61,7 @@ use crate::dom::html::htmlhtmlelement::HTMLHtmlElement;
+ use crate::dom::html::htmllabelelement::HTMLLabelElement;
+ use crate::dom::html::htmltextareaelement::HTMLTextAreaElement;
+ use crate::dom::html::input_element::HTMLInputElement;
++use crate::dom::html::popover::PopoverState;
+ use crate::dom::htmlformelement::FormControlElementHelpers;
+ use crate::dom::input_element::input_type::InputType;
+ use crate::dom::iterators::ShadowIncluding;
+@@ -781,6 +785,55 @@ impl HTMLElementMethods<crate::DomTypeHolder> for HTMLElement {
+             .set_bool_attribute(cx, &local_name!("autofocus"), autofocus);
+     }
+ 
++    /// <https://html.spec.whatwg.org/multipage/#dom-showpopover>
++    fn ShowPopover(&self, cx: &mut JSContext, options: &ShowPopoverOptions) -> ErrorResult {
++        self.show_popover_method(cx, options.source.as_deref())
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-hidepopover>
++    fn HidePopover(&self, cx: &mut JSContext) -> ErrorResult {
++        // > The hidePopover() method steps are to run the hide popover algorithm given this,
++        // > true, true, true, and false.
++        self.hide_popover(cx, true, true, true, false, None)
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-togglepopover>
++    fn TogglePopover(
++        &self,
++        cx: &mut JSContext,
++        options: TogglePopoverOptionsOrBoolean,
++    ) -> Fallible<bool> {
++        // > 1. Let force be null.
++        // > 2. If options is a boolean, set force to options.
++        // > 3. Otherwise, if options["force"] exists, set force to options["force"].
++        let (force, source) = match options {
++            TogglePopoverOptionsOrBoolean::Boolean(force) => (Some(force), None),
++            TogglePopoverOptionsOrBoolean::TogglePopoverOptions(options) => {
++                (options.force, options.parent.source)
++            },
++        };
++        self.toggle_popover_method(cx, force, source.as_deref())
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-popover>
++    fn GetPopover(&self) -> Option<DOMString> {
++        self.popover_attribute_getter()
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-popover>
++    fn SetPopover(&self, cx: &mut JSContext, value: Option<DOMString>) {
++        match value {
++            Some(value) => {
++                self.element
++                    .set_string_attribute(cx, &local_name!("popover"), value);
++            },
++            None => {
++                self.element
++                    .remove_attribute(cx, &ns!(), &local_name!("popover"));
++            },
++        }
++    }
++
+     /// <https://html.spec.whatwg.org/multipage/#dom-tabindex>
+     fn TabIndex(&self) -> i32 {
+         self.element.tab_index()
+@@ -1269,6 +1322,26 @@ impl VirtualMethods for HTMLElement {
+                     },
+                 }
+             },
++            (&local_name!("popover"), mutation) => {
++                let old_state = match mutation {
++                    AttributeMutation::Set(None, _) => None,
++                    AttributeMutation::Set(Some(old_value), _) => {
++                        Some(PopoverState::from_attribute_value(old_value))
++                    },
++                    AttributeMutation::Removed => {
++                        Some(PopoverState::from_attribute_value(&attr.value()))
++                    },
++                };
++                self.popover_attribute_changed(cx, old_state);
++            },
++            // Setting the content attribute directly drops an element set through
++            // popoverTargetElement: <https://html.spec.whatwg.org/multipage/#concept-element-attributes-change-ext>
++            (&local_name!("popovertarget"), _) => {
++                element
++                    .ensure_rare_data()
++                    .explicitly_set_popover_target_element
++                    .set(None);
++            },
+             (&local_name!("nonce"), mutation) => match mutation {
+                 AttributeMutation::Set(..) => {
+                     let nonce = &**attr.value();
+@@ -1371,6 +1444,8 @@ impl VirtualMethods for HTMLElement {
+                 .event_handler()
+                 .unassign_access_key(self);
+         }
++
++        self.popover_removing_steps(cx);
+     }
+ 
+     fn attribute_affects_presentational_hints(&self, attr: AttrRef<'_>) -> bool {
+diff --git a/components/script/dom/html/input_element/mod.rs b/components/script/dom/html/input_element/mod.rs
+index b7d62258aa3..69b9e01f584 100644
+--- a/components/script/dom/html/input_element/mod.rs
++++ b/components/script/dom/html/input_element/mod.rs
+@@ -64,6 +64,9 @@ use crate::dom::html::htmlfieldsetelement::HTMLFieldSetElement;
+ use crate::dom::html::htmlformelement::{
+     FormControl, FormDatum, FormDatumValue, FormSubmitterElement, HTMLFormElement, SubmittedFrom,
+ };
++use crate::dom::html::popover::{
++    popover_target_action_getter, popovertarget_associated_element, set_popover_target_element,
++};
+ use crate::dom::htmlinputelement::radio_input_type::{
+     broadcast_radio_checked, perform_radio_group_validation,
+ };
+@@ -1493,6 +1496,30 @@ impl HTMLInputElementMethods<crate::DomTypeHolder> for HTMLInputElement {
+     // https://html.spec.whatwg.org/multipage/#dom-input-usemap
+     make_setter!(SetUseMap, "usemap");
+ 
++    /// <https://html.spec.whatwg.org/multipage/#dom-popovertargetelement>
++    fn GetPopoverTargetElement(&self, cx: &mut JSContext) -> Option<DomRoot<Element>> {
++        popovertarget_associated_element(cx, self.upcast())
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-popovertargetelement>
++    fn SetPopoverTargetElement(&self, cx: &mut JSContext, value: Option<&Element>) {
++        set_popover_target_element(cx, self.upcast(), value);
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-popovertargetaction>
++    fn PopoverTargetAction(&self) -> DOMString {
++        popover_target_action_getter(self.upcast())
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-popovertargetaction>
++    fn SetPopoverTargetAction(&self, cx: &mut JSContext, value: DOMString) {
++        self.upcast::<Element>().set_string_attribute(
++            cx,
++            &local_name!("popovertargetaction"),
++            value,
++        );
++    }
++
+     /// <https://html.spec.whatwg.org/multipage/#dom-input-indeterminate>
+     fn Indeterminate(&self) -> bool {
+         self.upcast::<Element>()
+@@ -2797,6 +2824,12 @@ impl Activatable for HTMLInputElement {
+                 .as_specific()
+                 .activation_behavior(cx, self, event, target);
+         }
++
++        // <https://html.spec.whatwg.org/multipage/#the-input-element:activation-behaviour>
++        // > 3. Run the popover target attribute activation behavior given element and event's
++        // >    target.
++        self.upcast::<HTMLElement>()
++            .popover_target_attribute_activation_behavior(cx, target);
+     }
+ }
+ 
+diff --git a/components/script/dom/html/mod.rs b/components/script/dom/html/mod.rs
+index 88131769051..8ad659e3b10 100644
+--- a/components/script/dom/html/mod.rs
++++ b/components/script/dom/html/mod.rs
+@@ -82,3 +82,4 @@ pub(crate) mod htmlulistelement;
+ pub(crate) mod htmlunknownelement;
+ pub(crate) mod htmlvideoelement;
+ pub(crate) mod interactive_element_command;
++pub(crate) mod popover;
+diff --git a/components/script/dom/html/popover.rs b/components/script/dom/html/popover.rs
+new file mode 100644
+index 00000000000..9d6aa09870a
+--- /dev/null
++++ b/components/script/dom/html/popover.rs
+@@ -0,0 +1,1120 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! The popover API: <https://html.spec.whatwg.org/multipage/#the-popover-attribute>
++
++use html5ever::{local_name, ns};
++use js::context::JSContext;
++use malloc_size_of_derive::MallocSizeOf;
++use script_bindings::codegen::GenericBindings::DocumentBinding::DocumentMethods;
++use script_bindings::codegen::GenericBindings::DocumentFragmentBinding::DocumentFragmentMethods;
++use script_bindings::codegen::GenericBindings::NodeBinding::{GetRootNodeOptions, NodeMethods};
++use stylo_dom::ElementState;
++
++use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
++use crate::dom::bindings::inheritance::Castable;
++use crate::dom::bindings::refcounted::Trusted;
++use crate::dom::bindings::root::DomRoot;
++use crate::dom::bindings::str::DOMString;
++use crate::dom::document::Document;
++use crate::dom::documentfragment::DocumentFragment;
++use crate::dom::element::Element;
++use crate::dom::event::{Event, EventBubbles, EventCancelable};
++use crate::dom::eventtarget::EventTarget;
++use crate::dom::html::htmlbuttonelement::HTMLButtonElement;
++use crate::dom::html::htmlelement::HTMLElement;
++use crate::dom::html::htmlformelement::{FormControl, FormControlElementHelpers};
++use crate::dom::html::input_element::HTMLInputElement;
++use crate::dom::input_element::input_type::InputType;
++use crate::dom::iterators::ShadowIncluding;
++use crate::dom::node::{Node, NodeTraits};
++use crate::dom::toggleevent::ToggleEvent;
++use crate::dom::types::HTMLDialogElement;
++
++/// <https://html.spec.whatwg.org/multipage/#attr-popover>
++///
++/// The No Popover state is represented by the absence of a state.
++#[derive(Clone, Copy, Debug, MallocSizeOf, PartialEq)]
++pub(crate) enum PopoverState {
++    Auto,
++    Manual,
++    /// Hint popovers share the auto popover stack: the separate showing hint popover list is not
++    /// implemented.
++    Hint,
++}
++
++impl PopoverState {
++    /// The state for a present popover attribute with the given value.
++    pub(crate) fn from_attribute_value(value: &str) -> Self {
++        // > The attribute's missing value default is the No Popover state, its invalid value
++        // > default is the Manual state, and its empty value default is the Auto state.
++        match value.to_ascii_lowercase().as_str() {
++            "" | "auto" => PopoverState::Auto,
++            "hint" => PopoverState::Hint,
++            _ => PopoverState::Manual,
++        }
++    }
++
++    fn uses_auto_stack(self) -> bool {
++        matches!(self, PopoverState::Auto | PopoverState::Hint)
++    }
++}
++
++/// The value of a `popovertargetaction` attribute:
++/// <https://html.spec.whatwg.org/multipage/#attr-popovertargetaction>
++#[derive(Clone, Copy, PartialEq)]
++enum PopoverTargetAction {
++    Toggle,
++    Show,
++    Hide,
++}
++
++impl HTMLElement {
++    /// The state of the element's popover attribute, or `None` in the No Popover state.
++    pub(crate) fn popover_state(&self) -> Option<PopoverState> {
++        let value = self
++            .upcast::<Element>()
++            .get_attribute_string_value(&local_name!("popover"))?;
++        Some(PopoverState::from_attribute_value(&value))
++    }
++
++    /// Whether the element's popover visibility state is showing:
++    /// <https://html.spec.whatwg.org/multipage/#popover-visibility-state>
++    pub(crate) fn is_popover_showing(&self) -> bool {
++        self.upcast::<Element>()
++            .state()
++            .contains(ElementState::POPOVER_OPEN)
++    }
++
++    fn opened_in_popover_mode(&self) -> Option<PopoverState> {
++        self.upcast::<Element>()
++            .ensure_rare_data()
++            .opened_in_popover_mode
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#check-popover-validity>
++    fn check_popover_validity(
++        &self,
++        expected_to_be_showing: bool,
++        throw_exceptions: bool,
++        expected_document: Option<&Document>,
++        ignore_dom_state: bool,
++    ) -> Fallible<bool> {
++        // > 1. If ignoreDomState is false and element's popover attribute is in the No Popover
++        // >    state, then: if throwExceptions is true, then throw a "NotSupportedError"
++        // >    DOMException; return false.
++        if !ignore_dom_state && self.popover_state().is_none() {
++            if throw_exceptions {
++                return Err(Error::NotSupported(Some(
++                    "The element does not have a valid popover attribute.".into(),
++                )));
++            }
++            return Ok(false);
++        }
++
++        // > 2. If any of the following are true: expectedToBeShowing is true and element's
++        // >    popover visibility state is not showing; or expectedToBeShowing is false and
++        // >    element's popover visibility state is not hidden, then return false.
++        if expected_to_be_showing != self.is_popover_showing() {
++            return Ok(false);
++        }
++
++        // > 3. If any of the following are true: ignoreDomState is false and element is not
++        // >    connected; element's node document is not fully active; ignoreDomState is false and
++        // >    expectedDocument is not null and element's node document is not expectedDocument;
++        // >    element is a dialog element and its is modal is set to true; or element's
++        // >    fullscreen flag is set, then: if throwExceptions is true, then throw an
++        // >    "InvalidStateError" DOMException; return false.
++        let element = self.upcast::<Element>();
++        let document = self.owner_document();
++        if (!ignore_dom_state && !element.is_connected()) ||
++            !document.is_fully_active() ||
++            (!ignore_dom_state &&
++                expected_document.is_some_and(|expected| *expected != *document)) ||
++            (self.is::<HTMLDialogElement>() && element.state().contains(ElementState::MODAL)) ||
++            element.state().contains(ElementState::FULLSCREEN)
++        {
++            if throw_exceptions {
++                return Err(Error::InvalidState(Some(
++                    "The popover is disconnected, a modal dialog or fullscreen.".into(),
++                )));
++            }
++            return Ok(false);
++        }
++
++        // > 4. Return true.
++        Ok(true)
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#show-popover>
++    pub(crate) fn show_popover(
++        &self,
++        cx: &mut JSContext,
++        throw_exceptions: bool,
++        invoker: Option<&HTMLElement>,
++    ) -> ErrorResult {
++        // > 1. If the result of running check popover validity given element, false,
++        // >    throwExceptions, null, and false is false, then return.
++        if !self.check_popover_validity(false, throw_exceptions, None, false)? {
++            return Ok(());
++        }
++
++        // > 2. Let document be element's node document.
++        let document = self.owner_document();
++
++        // > 3. Assert: element's popover invoker is null.
++        // > 4. Assert: element is not in document's top layer.
++        debug_assert!(!document.top_layer().contains(self.upcast()));
++
++        // > 5. Let nestedShow be element's popover showing or hiding.
++        let nested_show = self
++            .upcast::<Element>()
++            .ensure_rare_data()
++            .popover_showing_or_hiding;
++
++        // > 6. Let fireEvents be the boolean negation of nestedShow.
++        let fire_events = !nested_show;
++
++        // > 7. Set element's popover showing or hiding to true.
++        self.set_popover_showing_or_hiding(true);
++
++        // > 8. Let cleanupShowingFlag be the following steps: if nestedShow is false, then set
++        // >    element's popover showing or hiding to false.
++        let cleanup_showing_flag = || {
++            if !nested_show {
++                self.set_popover_showing_or_hiding(false);
++            }
++        };
++
++        // > 9. If the result of firing an event named beforetoggle, using ToggleEvent, with the
++        // >    cancelable attribute initialized to true, the oldState attribute initialized to
++        // >    "closed", the newState attribute initialized to "open", and the source attribute
++        // >    initialized to invoker at element is false, then run cleanupShowingFlag and return.
++        if !self.fire_beforetoggle(cx, true, "closed", "open", invoker) {
++            cleanup_showing_flag();
++            return Ok(());
++        }
++
++        // > 10. If the result of running check popover validity given element, false,
++        // >     throwExceptions, document, and false is false, then run cleanupShowingFlag and
++        // >     return.
++        match self.check_popover_validity(false, throw_exceptions, Some(&document), false) {
++            Ok(true) => {},
++            result => {
++                cleanup_showing_flag();
++                return result.map(|_| ());
++            },
++        }
++
++        // > 11. Let shouldRestoreFocus be false.
++        let mut should_restore_focus = false;
++
++        // > 12. Let originalType be the current state of element's popover attribute.
++        let original_type = self
++            .popover_state()
++            .expect("check popover validity ensured there is a popover state");
++
++        // > 13. Let stackToAppendTo be null.
++        // > 14. If originalType is the Auto state, then: run close entire popover list given
++        // >     document's showing hint popover list, shouldRestoreFocus, and fireEvents; let
++        // >     ancestor be the result of running the topmost popover ancestor algorithm given
++        // >     element, document's showing auto popover list, invoker, and true; if ancestor is
++        // >     null, then set ancestor to document; run hide all popovers until given ancestor,
++        // >     shouldRestoreFocus, and fireEvents; set stackToAppendTo to "auto".
++        if original_type.uses_auto_stack() {
++            let ancestor = HTMLElement::topmost_popover_ancestor(
++                self.upcast(),
++                &document.top_layer().showing_auto_popover_list(),
++                invoker,
++                true,
++            );
++            HTMLElement::hide_all_popovers_until(
++                cx,
++                &document,
++                ancestor.as_deref(),
++                should_restore_focus,
++                fire_events,
++            );
++
++            // > 16. If originalType is not equal to the value of element's popover attribute,
++            // >     then: if throwExceptions is true, then throw an "InvalidStateError"
++            // >     DOMException; return.
++            if self.popover_state() != Some(original_type) {
++                cleanup_showing_flag();
++                if throw_exceptions {
++                    return Err(Error::InvalidState(Some(
++                        "The popover attribute changed while showing the popover.".into(),
++                    )));
++                }
++                return Ok(());
++            }
++
++            // > 17. If the result of running check popover validity given element, false,
++            // >     throwExceptions, document, and false is false, then run cleanupShowingFlag
++            // >     and return.
++            match self.check_popover_validity(false, throw_exceptions, Some(&document), false) {
++                Ok(true) => {},
++                result => {
++                    cleanup_showing_flag();
++                    return result.map(|_| ());
++                },
++            }
++
++            // > 18. If the result of running topmost auto or hint popover on document is null,
++            // >     then set shouldRestoreFocus to true.
++            if document.top_layer().topmost_auto_popover().is_none() {
++                should_restore_focus = true;
++            }
++
++            // > 19. If stackToAppendTo is "auto": Assert: document's showing auto popover list
++            // >     does not contain element. Set element's opened in popover mode to "auto".
++            // >     Append element to document's showing auto popover list.
++            document.top_layer().push_showing_auto_popover(self);
++
++            // > 21. Set element's popover close watcher to the result of establishing a close
++            // >     watcher given element's relevant global object, with cancelAction: return
++            // >     true; closeAction: hide a popover given element, true, true, false, and null;
++            // >     getEnabledState: return true.
++            document.top_layer().establish_close_watcher(self);
++        }
++
++        // > 22. Set element's previously focused element to null.
++        self.set_previously_focused_element(None);
++
++        // > 23. Let originallyFocusedElement be document's focused area of the document's DOM
++        // >     anchor.
++        let originally_focused_element = document
++            .focus_handler()
++            .focused_area()
++            .element()
++            .map(DomRoot::from_ref);
++
++        // > 24. Add an element to the top layer given element.
++        document.top_layer().add(self.upcast());
++
++        // > 25. Set element's popover visibility state to showing.
++        self.upcast::<Element>()
++            .set_state(ElementState::POPOVER_OPEN, true);
++
++        // > 26. Set element's popover invoker to invoker.
++        // > 27. Set element's opened in popover mode to originalType.
++        {
++            let mut rare_data = self.upcast::<Element>().ensure_rare_data();
++            rare_data.popover_invoker.set(invoker.map(Castable::upcast));
++            rare_data.opened_in_popover_mode = Some(original_type);
++        }
++
++        // > 28. Run the popover focusing steps given element.
++        self.run_popover_focusing_steps(cx);
++
++        // > 29. If shouldRestoreFocus is true and element's popover attribute is not in the No
++        // >     Popover state, then set element's previously focused element to
++        // >     originallyFocusedElement.
++        if should_restore_focus && self.popover_state().is_some() {
++            self.set_previously_focused_element(originally_focused_element.as_deref());
++        }
++
++        // > 30. Queue a popover toggle event task given element, "closed", "open", and invoker.
++        self.queue_popover_toggle_event_task("closed", "open", invoker);
++
++        // > 31. Run cleanupShowingFlag.
++        cleanup_showing_flag();
++        Ok(())
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#hide-popover-algorithm>
++    pub(crate) fn hide_popover(
++        &self,
++        cx: &mut JSContext,
++        focus_previous_element: bool,
++        mut fire_events: bool,
++        throw_exceptions: bool,
++        ignore_dom_state: bool,
++        source: Option<&HTMLElement>,
++    ) -> ErrorResult {
++        // > 1. If the result of running check popover validity given element, true,
++        // >    throwExceptions, null, and ignoreDomState is false, then return.
++        if !self.check_popover_validity(true, throw_exceptions, None, ignore_dom_state)? {
++            return Ok(());
++        }
++
++        // > 2. Let document be element's node document.
++        let document = self.owner_document();
++
++        // > 3. Let nestedHide be element's popover showing or hiding.
++        let nested_hide = self
++            .upcast::<Element>()
++            .ensure_rare_data()
++            .popover_showing_or_hiding;
++
++        // > 4. Set element's popover showing or hiding to true.
++        self.set_popover_showing_or_hiding(true);
++
++        // > 5. If nestedHide is true, then set fireEvents to false.
++        if nested_hide {
++            fire_events = false;
++        }
++
++        // > 6. Let cleanupSteps be the following steps: if nestedHide is false, then set
++        // >    element's popover showing or hiding to false.
++        let cleanup_steps = || {
++            if !nested_hide {
++                self.set_popover_showing_or_hiding(false);
++            }
++        };
++
++        // > 7. If element's opened in popover mode is "auto" or "hint", then: run hide all
++        // >    popovers until given element, focusPreviousElement, and fireEvents; if the result
++        // >    of running check popover validity given element, true, throwExceptions, and
++        // >    ignoreDomState is false, then run cleanupSteps and return.
++        if self
++            .opened_in_popover_mode()
++            .is_some_and(PopoverState::uses_auto_stack)
++        {
++            HTMLElement::hide_all_popovers_until(
++                cx,
++                &document,
++                Some(self),
++                focus_previous_element,
++                fire_events,
++            );
++            match self.check_popover_validity(true, throw_exceptions, None, ignore_dom_state) {
++                Ok(true) => {},
++                result => {
++                    cleanup_steps();
++                    return result.map(|_| ());
++                },
++            }
++        }
++
++        // > 8. Let autoPopoverListContainsElement be true if document's showing auto popover
++        // >    list's last item is element, otherwise false.
++        let auto_popover_list_contains_element =
++            document.top_layer().topmost_auto_popover().as_deref() == Some(self);
++
++        // > 9. Set element's popover invoker to null.
++        self.upcast::<Element>()
++            .ensure_rare_data()
++            .popover_invoker
++            .set(None);
++
++        // > 10. If fireEvents is true:
++        if fire_events {
++            // > 10.1. Fire an event named beforetoggle, using ToggleEvent, with the oldState
++            // >       attribute initialized to "open", the newState attribute initialized to
++            // >       "closed", and the source attribute set to source at element.
++            self.fire_beforetoggle(cx, false, "open", "closed", source);
++
++            // > 10.2. If autoPopoverListContainsElement is true and document's showing auto
++            // >       popover list's last item is not element, then run hide all popovers until
++            // >       given element, focusPreviousElement, and false.
++            if auto_popover_list_contains_element &&
++                document.top_layer().topmost_auto_popover().as_deref() != Some(self)
++            {
++                HTMLElement::hide_all_popovers_until(
++                    cx,
++                    &document,
++                    Some(self),
++                    focus_previous_element,
++                    false,
++                );
++            }
++
++            // > 10.3. If the result of running check popover validity given element, true,
++            // >       throwExceptions, null, and ignoreDomState is false, then run cleanupSteps
++            // >       and return.
++            match self.check_popover_validity(true, throw_exceptions, None, ignore_dom_state) {
++                Ok(true) => {},
++                result => {
++                    cleanup_steps();
++                    return result.map(|_| ());
++                },
++            }
++        }
++
++        // > 10.4. Request an element to be removed from the top layer given element.
++        // > 11. Otherwise, remove an element from the top layer immediately given element.
++        document.top_layer().remove(self.upcast());
++
++        // > 12. Set element's popover close watcher to null after destroying it, and remove
++        // >     element from document's showing auto popover list.
++        document.top_layer().destroy_close_watcher(self);
++        document.top_layer().remove_showing_auto_popover(self);
++
++        // > 13. Set element's opened in popover mode to null.
++        self.upcast::<Element>()
++            .ensure_rare_data()
++            .opened_in_popover_mode = None;
++
++        // > 14. Set element's popover visibility state to hidden.
++        self.upcast::<Element>()
++            .set_state(ElementState::POPOVER_OPEN, false);
++
++        // > 15. If fireEvents is true, then queue a popover toggle event task given element,
++        // >     "open", "closed", and source.
++        if fire_events {
++            self.queue_popover_toggle_event_task("open", "closed", source);
++        }
++
++        // > 16. Let previouslyFocusedElement be element's previously focused element.
++        // > 17. If previouslyFocusedElement is not null, then:
++        if let Some(previously_focused_element) = self.previously_focused_element() {
++            // > 17.1. Set element's previously focused element to null.
++            self.set_previously_focused_element(None);
++            // > 17.2. If focusPreviousElement is true and document's focused area of the
++            // >       document's DOM anchor is a shadow-including inclusive descendant of
++            // >       element, then run the focusing steps for previouslyFocusedElement; the
++            // >       viewport should not be scrolled by doing this step.
++            let anchor = document
++                .focus_handler()
++                .focused_area()
++                .dom_anchor(&document);
++            let focus_is_inside = self
++                .upcast::<Node>()
++                .is_shadow_including_inclusive_ancestor_of(&anchor);
++            if focus_previous_element && focus_is_inside {
++                previously_focused_element
++                    .upcast::<Node>()
++                    .run_the_focusing_steps(cx, None);
++            }
++        }
++
++        // > 18. Run cleanupSteps.
++        cleanup_steps();
++        Ok(())
++    }
++
++    fn set_popover_showing_or_hiding(&self, value: bool) {
++        self.upcast::<Element>()
++            .ensure_rare_data()
++            .popover_showing_or_hiding = value;
++    }
++
++    /// Fire a `beforetoggle` [`ToggleEvent`] at this element and return false if it was
++    /// canceled.
++    fn fire_beforetoggle(
++        &self,
++        cx: &mut JSContext,
++        cancelable: bool,
++        old_state: &str,
++        new_state: &str,
++        source: Option<&HTMLElement>,
++    ) -> bool {
++        let event = ToggleEvent::new(
++            cx,
++            &self.owner_window(),
++            atom!("beforetoggle"),
++            EventBubbles::DoesNotBubble,
++            if cancelable {
++                EventCancelable::Cancelable
++            } else {
++                EventCancelable::NotCancelable
++            },
++            DOMString::from(old_state),
++            DOMString::from(new_state),
++            source.map(|source| DomRoot::from_ref(source.upcast::<Element>())),
++        );
++        event
++            .upcast::<Event>()
++            .fire(cx, self.upcast::<EventTarget>())
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#queue-a-popover-toggle-event-task>
++    fn queue_popover_toggle_event_task(
++        &self,
++        old_state: &str,
++        new_state: &str,
++        source: Option<&HTMLElement>,
++    ) {
++        // > 1. If element's popover toggle task tracker is not null, then: set oldState to
++        // >    element's popover toggle task tracker's old state; remove element's popover toggle
++        // >    task tracker's task from its task queue; set element's popover toggle task tracker
++        // >    to null.
++        //
++        // Queued tasks cannot be removed, so a superseded task notices that the generation moved
++        // on and does nothing.
++        let (old_state, generation) = {
++            let mut rare_data = self.upcast::<Element>().ensure_rare_data();
++            let old_state = rare_data
++                .popover_toggle_task_old_state
++                .take()
++                .unwrap_or_else(|| DOMString::from(old_state));
++            rare_data.popover_toggle_task_generation += 1;
++            // > 3. Set element's popover toggle task tracker to a struct with task set to the
++            // >    just-queued task and old state set to oldState.
++            rare_data.popover_toggle_task_old_state = Some(old_state.clone());
++            (
++                old_state.to_string(),
++                rare_data.popover_toggle_task_generation,
++            )
++        };
++
++        let this = Trusted::new(self);
++        let new_state = new_state.to_owned();
++        let source = source.map(|source| Trusted::new(source.upcast::<Element>()));
++
++        // > 2. Queue an element task given the DOM manipulation task source and element to run the
++        // >    following steps:
++        self.owner_global()
++            .task_manager()
++            .dom_manipulation_task_source()
++            .queue(task!(fire_popover_toggle_event: move |cx| {
++                let this = this.root();
++                {
++                    let mut rare_data = this.upcast::<Element>().ensure_rare_data();
++                    if rare_data.popover_toggle_task_generation != generation {
++                        return;
++                    }
++                    // > 2.2. Set element's popover toggle task tracker to null.
++                    rare_data.popover_toggle_task_old_state = None;
++                }
++                // > 2.1. Fire an event named toggle at element, using ToggleEvent, with the
++                // >      oldState attribute initialized to oldState, the newState attribute
++                // >      initialized to newState, and the source attribute initialized to source.
++                let event = ToggleEvent::new(
++                    cx,
++                    &this.owner_window(),
++                    atom!("toggle"),
++                    EventBubbles::DoesNotBubble,
++                    EventCancelable::NotCancelable,
++                    DOMString::from(old_state),
++                    DOMString::from(new_state),
++                    source.map(|source| source.root()),
++                );
++                event.upcast::<Event>().fire(cx, this.upcast::<EventTarget>());
++            }));
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#popover-focusing-steps>
++    fn run_popover_focusing_steps(&self, cx: &mut JSContext) {
++        // > 1. If subject is a dialog element, then run the dialog focusing steps given subject
++        // >    and return.
++        if let Some(dialog) = self.downcast::<HTMLDialogElement>() {
++            dialog.run_dialog_focusing_steps(cx);
++            return;
++        }
++
++        // > 2. If subject has the autofocus attribute, then let control be subject.
++        // > 3. Otherwise, let control be the autofocus delegate for subject given "other".
++        let node = self.upcast::<Node>();
++        let control = if self
++            .upcast::<Element>()
++            .has_attribute(&local_name!("autofocus"))
++        {
++            Some(DomRoot::from_ref(node))
++        } else {
++            node.traverse_preorder(ShadowIncluding::No)
++                .skip(1)
++                .find(|descendant| {
++                    descendant
++                        .downcast::<Element>()
++                        .is_some_and(|element| element.has_attribute(&local_name!("autofocus"))) &&
++                        descendant.get_the_focusable_area().is_some()
++                })
++        };
++
++        // > 4. If control is null, then return.
++        // > 5. Run the focusing steps given control.
++        if let Some(control) = control {
++            control.run_the_focusing_steps(cx, None);
++        }
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#hide-all-popovers-until>
++    ///
++    /// An `endpoint` of `None` stands for the document.
++    pub(crate) fn hide_all_popovers_until(
++        cx: &mut JSContext,
++        document: &Document,
++        endpoint: Option<&HTMLElement>,
++        focus_previous_element: bool,
++        fire_events: bool,
++    ) {
++        // > 1. If endpoint is an HTML element and endpoint is not in the popover showing state,
++        // >    then return.
++        if endpoint.is_some_and(|endpoint| !endpoint.is_popover_showing()) {
++            return;
++        }
++
++        // > 5. If endpoint is a Document: run close entire popover list given document's showing
++        // >    auto popover list, focusPreviousElement, and fireEvents; return.
++        let Some(endpoint) = endpoint else {
++            while let Some(popover) = document.top_layer().topmost_auto_popover() {
++                popover
++                    .hide_popover(cx, focus_previous_element, fire_events, false, false, None)
++                    .unwrap();
++            }
++            return;
++        };
++
++        // > 7. Run hide popover stack until given endpoint, document's showing auto popover list,
++        // >    focusPreviousElement, and fireEvents.
++        Self::hide_popover_stack_until(cx, document, endpoint, focus_previous_element, fire_events);
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#hide-popover-stack-until>
++    fn hide_popover_stack_until(
++        cx: &mut JSContext,
++        document: &Document,
++        endpoint: &HTMLElement,
++        focus_previous_element: bool,
++        mut fire_events: bool,
++    ) {
++        // > 1. Let repeatingHide be false.
++        // > 2. Perform the following steps at least once:
++        loop {
++            // > 2.1. Let lastToHide be null.
++            // > 2.2. For each popover in popoverList: if popover is endpoint, then break; set
++            // >      lastToHide to popover... in reverse, so that lastToHide is the popover
++            // >      directly above endpoint.
++            let popover_list = document.top_layer().showing_auto_popover_list();
++            let last_to_hide = popover_list
++                .iter()
++                .position(|popover| &**popover == endpoint)
++                .and_then(|index| popover_list.get(index + 1).cloned());
++
++            // > 2.3. If lastToHide is null, then return.
++            let Some(last_to_hide) = last_to_hide else {
++                return;
++            };
++
++            // > 2.4. While lastToHide's popover visibility state is showing: Assert: popoverList
++            // >      is not empty; run the hide popover algorithm given the last item in
++            // >      popoverList, focusPreviousElement, fireEvents, false, and false.
++            while last_to_hide.is_popover_showing() {
++                let topmost = document
++                    .top_layer()
++                    .topmost_auto_popover()
++                    .expect("A showing auto popover is in the showing auto popover list");
++                topmost
++                    .hide_popover(cx, focus_previous_element, fire_events, false, false, None)
++                    .unwrap();
++            }
++
++            // > 2.6. Set repeatingHide to true if popoverList contains endpoint and popoverList's
++            // >      last item is not endpoint, otherwise false.
++            let repeating_hide = document
++                .top_layer()
++                .showing_auto_popover_list_contains(endpoint) &&
++                document.top_layer().topmost_auto_popover().as_deref() != Some(endpoint);
++
++            // > 2.7. If repeatingHide is true, then set fireEvents to false.
++            if !repeating_hide {
++                return;
++            }
++            fire_events = false;
++        }
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#topmost-popover-ancestor>
++    pub(crate) fn topmost_popover_ancestor(
++        new_popover_or_top_layer_element: &Element,
++        popover_list: &[DomRoot<HTMLElement>],
++        invoker: Option<&HTMLElement>,
++        is_popover: bool,
++    ) -> Option<DomRoot<HTMLElement>> {
++        // > 2. Let popoverPositions be an empty ordered map.
++        // > 3. Let index be 0.
++        // > 4. For each popover of popoverList: set popoverPositions[popover] to index; increment
++        // >    index by 1.
++        // > 5. If isPopover is true, then set popoverPositions[newPopoverOrTopLayerElement] to
++        // >    index, and increment index by 1.
++        let position = |popover: &HTMLElement| -> Option<usize> {
++            if let Some(index) = popover_list.iter().position(|item| &**item == popover) {
++                return Some(index);
++            }
++            if is_popover && popover.upcast::<Element>() == new_popover_or_top_layer_element {
++                return Some(popover_list.len());
++            }
++            None
++        };
++
++        // > 6. Let topmostPopoverAncestor be null.
++        let mut topmost_popover_ancestor: Option<(DomRoot<HTMLElement>, usize)> = None;
++
++        // > 7. Let checkAncestor be an algorithm which performs the following steps given
++        // >    candidate:
++        let mut check_ancestor = |candidate: Option<DomRoot<Node>>| {
++            // > 7.1. If candidate is null, then return.
++            let Some(candidate) = candidate else {
++                return;
++            };
++            // > 7.2. Let okNesting be false. 7.3. Let candidateAncestor be null.
++            // > 7.4. While okNesting is false: set candidateAncestor to the result of running
++            // >      nearest inclusive open popover given candidate; if candidateAncestor is null
++            // >      or popoverPositions does not contain candidateAncestor, then return.
++            //
++            // Hint popovers share the auto stack, so nesting is always ok.
++            let Some(candidate_ancestor) = Self::nearest_inclusive_open_popover(&candidate) else {
++                return;
++            };
++            let Some(candidate_position) = position(&candidate_ancestor) else {
++                return;
++            };
++            // > 7.6. If topmostPopoverAncestor is null or
++            // >      popoverPositions[topmostPopoverAncestor] is less than candidatePosition,
++            // >      then set topmostPopoverAncestor to candidateAncestor.
++            if topmost_popover_ancestor
++                .as_ref()
++                .is_none_or(|(_, topmost_position)| *topmost_position < candidate_position)
++            {
++                topmost_popover_ancestor = Some((candidate_ancestor, candidate_position));
++            }
++        };
++
++        // > 8. Run checkAncestor given newPopoverOrTopLayerElement's parent node within the flat
++        // >    tree.
++        check_ancestor(
++            new_popover_or_top_layer_element
++                .upcast::<Node>()
++                .parent_in_flat_tree(),
++        );
++
++        // > 9. Run checkAncestor given invoker.
++        check_ancestor(invoker.map(|invoker| DomRoot::from_ref(invoker.upcast::<Node>())));
++
++        // > 10. Return topmostPopoverAncestor.
++        topmost_popover_ancestor.map(|(popover, _)| popover)
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#nearest-inclusive-open-popover>
++    pub(crate) fn nearest_inclusive_open_popover(node: &Node) -> Option<DomRoot<HTMLElement>> {
++        // > 1. Let currentNode be node.
++        // > 2. While currentNode is not null: if currentNode's popover attribute is in the Auto
++        // >    state or the Hint state, and currentNode's popover visibility state is showing,
++        // >    then return currentNode; set currentNode to currentNode's parent in the flat tree.
++        // > 3. Return null.
++        node.inclusive_ancestors_in_flat_tree()
++            .filter_map(DomRoot::downcast::<HTMLElement>)
++            .find(|element| {
++                element.is_popover_showing() &&
++                    element
++                        .popover_state()
++                        .is_some_and(PopoverState::uses_auto_stack)
++            })
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#nearest-inclusive-target-popover-for-invoker>
++    pub(crate) fn nearest_inclusive_target_popover_for_invoker(
++        cx: &JSContext,
++        node: &Node,
++    ) -> Option<DomRoot<HTMLElement>> {
++        // > 1. Let currentNode be node.
++        // > 2. While currentNode is not null: let targetPopover be currentNode's popover target
++        // >    element; if targetPopover is not null and targetPopover's popover attribute is in
++        // >    the Auto state or the Hint state, and targetPopover's popover visibility state is
++        // >    showing, then return targetPopover; set currentNode to currentNode's ancestor in the
++        // >    flat tree.
++        // > 3. Return null.
++        node.inclusive_ancestors_in_flat_tree().find_map(|current| {
++            let target_popover = popover_target_element(cx, &current)?;
++            (target_popover.is_popover_showing() &&
++                target_popover
++                    .popover_state()
++                    .is_some_and(PopoverState::uses_auto_stack))
++            .then_some(target_popover)
++        })
++    }
++
++    /// The popover attribute change steps:
++    /// <https://html.spec.whatwg.org/multipage/#the-popover-attribute:concept-element-attributes-change-ext>
++    pub(crate) fn popover_attribute_changed(
++        &self,
++        cx: &mut JSContext,
++        old_state: Option<PopoverState>,
++    ) {
++        // > If element's popover visibility state is in the showing state and oldValue and value
++        // > are in different states, then run the hide popover algorithm given element, true,
++        // > true, false, and false.
++        if self.is_popover_showing() && old_state != self.popover_state() {
++            self.hide_popover(cx, true, true, false, false, None)
++                .unwrap();
++        }
++    }
++
++    /// The popover part of the HTML element removing steps:
++    /// <https://html.spec.whatwg.org/multipage/#dom-trees:concept-node-remove-ext>
++    pub(crate) fn popover_removing_steps(&self, cx: &mut JSContext) {
++        // > If removedNode's popover attribute is not in the No Popover state, then run the hide
++        // > popover algorithm given removedNode, false, false, false, and true.
++        if self.popover_state().is_some() {
++            self.hide_popover(cx, false, false, false, true, None)
++                .unwrap();
++        }
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#popover-target-attribute-activation-behavior>
++    pub(crate) fn popover_target_attribute_activation_behavior(
++        &self,
++        cx: &mut JSContext,
++        event_target: &EventTarget,
++    ) {
++        // > 1. Let popover be node's popover target element.
++        // > 2. If popover is null, then return.
++        let Some(popover) = popover_target_element(cx, self.upcast()) else {
++            return;
++        };
++
++        // > 3. If eventTarget is a shadow-including inclusive descendant of popover and popover is
++        // >    a shadow-including descendant of node, then return.
++        if let Some(event_target) = event_target.downcast::<Node>() &&
++            popover
++                .upcast::<Node>()
++                .is_shadow_including_inclusive_ancestor_of(event_target) &&
++            self.upcast::<Node>()
++                .is_shadow_including_inclusive_ancestor_of(popover.upcast()) &&
++            popover.upcast::<Node>() != self.upcast::<Node>()
++        {
++            return;
++        }
++
++        let action = popover_target_action(self.upcast());
++        let showing = popover.is_popover_showing();
++
++        // > 4. If node's popovertargetaction attribute is in the show state and popover's popover
++        // >    visibility state is showing, then return.
++        // > 5. If node's popovertargetaction attribute is in the hide state and popover's popover
++        // >    visibility state is hidden, then return.
++        if (action == PopoverTargetAction::Show && showing) ||
++            (action == PopoverTargetAction::Hide && !showing)
++        {
++            return;
++        }
++
++        // > 6. If popover's popover visibility state is showing, then run the hide popover
++        // >    algorithm given popover, true, true, false, false, and node.
++        if showing {
++            popover
++                .hide_popover(cx, true, true, false, false, Some(self))
++                .unwrap();
++            return;
++        }
++
++        // > 7. Otherwise, if popover's popover visibility state is hidden and the result of
++        // >    running check popover validity given popover, false, false, null, and false is
++        // >    true, then run show popover given popover, false, and node.
++        if popover
++            .check_popover_validity(false, false, None, false)
++            .unwrap()
++        {
++            popover.show_popover(cx, false, Some(self)).unwrap();
++        }
++    }
++
++    /// The Toggle Popover, Show Popover and Hide Popover command steps (steps 5.7 to 5.9) of
++    /// <https://html.spec.whatwg.org/multipage/#the-button-element:activation-behaviour>.
++    pub(crate) fn run_popover_command(
++        &self,
++        cx: &mut JSContext,
++        source: &HTMLElement,
++        show: bool,
++        hide: bool,
++    ) {
++        // > If command is in the Hide Popover state or the Toggle Popover state, and the result of
++        // > running check popover validity given target, true, false, null, and false is true,
++        // > then run the hide popover algorithm given target, true, true, false, false, and
++        // > element.
++        if hide &&
++            self.check_popover_validity(true, false, None, false)
++                .unwrap()
++        {
++            self.hide_popover(cx, true, true, false, false, Some(source))
++                .unwrap();
++            return;
++        }
++        // > Otherwise, if command is in the Show Popover state or the Toggle Popover state, and
++        // > the result of running check popover validity given target, false, false, null, and
++        // > false is true, then run show popover given target, false, and element.
++        if show &&
++            self.check_popover_validity(false, false, None, false)
++                .unwrap()
++        {
++            self.show_popover(cx, false, Some(source)).unwrap();
++        }
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-showpopover>
++    pub(crate) fn show_popover_method(
++        &self,
++        cx: &mut JSContext,
++        source: Option<&HTMLElement>,
++    ) -> ErrorResult {
++        // > 1. Let invoker be options["source"] if it exists; otherwise, null.
++        // > 2. Run show popover given this, true, and invoker.
++        self.show_popover(cx, true, source)
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-togglepopover>
++    pub(crate) fn toggle_popover_method(
++        &self,
++        cx: &mut JSContext,
++        force: Option<bool>,
++        source: Option<&HTMLElement>,
++    ) -> Fallible<bool> {
++        // > 4. If this's popover visibility state is showing, and force is null or false, then run
++        // >    the hide popover algorithm given this, true, true, true, and false.
++        if self.is_popover_showing() && force != Some(true) {
++            self.hide_popover(cx, true, true, true, false, None)?;
++        }
++        // > 5. Otherwise, if force is null or true, then run show popover given this, true, and
++        // >    invoker.
++        else if force != Some(false) {
++            self.show_popover(cx, true, source)?;
++        }
++        // > 6. Otherwise: let expectedToBeShowing be true if this's popover visibility state is
++        // >    showing; otherwise false; run check popover validity given this,
++        // >    expectedToBeShowing, true, null, and false.
++        else {
++            self.check_popover_validity(self.is_popover_showing(), true, None, false)?;
++        }
++        // > 7. Return true if this's popover visibility state is showing; otherwise false.
++        Ok(self.is_popover_showing())
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-popover>
++    pub(crate) fn popover_attribute_getter(&self) -> Option<DOMString> {
++        // > The popover IDL attribute must reflect the popover attribute, limited to only known
++        // > values.
++        self.popover_state().map(|state| {
++            DOMString::from(match state {
++                PopoverState::Auto => "auto",
++                PopoverState::Manual => "manual",
++                PopoverState::Hint => "hint",
++            })
++        })
++    }
++}
++
++/// <https://html.spec.whatwg.org/multipage/#popover-target-element>
++fn popover_target_element(cx: &JSContext, node: &Node) -> Option<DomRoot<HTMLElement>> {
++    // > 1. If node is not a button, then return null.
++    let element = node.downcast::<Element>()?;
++    let is_submit_button = if let Some(button) = node.downcast::<HTMLButtonElement>() {
++        button.is_submit_button()
++    } else if let Some(input) = node.downcast::<HTMLInputElement>() {
++        if !matches!(
++            *input.input_type(),
++            InputType::Submit(_) | InputType::Reset(_) | InputType::Button(_) | InputType::Image(_)
++        ) {
++            return None;
++        }
++        input.is_submit_button()
++    } else {
++        return None;
++    };
++
++    // > 2. If node is disabled, then return null.
++    if element.is_actually_disabled() {
++        return None;
++    }
++
++    // > 3. If node has a form owner and node is a submit button, then return null.
++    let has_form_owner = element
++        .as_maybe_form_control()
++        .is_some_and(|control| control.form_owner().is_some());
++    if has_form_owner && is_submit_button {
++        return None;
++    }
++
++    // > 4. Let popoverElement be the result of running node's get the popovertarget-associated
++    // >    element.
++    // > 5. If popoverElement is null, then return null.
++    let popover_element = popovertarget_associated_element(cx, element)?;
++    let popover_element = DomRoot::downcast::<HTMLElement>(popover_element)?;
++
++    // > 6. If popoverElement's popover attribute is in the No Popover state, then return null.
++    popover_element.popover_state()?;
++
++    // > 7. Return popoverElement.
++    Some(popover_element)
++}
++
++/// <https://html.spec.whatwg.org/multipage/#attr-associated-element> for `popovertarget`.
++pub(crate) fn popovertarget_associated_element(
++    cx: &JSContext,
++    element: &Element,
++) -> Option<DomRoot<Element>> {
++    // > 1. If element's explicitly set attr-element is not null: if it is a descendant of any of
++    // >    element's shadow-including ancestors, return it; otherwise return null.
++    let explicitly_set = element
++        .ensure_rare_data()
++        .explicitly_set_popover_target_element
++        .get();
++    if let Some(explicitly_set) = explicitly_set {
++        let explicitly_set_node = explicitly_set.upcast::<Node>();
++        let in_scope = element
++            .upcast::<Node>()
++            .inclusive_ancestors(ShadowIncluding::Yes)
++            .skip(1)
++            .any(|ancestor| ancestor.is_ancestor_of(explicitly_set_node));
++        return in_scope.then_some(explicitly_set);
++    }
++
++    // > 2. Otherwise, if the content attribute is present in element, return the first element
++    // >    in tree order within element's root whose ID is the attribute's value.
++    let id = element.get_attribute_string_value(&local_name!("popovertarget"))?;
++    let root_node = element
++        .upcast::<Node>()
++        .GetRootNode(&GetRootNodeOptions::empty());
++    if let Some(document) = root_node.downcast::<Document>() {
++        return document.GetElementById(cx, DOMString::from(id));
++    }
++    root_node
++        .downcast::<DocumentFragment>()?
++        .GetElementById(cx, DOMString::from(id))
++}
++
++/// <https://html.spec.whatwg.org/multipage/#attr-popovertargetaction>
++fn popover_target_action(element: &Element) -> PopoverTargetAction {
++    // > The attribute's missing value default and invalid value default are both the toggle
++    // > state.
++    match element
++        .get_attribute_string_value(&local_name!("popovertargetaction"))
++        .map(|value| value.to_ascii_lowercase())
++        .as_deref()
++    {
++        Some("show") => PopoverTargetAction::Show,
++        Some("hide") => PopoverTargetAction::Hide,
++        _ => PopoverTargetAction::Toggle,
++    }
++}
++
++/// The getter of the `popoverTargetAction` IDL attribute, which reflects `popovertargetaction`
++/// limited to only known values.
++pub(crate) fn popover_target_action_getter(element: &Element) -> DOMString {
++    DOMString::from(match popover_target_action(element) {
++        PopoverTargetAction::Toggle => "toggle",
++        PopoverTargetAction::Show => "show",
++        PopoverTargetAction::Hide => "hide",
++    })
++}
++
++/// The setter of a reflected `Element?` attribute for `popovertarget`:
++/// <https://html.spec.whatwg.org/multipage/#reflecting-content-attributes-in-idl-attributes>
++pub(crate) fn set_popover_target_element(
++    cx: &mut JSContext,
++    element: &Element,
++    value: Option<&Element>,
++) {
++    match value {
++        // > 1. If the given value is null, then: set this's explicitly set attr-element to null;
++        // >    run this's delete the content attribute; return.
++        None => {
++            element
++                .ensure_rare_data()
++                .explicitly_set_popover_target_element
++                .set(None);
++            element.remove_attribute(cx, &ns!(), &local_name!("popovertarget"));
++        },
++        // > 2. Run this's set the content attribute with the empty string.
++        // > 3. Set this's explicitly set attr-element to a weak reference to the given value.
++        Some(value) => {
++            element.set_string_attribute(cx, &local_name!("popovertarget"), DOMString::new());
++            element
++                .ensure_rare_data()
++                .explicitly_set_popover_target_element
++                .set(Some(value));
++        },
++    }
++}
+diff --git a/components/script/dom/raredata.rs b/components/script/dom/raredata.rs
+index 972e954cfd5..69765bca87d 100644
+--- a/components/script/dom/raredata.rs
++++ b/components/script/dom/raredata.rs
+@@ -11,12 +11,14 @@ use stylo_atoms::Atom;
+ 
+ use crate::dom::UniqueId;
+ use crate::dom::bindings::root::{Dom, MutNullableDom};
++use crate::dom::bindings::str::DOMString;
+ use crate::dom::customelementregistry::{
+     CustomElementDefinition, CustomElementReaction, CustomElementRegistry, CustomElementState,
+ };
+ use crate::dom::domtokenlist::DOMTokenList;
+ use crate::dom::elementinternals::ElementInternals;
+ use crate::dom::html::htmlslotelement::SlottableData;
++use crate::dom::html::popover::PopoverState;
+ use crate::dom::intersectionobserver::IntersectionObserverRegistration;
+ use crate::dom::mutationobserver::RegisteredObserver;
+ use crate::dom::nodelist::NodeList;
+@@ -107,4 +109,21 @@ pub(crate) struct ElementRareData {
+ 
+     /// <https://html.spec.whatwg.org/multipage/#previously-focused-element>
+     pub(crate) previously_focused_element: MutNullableDom<Element>,
++
++    /// <https://html.spec.whatwg.org/multipage/#popover-invoker>
++    pub(crate) popover_invoker: MutNullableDom<Element>,
++    /// <https://html.spec.whatwg.org/multipage/#opened-in-popover-mode>
++    #[no_trace]
++    pub(crate) opened_in_popover_mode: Option<PopoverState>,
++    /// <https://html.spec.whatwg.org/multipage/#popover-showing-or-hiding>
++    pub(crate) popover_showing_or_hiding: bool,
++    /// The old state of the <https://html.spec.whatwg.org/multipage/#popover-toggle-task-tracker>,
++    /// if a toggle event task is queued.
++    pub(crate) popover_toggle_task_old_state: Option<DOMString>,
++    /// Identifies the most recently queued popover toggle event task, so that superseded tasks
++    /// can skip firing.
++    pub(crate) popover_toggle_task_generation: u64,
++    /// The explicitly set attr-element of the `popovertarget` attribute:
++    /// <https://html.spec.whatwg.org/multipage/#explicitly-set-attr-element>
++    pub(crate) explicitly_set_popover_target_element: MutNullableDom<Element>,
+ }
+diff --git a/components/script/dom/useractivation.rs b/components/script/dom/useractivation.rs
+index 79e56d77847..9f878b15bd0 100644
+--- a/components/script/dom/useractivation.rs
++++ b/components/script/dom/useractivation.rs
+@@ -7,6 +7,7 @@ use std::ops::Add;
+ use dom_struct::dom_struct;
+ use js::context::JSContext;
+ use script_bindings::codegen::GenericBindings::UserActivationBinding::UserActivationMethods;
++use script_bindings::codegen::GenericBindings::WindowBinding::WindowMethods;
+ use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+ use servo_base::cross_process_instant::CrossProcessInstant;
+ use time::Duration;
+@@ -75,7 +76,7 @@ impl UserActivation {
+ 
+             // Step 5.2.
+             // > Notify the close watcher manager about user activation given window.
+-            // TODO: impl close watcher
++            window.Document().top_layer().notify_about_user_activation();
+         }
+     }
+ }
+diff --git a/components/script/dom/window/window.rs b/components/script/dom/window/window.rs
+index 754c7834826..4f0c16938f3 100644
+--- a/components/script/dom/window/window.rs
++++ b/components/script/dom/window/window.rs
+@@ -499,6 +499,10 @@ pub(crate) struct Window {
+     #[no_trace]
+     last_activation_timestamp: Cell<UserActivationTimestamp>,
+ 
++    /// <https://html.spec.whatwg.org/multipage/#last-history-action-activation-timestamp>
++    #[no_trace]
++    last_history_action_activation_timestamp: Cell<UserActivationTimestamp>,
++
+     /// A flag to indicate whether the developer tools has requested
+     /// live updates from the window.
+     devtools_wants_updates: Cell<bool>,
+@@ -1931,7 +1935,7 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
+         // Step 3.1: Parse pseudoElt as a <pseudo-element-selector>, and let type be the result.
+         // TODO(#43095): This is quite hacky and it would be better to have a parsing function that
+         // is integrated with stylo `PseudoElement` itself. Comparing with stylo, we are now currently
+-        // missing `::backdrop`, `::color-swatch`, and `::details-content`.
++        // missing `::color-swatch` and `::details-content`.
+         let pseudo = pseudo.map(|mut s| {
+             s.make_ascii_lowercase();
+             s
+@@ -1946,6 +1950,7 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
+             Some(ref pseudo) if pseudo == "::selection" => Some(PseudoElement::Selection),
+             Some(ref pseudo) if pseudo == "::marker" => Some(PseudoElement::Marker),
+             Some(ref pseudo) if pseudo == "::placeholder" => Some(PseudoElement::Placeholder),
++            Some(ref pseudo) if pseudo == "::backdrop" => Some(PseudoElement::Backdrop),
+             Some(ref pseudo) if pseudo.starts_with(':') => {
+                 // Step 3.2: If type is failure, or is a ::slotted() or ::part()
+                 // pseudo-element, let obj be null.
+@@ -3747,6 +3752,40 @@ impl Window {
+                     pref!(dom_transient_activation_duration_ms)
+     }
+ 
++    /// <https://html.spec.whatwg.org/multipage/#history-action-activation>
++    pub(crate) fn has_history_action_activation(&self) -> bool {
++        // > When the last history-action activation timestamp of W is not equal to the last
++        // > activation timestamp of W, then W is said to have history-action activation.
++        self.last_history_action_activation_timestamp.get() != self.last_activation_timestamp.get()
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#consume-history-action-user-activation>
++    pub(crate) fn consume_history_action_user_activation(&self) {
++        // > 1. If W's navigable is null, then return.
++        if self.undiscarded_window_proxy().is_none() {
++            return;
++        }
++        // > 2. Let top be W's navigable's top-level traversable.
++        // TODO: This wouldn't work if top level document is in another ScriptThread.
++        let Some(top_level_document) = self.top_level_document_if_local() else {
++            return;
++        };
++        // > 3. Let navigables be the inclusive descendant navigables of top's active document.
++        // > 4. Let windows be the list of Window objects constructed by taking the active window
++        // >    of each item in navigables.
++        // > 5. For each window in windows, set window's last history-action activation timestamp
++        // >    to window's last activation timestamp.
++        let consume = |window: &Window| {
++            window
++                .last_history_action_activation_timestamp
++                .set(window.last_activation_timestamp.get());
++        };
++        consume(top_level_document.window());
++        for document in SameOriginDescendantNavigablesIterator::new(top_level_document) {
++            consume(document.window());
++        }
++    }
++
+     pub(crate) fn consume_last_activation_timestamp(&self) {
+         if self.last_activation_timestamp.get() != UserActivationTimestamp::PositiveInfinity {
+             self.set_last_activation_timestamp(UserActivationTimestamp::NegativeInfinity);
+@@ -3915,6 +3954,9 @@ impl Window {
+             has_changed_visual_viewport_dimension: Default::default(),
+             pending_media_query_evaluation: Default::default(),
+             last_activation_timestamp: Cell::new(UserActivationTimestamp::PositiveInfinity),
++            last_history_action_activation_timestamp: Cell::new(
++                UserActivationTimestamp::PositiveInfinity,
++            ),
+             devtools_wants_updates: Default::default(),
+         });
+ 
+diff --git a/components/script_bindings/codegen/Bindings.conf b/components/script_bindings/codegen/Bindings.conf
+index e4cb3a618c4..9adf31f0af1 100644
+--- a/components/script_bindings/codegen/Bindings.conf
++++ b/components/script_bindings/codegen/Bindings.conf
+@@ -686,7 +686,7 @@ DOMInterfaces = {
+ },
+ 
+ 'HTMLButtonElement': {
+-    'cx': ['CheckValidity', 'ReportValidity', 'SetCustomValidity', 'Validity', 'ValidationMessage'],
++    'cx': ['CheckValidity', 'GetPopoverTargetElement', 'ReportValidity', 'SetCustomValidity', 'Validity', 'ValidationMessage'],
+     'implicitCxSetters': True,
+ },
+ 
+@@ -705,7 +705,7 @@ DOMInterfaces = {
+ },
+ 
+ 'HTMLDialogElement': {
+-    'cx': ['Close', 'Show', 'ShowModal'],
++    'cx': ['Close', 'RequestClose', 'Show', 'ShowModal'],
+ },
+ 
+ 'HTMLDocument': {
+@@ -725,7 +725,10 @@ DOMInterfaces = {
+         'GetOnload',
+         'GetOnresize',
+         'GetOnscroll',
++        'HidePopover',
++        'ShowPopover',
+         'Style',
++        'TogglePopover',
+     ],
+     'implicitCxSetters': True,
+ },
+@@ -768,6 +771,7 @@ DOMInterfaces = {
+     'cx': [
+         'CheckValidity',
+         'GetLabels',
++        'GetPopoverTargetElement',
+         'GetValueAsDate',
+         'ReportValidity',
+         'SetChecked',
+diff --git a/components/script_bindings/webidls/HTMLButtonElement.webidl b/components/script_bindings/webidls/HTMLButtonElement.webidl
+index 8c54b1064ca..f5824064006 100644
+--- a/components/script_bindings/webidls/HTMLButtonElement.webidl
++++ b/components/script_bindings/webidls/HTMLButtonElement.webidl
+@@ -43,3 +43,4 @@ interface HTMLButtonElement : HTMLElement {
+ 
+   readonly attribute NodeList labels;
+ };
++HTMLButtonElement includes PopoverInvokerElement;
+diff --git a/components/script_bindings/webidls/HTMLDialogElement.webidl b/components/script_bindings/webidls/HTMLDialogElement.webidl
+index 7d41489222f..f7b22105fa6 100644
+--- a/components/script_bindings/webidls/HTMLDialogElement.webidl
++++ b/components/script_bindings/webidls/HTMLDialogElement.webidl
+@@ -16,6 +16,8 @@ interface HTMLDialogElement : HTMLElement {
+   undefined showModal();
+   [CEReactions]
+   undefined close(optional DOMString returnValue);
+-  // [CEReactions]
+-  // undefined requestClose(optional DOMString returnValue);
++  [CEReactions]
++  undefined requestClose(optional DOMString returnValue);
++  [CEReactions]
++  attribute DOMString closedBy;
+ };
+diff --git a/components/script_bindings/webidls/HTMLElement.webidl b/components/script_bindings/webidls/HTMLElement.webidl
+index 8e6553b22d5..99c8bef0004 100644
+--- a/components/script_bindings/webidls/HTMLElement.webidl
++++ b/components/script_bindings/webidls/HTMLElement.webidl
+@@ -37,22 +37,22 @@ interface HTMLElement : Element {
+   [Throws] ElementInternals attachInternals();
+ 
+   // The popover API
+-  // undefined showPopover(optional ShowPopoverOptions options = {});
+-  // undefined hidePopover();
+-  // boolean togglePopover(optional (TogglePopoverOptions or boolean) options = {});
+-  // [CEReactions] attribute DOMString? popover;
++  [CEReactions, Throws] undefined showPopover(optional ShowPopoverOptions options = {});
++  [CEReactions, Throws] undefined hidePopover();
++  [CEReactions, Throws] boolean togglePopover(optional (TogglePopoverOptions or boolean) options = {});
++  [CEReactions] attribute DOMString? popover;
+ 
+   // [CEReactions, Reflect, ReflectRange=(0, 8)] attribute unsigned long headingOffset;
+   // [CEReactions, Reflect] attribute boolean headingReset;
+ };
+ 
+-// dictionary ShowPopoverOptions {
+-//   HTMLElement source;
+-// };
+-//
+-// dictionary TogglePopoverOptions : ShowPopoverOptions {
+-//   boolean force;
+-// };
++dictionary ShowPopoverOptions {
++  HTMLElement source;
++};
++
++dictionary TogglePopoverOptions : ShowPopoverOptions {
++  boolean force;
++};
+ 
+ // http://dev.w3.org/csswg/cssom-view/#extensions-to-the-htmlelement-interface
+ partial interface HTMLElement {
+diff --git a/components/script_bindings/webidls/HTMLInputElement.webidl b/components/script_bindings/webidls/HTMLInputElement.webidl
+index 6ef88802ad3..35a6b29edf9 100644
+--- a/components/script_bindings/webidls/HTMLInputElement.webidl
++++ b/components/script_bindings/webidls/HTMLInputElement.webidl
+@@ -120,3 +120,4 @@ partial interface HTMLInputElement {
+   //         attribute DOMString align;
+   attribute DOMString useMap;
+ };
++HTMLInputElement includes PopoverInvokerElement;
+diff --git a/components/script_bindings/webidls/PopoverInvokerElement.webidl b/components/script_bindings/webidls/PopoverInvokerElement.webidl
+new file mode 100644
+index 00000000000..309f3362bc7
+--- /dev/null
++++ b/components/script_bindings/webidls/PopoverInvokerElement.webidl
+@@ -0,0 +1,9 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++// https://html.spec.whatwg.org/multipage/#popoverinvokerelement
++interface mixin PopoverInvokerElement {
++  [CEReactions] attribute Element? popoverTargetElement;
++  [CEReactions] attribute DOMString popoverTargetAction;
++};
+-- 
+2.43.0
+

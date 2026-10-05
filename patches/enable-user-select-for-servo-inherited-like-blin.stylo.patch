@@ -1,0 +1,42 @@
+From cd2ec36a70548eaadd465cf8b84eed422024d410 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 18:41:55 -0400
+Subject: [PATCH] style: enable user-select for Servo, inherited like Blink
+
+user-select was gecko-only, so pages could not make text unselectable.
+It is enabled for Servo and inherited, as in Blink, so getComputedStyle
+matches Chrome; -webkit-user-select stays as an alias and
+-moz-user-select is Gecko-only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ style/properties/longhands.toml | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/style/properties/longhands.toml b/style/properties/longhands.toml
+index d07e0fe55..8f540369f 100644
+--- a/style/properties/longhands.toml
++++ b/style/properties/longhands.toml
+@@ -2177,12 +2177,15 @@ affects = "overflow"
+ [user-select]
+ type = "UserSelect"
+ initial = "computed::UserSelect::Auto"
+-struct = "ui"
+-servo_pref = "layout.unimplemented"
+-extra_prefixes = ["moz", "webkit"]
++# Inherited as in Blink and WebKit, whose `none` and `all` subtrees this reproduces, rather than
++# resolving `auto` from the parent as https://drafts.csswg.org/css-ui-4/#content-selection does.
++struct = "inherited_ui"
++extra_prefixes = ["webkit"]
++extra_gecko_aliases = ["-moz-user-select"]
+ animation_type = "discrete"
+ spec = "https://drafts.csswg.org/css-ui-4/#propdef-user-select"
+-affects = ""
++servo_restyle_damage = "repaint"
++affects = "paint"
+ 
+ [-moz-force-broken-image-icon]
+ type = "BoolInteger"
+-- 
+2.43.0
+

@@ -1,0 +1,463 @@
+From 835bc1a7063d779b59b8c910eea7a1d0b3003c65 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 01:09:04 -0400
+Subject: [PATCH] layout: transfer min/max block sizes through aspect-ratio to
+ the inline size
+
+A non-replaced box with aspect-ratio, width:auto and height:auto stretched
+to the full available inline size even when max-height capped its block
+size, so `aspect-ratio: .7234; max-height: 200px` came out 566x200 where
+Chrome gives 145x200 (Mastodon media). Per css-sizing-4 the min and max
+block sizes are transferred through the ratio: a stretched automatic inline
+size is now clamped by them, and a definite block size gives the inline size
+through the ratio (no narrower than min-content) for block containers as
+well, not only inline-blocks. Content sizes of boxes with a ratio are
+clamped the same way, which fixes floats, inline-blocks and shrink-to-fit
+abspos boxes.
+
+The block size from the ratio was only applied on the parallel in-flow
+path. Blocks laid out sequentially (any block formatting context with
+floats), floats, atomic inlines and abspos boxes without insets on both
+block sides now take it too. The helpers live in sizing.rs since all these
+paths share them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/flow/mod.rs            | 99 +++++++++++++++++-------
+ components/layout/formatting_contexts.rs | 29 +++----
+ components/layout/positioned.rs          | 35 ++++++++-
+ components/layout/sizing.rs              | 83 ++++++++++++++++++++
+ 4 files changed, 199 insertions(+), 47 deletions(-)
+
+diff --git a/components/layout/flow/mod.rs b/components/layout/flow/mod.rs
+index be4645c8fbd..b84cce7d7f7 100644
+--- a/components/layout/flow/mod.rs
++++ b/components/layout/flow/mod.rs
+@@ -42,7 +42,7 @@ use crate::sizing::{
+     SizeConstraint, Sizes,
+ };
+ use crate::style_ext::{
+-    AspectRatio, Clamp, ComputedValuesExt, ContentBoxSizesAndPBM, LayoutStyle, PaddingBorderMargin,
++    AspectRatio, ComputedValuesExt, ContentBoxSizesAndPBM, LayoutStyle, PaddingBorderMargin,
+ };
+ use crate::{ConstraintSpace, ContainingBlock, ContainingBlockSize, IndefiniteContainingBlock};
+ 
+@@ -1225,13 +1225,20 @@ impl IndependentFormattingContext {
+ 
+         let justify_self = resolve_justify_self(style, containing_block.style, has_inline_parent);
+         let automatic_inline_size = automatic_inline_size(justify_self, Some(self));
++        let is_replaced = self.is_replaced();
+         let compute_inline_size = |cache: &mut Cache, stretch_size| {
+             if cache.depends_on_stretch_size {
+                 update_cache(cache, stretch_size);
+             }
+             content_box_sizes.inline.resolve(
+                 Direction::Inline,
+-                automatic_inline_size,
++                sizing::automatic_inline_size_with_aspect_ratio(
++                    automatic_inline_size,
++                    preferred_aspect_ratio,
++                    is_replaced,
++                    cache.tentative_block_size,
++                    stretch_size,
++                ),
+                 Au::zero,
+                 Some(stretch_size),
+                 || get_inline_content_sizes(cache),
+@@ -1239,6 +1246,19 @@ impl IndependentFormattingContext {
+             )
+         };
+ 
++        let aspect_ratio_block_size = |inline_size| {
++            sizing::block_size_from_aspect_ratio(
++                preferred_aspect_ratio,
++                is_replaced,
++                &content_box_sizes.block,
++                available_block_size,
++                inline_size,
++            )
++        };
++        let containing_block_block_size = |cache: &Cache, aspect_ratio_block_size: Option<Au>| {
++            aspect_ratio_block_size.map_or(cache.tentative_block_size, SizeConstraint::Definite)
++        };
++
+         let get_lazy_block_size = || {
+             LazySize::new(
+                 &content_box_sizes.block,
+@@ -1265,6 +1285,7 @@ impl IndependentFormattingContext {
+             // compute it with an available inline space of zero. Then, after layout we can
+             // compute the block size, and finally place among floats.
+             let inline_size = inline_size_with_no_available_space;
++            let aspect_ratio_block_size = aspect_ratio_block_size(inline_size);
+             let lazy_block_size = get_lazy_block_size();
+             layout = self.layout(
+                 layout_context,
+@@ -1275,7 +1296,7 @@ impl IndependentFormattingContext {
+                         // `cache.tentative_block_size` can only depend on the inline stretch size
+                         // for replaced elements, whose layout doesn't use the block size of the
+                         // containing block for children.
+-                        block: cache.tentative_block_size,
++                        block: containing_block_block_size(&cache, aspect_ratio_block_size),
+                     },
+                     style,
+                 },
+@@ -1285,7 +1306,11 @@ impl IndependentFormattingContext {
+             );
+ 
+             content_size = LogicalVec2 {
+-                block: lazy_block_size.resolve(|| layout.content_block_size),
++                block: lazy_block_size.resolve(|| {
++                    layout
++                        .content_block_size
++                        .max(aspect_ratio_block_size.unwrap_or_default())
++                }),
+                 inline: layout.content_inline_size_for_table.unwrap_or(inline_size),
+             };
+ 
+@@ -1336,6 +1361,7 @@ impl IndependentFormattingContext {
+                 let available_inline_size =
+                     placement_rect.size.inline - pbm.padding_border_sums.inline;
+                 let proposed_inline_size = compute_inline_size(&mut cache, available_inline_size);
++                let aspect_ratio_block_size = aspect_ratio_block_size(proposed_inline_size);
+ 
+                 // Now lay out the block using the inline size we calculated from the placement.
+                 // Later we'll check to see if the resulting block size is compatible with the
+@@ -1348,7 +1374,7 @@ impl IndependentFormattingContext {
+                     &ContainingBlock {
+                         size: ContainingBlockSize {
+                             inline: proposed_inline_size,
+-                            block: cache.tentative_block_size,
++                            block: containing_block_block_size(&cache, aspect_ratio_block_size),
+                         },
+                         style,
+                     },
+@@ -1368,7 +1394,11 @@ impl IndependentFormattingContext {
+                     proposed_inline_size
+                 };
+                 content_size = LogicalVec2 {
+-                    block: lazy_block_size.resolve(|| layout.content_block_size),
++                    block: lazy_block_size.resolve(|| {
++                        layout
++                            .content_block_size
++                            .max(aspect_ratio_block_size.unwrap_or_default())
++                    }),
+                     inline: inline_size,
+                 };
+ 
+@@ -1578,17 +1608,33 @@ fn solve_containing_block_padding_and_border_for_in_flow_box<'a>(
+ 
+     // https://drafts.csswg.org/css2/#the-width-property
+     // https://drafts.csswg.org/css2/visudet.html#min-max-widths
++    let is_replaced = context.is_some_and(|context| context.is_replaced());
+     let get_inline_content_sizes = || {
+-        get_inline_content_sizes(&ConstraintSpace::new(
++        let sizes = get_inline_content_sizes(&ConstraintSpace::new(
+             tentative_block_size,
+             style,
+             preferred_aspect_ratio,
+-        ))
++        ));
++        // Boxes that establish an independent formatting context already transfer the
++        // aspect ratio in their content sizes, but a block container doesn't.
++        match preferred_aspect_ratio.filter(|_| !is_replaced) {
++            Some(ratio) => {
++                sizing::content_sizes_with_aspect_ratio(sizes, ratio, tentative_block_size)
++                    .unwrap_or(sizes)
++            },
++            None => sizes,
++        }
+     };
+     let justify_self = resolve_justify_self(style, containing_block.style, has_inline_parent);
+     let inline_size = content_box_sizes.inline.resolve(
+         Direction::Inline,
+-        automatic_inline_size(justify_self, context),
++        sizing::automatic_inline_size_with_aspect_ratio(
++            automatic_inline_size(justify_self, context),
++            preferred_aspect_ratio,
++            is_replaced,
++            tentative_block_size,
++            available_inline_size,
++        ),
+         Au::zero,
+         Some(available_inline_size),
+         get_inline_content_sizes,
+@@ -1598,21 +1644,13 @@ fn solve_containing_block_padding_and_border_for_in_flow_box<'a>(
+     // <https://drafts.csswg.org/css-sizing-4/#aspect-ratio>: with an `auto` block size, a
+     // non-replaced box takes its block size from the inline size. Its children see that as a
+     // definite containing block size.
+-    let aspect_ratio_block_size = preferred_aspect_ratio
+-        .filter(|_| {
+-            content_box_sizes.block.preferred.is_initial() &&
+-                context.is_none_or(|context| !context.is_replaced())
+-        })
+-        .map(|ratio| {
+-            let (_, min, max) = content_box_sizes.block.resolve_each_extrinsic(
+-                Size::FitContent,
+-                Au::zero(),
+-                available_block_size,
+-            );
+-            ratio
+-                .compute_dependent_size(Direction::Block, inline_size)
+-                .clamp_between_extremums(min, max)
+-        });
++    let aspect_ratio_block_size = sizing::block_size_from_aspect_ratio(
++        preferred_aspect_ratio,
++        is_replaced,
++        &content_box_sizes.block,
++        available_block_size,
++        inline_size,
++    );
+     let tentative_block_size = match aspect_ratio_block_size {
+         Some(block_size) => SizeConstraint::Definite(block_size),
+         None => tentative_block_size,
+@@ -2177,10 +2215,18 @@ impl IndependentFormattingContext {
+             is_table,
+         );
+ 
++        let aspect_ratio_block_size = sizing::block_size_from_aspect_ratio(
++            preferred_aspect_ratio,
++            self.is_replaced(),
++            &content_box_sizes_and_pbm.content_box_sizes.block,
++            available_block_size,
++            inline_size,
++        );
+         let containing_block_for_children = ContainingBlock {
+             size: ContainingBlockSize {
+                 inline: inline_size,
+-                block: tentative_block_size,
++                block: aspect_ratio_block_size
++                    .map_or(tentative_block_size, SizeConstraint::Definite),
+             },
+             style,
+         };
+@@ -2217,7 +2263,8 @@ impl IndependentFormattingContext {
+ 
+         let content_size = LogicalVec2 {
+             inline: content_inline_size_for_table.unwrap_or(inline_size),
+-            block: lazy_block_size.resolve(|| content_block_size),
++            block: lazy_block_size
++                .resolve(|| content_block_size.max(aspect_ratio_block_size.unwrap_or_default())),
+         }
+         .to_physical_size(container_writing_mode);
+         let content_rect = PhysicalRect::new(PhysicalPoint::zero(), content_size);
+diff --git a/components/layout/formatting_contexts.rs b/components/layout/formatting_contexts.rs
+index dbc24680b1c..3dc8ec6e3a9 100644
+--- a/components/layout/formatting_contexts.rs
++++ b/components/layout/formatting_contexts.rs
+@@ -32,7 +32,7 @@ use crate::table::Table;
+ use crate::taffy::TaffyContainer;
+ use crate::{
+     ArcRefCell, ConstraintSpace, ContainingBlock, IndefiniteContainingBlock, LogicalVec2,
+-    PropagatedBoxTreeData, SizeConstraint,
++    PropagatedBoxTreeData,
+ };
+ 
+ /// <https://drafts.csswg.org/css-display/#independent-formatting-context>
+@@ -295,28 +295,23 @@ impl IndependentFormattingContext {
+         let result = self
+             .base
+             .inline_content_sizes(layout_context, constraint_space, &self.contents);
+-        // <https://drafts.csswg.org/css-sizing-4/#aspect-ratio-size-transfers>: a non-replaced
+-        // box with an `aspect-ratio` and a definite block size takes its automatic inline size
+-        // from the ratio (an inline-block with `height: 50px; aspect-ratio: 2` is 100px wide),
+-        // but no narrower than its min-content size. Replaced boxes transfer in their own
+-        // content sizes.
++        // Replaced boxes transfer their aspect ratio in their own content sizes.
+         if self.is_replaced() {
+             return result;
+         }
+-        let (Some(ratio), SizeConstraint::Definite(block_size)) =
+-            (constraint_space.preferred_aspect_ratio, constraint_space.block_size)
+-        else {
++        let Some(ratio) = constraint_space.preferred_aspect_ratio else {
+             return result;
+         };
+-        let inline_size = ratio
+-            .compute_dependent_size(Direction::Inline, block_size)
+-            .max(result.sizes.min_content);
+-        InlineContentSizesResult {
+-            sizes: ContentSizes {
+-                min_content: inline_size,
+-                max_content: inline_size,
++        match sizing::content_sizes_with_aspect_ratio(
++            result.sizes,
++            ratio,
++            constraint_space.block_size,
++        ) {
++            Some(sizes) => InlineContentSizesResult {
++                sizes,
++                depends_on_block_constraints: true,
+             },
+-            depends_on_block_constraints: true,
++            None => result,
+         }
+     }
+ 
+diff --git a/components/layout/positioned.rs b/components/layout/positioned.rs
+index 502c86ce275..8d9d5d896aa 100644
+--- a/components/layout/positioned.rs
++++ b/components/layout/positioned.rs
+@@ -28,7 +28,7 @@ use crate::geom::{
+     PhysicalSides, PhysicalSize, PhysicalVec, ToLogical, ToLogicalWithContainingBlock,
+ };
+ use crate::layout_box_base::{IndependentFormattingContextLayoutResult, LayoutBoxBase};
+-use crate::sizing::{LazySize, Size, SizeConstraint, Sizes};
++use crate::sizing::{self, LazySize, Size, SizeConstraint, Sizes};
+ use crate::style_ext::{Clamp, ComputedValuesExt, ContentBoxSizesAndPBM, DisplayInside};
+ use crate::{
+     ConstraintSpace, ContainingBlock, ContainingBlockSize, DefiniteContainingBlock,
+@@ -639,19 +639,45 @@ impl IndependentFormattingContext {
+             self.inline_content_sizes(layout_context, &constraint_space)
+                 .sizes
+         };
++        // TODO: With insets on both block sides, Blink lets the aspect ratio override the
++        // stretched automatic block size when the inline size is stretched or definite.
++        let aspect_ratio_applies = !matches!(block_automatic_size, Size::Stretch);
++        let inline_automatic_size = if aspect_ratio_applies {
++            sizing::automatic_inline_size_with_aspect_ratio(
++                inline_axis_solver.automatic_size(),
++                preferred_aspect_ratio,
++                self.is_replaced(),
++                tentative_block_size,
++                inline_stretch_size,
++            )
++        } else {
++            inline_axis_solver.automatic_size()
++        };
+         let inline_size = inline_axis_solver.computed_sizes.resolve(
+             Direction::Inline,
+-            inline_axis_solver.automatic_size(),
++            inline_automatic_size,
+             Au::zero,
+             Some(inline_stretch_size),
+             get_inline_content_size,
+             is_table,
+         );
+ 
++        let aspect_ratio_block_size = aspect_ratio_applies
++            .then(|| {
++                sizing::block_size_from_aspect_ratio(
++                    preferred_aspect_ratio,
++                    self.is_replaced(),
++                    &block_axis_solver.computed_sizes,
++                    block_stretch_size,
++                    inline_size,
++                )
++            })
++            .flatten();
+         let containing_block_for_children = ContainingBlock {
+             size: ContainingBlockSize {
+                 inline: inline_size,
+-                block: tentative_block_size,
++                block: aspect_ratio_block_size
++                    .map_or(tentative_block_size, SizeConstraint::Definite),
+             },
+             style: &style,
+         };
+@@ -694,7 +720,8 @@ impl IndependentFormattingContext {
+             inline: content_inline_size_for_table.unwrap_or(inline_size),
+ 
+             // Now we can properly solve the block size.
+-            block: lazy_block_size.resolve(|| content_block_size),
++            block: lazy_block_size
++                .resolve(|| content_block_size.max(aspect_ratio_block_size.unwrap_or_default())),
+         };
+ 
+         let inline_margins = inline_axis_solver.solve_margins(content_size.inline);
+diff --git a/components/layout/sizing.rs b/components/layout/sizing.rs
+index ed54d4b4806..04050c353f2 100644
+--- a/components/layout/sizing.rs
++++ b/components/layout/sizing.rs
+@@ -767,6 +767,89 @@ impl Sizes {
+     }
+ }
+ 
++/// <https://drafts.csswg.org/css-sizing-4/#aspect-ratio-size-transfers>: the content sizes of a
++/// non-replaced box with a preferred aspect ratio, given the block size constraint it is laid
++/// out with. A definite block size gives the inline size through the ratio, but no narrower
++/// than the min-content size; otherwise the min and max block sizes are transferred through the
++/// ratio and clamp both content sizes. Returns `None` when nothing is transferred.
++pub(crate) fn content_sizes_with_aspect_ratio(
++    content_sizes: ContentSizes,
++    preferred_aspect_ratio: AspectRatio,
++    block_size: SizeConstraint,
++) -> Option<ContentSizes> {
++    match block_size {
++        SizeConstraint::Definite(block_size) => Some(
++            preferred_aspect_ratio
++                .compute_dependent_size(Direction::Inline, block_size)
++                .max(content_sizes.min_content)
++                .into(),
++        ),
++        SizeConstraint::MinMax(min, None) if min.is_zero() => None,
++        SizeConstraint::MinMax(min, max) => {
++            let (min, max) = transferred_inline_extremums(preferred_aspect_ratio, min, max);
++            Some(content_sizes.map(|size| size.clamp_between_extremums(min, max)))
++        },
++    }
++}
++
++/// <https://drafts.csswg.org/css-sizing-4/#aspect-ratio-size-transfers>: the automatic inline
++/// size of a non-replaced box with a preferred aspect ratio. If it would stretch, a definite
++/// block size instead gives the inline size through the ratio (which the content sizes carry,
++/// see [`content_sizes_with_aspect_ratio`]), and otherwise the stretch size is clamped by the
++/// min and max block sizes transferred through the ratio: `width: auto; max-height: 200px;
++/// aspect-ratio: 1 / 2` is 100px wide.
++pub(crate) fn automatic_inline_size_with_aspect_ratio(
++    automatic_size: Size<Au>,
++    preferred_aspect_ratio: Option<AspectRatio>,
++    is_replaced: bool,
++    block_size: SizeConstraint,
++    stretch_size: Au,
++) -> Size<Au> {
++    let (false, Size::Stretch, Some(ratio)) =
++        (is_replaced, &automatic_size, preferred_aspect_ratio)
++    else {
++        return automatic_size;
++    };
++    match block_size {
++        SizeConstraint::Definite(_) => Size::FitContent,
++        SizeConstraint::MinMax(min, max) => {
++            let (min, max) = transferred_inline_extremums(ratio, min, max);
++            Size::Numeric(stretch_size.clamp_between_extremums(min, max))
++        },
++    }
++}
++
++/// The min and max block sizes transferred to the inline axis through the ratio. A zero minimum
++/// stays zero, like in Blink, so that `box-sizing: border-box` doesn't turn it into a
++/// non-zero inline minimum.
++fn transferred_inline_extremums(ratio: AspectRatio, min: Au, max: Option<Au>) -> (Au, Option<Au>) {
++    let transfer = |size| ratio.compute_dependent_size(Direction::Inline, size);
++    let min = if min.is_zero() { min } else { transfer(min) };
++    (min, max.map(transfer))
++}
++
++/// <https://drafts.csswg.org/css-sizing-4/#aspect-ratio>: the block size that a non-replaced box
++/// with a preferred aspect ratio and an `auto` block size takes from its inline size, clamped by
++/// its min and max block sizes. Its content can still make it taller.
++pub(crate) fn block_size_from_aspect_ratio(
++    preferred_aspect_ratio: Option<AspectRatio>,
++    is_replaced: bool,
++    block_sizes: &Sizes,
++    block_stretch_size: Option<Au>,
++    inline_size: Au,
++) -> Option<Au> {
++    if is_replaced || !block_sizes.preferred.is_initial() {
++        return None;
++    }
++    let (_, min, max) =
++        block_sizes.resolve_each_extrinsic(Size::FitContent, Au::zero(), block_stretch_size);
++    Some(
++        preferred_aspect_ratio?
++            .compute_dependent_size(Direction::Block, inline_size)
++            .clamp_between_extremums(min, max),
++    )
++}
++
+ struct LazySizeData<'a> {
+     sizes: &'a Sizes,
+     axis: Direction,
+-- 
+2.43.0
+

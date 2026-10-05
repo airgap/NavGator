@@ -1,0 +1,503 @@
+From 8640915738e575577899fd6dc924ef5d2e420bd2 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 06:38:37 -0400
+Subject: [PATCH] text: paint -webkit-text-stroke
+
+Text runs whose style has a non-zero -webkit-text-stroke-width now paint a second run over
+the fill, in -webkit-text-stroke-color, using a font instance whose glyphs WebRender
+rasterizes as the outline of a stroke of that width (airgap/webrender's FreeType stroker).
+Font instances are keyed on the stroke width as well as the painter, and the font services
+and paint API now pass whole FontInstanceOptions instead of only their flags so the width
+reaches WebRender. The glyph bounds grow by half the stroke width.
+
+Only WebRender's FreeType rasterizer strokes outlines, so on macOS and Windows no stroke is
+painted rather than painting filled glyphs in the stroke colour.
+https://compat.spec.whatwg.org/#the-webkit-text-stroke
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/fonts/font.rs                      | 20 +++++++++++--
+ components/fonts/font_context.rs              | 20 ++++++++-----
+ components/fonts/system_font_service.rs       | 18 ++++++------
+ components/layout/display_list/mod.rs         | 29 +++++++++++++++++--
+ components/layout/flow/inline/line.rs         | 25 ++++++++++++++++
+ components/layout/fragment_tree/fragment.rs   |  3 ++
+ components/malloc_size_of/lib.rs              |  1 +
+ components/paint/paint.rs                     | 10 +++++--
+ components/paint/painter.rs                   | 16 ++++------
+ .../shared/fonts/system_font_service_proxy.rs |  8 ++---
+ components/shared/paint/lib.rs                |  8 ++---
+ 11 files changed, 117 insertions(+), 41 deletions(-)
+
+diff --git a/components/fonts/font.rs b/components/fonts/font.rs
+index ca0916ad966..c454eccec1b 100644
+--- a/components/fonts/font.rs
++++ b/components/fonts/font.rs
+@@ -280,7 +280,7 @@ pub struct Font {
+ 
+     shaper: OnceLock<Shaper>,
+     cached_shape_data: RwLock<CachedShapeData>,
+-    font_instance_key: RwLock<FxHashMap<PainterId, FontInstanceKey>>,
++    font_instance_key: RwLock<FxHashMap<(PainterId, Au), FontInstanceKey>>,
+ 
+     /// If this is a synthesized small caps font, then this font reference is for
+     /// the version of the font used to replace lowercase ASCII letters. It's up
+@@ -388,11 +388,25 @@ impl Font {
+     }
+ 
+     pub fn key(&self, painter_id: PainterId, font_context: &FontContext) -> FontInstanceKey {
++        self.stroked_key(painter_id, font_context, Au::zero())
++    }
++
++    /// The key of an instance of this font whose glyphs are the outlines of a stroke of the given
++    /// width along the glyph outlines, for `-webkit-text-stroke`. A zero width gives the plain
++    /// instance.
++    pub fn stroked_key(
++        &self,
++        painter_id: PainterId,
++        font_context: &FontContext,
++        stroke_width: Au,
++    ) -> FontInstanceKey {
+         *self
+             .font_instance_key
+             .write()
+-            .entry(painter_id)
+-            .or_insert_with(|| font_context.create_font_instance_key(self, painter_id))
++            .entry((painter_id, stroke_width))
++            .or_insert_with(|| {
++                font_context.create_font_instance_key(self, painter_id, stroke_width)
++            })
+     }
+ 
+     /// Return the data for this `Font`. Note that this is currently highly inefficient for system
+diff --git a/components/fonts/font_context.rs b/components/fonts/font_context.rs
+index f625fb27749..4dde09ccc47 100644
+--- a/components/fonts/font_context.rs
++++ b/components/fonts/font_context.rs
+@@ -50,7 +50,7 @@ use style::values::computed::font::{
+ };
+ use url::Url;
+ use uuid::Uuid;
+-use webrender_api::{FontInstanceFlags, FontInstanceKey, FontKey, FontVariation};
++use webrender_api::{FontInstanceKey, FontInstanceOptions, FontKey, FontVariation};
+ 
+ use crate::font::{Font, FontFamilyDescriptor, FontGroup, FontRef, FontSearchScope};
+ use crate::font_store::{CrossThreadFontStore, FontStore};
+@@ -64,7 +64,7 @@ pub(crate) struct FontParameters {
+     pub(crate) font_key: FontKey,
+     pub(crate) pt_size: Au,
+     pub(crate) variations: Vec<FontVariation>,
+-    pub(crate) flags: FontInstanceFlags,
++    pub(crate) options: FontInstanceOptions,
+ }
+ 
+ pub type FontGroupRef = Arc<FontGroup>;
+@@ -466,12 +466,18 @@ impl FontContext {
+         &self,
+         font: &Font,
+         painter_id: PainterId,
++        stroke_width: Au,
+     ) -> FontInstanceKey {
++        let options = FontInstanceOptions {
++            flags: font.webrender_font_instance_flags(),
++            stroke_width: (stroke_width.to_f32_px() * 64.).round() as u32,
++            ..Default::default()
++        };
+         match font.template.identifier() {
+             FontIdentifier::Local(_) => self.system_font_service_proxy.get_system_font_instance(
+                 font.template.identifier(),
+                 font.descriptor.pt_size,
+-                font.webrender_font_instance_flags(),
++                options,
+                 font.variations().to_owned(),
+                 painter_id,
+             ),
+@@ -479,7 +485,7 @@ impl FontContext {
+                 .create_web_font_instance(
+                     font.template.clone(),
+                     font.descriptor.pt_size,
+-                    font.webrender_font_instance_flags(),
++                    options,
+                     font.variations().to_owned(),
+                     painter_id,
+                 ),
+@@ -490,7 +496,7 @@ impl FontContext {
+         &self,
+         font_template: FontTemplateRef,
+         pt_size: Au,
+-        flags: FontInstanceFlags,
++        options: FontInstanceOptions,
+         variations: Vec<FontVariation>,
+         painter_id: PainterId,
+     ) -> FontInstanceKey {
+@@ -516,7 +522,7 @@ impl FontContext {
+             font_key,
+             pt_size,
+             variations: variations.clone(),
+-            flags,
++            options,
+         };
+         *self
+             .webrender_font_instance_keys
+@@ -530,7 +536,7 @@ impl FontContext {
+                     font_instance_key,
+                     font_key,
+                     pt_size.to_f32_px(),
+-                    flags,
++                    options,
+                     variations,
+                 );
+                 font_instance_key
+diff --git a/components/fonts/system_font_service.rs b/components/fonts/system_font_service.rs
+index f8d2280554e..55673d7e983 100644
+--- a/components/fonts/system_font_service.rs
++++ b/components/fonts/system_font_service.rs
+@@ -24,7 +24,7 @@ use servo_base::generic_channel::{self, GenericReceiver};
+ use servo_base::id::PainterId;
+ use servo_config::pref;
+ use style::values::computed::font::{GenericFontFamily, SingleFontFamily};
+-use webrender_api::{FontInstanceFlags, FontInstanceKey, FontKey, FontVariation};
++use webrender_api::{FontInstanceKey, FontInstanceOptions, FontKey, FontVariation};
+ 
+ use crate::font_store::FontStore;
+ use crate::platform::font_list::{
+@@ -62,7 +62,7 @@ struct FontInstancesMapKey {
+     pt_size: Au,
+     variations: Vec<FontVariation>,
+     painter_id: PainterId,
+-    flags: FontInstanceFlags,
++    options: FontInstanceOptions,
+ }
+ 
+ /// The system font service. There is one of these for every Servo instance. This is a thread,
+@@ -146,13 +146,13 @@ impl SystemFontService {
+                     painter_id,
+                     identifier,
+                     pt_size,
+-                    flags,
++                    options,
+                     variations,
+                     result,
+                 ) => {
+-                    let _ = result.send(
+-                        self.get_font_instance(painter_id, identifier, pt_size, flags, variations),
+-                    );
++                    let _ = result.send(self.get_font_instance(
++                        painter_id, identifier, pt_size, options, variations,
++                    ));
+                 },
+                 SystemFontServiceMessage::GetFontKey(painter_id, result_sender) => {
+                     self.fetch_font_keys_if_needed(painter_id);
+@@ -289,7 +289,7 @@ impl SystemFontService {
+         painter_id: PainterId,
+         identifier: FontIdentifier,
+         pt_size: Au,
+-        flags: FontInstanceFlags,
++        options: FontInstanceOptions,
+         variations: Vec<FontVariation>,
+     ) -> FontInstanceKey {
+         self.fetch_font_keys_if_needed(painter_id);
+@@ -318,7 +318,7 @@ impl SystemFontService {
+             pt_size,
+             variations: variations.clone(),
+             painter_id,
+-            flags,
++            options,
+         };
+         *self.font_instances.entry(entry_key).or_insert_with(|| {
+             let font_instance_key = self
+@@ -331,7 +331,7 @@ impl SystemFontService {
+                 font_instance_key,
+                 font_key,
+                 pt_size.to_f32_px(),
+-                flags,
++                options,
+                 variations,
+             );
+             font_instance_key
+diff --git a/components/layout/display_list/mod.rs b/components/layout/display_list/mod.rs
+index ac85961a26d..03350e56638 100644
+--- a/components/layout/display_list/mod.rs
++++ b/components/layout/display_list/mod.rs
+@@ -1138,9 +1138,17 @@ impl Fragment {
+         // paint`), we just need to make sure these boundaries are big enough to
+         // contain the inked portion of the glyphs. We assume that the descent and
+         // ascent are big enough and then just expand the advance-based boundaries by
+-        // twice the size of the biggest advance in the advance dimention.
++        // twice the size of the biggest advance in the advance dimention. A text stroke reaches
++        // half its width beyond the glyph outlines.
++        let stroke_overflow = match fragment.stroke_font_key {
++            Some(_) => parent_style
++                .get_inherited_text()
++                .clone__webkit_text_stroke_width()
++                .scale_by(0.5),
++            None => Au::zero(),
++        };
+         let glyph_bounds = rect
+-            .inflate(largest_advance.scale_by(2.0), Au::zero())
++            .inflate(largest_advance.scale_by(2.0) + stroke_overflow, stroke_overflow)
+             .to_webrender();
+         let common = builder.common_properties(state, glyph_bounds, &parent_style);
+ 
+@@ -1229,6 +1237,23 @@ impl Fragment {
+             None,
+         );
+ 
++        // <https://compat.spec.whatwg.org/#the-webkit-text-stroke>: the stroke paints over the
++        // fill, as in Chrome.
++        if let Some(stroke_font_key) = fragment.stroke_font_key {
++            let stroke_color = parent_style
++                .get_inherited_text()
++                .clone__webkit_text_stroke_color()
++                .resolve_to_absolute(&color);
++            builder.wr().push_text(
++                &common,
++                glyph_bounds,
++                &glyphs,
++                stroke_font_key,
++                rgba(stroke_color),
++                None,
++            );
++        }
++
+         builder.check_if_paintable(glyph_bounds, common.clip_rect, parent_style.clone_opacity());
+ 
+         // From <https://www.w3.org/TR/paint-timing/#contentful>:
+diff --git a/components/layout/flow/inline/line.rs b/components/layout/flow/inline/line.rs
+index f8f7687e9c0..6669f6a148c 100644
+--- a/components/layout/flow/inline/line.rs
++++ b/components/layout/flow/inline/line.rs
+@@ -14,6 +14,7 @@ use malloc_size_of_derive::MallocSizeOf;
+ use style::Zero;
+ use style::computed_values::position::T as Position;
+ use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
++use style::properties::ComputedValues;
+ use style::values::computed::BaselineShift;
+ use style::values::generics::box_::BaselineShiftKeyword;
+ use style::values::specified::align::AlignFlags;
+@@ -602,6 +603,14 @@ impl LineItemLayout<'_, '_> {
+             self.layout.layout_context.painter_id,
+             &self.layout.layout_context.font_context,
+         );
++        let stroke_font_key =
++            text_stroke_width(&text_item.inline_styles.style.borrow()).map(|width| {
++                text_item.info.font.stroked_key(
++                    self.layout.layout_context.painter_id,
++                    &self.layout.layout_context.font_context,
++                    width,
++                )
++            });
+ 
+         self.current_state.inline_advance += inline_advance;
+         self.current_state.fragments.push((
+@@ -614,6 +623,7 @@ impl LineItemLayout<'_, '_> {
+                 selected_style: text_item.inline_styles.selected.clone(),
+                 font_metrics: font_metrics.clone(),
+                 font_key,
++                stroke_font_key,
+                 font: text_item.info.font.clone(),
+                 glyphs: text_item.text,
+                 justification_adjustment: self.justification_adjustment,
+@@ -1032,6 +1042,21 @@ pub(super) struct FloatLineItem {
+ 
+ /// Sort a mutable slice by the given indices array in place, reording the slice so that final
+ /// value of `slice[x]` is `slice[indices[x]]`.
++/// The width of the `-webkit-text-stroke` that text with this style paints, if any.
++/// <https://compat.spec.whatwg.org/#the-webkit-text-stroke-width>
++#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
++fn text_stroke_width(style: &ComputedValues) -> Option<Au> {
++    let width = style.get_inherited_text().clone__webkit_text_stroke_width();
++    (width > Au::zero()).then_some(width)
++}
++
++/// Only WebRender's FreeType glyph rasterizer strokes glyph outlines, so text elsewhere paints no
++/// stroke rather than painting its glyphs filled in the stroke color.
++#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
++fn text_stroke_width(_style: &ComputedValues) -> Option<Au> {
++    None
++}
++
+ fn sort_by_indices_in_place<T>(data: &mut [T], mut indices: Vec<usize>) {
+     for idx in 0..data.len() {
+         if indices[idx] == idx {
+diff --git a/components/layout/fragment_tree/fragment.rs b/components/layout/fragment_tree/fragment.rs
+index 08288aa0563..cc5e3300c74 100644
+--- a/components/layout/fragment_tree/fragment.rs
++++ b/components/layout/fragment_tree/fragment.rs
+@@ -94,6 +94,9 @@ pub(crate) struct TextFragment {
+     #[conditional_malloc_size_of]
+     pub font_metrics: Arc<FontMetrics>,
+     pub font_key: FontInstanceKey,
++    /// The instance of the font that paints `-webkit-text-stroke` over the glyphs, if the stroke
++    /// has a width.
++    pub stroke_font_key: Option<FontInstanceKey>,
+     /// The font used to shape `glyphs`. Retained so the display-list builder can rasterize the
+     /// glyphs to an alpha coverage mask for `background-clip: text`.
+     pub font: FontRef,
+diff --git a/components/malloc_size_of/lib.rs b/components/malloc_size_of/lib.rs
+index 3b6ca93bff3..4a694e56277 100644
+--- a/components/malloc_size_of/lib.rs
++++ b/components/malloc_size_of/lib.rs
+@@ -1244,6 +1244,7 @@ malloc_size_of_is_webrender_malloc_size_of!(webrender_api::Epoch);
+ malloc_size_of_is_webrender_malloc_size_of!(webrender_api::ExtendMode);
+ malloc_size_of_is_webrender_malloc_size_of!(webrender_api::ExternalScrollId);
+ malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontInstanceFlags);
++malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontInstanceOptions);
+ malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontInstanceKey);
+ malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontKey);
+ malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontVariation);
+diff --git a/components/paint/paint.rs b/components/paint/paint.rs
+index 478b9e85e0e..8c718eea680 100644
+--- a/components/paint/paint.rs
++++ b/components/paint/paint.rs
+@@ -510,14 +510,20 @@ impl Paint {
+                 font_instance_key,
+                 font_key,
+                 size,
+-                flags,
++                options,
+                 variations,
+             ) => {
+                 debug_assert!(painter_id == font_key.into());
+                 debug_assert!(painter_id == font_instance_key.into());
+ 
+                 if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
+-                    painter.add_font_instance(font_instance_key, font_key, size, flags, variations);
++                    painter.add_font_instance(
++                        font_instance_key,
++                        font_key,
++                        size,
++                        options,
++                        variations,
++                    );
+                 }
+             },
+             PaintMessage::RemoveFonts(painter_id, keys, instance_keys) => {
+diff --git a/components/paint/painter.rs b/components/paint/painter.rs
+index 576c5b24899..68b6f2b08ed 100644
+--- a/components/paint/painter.rs
++++ b/components/paint/painter.rs
+@@ -47,10 +47,10 @@ use webrender_api::units::{
+ };
+ use webrender_api::{
+     self, BuiltDisplayList, BuiltDisplayListDescriptor, ColorF, DirtyRect, DisplayListPayload,
+-    DocumentId, DynamicProperties, Epoch as WebRenderEpoch, ExternalScrollId, FontInstanceFlags,
+-    FontInstanceKey, FontInstanceOptions, FontKey, FontVariation, ImageData, ImageKey,
+-    NativeFontHandle, PipelineId as WebRenderPipelineId, PropertyBinding, ReferenceFrameKind,
+-    RenderReasons, SampledScrollOffset, SpaceAndClipInfo, SpatialId, TransformStyle,
++    DocumentId, DynamicProperties, Epoch as WebRenderEpoch, ExternalScrollId, FontInstanceKey,
++    FontInstanceOptions, FontKey, FontVariation, ImageData, ImageKey, NativeFontHandle,
++    PipelineId as WebRenderPipelineId, PropertyBinding, ReferenceFrameKind, RenderReasons,
++    SampledScrollOffset, SpaceAndClipInfo, SpatialId, TransformStyle,
+ };
+ use wr_malloc_size_of::MallocSizeOfOps;
+ 
+@@ -1140,7 +1140,7 @@ impl Painter {
+         instance_key: FontInstanceKey,
+         font_key: FontKey,
+         size: f32,
+-        flags: FontInstanceFlags,
++        options: FontInstanceOptions,
+         variations: Vec<FontVariation>,
+     ) {
+         let variations = if pref!(layout_variable_fonts_enabled) {
+@@ -1151,15 +1151,11 @@ impl Painter {
+ 
+         let mut transaction = Transaction::new();
+ 
+-        let font_instance_options = FontInstanceOptions {
+-            flags,
+-            ..Default::default()
+-        };
+         transaction.add_font_instance(
+             instance_key,
+             font_key,
+             size,
+-            Some(font_instance_options),
++            Some(options),
+             None,
+             variations,
+         );
+diff --git a/components/shared/fonts/system_font_service_proxy.rs b/components/shared/fonts/system_font_service_proxy.rs
+index ba0c1f3b5dc..e3be9bc995e 100644
+--- a/components/shared/fonts/system_font_service_proxy.rs
++++ b/components/shared/fonts/system_font_service_proxy.rs
+@@ -13,7 +13,7 @@ use servo_base::generic_channel::{self, GenericSender};
+ use servo_base::id::PainterId;
+ use style::values::computed::font::SingleFontFamily;
+ use webrender_api::units::Au;
+-use webrender_api::{FontInstanceFlags, FontInstanceKey, FontKey, FontVariation};
++use webrender_api::{FontInstanceKey, FontInstanceOptions, FontKey, FontVariation};
+ 
+ use crate::{FontDescriptor, FontIdentifier, FontTemplate, FontTemplateRef};
+ 
+@@ -29,7 +29,7 @@ pub enum SystemFontServiceMessage {
+         PainterId,
+         FontIdentifier,
+         Au,
+-        FontInstanceFlags,
++        FontInstanceOptions,
+         Vec<FontVariation>,
+         GenericSender<FontInstanceKey>,
+     ),
+@@ -86,7 +86,7 @@ impl SystemFontServiceProxy {
+         &self,
+         identifier: FontIdentifier,
+         size: Au,
+-        flags: FontInstanceFlags,
++        options: FontInstanceOptions,
+         variations: Vec<FontVariation>,
+         painter_id: PainterId,
+     ) -> FontInstanceKey {
+@@ -97,7 +97,7 @@ impl SystemFontServiceProxy {
+                 painter_id,
+                 identifier,
+                 size,
+-                flags,
++                options,
+                 variations,
+                 response_chan,
+             ))
+diff --git a/components/shared/paint/lib.rs b/components/shared/paint/lib.rs
+index 7336f7997ff..6d18d94ff24 100644
+--- a/components/shared/paint/lib.rs
++++ b/components/shared/paint/lib.rs
+@@ -42,7 +42,7 @@ pub use webrender_api::ExternalImageSource;
+ use webrender_api::units::{DevicePixel, LayoutVector2D, TexelRect};
+ use webrender_api::{
+     BuiltDisplayList, BuiltDisplayListDescriptor, ExternalImage, ExternalImageData,
+-    ExternalImageHandler, ExternalImageId, ExternalScrollId, FontInstanceFlags, FontInstanceKey,
++    ExternalImageHandler, ExternalImageId, ExternalScrollId, FontInstanceKey, FontInstanceOptions,
+     FontKey, ImageData, ImageDescriptor, ImageKey, NativeFontHandle,
+     PipelineId as WebRenderPipelineId,
+ };
+@@ -172,7 +172,7 @@ pub enum PaintMessage {
+         FontInstanceKey,
+         FontKey,
+         f32,
+-        FontInstanceFlags,
++        FontInstanceOptions,
+         Vec<FontVariation>,
+     ),
+     /// Remove the given font resources from our WebRender instance.
+@@ -474,7 +474,7 @@ impl CrossProcessPaintApi {
+         font_instance_key: FontInstanceKey,
+         font_key: FontKey,
+         size: f32,
+-        flags: FontInstanceFlags,
++        options: FontInstanceOptions,
+         variations: Vec<FontVariation>,
+     ) {
+         let _x = self.0.send(PaintMessage::AddFontInstance(
+@@ -482,7 +482,7 @@ impl CrossProcessPaintApi {
+             font_instance_key,
+             font_key,
+             size,
+-            flags,
++            options,
+             variations,
+         ));
+     }
+-- 
+2.43.0
+

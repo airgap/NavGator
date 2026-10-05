@@ -1,0 +1,82 @@
+From 58012563242cafac1ff24ed90374609dc112933e Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 16:23:56 -0400
+Subject: [PATCH] grid: treat calc() track sizes as fixed sizing functions
+
+has_fixed_component() only accepted plain lengths and percentages, so a
+template such as repeat(auto-fit, minmax(calc((100% - 3rem) / 7), 1fr)) or
+repeat(auto-fit, minmax(min(100%, 250px), 1fr)) was considered an invalid
+auto-repetition and the explicit grid collapsed to zero tracks, leaving all
+items in a single implicit column. calc() track sizes are always
+<length-percentage> values, which the spec counts as fixed sizing functions,
+and track_definite_value() already resolves them through the calc resolver.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/compute/grid/explicit_grid.rs | 30 ++++++++++++++++++++++++++++++
+ src/style/grid.rs                 |  8 +++++++-
+ 2 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/src/compute/grid/explicit_grid.rs b/src/compute/grid/explicit_grid.rs
+index b32f2c96..09c55b46 100644
+--- a/src/compute/grid/explicit_grid.rs
++++ b/src/compute/grid/explicit_grid.rs
+@@ -446,6 +446,36 @@ mod test {
+         assert_eq!(auto_row_reps, 4);
+     }
+ 
++    #[test]
++    #[cfg(feature = "calc")]
++    fn explicit_grid_sizing_auto_fit_calc_minimum() {
++        use RepetitionCount::AutoFit;
++        // repeat(auto-fit, minmax(calc(...), 1fr)) is valid: a calc() minimum is a fixed sizing function
++        let calc_handle = 0x100 as *const ();
++        let grid_style: Style<DefaultCheapStr> = Style {
++            display: Display::Grid,
++            size: Size { width: length(400.0), height: auto() },
++            grid_template_columns: vec![repeat(
++                AutoFit,
++                vec![minmax(MinTrackSizingFunction::calc(calc_handle), fr(1.0))],
++            )],
++            ..Default::default()
++        };
++        let preferred_size = grid_style.size.map(|s| s.into_option());
++        let (auto_col_reps, col_count) = compute_explicit_grid_size_in_axis(
++            &grid_style,
++            preferred_size.get_abs(AbsoluteAxis::Horizontal),
++            AutoRepeatStrategy::MaxRepetitionsThatDoNotOverflow,
++            |handle, basis| {
++                assert_eq!(handle, calc_handle);
++                basis / 4.0
++            },
++            AbsoluteAxis::Horizontal,
++        );
++        assert_eq!(col_count, 4);
++        assert_eq!(auto_col_reps, 4);
++    }
++
+     #[test]
+     fn explicit_grid_sizing_auto_fill_min_size_exact_fit() {
+         use RepetitionCount::AutoFill;
+diff --git a/src/style/grid.rs b/src/style/grid.rs
+index 1e0a8b06..59043616 100644
+--- a/src/style/grid.rs
++++ b/src/style/grid.rs
+@@ -1253,7 +1253,13 @@ impl TrackSizingFunction {
+     }
+     /// Determine whether at least one of the components ("min" and "max") are fixed sizing function
+     pub fn has_fixed_component(&self) -> bool {
+-        self.min.0.is_length_or_percentage() || self.max.0.is_length_or_percentage()
++        // calc() track sizes are always <length-percentage> values, so they are fixed sizing functions too
++        // https://www.w3.org/TR/css-grid-2/#fixed-sizing-function
++        #[cfg(feature = "calc")]
++        let is_fixed = |value: CompactLength| value.is_length_or_percentage() || value.is_calc();
++        #[cfg(not(feature = "calc"))]
++        let is_fixed = |value: CompactLength| value.is_length_or_percentage();
++        is_fixed(self.min.0) || is_fixed(self.max.0)
+     }
+ }
+ impl TaffyAuto for TrackSizingFunction {
+-- 
+2.43.0
+

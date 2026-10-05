@@ -1,0 +1,133 @@
+From 9e2bd79f589d40d22a99ce24e53a113ce6db2760 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 05:10:12 -0400
+Subject: [PATCH] layout: paint and hit test the top layer in show order
+
+Top layer boxes were built in the order layout met their placeholders,
+which is document order, so a popover earlier in the document than an
+open modal dialog painted under the dialog's backdrop even when it was
+shown last. Layout now reads the document's top layer at reflow and
+orders the top layer stacking contexts by when their element was added,
+with each ::backdrop just below its element. Hit testing walks the same
+stacking context tree, so it follows. A change in the order alone
+rebuilds the stacking context tree.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../layout/display_list/stacking_context.rs   | 27 ++++++++++++++++---
+ components/layout/layout_impl.rs              | 16 +++++++++++
+ 2 files changed, 39 insertions(+), 4 deletions(-)
+
+diff --git a/components/layout/display_list/stacking_context.rs b/components/layout/display_list/stacking_context.rs
+index efb331ce46b..38f8cbd3241 100644
+--- a/components/layout/display_list/stacking_context.rs
++++ b/components/layout/display_list/stacking_context.rs
+@@ -19,6 +19,7 @@ use servo_base::print_tree::PrintTree;
+ use servo_config::opts::{DiagnosticsLogging, DiagnosticsLoggingOption};
+ use servo_geometry::MaxRect;
+ use style::Zero;
++use style::dom::OpaqueNode;
+ use style::color::AbsoluteColor;
+ use style::computed_values::overflow_x::T as ComputedOverflow;
+ use style::computed_values::position::T as ComputedPosition;
+@@ -140,6 +141,7 @@ impl StackingContextTree {
+     /// pipeline id.
+     pub fn new(
+         fragment_tree: &FragmentTree,
++        top_layer_order: &[OpaqueNode],
+         viewport_details: ViewportDetails,
+         pipeline_id: wr::PipelineId,
+         first_reflow: bool,
+@@ -215,8 +217,8 @@ impl StackingContextTree {
+         }
+ 
+         // Top layer boxes are stacking contexts on the root stacking context, painted after every
+-        // other descendant in top layer order. Building one may find further top layer boxes
+-        // nested inside of it, which go after it.
++        // other descendant. Building one may find further top layer boxes nested inside of it.
++        let mut top_layer_stacking_contexts = Vec::new();
+         let mut index = 0;
+         while let Some(fragment) = stacking_context_tree
+             .top_layer_fragments
+@@ -231,11 +233,28 @@ impl StackingContextTree {
+                 StackingContextBuildMode::IncludeHoisted,
+                 &text_decorations,
+             );
+-            for child in &mut root_stacking_context.children[first_child_index..] {
+-                child.z_index = i32::MAX;
++            let mut stacking_contexts = root_stacking_context.children.split_off(first_child_index);
++            for stacking_context in &mut stacking_contexts {
++                stacking_context.z_index = i32::MAX;
+             }
++            // > The top layer is an ordered set of elements, rendered in the order they appear in
++            // > the set. The last element in the set is rendered last, and thus appears on top.
++            // A ::backdrop shares the position of its element and was found just before it.
++            // Elements layout does not know the position of, like the fullscreen element, go
++            // last.
++            let position = fragment
++                .tag()
++                .and_then(|tag| top_layer_order.iter().position(|node| *node == tag.node))
++                .unwrap_or(usize::MAX);
++            top_layer_stacking_contexts.push((position, stacking_contexts));
+             index += 1;
+         }
++        top_layer_stacking_contexts.sort_by_key(|(position, _)| *position);
++        root_stacking_context.children.extend(
++            top_layer_stacking_contexts
++                .into_iter()
++                .flat_map(|(_, stacking_contexts)| stacking_contexts),
++        );
+ 
+         // The sort is stable, so top layer stacking contexts keep their order after every
+         // other stacking context, including those with the maximum z-index.
+diff --git a/components/layout/layout_impl.rs b/components/layout/layout_impl.rs
+index ad06891ea1a..6cea944404e 100644
+--- a/components/layout/layout_impl.rs
++++ b/components/layout/layout_impl.rs
+@@ -210,6 +210,10 @@ pub struct LayoutThread {
+     /// to preserve scroll offsets from the old tree to the new one.
+     need_new_stacking_context_tree: Cell<bool>,
+ 
++    /// The document's top layer, in the order its elements were added, which is the order
++    /// the stacking context tree paints and hit tests them in.
++    top_layer_order: RefCell<Vec<OpaqueNode>>,
++
+     /// The box tree.
+     box_tree: RefCell<Option<Arc<BoxTree>>>,
+ 
+@@ -898,6 +902,7 @@ impl LayoutThread {
+             container_slots: Default::default(),
+             uses_container_queries: Cell::new(false),
+             need_new_stacking_context_tree: Cell::new(false),
++            top_layer_order: Default::default(),
+             box_tree: Default::default(),
+             fragment_tree: Default::default(),
+             stacking_context_tree: Default::default(),
+@@ -1103,6 +1108,16 @@ impl LayoutThread {
+             return None;
+         };
+ 
++        let top_layer_order: Vec<OpaqueNode> = document
++            .top_layer_elements()
++            .map(|element| element.as_node().opaque())
++            .collect();
++        if *self.top_layer_order.borrow() != top_layer_order {
++            *self.top_layer_order.borrow_mut() = top_layer_order;
++            self.need_new_stacking_context_tree.set(true);
++            self.need_new_display_list.set(true);
++        }
++
+         let image_resolver = Arc::new(ImageResolver {
+             origin: reflow_request.origin.clone(),
+             image_cache: self.image_cache.clone(),
+@@ -1615,6 +1630,7 @@ impl LayoutThread {
+         // applicable spatial and clip nodes.
+         let mut new_stacking_context_tree = StackingContextTree::new(
+             fragment_tree,
++            &self.top_layer_order.borrow(),
+             viewport_details,
+             self.id.into(),
+             !self.have_ever_generated_display_list.get(),
+-- 
+2.43.0
+

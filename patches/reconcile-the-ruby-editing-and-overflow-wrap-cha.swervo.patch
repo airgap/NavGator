@@ -1,0 +1,48 @@
+From e37c438d18cabe4e60b5cf90458f2b76f86d70bc Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 05:10:19 -0400
+Subject: [PATCH] layout: reconcile the ruby, editing and overflow-wrap changes
+ with node text offsets
+
+Integrating separately developed changes left two call sites behind: the
+space between ruby columns now passes a zero text offset (it stands for
+white space between columns, not text of a node), and overflow-wrap's
+per-cluster TextRunOffsets carries the editable text origin.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/flow/construct.rs       | 4 +++-
+ components/layout/flow/inline/text_run.rs | 1 +
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/components/layout/flow/construct.rs b/components/layout/flow/construct.rs
+index 9312310160c..abf8b2eaa80 100644
+--- a/components/layout/flow/construct.rs
++++ b/components/layout/flow/construct.rs
+@@ -636,8 +636,10 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
+             let column = match item {
+                 RubyItem::Column(column) => column,
+                 RubyItem::WhiteSpace => {
++                    // The space stands for white space between columns, not for text of
++                    // a node, so it has no offset into one.
+                     self.ensure_inline_formatting_context_builder()
+-                        .push_text(" ".into(), info);
++                        .push_text(" ".into(), 0, info);
+                     continue;
+                 },
+             };
+diff --git a/components/layout/flow/inline/text_run.rs b/components/layout/flow/inline/text_run.rs
+index 3bd9f79658c..aad303205b2 100644
+--- a/components/layout/flow/inline/text_run.rs
++++ b/components/layout/flow/inline/text_run.rs
+@@ -280,6 +280,7 @@ impl TextRunSegment {
+                     let cluster_character_end = cluster_character_start + cluster.character_count();
+                     let offsets = offsets.as_ref().map(|offsets| TextRunOffsets {
+                         shared_selection: offsets.shared_selection.clone(),
++                        editable_text: offsets.editable_text.clone(),
+                         character_range: cluster_character_start..cluster_character_end,
+                     });
+                     ifc.process_overflow_wrap_opportunity(cluster.total_advance());
+-- 
+2.43.0
+

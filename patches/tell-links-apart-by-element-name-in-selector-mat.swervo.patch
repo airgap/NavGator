@@ -1,0 +1,66 @@
+From 857749a21eb842de138556da5f34a9aafef3b818 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 05:58:13 -0400
+Subject: [PATCH] script: tell links apart by element name in selector matching
+
+Selector matching asks is_link() of every element it visits, and the
+implementation read the element's type id, which lives in its JS
+reflector: 9% of a querySelectorAll('.c b') over 20000 elements went to
+that lookup. An HTML element's interface follows from its name, so
+compare the namespace and local name instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../servo_dangerous_style_element.rs          | 29 +++++++++----------
+ 1 file changed, 13 insertions(+), 16 deletions(-)
+
+diff --git a/components/script/layout_dom/servo_dangerous_style_element.rs b/components/script/layout_dom/servo_dangerous_style_element.rs
+index a7b30409cad..412e9cfdf7f 100644
+--- a/components/script/layout_dom/servo_dangerous_style_element.rs
++++ b/components/script/layout_dom/servo_dangerous_style_element.rs
+@@ -44,9 +44,7 @@ use style::values::{AtomIdent, AtomString};
+ use stylo_atoms::Atom;
+ use stylo_dom::ElementState;
+ 
+-use crate::dom::bindings::inheritance::{
+-    CharacterDataTypeId, DocumentFragmentTypeId, ElementTypeId, HTMLElementTypeId, NodeTypeId,
+-};
++use crate::dom::bindings::inheritance::{CharacterDataTypeId, DocumentFragmentTypeId, NodeTypeId};
+ use crate::dom::bindings::root::LayoutDom;
+ use crate::dom::element::Element;
+ use crate::dom::html::htmlslotelement::HTMLSlotElement;
+@@ -856,19 +854,18 @@ impl<'dom> ::selectors::Element for ServoDangerousStyleElement<'dom> {
+ 
+     #[inline]
+     fn is_link(&self) -> bool {
+-        match self.as_node().node.type_id_for_layout() {
+-            // https://html.spec.whatwg.org/multipage/#selector-link
+-            NodeTypeId::Element(ElementTypeId::HTMLElement(
+-                HTMLElementTypeId::HTMLAnchorElement,
+-            )) |
+-            NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLAreaElement)) |
+-            NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLLinkElement)) => {
+-                self.element
+-                    .get_attr_val_for_layout(&ns!(), &local_name!("href"))
+-                    .is_some()
+-            },
+-            _ => false,
+-        }
++        // https://html.spec.whatwg.org/multipage/#selector-link
++        // Selector matching asks this of every element it visits. The HTML element type
++        // follows from the name, which is cheaper to read than the type id, which lives in
++        // the element's JS reflector.
++        *self.element.namespace() == ns!(html) &&
++            matches!(
++                *self.element.local_name(),
++                local_name!("a") | local_name!("area") | local_name!("link")
++            ) &&
++            self.element
++                .get_attr_val_for_layout(&ns!(), &local_name!("href"))
++                .is_some()
+     }
+ 
+     #[inline]
+-- 
+2.43.0
+

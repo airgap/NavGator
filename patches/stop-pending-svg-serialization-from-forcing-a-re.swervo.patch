@@ -1,0 +1,61 @@
+From ac9b6c02d736e737db5407278d1c1b1c93a6e0dd Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 06:37:55 -0400
+Subject: [PATCH] script: stop pending SVG serialization from forcing a reflow
+ per query
+
+When a layout query reflowed while inline <svg>s were waiting to be
+serialized, the SVGs were marked dirty so that a rendering update would
+follow. Dirty nodes are pending restyles, so the next geometry query
+restyled and laid out the whole page again, which queued the SVGs and
+dirtied them again. On linear.app 238 offsetTop/offsetLeft/clientWidth
+reads took 12.5 s (about 50 ms each) and the hero headline stayed
+invisible for over 45 s.
+
+The query path now records a PendingSvgSerialization rendering-update
+reason instead, which schedules the update without invalidating layout.
+The same reads now take under 0.2 s in total and the headline finishes
+animating at ~11 s on this (heavily loaded) machine.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/document/document.rs | 3 +++
+ components/script/dom/window/window.rs     | 8 ++++++--
+ 2 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index 9cc31633552..be78f86119d 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -377,6 +377,9 @@ bitflags! {
+         /// A scrolling box scrolled during the last rendering update. Another rendering update
+         /// is needed to notice that it stopped, at which point `scrollend` fires.
+         const ScrollInProgress = 1 << 4;
++        /// Layout queued inline `<svg>`s for serialization during a query reflow, which can't
++        /// serialize them, so a rendering update has to follow to do it.
++        const PendingSvgSerialization = 1 << 5;
+     }
+ }
+ 
+diff --git a/components/script/dom/window/window.rs b/components/script/dom/window/window.rs
+index 62cef4dc41a..c7ca9e36e62 100644
+--- a/components/script/dom/window/window.rs
++++ b/components/script/dom/window/window.rs
+@@ -4040,8 +4040,12 @@ impl Window {
+     /// otherwise make sure a rendering update follows to do it.
+     fn serialize_pending_svgs(&self, cx: &mut JSContext, updates_the_rendering: bool) {
+         if !updates_the_rendering {
+-            for svg in self.pending_svg_serialization.borrow().iter() {
+-                svg.upcast::<Node>().dirty(NodeDamage::Other);
++            // Ask for a rendering update without dirtying the `<svg>`s: dirty nodes make every
++            // later geometry query restyle and lay out the whole page again, which turned pages
++            // that read layout in loops (linear.app) into seconds of back-to-back reflows.
++            if !self.pending_svg_serialization.borrow().is_empty() {
++                self.Document()
++                    .add_rendering_update_reason(RenderingUpdateReason::PendingSvgSerialization);
+             }
+             return;
+         }
+-- 
+2.43.0
+

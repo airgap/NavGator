@@ -1,0 +1,211 @@
+From c464ff604228d8369701b276b95cf69bf53375ea Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 05:35:38 -0400
+Subject: [PATCH] script: carry an iframe's browsing context name into other
+ script threads
+
+The iframe `name` attribute is stored on the WindowProxy in the parent's
+script thread. When the iframe navigates to a host served by another script
+thread, that thread creates a fresh WindowProxy with an empty name, so the
+child's window.name was "". Dailymotion's player passes its configuration
+through the iframe name; without it the player never initialised, the page's
+player promise never resolved, and the React app never mounted (blank page).
+
+Send the name with IFrameLoadInfo, forward it through the constellation in
+NewPipelineInfo, and apply it when the loading script thread creates the
+WindowProxy for the browsing context.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/constellation/constellation.rs              | 8 ++++++++
+ components/script/dom/html/htmliframeelement.rs        | 4 ++++
+ components/script/dom/window/windowproxy.rs            | 1 +
+ components/script/navigation.rs                        | 3 +++
+ components/script/script_thread.rs                     | 9 +++++++++
+ components/shared/constellation/from_script_message.rs | 4 ++++
+ components/shared/script/lib.rs                        | 4 ++++
+ 7 files changed, 33 insertions(+)
+
+diff --git a/components/constellation/constellation.rs b/components/constellation/constellation.rs
+index 1872745affa..541f74123e4 100644
+--- a/components/constellation/constellation.rs
++++ b/components/constellation/constellation.rs
+@@ -1030,6 +1030,7 @@ where
+         is_private: bool,
+         throttled: bool,
+         target_snapshot_params: TargetSnapshotParams,
++        browsing_context_name: String,
+     ) {
+         if self.shutting_down {
+             return;
+@@ -1072,6 +1073,7 @@ where
+             user_content_manager_id,
+             theme,
+             target_snapshot_params,
++            browsing_context_name,
+         };
+         let pipeline = match Pipeline::spawn(new_pipeline_info, event_loop, self, throttled) {
+             Ok(pipeline) => pipeline,
+@@ -3093,6 +3095,7 @@ where
+             is_private,
+             throttled,
+             TargetSnapshotParams::default(),
++            String::new(),
+         );
+         self.add_pending_change(SessionHistoryChange {
+             webview_id,
+@@ -3356,6 +3359,7 @@ where
+             is_private,
+             throttled,
+             TargetSnapshotParams::default(),
++            String::new(),
+         );
+         self.add_pending_change(SessionHistoryChange {
+             webview_id,
+@@ -3496,6 +3500,7 @@ where
+             is_private,
+             mut history_handling,
+             target_snapshot_params,
++            browsing_context_name,
+             ..
+         } = load_info.info;
+ 
+@@ -3576,6 +3581,7 @@ where
+             is_private,
+             browsing_context_throttled,
+             target_snapshot_params,
++            browsing_context_name,
+         );
+         self.add_pending_change(SessionHistoryChange {
+             webview_id,
+@@ -3993,6 +3999,7 @@ where
+                     is_private,
+                     is_throttled,
+                     target_snapshot_params,
++                    String::new(),
+                 );
+                 self.add_pending_change(SessionHistoryChange {
+                     webview_id,
+@@ -4291,6 +4298,7 @@ where
+                     // with the pipeline when it's created, so we can support reloading
+                     // a discarded document properly.
+                     TargetSnapshotParams::default(),
++                    String::new(),
+                 );
+                 self.add_pending_change(SessionHistoryChange {
+                     webview_id,
+diff --git a/components/script/dom/html/htmliframeelement.rs b/components/script/dom/html/htmliframeelement.rs
+index 6cd67bf5918..17e3500d1c3 100644
+--- a/components/script/dom/html/htmliframeelement.rs
++++ b/components/script/dom/html/htmliframeelement.rs
+@@ -272,6 +272,9 @@ impl HTMLIFrameElement {
+             inherited_secure_context: load_data.inherited_secure_context,
+             history_handling,
+             target_snapshot_params,
++            browsing_context_name: self
++                .GetContentWindow()
++                .map_or_else(String::new, |window_proxy| window_proxy.get_name().into()),
+         };
+ 
+         let viewport_details = window
+@@ -309,6 +312,7 @@ impl HTMLIFrameElement {
+                     user_content_manager_id: None,
+                     theme: window.theme(),
+                     target_snapshot_params,
++                    browsing_context_name: String::new(),
+                 };
+ 
+                 self.pipeline_id.set(Some(new_pipeline_id));
+diff --git a/components/script/dom/window/windowproxy.rs b/components/script/dom/window/windowproxy.rs
+index 7f0d05b7b5a..97d0865a412 100644
+--- a/components/script/dom/window/windowproxy.rs
++++ b/components/script/dom/window/windowproxy.rs
+@@ -379,6 +379,7 @@ impl WindowProxy {
+                 sandboxing_flags: sandboxing_flag_set,
+                 iframe_element_referrer_policy: ReferrerPolicy::EmptyString,
+             },
++            browsing_context_name: String::new(),
+         };
+ 
+         with_script_thread(|script_thread| {
+diff --git a/components/script/navigation.rs b/components/script/navigation.rs
+index 30892a4bc42..4c86f2222bb 100644
+--- a/components/script/navigation.rs
++++ b/components/script/navigation.rs
+@@ -184,6 +184,8 @@ pub(crate) struct InProgressLoad {
+     /// The [`TargetSnapshotParams`] to use when creating this document.
+     #[no_trace]
+     pub(crate) target_snapshot_params: TargetSnapshotParams,
++    /// The name to give this load's `WindowProxy` if the load creates it.
++    pub(crate) browsing_context_name: String,
+ }
+ 
+ impl InProgressLoad {
+@@ -206,6 +208,7 @@ impl InProgressLoad {
+             user_content_manager_id: new_pipeline_info.user_content_manager_id,
+             theme: new_pipeline_info.theme,
+             target_snapshot_params: new_pipeline_info.target_snapshot_params,
++            browsing_context_name: new_pipeline_info.browsing_context_name,
+         }
+     }
+ 
+diff --git a/components/script/script_thread.rs b/components/script/script_thread.rs
+index badb627f736..8227bcc563b 100644
+--- a/components/script/script_thread.rs
++++ b/components/script/script_thread.rs
+@@ -3649,6 +3649,12 @@ impl ScriptThread {
+         window.init_document(&document);
+ 
+         // Initialize the browsing context for the window.
++        // A nested browsing context navigated into this script thread from another one has no
++        // WindowProxy here yet, and its name lives in the other thread's WindowProxy.
++        let creates_window_proxy = self
++            .window_proxies
++            .find_window_proxy(incomplete.browsing_context_id)
++            .is_none();
+         let window_proxy = self.window_proxies.local_window_proxy(
+             cx,
+             &self.senders,
+@@ -3659,6 +3665,9 @@ impl ScriptThread {
+             incomplete.parent_info,
+             incomplete.opener,
+         );
++        if creates_window_proxy {
++            window_proxy.set_name(DOMString::from(incomplete.browsing_context_name.as_str()));
++        }
+         if window_proxy.parent().is_some() {
+             // https://html.spec.whatwg.org/multipage/#navigating-across-documents:delaying-load-events-mode-2
+             // The user agent must take this nested browsing context
+diff --git a/components/shared/constellation/from_script_message.rs b/components/shared/constellation/from_script_message.rs
+index d5670caf1a7..c8830e522de 100644
+--- a/components/shared/constellation/from_script_message.rs
++++ b/components/shared/constellation/from_script_message.rs
+@@ -492,6 +492,10 @@ pub struct IFrameLoadInfo {
+     /// A snapshot of the navigation-related parameters of the target
+     /// of this navigation.
+     pub target_snapshot_params: TargetSnapshotParams,
++    /// The name of the iframe's nested browsing context, which the new document's `window.name`
++    /// starts with when it is created in another script thread.
++    /// <https://html.spec.whatwg.org/multipage/#browsing-context-names>
++    pub browsing_context_name: String,
+ }
+ 
+ /// Specifies the information required to load a URL in an iframe.
+diff --git a/components/shared/script/lib.rs b/components/shared/script/lib.rs
+index 9174a228c4c..2720e4e385e 100644
+--- a/components/shared/script/lib.rs
++++ b/components/shared/script/lib.rs
+@@ -81,6 +81,10 @@ pub struct NewPipelineInfo {
+     pub theme: Theme,
+     /// A snapshot of the navigation parameters of the target of this navigation.
+     pub target_snapshot_params: TargetSnapshotParams,
++    /// The browsing context name to give the `WindowProxy` if this pipeline is the first in its
++    /// script thread for this browsing context.
++    /// <https://html.spec.whatwg.org/multipage/#browsing-context-names>
++    pub browsing_context_name: String,
+ }
+ 
+ /// When a pipeline is closed, should its browsing context be discarded too?
+-- 
+2.43.0
+

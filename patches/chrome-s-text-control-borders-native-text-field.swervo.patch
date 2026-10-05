@@ -1,0 +1,298 @@
+From 9d0a727a9c99258882293c9af2e314d2bd83ee40 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 05:10:37 -0400
+Subject: [PATCH] forms: Chrome's text control borders, native text field look
+ and intrinsic sizes
+
+Text inputs take Chrome's computed defaults, `2px inset rgb(118, 118, 118)`
+with `1px 2px` padding, and textareas `1px solid rgb(118, 118, 118)`. Chrome
+draws an unstyled text field natively over that border: a 1px line in the
+border colour with 2px rounded corners along the border box. The display list
+does the same for widgets whose -moz-default-appearance is textfield or
+textarea while their appearance is not none and the author has not styled
+their border or background (LayoutTheme::IsControlStyled). Image inputs keep
+no border, as in Chrome.
+
+The size, cols and rows attributes now reach layout through the internal
+-servo-text-control-width/height longhands, which give the control its
+intrinsic inline and block size. Widgets already size as fit-content in
+block flow, so an auto width resolves to that size plus padding and border
+whatever the box-sizing, a percentage width in a shrink-to-fit container
+resolves against it, and grid and flex items still stretch, all as in Chrome.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/display_list/mod.rs    | 49 +++++++++++++++++++++++-
+ components/layout/formatting_contexts.rs | 29 ++++++++++++++
+ components/layout/layout_impl.rs         |  2 +
+ components/layout/stylesheets/servo.css  | 18 +++++++--
+ components/script/dom/element/element.rs | 41 ++++++++------------
+ 5 files changed, 110 insertions(+), 29 deletions(-)
+
+diff --git a/components/layout/display_list/mod.rs b/components/layout/display_list/mod.rs
+index 8ba36ca2851..0e85ad49dbf 100644
+--- a/components/layout/display_list/mod.rs
++++ b/components/layout/display_list/mod.rs
+@@ -32,12 +32,13 @@ use style::computed_values::text_decoration_style::{
+     T as ComputedTextDecorationStyle, T as TextDecorationStyle,
+ };
+ use style::dom::OpaqueNode;
++use style::computed_value_flags::ComputedValueFlags;
+ use style::properties::ComputedValues;
+ use style::properties::longhands::visibility::computed_value::T as Visibility;
+ use style::properties::style_structs::Border;
+ use style::values::computed::basic_shape::ClipPath;
+ use style::values::computed::{
+-    BorderImageSideWidth, BorderImageWidth, BorderStyle, LengthPercentage,
++    Appearance, BorderImageSideWidth, BorderImageWidth, BorderStyle, LengthPercentage,
+     NonNegativeLengthOrNumber, NumberOrPercentage, OutlineStyle,
+ };
+ use style::values::generics::NonNegative;
+@@ -2401,6 +2402,31 @@ impl<'a> BuilderForBoxFragment<'a> {
+ 
+         let current_color = style.get_inherited_text().clone_color();
+         let style_color = BorderStyleColor::from_border(border, &current_color);
++        if paints_native_text_field(style) {
++            // Chrome draws an unstyled text field itself (`NativeThemeBase::PaintTextField`): a
++            // 1px border in the field's border colour along the border box edge, with rounded
++            // corners, whatever the width and style of its CSS border.
++            let side = wr::BorderSide {
++                color: rgba(style_color.top.color),
++                style: wr::BorderStyle::Solid,
++            };
++            let details = wr::BorderDetails::Normal(wr::NormalBorder {
++                top: side,
++                right: side,
++                bottom: side,
++                left: side,
++                radius: self.border_radius(),
++                do_aa: true,
++            });
++            let common = builder.common_properties(state, self.border_rect, style);
++            builder.wr().push_border(
++                &common,
++                self.border_rect,
++                SideOffsets2D::new_all_same(1.0),
++                details,
++            );
++            return;
++        }
+         let details = wr::BorderDetails::Normal(wr::NormalBorder {
+             top: self.build_border_side(style_color.top),
+             right: self.build_border_side(style_color.right),
+@@ -2943,9 +2969,29 @@ pub(super) fn compute_margin_box_radius(
+     }
+ }
+ 
++/// Whether this is a text field that Chrome would draw natively, which it does unless the author
++/// styles its border or background (`LayoutTheme::IsControlStyled`).
++fn paints_native_text_field(style: &ComputedValues) -> bool {
++    let box_style = style.get_box();
++    matches!(
++        box_style.clone__moz_default_appearance(),
++        Appearance::Textfield | Appearance::Textarea
++    ) && box_style.clone_appearance() != Appearance::None &&
++        !style
++            .flags
++            .contains(ComputedValueFlags::HAS_AUTHOR_SPECIFIED_BORDER_BACKGROUND)
++}
++
+ impl BoxFragment {
+     fn border_radius(&self) -> BorderRadius {
+         let style = self.style();
++        let border_rect = self.border_rect();
++        if paints_native_text_field(&style) {
++            // The corner radius of Chrome's native text fields.
++            let mut radius = wr::BorderRadius::uniform(2.0);
++            normalize_radii(&border_rect.to_webrender(), &mut radius);
++            return radius;
++        }
+         let border = style.get_border();
+         if border.border_top_left_radius.0.is_zero() &&
+             border.border_top_right_radius.0.is_zero() &&
+@@ -2955,7 +3001,6 @@ impl BoxFragment {
+             return BorderRadius::zero();
+         }
+ 
+-        let border_rect = self.border_rect();
+         let resolve =
+             |radius: &LengthPercentage, box_size: Au| radius.to_used_value(box_size).to_f32_px();
+         let corner = |corner: &style::values::computed::BorderCornerRadius| {
+diff --git a/components/layout/formatting_contexts.rs b/components/layout/formatting_contexts.rs
+index 3dc8ec6e3a9..6469d1f42e0 100644
+--- a/components/layout/formatting_contexts.rs
++++ b/components/layout/formatting_contexts.rs
+@@ -12,6 +12,7 @@ use style::context::SharedStyleContext;
+ use style::logical_geometry::Direction;
+ use style::properties::ComputedValues;
+ use style::selector_parser::PseudoElement;
++use style::values::generics::length::GenericLengthPercentageOrAuto;
+ use style::values::specified::align::AlignFlags;
+ 
+ use crate::context::LayoutContext;
+@@ -292,6 +293,24 @@ impl IndependentFormattingContext {
+         layout_context: &LayoutContext,
+         constraint_space: &ConstraintSpace,
+     ) -> InlineContentSizesResult {
++        // A text control's `size` or `cols` attribute gives its intrinsic inline size whatever its
++        // text, as in Chrome (`TextFieldIntrinsicInlineSize`); this is what a percentage width
++        // resolves against in a shrink-to-fit container.
++        if let GenericLengthPercentageOrAuto::LengthPercentage(width) = self
++            .style()
++            .get_position()
++            .clone__servo_text_control_width() &&
++            self.style().writing_mode.is_horizontal()
++        {
++            let size = width.0.to_used_value(Au(0));
++            return InlineContentSizesResult {
++                sizes: ContentSizes {
++                    min_content: size,
++                    max_content: size,
++                },
++                depends_on_block_constraints: false,
++            };
++        }
+         let result = self
+             .base
+             .inline_content_sizes(layout_context, constraint_space, &self.contents);
+@@ -495,6 +514,16 @@ impl IndependentFormattingContext {
+                 let mut result =
+                     bfc.layout(layout_context, positioning_context, containing_block_for_children);
+                 align_block_container_content(self.style(), lazy_block_size, &mut result);
++                // A `<textarea>`'s `rows` attribute gives its intrinsic block size whatever its
++                // text, which scrolls instead (Chrome's `TextAreaIntrinsicBlockSize`).
++                if let GenericLengthPercentageOrAuto::LengthPercentage(height) = self
++                    .style()
++                    .get_position()
++                    .clone__servo_text_control_height() &&
++                    self.style().writing_mode.is_horizontal()
++                {
++                    result.content_block_size = height.0.to_used_value(Au(0));
++                }
+                 result
+             },
+             IndependentFormattingContextContents::Flex(fc) => fc.layout(
+diff --git a/components/layout/layout_impl.rs b/components/layout/layout_impl.rs
+index 6cea944404e..95353713045 100644
+--- a/components/layout/layout_impl.rs
++++ b/components/layout/layout_impl.rs
+@@ -2034,6 +2034,8 @@ impl FontMetricsProvider for LayoutFontMetricsProvider {
+             ascent: first_font_metrics.ascent.into(),
+             average_char_width: Some(first_font_metrics.average_advance.into()),
+             max_char_width: Some(first_font_metrics.max_advance.into()),
++            // `line_gap` holds the whole normal line height, not the font's line gap.
++            normal_line_height: Some(first_font_metrics.line_gap.into()),
+             script_percent_scale_down: None,
+             script_script_percent_scale_down: None,
+         }
+diff --git a/components/layout/stylesheets/servo.css b/components/layout/stylesheets/servo.css
+index f1a883fac07..6322801c352 100644
+--- a/components/layout/stylesheets/servo.css
++++ b/components/layout/stylesheets/servo.css
+@@ -2,11 +2,23 @@ input[type="hidden"] {
+   display: none !important;
+ }
+ 
+-/* Textual inputs */
+-input:not([type="file"]),
++/* Textual inputs take Chrome's borders. Chrome draws text fields natively over these unless the
++   author styles their border or background, and so does layout's display list. */
++input:not([type="file"], [type="image"]) {
++  background: white;
++  border: 2px inset rgb(118, 118, 118);
++  color: black;
++}
++
++input:not([type=button i], [type=submit i], [type=reset i], [type=image i], [type=file i],
++          [type=color i], [type=range i], [type=checkbox i], [type=radio i], [type=hidden i]) {
++  -moz-default-appearance: textfield;
++}
++
+ textarea {
++  -moz-default-appearance: textarea;
+   background: white;
+-  border: solid grey 1px;
++  border: 1px solid rgb(118, 118, 118);
+   color: black;
+ }
+ 
+diff --git a/components/script/dom/element/element.rs b/components/script/dom/element/element.rs
+index 43610b082a1..f71558668a1 100644
+--- a/components/script/dom/element/element.rs
++++ b/components/script/dom/element/element.rs
+@@ -57,7 +57,7 @@ use style::values::computed::{Overflow, ScrollSnapStrictness, ScrollSnapType};
+ use style::values::generics::NonNegative;
+ use style::values::generics::position::PreferredRatio;
+ use style::values::generics::ratio::Ratio;
+-use style::values::{AtomIdent, AtomString, CSSFloat, GenericAtomIdent, computed, specified};
++use style::values::{AtomIdent, AtomString, GenericAtomIdent, computed, specified};
+ use style::{ArcSlice, CaseSensitivityExt, dom_apis, thread_state};
+ use style_traits::CSSPixel;
+ use stylo_atoms::Atom;
+@@ -1510,13 +1510,16 @@ impl<'dom> LayoutDom<'dom, Element> {
+                 }
+             });
+ 
++        let text_control_size = |value: specified::NoCalcLength| {
++            style::values::generics::length::LengthPercentageOrAuto::LengthPercentage(NonNegative(
++                specified::LengthPercentage::Length(value),
++            ))
++        };
+         if let Some(size) = size {
+             let value = specified::NoCalcLength::from_servo_character_width(size);
+-            push(PropertyDeclaration::Width(
+-                specified::Size::LengthPercentage(NonNegative(
+-                    specified::LengthPercentage::Length(value),
+-                )),
+-            ));
++            push(PropertyDeclaration::ServoTextControlWidth(text_control_size(
++                value,
++            )));
+         }
+ 
+         let width = if let Some(this) = self.downcast::<HTMLIFrameElement>() {
+@@ -1632,17 +1635,11 @@ impl<'dom> LayoutDom<'dom, Element> {
+         if let Some(cols) = cols {
+             let cols = cols as i32;
+             if cols > 0 {
+-                // TODO(mttr) ServoCharacterWidth uses the size math for <input type="text">, but
+-                // the math for <textarea> is a little different since we need to take
+-                // scrollbar size into consideration (but we don't have a scrollbar yet!)
+-                //
+                 // https://html.spec.whatwg.org/multipage/#textarea-effective-width
+-                let value = specified::NoCalcLength::from_servo_character_width(cols);
+-                push(PropertyDeclaration::Width(
+-                    specified::Size::LengthPercentage(NonNegative(
+-                        specified::LengthPercentage::Length(value),
+-                    )),
+-                ));
++                let value = specified::NoCalcLength::from_servo_textarea_columns(cols);
++                push(PropertyDeclaration::ServoTextControlWidth(text_control_size(
++                    value,
++                )));
+             }
+         }
+ 
+@@ -1652,15 +1649,11 @@ impl<'dom> LayoutDom<'dom, Element> {
+         if let Some(rows) = rows {
+             let rows = rows as i32;
+             if rows > 0 {
+-                // TODO(mttr) This should take scrollbar size into consideration.
+-                //
+                 // https://html.spec.whatwg.org/multipage/#textarea-effective-height
+-                let value = specified::NoCalcLength::from_em(rows as CSSFloat);
+-                push(PropertyDeclaration::Height(
+-                    specified::Size::LengthPercentage(NonNegative(
+-                        specified::LengthPercentage::Length(value),
+-                    )),
+-                ));
++                let value = specified::NoCalcLength::from_servo_textarea_rows(rows);
++                push(PropertyDeclaration::ServoTextControlHeight(text_control_size(
++                    value,
++                )));
+             }
+         }
+ 
+-- 
+2.43.0
+

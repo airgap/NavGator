@@ -1,0 +1,141 @@
+From b98a857ac67fcad458c04b0616e7c314c357e20d Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 06:38:35 -0400
+Subject: [PATCH] forms: size date and time fields like Chrome
+
+Date, time, datetime-local, month and week fields took the `size` attribute's 20-character
+width in sans-serif. Chrome ignores `size` for them (the attribute does not apply per the
+HTML spec), sets them in monospace with a 1px start padding, and sizes them from their
+editable fields and picker icon. The UA sheet now gives each type the width and height that
+comes to at any font size, measured in Chrome, through the text control intrinsic size
+properties. The time field is taller for its clock icon and centres its text, so a block
+container's `align-content` now distributes the space up to that intrinsic block size.
+
+The fields still show the raw value and no placeholder fields or picker icon.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/formatting_contexts.rs | 29 ++++++++++++++++-----
+ components/layout/stylesheets/servo.css  | 33 ++++++++++++++++++++++++
+ components/script/dom/element/element.rs |  4 +++
+ 3 files changed, 59 insertions(+), 7 deletions(-)
+
+diff --git a/components/layout/formatting_contexts.rs b/components/layout/formatting_contexts.rs
+index 49a04668ef5..660e54237d7 100644
+--- a/components/layout/formatting_contexts.rs
++++ b/components/layout/formatting_contexts.rs
+@@ -526,16 +526,29 @@ impl IndependentFormattingContext {
+                 let mut result = multicol_result.unwrap_or_else(|| {
+                     bfc.layout(layout_context, positioning_context, containing_block_for_children)
+                 });
+-                align_block_container_content(self.style(), lazy_block_size, &mut result);
+                 // A `<textarea>`'s `rows` attribute gives its intrinsic block size whatever its
+-                // text, which scrolls instead (Chrome's `TextAreaIntrinsicBlockSize`).
+-                if let GenericLengthPercentageOrAuto::LengthPercentage(height) = self
++                // text, which scrolls instead (Chrome's `TextAreaIntrinsicBlockSize`). The UA sheet
++                // also sizes date and time fields this way.
++                let text_control_block_size = match self
+                     .style()
+                     .get_position()
+-                    .clone__servo_text_control_height() &&
+-                    self.style().writing_mode.is_horizontal()
++                    .clone__servo_text_control_height()
+                 {
+-                    result.content_block_size = height.0.to_used_value(Au(0));
++                    GenericLengthPercentageOrAuto::LengthPercentage(height)
++                        if self.style().writing_mode.is_horizontal() =>
++                    {
++                        Some(height.0.to_used_value(Au(0)))
++                    },
++                    _ => None,
++                };
++                align_block_container_content(
++                    self.style(),
++                    lazy_block_size,
++                    text_control_block_size,
++                    &mut result,
++                );
++                if let Some(block_size) = text_control_block_size {
++                    result.content_block_size = block_size;
+                 }
+                 result
+             },
+@@ -729,13 +742,15 @@ fn block_container_content_alignment(style: &ComputedValues) -> Option<AlignFlag
+ fn align_block_container_content(
+     style: &ComputedValues,
+     lazy_block_size: &LazySize,
++    intrinsic_block_size: Option<Au>,
+     result: &mut IndependentFormattingContextLayoutResult,
+ ) {
+     let Some(alignment) = block_container_content_alignment(style) else {
+         return;
+     };
+     let content_block_size = result.content_block_size;
+-    let free_space = lazy_block_size.resolve(|| content_block_size) - content_block_size;
++    let free_space = lazy_block_size.resolve(|| intrinsic_block_size.unwrap_or(content_block_size)) -
++        content_block_size;
+     if free_space <= Au(0) {
+         return;
+     }
+diff --git a/components/layout/stylesheets/servo.css b/components/layout/stylesheets/servo.css
+index 2ed66dbd4d3..88cf4ccaa5d 100644
+--- a/components/layout/stylesheets/servo.css
++++ b/components/layout/stylesheets/servo.css
+@@ -43,6 +43,39 @@ input {
+     padding: 1px 2px;
+ }
+ 
++/* Chrome sets date and time fields in monospace with only a 1px start padding, and sizes them
++   from their editable fields and picker icon rather than from the `size` attribute. These sizes
++   are what that comes to at any font size, measured in Chrome. Chrome pads the line of fields by
++   1px above and below inside the control, and the time field is taller for its clock icon. */
++input:is([type=date i], [type=time i], [type=datetime-local i], [type=month i], [type=week i]) {
++  font-family: monospace;
++  padding-block: 1px;
++  padding-inline: 1px 0;
++}
++
++input[type=date i] {
++  -servo-text-control-width: calc(8.2em + 11px);
++}
++
++input[type=time i] {
++  -servo-text-control-width: calc(5.85em + 21px);
++  padding-block: 0;
++  -servo-text-control-height: calc(1.05em + 6px);
++  align-content: center;
++}
++
++input[type=datetime-local i] {
++  -servo-text-control-width: calc(14.25em + 16px);
++}
++
++input[type=month i] {
++  -servo-text-control-width: calc(10.65em + 8px);
++}
++
++input[type=week i] {
++  -servo-text-control-width: calc(10.05em + 8px);
++}
++
+ /* Matches https://searchfox.org/mozilla-central/rev/a1f4cb9fc03d81be41ca2ba81294592df784364d/layout/style/res/forms.css#120-132 */
+ button,
+ input,
+diff --git a/components/script/dom/element/element.rs b/components/script/dom/element/element.rs
+index e761d6effc8..2bab3a1b865 100644
+--- a/components/script/dom/element/element.rs
++++ b/components/script/dom/element/element.rs
+@@ -1502,6 +1502,10 @@ impl<'dom> LayoutDom<'dom, Element> {
+                     Some("hidden") | Some("range") | Some("color") | Some("checkbox") |
+                     Some("radio") | Some("file") | Some("submit") | Some("image") |
+                     Some("reset") | Some("button") => None,
++                    // <https://html.spec.whatwg.org/multipage/#attr-input-size> does not apply to
++                    // these; the UA sheet sizes them like Chrome does.
++                    Some("date") | Some("time") | Some("datetime-local") | Some("month") |
++                    Some("week") => None,
+                     // Others
+                     _ => match input_element.size_for_layout() {
+                         0 => None,
+-- 
+2.43.0
+

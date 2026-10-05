@@ -1,0 +1,159 @@
+From 7c87f1a8468ed97fc6f795348b8975dd7a94dfee Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 06:38:59 -0400
+Subject: [PATCH] script: keep adopted stylesheets out of StyleSheetList and
+ after owned sheets
+
+document.styleSheets and shadowRoot.styleSheets listed adopted (constructed)
+sheets, so a shadow root with one <style> and one adopted sheet reported
+length 2 where Chrome and the CSSOM spec report 1. The list now covers only
+the owned prefix of the stylesheet set; adopted sheets stay reachable
+through adoptedStyleSheets.
+
+That prefix only existed by accident: append_constructed_stylesheet used the
+last sheet in the set as an insertion point and inserted *before* it, so an
+adopted sheet landed ahead of the last <style>. In a shadow root this also
+put the adopted rules earlier in the cascade, letting a <style> override an
+adopted sheet (Lit components style themselves with adopted sheets).
+Constructed sheets are now appended at the end, as the final CSS style
+sheets ordering requires.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/css/stylesheetlist.rs | 17 ++++++++++++++-
+ components/script/dom/document/document.rs  | 23 ++++++++++-----------
+ components/script/dom/shadowroot.rs         | 14 ++++++++++---
+ 3 files changed, 38 insertions(+), 16 deletions(-)
+
+diff --git a/components/script/dom/css/stylesheetlist.rs b/components/script/dom/css/stylesheetlist.rs
+index 644bbbdaf7e..5f10c178079 100644
+--- a/components/script/dom/css/stylesheetlist.rs
++++ b/components/script/dom/css/stylesheetlist.rs
+@@ -32,6 +32,15 @@ impl StyleSheetListOwner {
+         }
+     }
+ 
++    pub(crate) fn owned_stylesheet_count(&self) -> usize {
++        match *self {
++            StyleSheetListOwner::Document(ref doc) => doc.owned_stylesheet_count(),
++            StyleSheetListOwner::ShadowRoot(ref shadow_root) => {
++                shadow_root.owned_stylesheet_count()
++            },
++        }
++    }
++
+     pub(crate) fn stylesheet_at(&self, index: usize) -> Option<DomRoot<CSSStyleSheet>> {
+         match *self {
+             StyleSheetListOwner::Document(ref doc) => doc.stylesheet_at(index),
+@@ -121,14 +130,20 @@ impl StyleSheetList {
+ 
+ impl StyleSheetListMethods<crate::DomTypeHolder> for StyleSheetList {
+     /// <https://drafts.csswg.org/cssom/#dom-stylesheetlist-length>
++    /// Adopted (constructed) sheets are part of the final CSS style sheets but are not
++    /// document or shadow root CSS style sheets, so they are excluded from this list.
++    /// <https://drafts.csswg.org/cssom/#documentorshadowroot-document-or-shadow-root-css-style-sheets>
+     fn Length(&self) -> u32 {
+-        self.document_or_shadow_root.stylesheet_count() as u32
++        self.document_or_shadow_root.owned_stylesheet_count() as u32
+     }
+ 
+     /// <https://drafts.csswg.org/cssom/#dom-stylesheetlist-item>
+     fn Item(&self, index: u32) -> Option<DomRoot<StyleSheet>> {
+         // XXXManishearth this  doesn't handle the origin clean flag and is a
+         // cors vulnerability
++        if index >= self.Length() {
++            return None;
++        }
+         self.document_or_shadow_root
+             .stylesheet_at(index as usize)
+             .map(DomRoot::upcast)
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index be78f86119d..9beafbf5d4b 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -4900,6 +4900,15 @@ impl Document {
+         self.stylesheets.borrow().len()
+     }
+ 
++    /// Owned sheets are kept ahead of constructed ones, so they form a prefix of the set.
++    pub(crate) fn owned_stylesheet_count(&self) -> usize {
++        self.stylesheets
++            .borrow()
++            .iter()
++            .take_while(|(sheet, _origin)| !sheet.owner.is_constructed())
++            .count()
++    }
++
+     pub(crate) fn stylesheet_at(&self, index: usize) -> Option<DomRoot<CSSStyleSheet>> {
+         let stylesheets = self.stylesheets.borrow();
+ 
+@@ -4970,25 +4979,15 @@ impl Document {
+         let stylesheets = &mut *self.stylesheets.borrow_mut();
+         let sheet = cssom_stylesheet.style_stylesheet().clone();
+ 
+-        let insertion_point = stylesheets
+-            .iter()
+-            .last()
+-            .map(|(sheet, _origin)| sheet)
+-            .cloned();
+-
+         if self.has_browsing_context() {
+-            self.add_stylesheet_to_stylist(
+-                cx,
+-                sheet.clone(),
+-                insertion_point.as_ref().map(|s| s.sheet.clone()),
+-            );
++            self.add_stylesheet_to_stylist(cx, sheet.clone(), None);
+         }
+ 
+         DocumentOrShadowRoot::add_stylesheet(
+             StylesheetSource::Constructed(Dom::from_ref(cssom_stylesheet)),
+             StylesheetSetRef::Document(stylesheets),
+             sheet,
+-            insertion_point,
++            None,
+             self.style_shared_author_lock(),
+         );
+     }
+diff --git a/components/script/dom/shadowroot.rs b/components/script/dom/shadowroot.rs
+index a7721cff05d..9451f18864f 100644
+--- a/components/script/dom/shadowroot.rs
++++ b/components/script/dom/shadowroot.rs
+@@ -179,6 +179,16 @@ impl ShadowRoot {
+         self.author_styles.borrow().stylesheets.len()
+     }
+ 
++    /// Owned sheets are kept ahead of constructed ones, so they form a prefix of the set.
++    pub(crate) fn owned_stylesheet_count(&self) -> usize {
++        self.author_styles
++            .borrow()
++            .stylesheets
++            .iter()
++            .take_while(|sheet| !sheet.owner.is_constructed())
++            .count()
++    }
++
+     pub(crate) fn stylesheet_at(&self, index: usize) -> Option<DomRoot<CSSStyleSheet>> {
+         let stylesheets = &self.author_styles.borrow().stylesheets;
+ 
+@@ -246,8 +256,6 @@ impl ShadowRoot {
+             let stylesheets = &mut self.author_styles.borrow_mut().stylesheets;
+             let sheet = cssom_stylesheet.style_stylesheet().clone();
+ 
+-            let insertion_point = stylesheets.iter().last().cloned();
+-
+             let document = self.owner_document();
+             if document.has_browsing_context() {
+                 document.load_web_fonts_from_stylesheet(cx, &sheet);
+@@ -257,7 +265,7 @@ impl ShadowRoot {
+                 StylesheetSource::Constructed(Dom::from_ref(cssom_stylesheet)),
+                 StylesheetSetRef::Author(stylesheets),
+                 sheet,
+-                insertion_point,
++                None,
+                 document.style_shared_author_lock(),
+             );
+         }
+-- 
+2.43.0
+

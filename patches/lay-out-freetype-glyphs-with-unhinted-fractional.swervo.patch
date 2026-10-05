@@ -1,0 +1,87 @@
+From 1b789d556a0c5123ff2d2be782a14b10035a2d86 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 01:09:02 -0400
+Subject: [PATCH] fonts: lay out FreeType glyphs with unhinted fractional
+ advances
+
+glyph_h_advance returned the hinted horiAdvance, which light hinting rounds
+to whole pixels, so every glyph was up to half a pixel off and the error
+added up over a line: text measured about 1-2% wider or narrower than in
+Chrome and paragraphs wrapped at different words. Chrome on Linux shapes
+with the linear (unhinted) advances and positions glyphs at fractional
+offsets. Use linearHoriAdvance for scalable faces (keeping the synthetic
+bold widening), request unfitted kerning for the kern-table fast path, and
+give FreeType font instances SUBPIXEL_POSITION so WebRender rasterizes each
+glyph at its fractional offset instead of snapping it. Glyph hinting for
+rasterization is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/fonts/platform/freetype/font.rs | 27 ++++++++++++++++++----
+ 1 file changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/components/fonts/platform/freetype/font.rs b/components/fonts/platform/freetype/font.rs
+index a4bc88e86d1..2098d5920e1 100644
+--- a/components/fonts/platform/freetype/font.rs
++++ b/components/fonts/platform/freetype/font.rs
+@@ -9,7 +9,7 @@ use app_units::Au;
+ use euclid::default::{Point2D, Rect, Size2D};
+ use fonts_traits::{FontIdentifier, FontTemplateDescriptor, LocalFontIdentifier};
+ use freetype_sys::{
+-    FT_F26Dot6, FT_Get_Char_Index, FT_Get_Kerning, FT_GlyphSlot, FT_KERNING_DEFAULT,
++    FT_F26Dot6, FT_Get_Char_Index, FT_Get_Kerning, FT_GlyphSlot, FT_KERNING_UNFITTED,
+     FT_LOAD_DEFAULT, FT_LOAD_NO_HINTING, FT_Load_Glyph, FT_PIXEL_MODE_GRAY, FT_RENDER_MODE_NORMAL,
+     FT_Render_Glyph, FT_Size_Metrics, FT_SizeRec, FT_UInt, FT_ULong, FT_Vector,
+ };
+@@ -182,7 +182,9 @@ impl PlatformFontMethods for PlatformFont {
+                 face.as_ptr(),
+                 first_glyph,
+                 second_glyph,
+-                FT_KERNING_DEFAULT,
++                // Grid-fitted kerning would round each pair to whole pixels, while glyph
++                // advances are fractional (see `glyph_h_advance`).
++                FT_KERNING_UNFITTED,
+                 &mut delta,
+             );
+         }
+@@ -205,12 +207,23 @@ impl PlatformFontMethods for PlatformFont {
+             return None;
+         }
+ 
++        let hinted_advance = unsafe { (*slot).metrics.horiAdvance };
+         if self.synthetic_bold {
+             mozilla_glyphslot_embolden_less(slot);
+         }
+-
+-        let advance = unsafe { (*slot).metrics.horiAdvance };
+-        Some(fixed_26_dot_6_to_float(advance) * self.unscalable_font_metrics_scale())
++        let synthetic_bold_advance = unsafe { (*slot).metrics.horiAdvance } - hinted_advance;
++
++        // Lay out with the unhinted advance, which hinting would round to whole pixels: Chrome
++        // on Linux positions glyphs at fractional offsets with the linear advances, and the
++        // rounding error otherwise accumulates over a line and wraps text at different words.
++        // Bitmap fonts have no outline to scale, so their hinted advance is the real one.
++        let advance = if face.scalable() {
++            (unsafe { (*slot).linearHoriAdvance }) as f64 / 65536.0 +
++                fixed_26_dot_6_to_float(synthetic_bold_advance)
++        } else {
++            fixed_26_dot_6_to_float(hinted_advance + synthetic_bold_advance)
++        };
++        Some(advance * self.unscalable_font_metrics_scale())
+     }
+ 
+     fn rasterize_glyph(&self, glyph: GlyphId) -> Option<GlyphRaster> {
+@@ -475,6 +488,10 @@ impl PlatformFontMethods for PlatformFont {
+         // loading bitmaps. There's no harm to always passing it.
+         let mut flags = FontInstanceFlags::EMBEDDED_BITMAPS;
+ 
++        // Glyph advances are fractional (see `glyph_h_advance`), so glyphs have to be
++        // rasterized at their subpixel offsets instead of being snapped to whole pixels.
++        flags |= FontInstanceFlags::SUBPIXEL_POSITION;
++
+         // TODO: Add support for synthetic italics.
+         // <https://github.com/servo/servo/issues/39637>
+         if self.synthetic_bold {
+-- 
+2.43.0
+

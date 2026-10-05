@@ -1,0 +1,1063 @@
+From 407be14cdcb9172b1d3c655898ac01eed4cb3feb Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 01:52:31 -0400
+Subject: [PATCH] fonts: lazy-load FontFaceSet faces on match; implement
+ fonts.load() and fonts.check()
+
+FontFaces added to document.fonts without an explicit load() never took part
+in font matching, so pages that register web fonts this way (Excalidraw's
+Excalifont, Chrome-style lazy font registration) rendered in the fallback
+font. Unloaded faces in the document's FontFaceSet are now registered with the
+FontContext. Font matching treats them like the family's loaded templates
+(best descriptor distance wins, unicode-range filters per codepoint) and
+records the ones it selects; after each reflow script calls load() on those
+faces, so they go loading -> loaded and the document re-lays out, as Chrome
+does. Faces leave the registry when they start loading or are removed from
+the set, and re-register when a descriptor setter changes them.
+
+FontFaceSet.load() now implements "find the matching font faces": it parses
+the font shorthand (CSS-wide keywords and var() are syntax errors, bolder and
+lighter resolve against normal), matches faces of each named family by the
+CSS font matching distance, filters by unicode-range against the text, loads
+the matches and resolves with their [[FontStatusPromise]]s. FontFaceSet.check()
+is exposed and returns false while a matching face is not loaded. @font-face
+rules have no FontFace objects in this engine, so both consult the font
+context for families whose stylesheet fonts are still downloading: load()
+waits for the set's ready promise and check() returns false.
+
+A FontFace whose descriptors fail to parse (new FontFace(name, "") as used
+for local-font placeholders) rejected its [[FontStatusPromise]] eagerly, which
+logged an unhandled rejection nobody could handle. The rejection now happens
+when script first takes the promise through loaded or load(), matching when
+Chrome reports it.
+
+https://drafts.csswg.org/css-font-loading/#find-the-matching-font-faces
+https://drafts.csswg.org/css-font-loading/#dom-fontfaceset-check
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/fonts/font.rs                      |  63 +++-
+ components/fonts/font_context.rs              | 119 +++++-
+ components/fonts/lib.rs                       |   2 +-
+ components/script/dom/css/fontface.rs         |  90 ++++-
+ components/script/dom/css/fontfaceset.rs      | 349 ++++++++++++++++--
+ components/script/dom/document/document.rs    |   7 +
+ components/script/dom/window/window.rs        |   4 +-
+ .../script_bindings/codegen/Bindings.conf     |   2 +-
+ .../webidls/FontFaceSet.webidl                |   3 +-
+ components/shared/fonts/font_template.rs      |  18 +-
+ 10 files changed, 593 insertions(+), 64 deletions(-)
+
+diff --git a/components/fonts/font.rs b/components/fonts/font.rs
+index 9e2cb79d1a2..c420a453c4b 100644
+--- a/components/fonts/font.rs
++++ b/components/fonts/font.rs
+@@ -38,6 +38,7 @@ use style::values::computed::{
+ use unicode_script::Script;
+ use webrender_api::{FontInstanceFlags, FontInstanceKey, FontVariation};
+ 
++use crate::font_context::UnloadedFontFace;
+ use crate::platform::font::{FontTable, PlatformFont};
+ use crate::platform::font_list::fallback_font_families;
+ use crate::{
+@@ -764,6 +765,7 @@ impl FontGroup {
+ 
+         if let Some(font) = self.find(
+             font_context,
++            options.character,
+             &char_in_template,
+             &font_has_glyph_and_presentation,
+         ) {
+@@ -814,7 +816,7 @@ impl FontGroup {
+         // > Note: it does not matter whether that font actually has a glyph for the space character.
+         let space_in_template = |template: FontTemplateRef| template.char_in_unicode_range(' ');
+         let font_predicate = |_: &FontRef| true;
+-        self.find(font_context, &space_in_template, &font_predicate)
++        self.find(font_context, ' ', &space_in_template, &font_predicate)
+             .or_else(|| {
+                 self.find_fallback_using_system_font_list(
+                     font_context,
+@@ -825,26 +827,31 @@ impl FontGroup {
+             })
+     }
+ 
+-    /// Attempts to find a font which matches the given `template_predicate` and `font_predicate`.
+-    /// This method mutates because we may need to load new font data in the process of finding
+-    /// a suitable font.
++    /// Attempts to find a font for `codepoint` which matches the given `template_predicate` and
++    /// `font_predicate`. This method mutates because we may need to load new font data in the
++    /// process of finding a suitable font.
+     fn find(
+         &self,
+         font_context: &FontContext,
++        codepoint: char,
+         template_predicate: &impl Fn(FontTemplateRef) -> bool,
+         font_predicate: &impl Fn(&FontRef) -> bool,
+     ) -> Option<FontRef> {
+-        self.families
+-            .iter()
+-            .flat_map(|family| family.templates(font_context, &self.descriptor))
+-            .find_map(|template| {
+-                template.font_if_matches(
+-                    font_context,
+-                    &self.descriptor,
+-                    template_predicate,
+-                    font_predicate,
+-                )
+-            })
++        self.families.iter().find_map(|family| {
++            // Every family consulted before a usable font is found would have its matching
++            // faces loaded in a browser that loads fonts on demand, so request the unloaded ones.
++            family.request_unloaded_script_faces(font_context, &self.descriptor, codepoint);
++            family
++                .templates(font_context, &self.descriptor)
++                .find_map(|template| {
++                    template.font_if_matches(
++                        font_context,
++                        &self.descriptor,
++                        template_predicate,
++                        font_predicate,
++                    )
++                })
++        })
+     }
+ 
+     /// Attempts to find a suitable fallback font which matches the given `template_predicate` and
+@@ -943,6 +950,7 @@ impl FontGroupFamilyTemplate {
+ struct FontGroupFamily {
+     family_descriptor: FontFamilyDescriptor,
+     members: OnceLock<Vec<FontGroupFamilyTemplate>>,
++    unloaded_script_faces: OnceLock<Vec<UnloadedFontFace>>,
+ }
+ 
+ impl From<FontFamilyDescriptor> for FontGroupFamily {
+@@ -950,6 +958,7 @@ impl From<FontFamilyDescriptor> for FontGroupFamily {
+         Self {
+             family_descriptor,
+             members: Default::default(),
++            unloaded_script_faces: Default::default(),
+         }
+     }
+ }
+@@ -974,6 +983,30 @@ impl FontGroupFamily {
+             })
+             .iter()
+     }
++
++    fn request_unloaded_script_faces(
++        &self,
++        font_context: &FontContext,
++        font_descriptor: &FontDescriptor,
++        codepoint: char,
++    ) {
++        let faces = self.unloaded_script_faces.get_or_init(|| {
++            let loaded: Vec<FontTemplateRef> = self
++                .templates(font_context, font_descriptor)
++                .map(|member| member.template.clone())
++                .collect();
++            font_context.matching_unloaded_script_faces(
++                font_descriptor,
++                &self.family_descriptor,
++                &loaded,
++            )
++        });
++        for face in faces {
++            if face.descriptor.char_in_unicode_range(codepoint) {
++                font_context.request_unloaded_script_face_load(face.id);
++            }
++        }
++    }
+ }
+ 
+ /// The scope within which we will look for a font.
+diff --git a/components/fonts/font_context.rs b/components/fonts/font_context.rs
+index 50fc6bf42e8..edca79b05b4 100644
+--- a/components/fonts/font_context.rs
++++ b/components/fonts/font_context.rs
+@@ -6,13 +6,13 @@ use std::collections::{HashMap, HashSet};
+ use std::default::Default;
+ use std::hash::{Hash, Hasher};
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+ 
+ use app_units::Au;
+ use content_security_policy::Violation;
+ use fonts_traits::{
+-    CSSFontFaceDescriptors, FontDescriptor, FontIdentifier, FontTemplate, FontTemplateRef,
+-    FontTemplateRefMethods, StylesheetWebFontLoadFinishedCallback,
++    CSSFontFaceDescriptors, FontDescriptor, FontIdentifier, FontTemplate, FontTemplateDescriptor,
++    FontTemplateRef, FontTemplateRefMethods, StylesheetWebFontLoadFinishedCallback,
+ };
+ use log::{debug, trace};
+ use malloc_size_of::MallocSizeOf;
+@@ -112,6 +112,26 @@ pub struct FontContext {
+     /// Maps from a URL to all the `@font-face` rules that are currently waiting for the load to
+     /// finish.
+     currently_downloading_fonts: Mutex<HashMap<ServoUrl, Vec<WebFontDownloadState>>>,
++
++    /// `FontFace`s in a document's `FontFaceSet` that script has not loaded. Font faces in the
++    /// document's font source take part in font matching, and are only fetched once matching
++    /// selects them: <https://drafts.csswg.org/css-font-loading/#font-face-set-css> and
++    /// <https://drafts.csswg.org/css-fonts/#font-face-loading>.
++    unloaded_script_faces: RwLock<HashMap<LowercaseFontFamilyName, Vec<UnloadedFontFace>>>,
++
++    /// The unloaded script faces that font matching selected and that script has not started
++    /// loading yet.
++    unloaded_script_face_load_requests: Mutex<HashSet<UnloadedFontFaceId>>,
++}
++
++/// Identifies a `FontFace` registered with [`FontContext::add_unloaded_script_face`].
++#[derive(Clone, Copy, Debug, Eq, Hash, MallocSizeOf, PartialEq)]
++pub struct UnloadedFontFaceId(u64);
++
++#[derive(Clone, Debug, MallocSizeOf)]
++pub(crate) struct UnloadedFontFace {
++    pub(crate) id: UnloadedFontFaceId,
++    pub(crate) descriptor: FontTemplateDescriptor,
+ }
+ 
+ /// A callback that will be invoked on the Fetch thread if a web font download
+@@ -169,6 +189,8 @@ impl FontContext {
+             have_removed_web_fonts: AtomicBool::new(false),
+             font_data: RwLock::default(),
+             currently_downloading_fonts: Default::default(),
++            unloaded_script_faces: Default::default(),
++            unloaded_script_face_load_requests: Default::default(),
+         }
+     }
+ 
+@@ -316,6 +338,97 @@ impl FontContext {
+             .map(|templates| templates.find_for_descriptor(Some(descriptor_to_match)))
+     }
+ 
++    /// The unloaded script faces of a family that font matching would pick for `descriptor_to_match`.
++    /// They compete with the family's `loaded` templates: a face only matches if no loaded
++    /// template is a closer match.
++    pub(crate) fn matching_unloaded_script_faces(
++        &self,
++        descriptor_to_match: &FontDescriptor,
++        family_descriptor: &FontFamilyDescriptor,
++        loaded: &[FontTemplateRef],
++    ) -> Vec<UnloadedFontFace> {
++        if family_descriptor.scope != FontSearchScope::Any {
++            return Vec::new();
++        }
++        let SingleFontFamily::FamilyName(ref family_name) = family_descriptor.family else {
++            return Vec::new();
++        };
++        let unloaded_script_faces = self.unloaded_script_faces.read();
++        let Some(faces) = unloaded_script_faces.get(&family_name.name.clone().into()) else {
++            return Vec::new();
++        };
++
++        let best_loaded_distance = loaded
++            .iter()
++            .map(|template| template.descriptor_distance(descriptor_to_match))
++            .fold(f32::MAX, f32::min);
++        let best_distance = faces
++            .iter()
++            .map(|face| face.descriptor.distance_from(descriptor_to_match))
++            .fold(f32::MAX, f32::min);
++        if best_distance > best_loaded_distance {
++            return Vec::new();
++        }
++        faces
++            .iter()
++            .filter(|face| face.descriptor.distance_from(descriptor_to_match) == best_distance)
++            .cloned()
++            .collect()
++    }
++
++    pub(crate) fn request_unloaded_script_face_load(&self, id: UnloadedFontFaceId) {
++        self.unloaded_script_face_load_requests.lock().insert(id);
++    }
++
++    /// Make a `FontFace` that has not been loaded available to font matching. Matching it marks
++    /// it as requested, see [`Self::take_unloaded_script_face_load_request`].
++    pub fn add_unloaded_script_face(
++        &self,
++        descriptors: &CSSFontFaceDescriptors,
++    ) -> UnloadedFontFaceId {
++        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
++        let id = UnloadedFontFaceId(NEXT_ID.fetch_add(1, Ordering::Relaxed));
++        let mut descriptor = FontTemplateDescriptor::default();
++        descriptor.override_values_with_css_font_template_descriptors(descriptors);
++        self.unloaded_script_faces
++            .write()
++            .entry(descriptors.family_name.clone())
++            .or_default()
++            .push(UnloadedFontFace { id, descriptor });
++        self.invalidate_font_groups_after_web_font_load();
++        id
++    }
++
++    pub fn remove_unloaded_script_face(&self, id: UnloadedFontFaceId) {
++        self.unloaded_script_faces.write().retain(|_, faces| {
++            faces.retain(|face| face.id != id);
++            !faces.is_empty()
++        });
++        self.unloaded_script_face_load_requests.lock().remove(&id);
++        self.invalidate_font_groups_after_web_font_load();
++    }
++
++    pub fn has_unloaded_script_face_load_requests(&self) -> bool {
++        !self.unloaded_script_face_load_requests.lock().is_empty()
++    }
++
++    /// Returns true if font matching selected this face since it was added or last taken.
++    pub fn take_unloaded_script_face_load_request(&self, id: UnloadedFontFaceId) -> bool {
++        self.unloaded_script_face_load_requests.lock().remove(&id)
++    }
++
++    /// Whether an `@font-face` rule for this family is still being fetched.
++    pub fn is_loading_stylesheet_web_font(&self, family_name: &LowercaseFontFamilyName) -> bool {
++        self.currently_downloading_fonts
++            .lock()
++            .values()
++            .flatten()
++            .any(|download_state| {
++                download_state.initiator.font_face_rule().is_some() &&
++                    download_state.css_font_face_descriptors.family_name == *family_name
++            })
++    }
++
+     /// Try to find matching templates in this [`FontContext`], first looking in the list of web fonts and
+     /// falling back to asking the [`super::SystemFontService`] for a matching system font.
+     pub fn matching_templates(
+diff --git a/components/fonts/lib.rs b/components/fonts/lib.rs
+index 679af4a502c..6904a5f9a7e 100644
+--- a/components/fonts/lib.rs
++++ b/components/fonts/lib.rs
+@@ -22,7 +22,7 @@ pub use font::{
+ };
+ pub use font_context::{
+     CspViolationHandler, FontContext, FontContextWebFontMethods, NetworkTimingHandler,
+-    WebFontDocumentContext,
++    UnloadedFontFaceId, WebFontDocumentContext,
+ };
+ pub use font_store::FontTemplates;
+ pub use fonts_traits::*;
+diff --git a/components/script/dom/css/fontface.rs b/components/script/dom/css/fontface.rs
+index 193a81403a2..e89e25351a4 100644
+--- a/components/script/dom/css/fontface.rs
++++ b/components/script/dom/css/fontface.rs
+@@ -7,7 +7,10 @@ use std::rc::Rc;
+ 
+ use cssparser::{Parser, ParserInput};
+ use dom_struct::dom_struct;
+-use fonts::{FontContext, FontContextWebFontMethods, FontTemplate, LowercaseFontFamilyName};
++use fonts::{
++    CSSFontFaceDescriptors, FontContext, FontContextWebFontMethods, FontTemplate,
++    LowercaseFontFamilyName, UnloadedFontFaceId,
++};
+ use js::context::JSContext;
+ use js::rust::HandleObject;
+ use script_bindings::cell::DomRefCell;
+@@ -66,6 +69,11 @@ pub struct FontFace {
+     /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-fontstatuspromise-slot>
+     #[conditional_malloc_size_of]
+     font_status_promise: Rc<Promise>,
++
++    /// Set while this unloaded `FontFace` is in the document's `FontFaceSet` and so takes part
++    /// in font matching, see [`FontContext::add_unloaded_script_face`].
++    #[no_trace]
++    unloaded_font_face_id: Cell<Option<UnloadedFontFaceId>>,
+ }
+ 
+ /// Given the various font face descriptors, construct the equivalent `@font-face` css rule as a
+@@ -187,16 +195,22 @@ impl FontFace {
+     /// Construct a [`FontFace`] to be used in the case of failure in parsing the
+     /// font face descriptors.
+     fn new_failed_font_face(cx: &mut JSContext, global: &GlobalScope) -> Self {
+-        let font_status_promise = Promise::new(cx, global);
+         // If any of them fail to parse correctly, reject font face’s [[FontStatusPromise]] with a
+         // DOMException named "SyntaxError"
+-        font_status_promise.reject_error(cx, Error::Syntax(None));
++        //
++        // The rejection is deferred to `Self::font_status_promise`, so that it happens when
++        // script first observes the promise. Rejecting here would report an unhandled rejection
++        // for every such face, while Chrome only reports one when script takes the promise
++        // (through `loaded` or `load()`) and does not handle it; pages build faces with an empty
++        // source as placeholders for local fonts.
++        let font_status_promise = Promise::new(cx, global);
+ 
+         // set font face’s corresponding attributes to the empty string, and set font face’s status
+         // attribute to "error"
+         Self {
+             reflector: Reflector::new(),
+             font_face_set: MutNullableDom::default(),
++            unloaded_font_face_id: Cell::new(None),
+             font_status_promise,
+             family_name: DomRefCell::default(),
+             urls: Default::default(),
+@@ -260,6 +274,7 @@ impl FontFace {
+             )),
+ 
+             font_face_set: MutNullableDom::default(),
++            unloaded_font_face_id: Cell::new(None),
+             family_name: DomRefCell::new(family_name),
+             urls: DomRefCell::new(sources),
+             template: RefCell::default(),
+@@ -409,6 +424,64 @@ impl FontFace {
+         self.template.borrow().clone()
+     }
+ 
++    /// The [[FontStatusPromise]], rejecting it first if construction failed to parse the
++    /// descriptors (see `Self::new_failed_font_face`).
++    fn font_status_promise(&self, cx: &mut JSContext) -> Rc<Promise> {
++        if self.status.get() == FontFaceLoadStatus::Error && self.font_status_promise.is_pending()
++        {
++            self.font_status_promise
++                .reject_error(cx, Error::Syntax(None));
++        }
++        self.font_status_promise.clone()
++    }
++
++    /// The parsed descriptors of this `FontFace`, or `None` if they failed to parse when it was
++    /// constructed.
++    pub(super) fn css_font_face_descriptors(&self) -> Option<CSSFontFaceDescriptors> {
++        self.font_face_rule(&self.global())
++            .ok()
++            .map(|rule| (&rule).into())
++    }
++
++    /// Let font matching use this face while it is unloaded and in the document's `FontFaceSet`.
++    pub(super) fn add_to_font_matching(&self, window: &Window) {
++        if self.status.get() != FontFaceLoadStatus::Unloaded || self.urls.borrow().is_none() {
++            return;
++        }
++        let descriptors = self
++            .css_font_face_descriptors()
++            .expect("An unloaded FontFace has valid descriptors");
++        let id = window.font_context().add_unloaded_script_face(&descriptors);
++        self.unloaded_font_face_id.set(Some(id));
++        window.Document().dirty_all_nodes();
++    }
++
++    pub(super) fn remove_from_font_matching(&self) {
++        let Some(id) = self.unloaded_font_face_id.take() else {
++            return;
++        };
++        self.global()
++            .as_window()
++            .font_context()
++            .remove_unloaded_script_face(id);
++    }
++
++    /// Returns true if font matching selected this unloaded face since the last call.
++    pub(super) fn take_font_matching_load_request(&self, font_context: &FontContext) -> bool {
++        self.unloaded_font_face_id
++            .get()
++            .is_some_and(|id| font_context.take_unloaded_script_face_load_request(id))
++    }
++
++    /// Re-register with font matching after a descriptor changed, so matching uses the new values.
++    fn refresh_font_matching(&self) {
++        if self.unloaded_font_face_id.get().is_none() {
++            return;
++        }
++        self.remove_from_font_matching();
++        self.add_to_font_matching(&self.global().as_window());
++    }
++
+     /// Implements the body of the setter for the descriptor attributes of the [`FontFace`] interface.
+     ///
+     /// <https://drafts.csswg.org/css-font-loading/#fontface-interface>:
+@@ -426,6 +499,7 @@ impl FontFace {
+ 
+         *self.descriptors.borrow_mut() =
+             serialize_parsed_descriptors(&parsed_font_face_rule.descriptors);
++        self.refresh_font_matching();
+         Ok(())
+     }
+ 
+@@ -453,6 +527,7 @@ impl FontFaceMethods<crate::DomTypeHolder> for FontFace {
+         let global = self.global();
+         let _ = parse_font_face_descriptors(&global, &family_name, None, &descriptors)?;
+         *self.family_name.borrow_mut() = family_name;
++        self.refresh_font_matching();
+         Ok(())
+     }
+ 
+@@ -590,9 +665,12 @@ impl FontFaceMethods<crate::DomTypeHolder> for FontFace {
+             // Step 2. If font face’s [[Urls]] slot is null, or its status attribute is anything
+             // other than "unloaded", return font face’s [[FontStatusPromise]] and abort these
+             // steps.
+-            return self.font_status_promise.clone();
++            return self.font_status_promise(cx);
+         };
+ 
++        // Once loading starts the face reaches font matching through its template instead.
++        self.remove_from_font_matching();
++
+         // FontFace must not be loaded at this point as `self.urls` is not None, implying `Load`
+         // wasn't called already. In our implementation, `urls` is set after parsing, so it
+         // cannot be `Some` if the status is `Error`.
+@@ -681,8 +759,8 @@ impl FontFaceMethods<crate::DomTypeHolder> for FontFace {
+     }
+ 
+     /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-loaded>
+-    fn Loaded(&self) -> Rc<Promise> {
+-        self.font_status_promise.clone()
++    fn Loaded(&self, cx: &mut JSContext) -> Rc<Promise> {
++        self.font_status_promise(cx)
+     }
+ 
+     /// <https://drafts.csswg.org/css-font-loading/#font-face-constructor>
+diff --git a/components/script/dom/css/fontfaceset.rs b/components/script/dom/css/fontfaceset.rs
+index aea3ecc2732..55c7f75fd3f 100644
+--- a/components/script/dom/css/fontfaceset.rs
++++ b/components/script/dom/css/fontfaceset.rs
+@@ -5,10 +5,13 @@
+ use std::cell::RefCell;
+ use std::rc::Rc;
+ 
++use app_units::Au;
+ use dom_struct::dom_struct;
++use fonts::{FontDescriptor, FontTemplateDescriptor, LowercaseFontFamilyName};
+ use js::context::JSContext;
+ use js::gc::Handle;
+ use js::jsapi::Value;
++use js::jsval::ObjectValue;
+ use js::realm::CurrentRealm;
+ use js::rust::HandleObject;
+ use script_bindings::cell::DomRefCell;
+@@ -17,22 +20,145 @@ use script_bindings::codegen::GenericBindings::FontFaceBinding::{
+ };
+ use script_bindings::like::Setlike;
+ use script_bindings::reflector::reflect_dom_object_with_proto_and_cx;
++use style::computed_values::font_optical_sizing::T as FontOpticalSizing;
++use style::computed_values::font_variant_caps::T as FontVariantCaps;
++use style::properties::{
++    PropertyDeclaration, PropertyId, ShorthandId, SourcePropertyDeclaration,
++    parse_one_declaration_into,
++};
++use style::stylesheets::{CssRuleType, Origin, UrlExtraData};
++use style::values::computed::font::SingleFontFamily;
++use style::values::computed::{FontStretch, FontStyle, FontSynthesis, FontWeight};
++use style::values::generics::font::FontStyle as GenericFontStyle;
++use style::values::specified::font::{
++    FontFamily as SpecifiedFontFamily, FontStretch as SpecifiedFontStretch,
++    FontStyle as SpecifiedFontStyleProperty, FontWeight as SpecifiedFontWeight,
++    SpecifiedFontStyle,
++};
++use style_traits::ParsingMode;
+ 
+ use crate::dom::bindings::codegen::Bindings::FontFaceSetBinding::FontFaceSetMethods;
+ use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
+-use crate::dom::bindings::refcounted::TrustedPromise;
++use crate::dom::bindings::error::{Error, Fallible};
++use crate::dom::bindings::refcounted::{Trusted, TrustedPromise};
+ use crate::dom::bindings::reflector::DomGlobal;
+ use crate::dom::bindings::root::{Dom, DomRoot};
+ use crate::dom::bindings::str::DOMString;
+ use crate::dom::eventtarget::EventTarget;
+ use crate::dom::fontface::FontFace;
+ use crate::dom::globalscope::GlobalScope;
+-use crate::dom::promise::Promise;
++use crate::dom::node::NodeTraits;
++use crate::dom::promise::{Promise, wait_for_all_promise};
+ use crate::dom::promisenativehandler::Callback;
+ use crate::dom::types::PromiseNativeHandler;
+ use crate::dom::window::Window;
+ use crate::realms::enter_auto_realm;
+ 
++/// The result of <https://drafts.csswg.org/css-font-loading/#find-the-matching-font-faces>.
++struct MatchingFontFaces {
++    font_faces: Vec<DomRoot<FontFace>>,
++    /// The named families of the `font` argument. `@font-face` rules have no [`FontFace`] objects
++    /// in this implementation, so callers consult the font context about these families.
++    family_names: Vec<LowercaseFontFamilyName>,
++}
++
++/// Parse a `font` shorthand value into its font families and the style that font matching uses,
++/// with relative values absolutized against the initial values, as in step 1 of
++/// <https://drafts.csswg.org/css-font-loading/#find-the-matching-font-faces>.
++fn parse_font_for_matching(
++    window: &Window,
++    font: &str,
++) -> Fallible<(Vec<SingleFontFamily>, FontDescriptor)> {
++    let document = window.Document();
++    let url_data = UrlExtraData(document.owner_global().api_base_url().get_arc());
++    let mut declarations = SourcePropertyDeclaration::default();
++    parse_one_declaration_into(
++        &mut declarations,
++        PropertyId::NonCustom(ShorthandId::Font.into()),
++        font,
++        Origin::Author,
++        &url_data,
++        None,
++        ParsingMode::DEFAULT,
++        document.quirks_mode(),
++        CssRuleType::Style,
++    )
++    .map_err(|()| Error::Syntax(None))?;
++
++    let mut families = Vec::new();
++    let mut descriptor = FontDescriptor {
++        weight: FontWeight::NORMAL,
++        stretch: FontStretch::NORMAL,
++        style: FontStyle::NORMAL,
++        variant: FontVariantCaps::Normal,
++        pt_size: Au(0),
++        variation_settings: Vec::new(),
++        synthesis_weight: FontSynthesis::Auto,
++        optical_sizing: FontOpticalSizing::Auto,
++    };
++    // Values that only resolve at computed-value time (calc() with relative units) cannot be
++    // absolutized against initial values here, so they are treated like unparsable input.
++    for declaration in declarations.declarations.iter() {
++        match declaration {
++            // A CSS-wide keyword (or a var() reference) is a syntax error for this algorithm.
++            PropertyDeclaration::CSSWideKeyword(..) | PropertyDeclaration::WithVariables(..) => {
++                return Err(Error::Syntax(None));
++            },
++            PropertyDeclaration::FontFamily(family) => match family {
++                SpecifiedFontFamily::Values(list) => families = list.iter().cloned().collect(),
++                SpecifiedFontFamily::System(system) => match *system {},
++            },
++            PropertyDeclaration::FontWeight(weight) => {
++                descriptor.weight = match weight {
++                    SpecifiedFontWeight::Absolute(absolute) => {
++                        absolute.compute().ok_or(Error::Syntax(None))?
++                    },
++                    SpecifiedFontWeight::Bolder => FontWeight::NORMAL.bolder(),
++                    SpecifiedFontWeight::Lighter => FontWeight::NORMAL.lighter(),
++                    SpecifiedFontWeight::System(system) => match *system {},
++                }
++            },
++            PropertyDeclaration::FontStyle(font_style) => {
++                descriptor.style = match font_style {
++                    SpecifiedFontStyleProperty::Specified(GenericFontStyle::Italic) => {
++                        FontStyle::ITALIC
++                    },
++                    SpecifiedFontStyleProperty::Specified(GenericFontStyle::Oblique(angle)) => {
++                        FontStyle::oblique(
++                            SpecifiedFontStyle::compute_angle_degrees(angle)
++                                .ok_or(Error::Syntax(None))?,
++                        )
++                    },
++                    SpecifiedFontStyleProperty::System(system) => match *system {},
++                }
++            },
++            PropertyDeclaration::FontStretch(stretch) => {
++                descriptor.stretch = match stretch {
++                    SpecifiedFontStretch::Keyword(keyword) => keyword.compute(),
++                    SpecifiedFontStretch::Stretch(percentage) => FontStretch::from_percentage(
++                        percentage.compute().ok_or(Error::Syntax(None))?.0,
++                    ),
++                    SpecifiedFontStretch::System(system) => match *system {},
++                }
++            },
++            _ => {},
++        }
++    }
++    Ok((families, descriptor))
++}
++
++/// Resolve `promise` with the result of waiting for all of `status_promises`, in order.
++fn resolve_with_all_status_promises(
++    cx: &mut CurrentRealm,
++    global: &GlobalScope,
++    promise: &Promise,
++    status_promises: Vec<Rc<Promise>>,
++) {
++    let all = wait_for_all_promise(cx, global, status_promises);
++    rooted!(&in(cx) let all_value = ObjectValue(all.promise_obj().get()));
++    promise.resolve(cx, all_value.handle());
++}
++
+ /// <https://drafts.csswg.org/css-font-loading/#FontFaceSet-interface>
+ #[dom_struct]
+ pub(crate) struct FontFaceSet {
+@@ -103,6 +229,107 @@ impl FontFaceSet {
+         !self.promise.borrow().is_fulfilled()
+     }
+ 
++    /// Load the faces in this set that font matching selected during the last layout. Browsers
++    /// load a `FontFace` in the document's font source on demand, when matching first needs it.
++    pub(crate) fn load_faces_requested_by_font_matching(&self, cx: &mut JSContext) {
++        let global = self.global();
++        let font_context = global.as_window().font_context();
++        if !font_context.has_unloaded_script_face_load_requests() {
++            return;
++        }
++        let requested: Vec<DomRoot<FontFace>> = self
++            .set_entries
++            .borrow()
++            .iter()
++            .filter(|face| face.take_font_matching_load_request(font_context))
++            .map(|face| face.as_rooted())
++            .collect();
++        for face in requested {
++            face.Load(cx);
++        }
++    }
++
++    /// <https://drafts.csswg.org/css-font-loading/#find-the-matching-font-faces>
++    fn find_matching_font_faces(&self, font: &str, text: &str) -> Fallible<MatchingFontFaces> {
++        // Step 1. Parse font using the CSS value syntax of the font property. If a syntax error
++        // occurs, return a syntax error. If the parsed value is a CSS-wide keyword, return a
++        // syntax error. Absolutize all relative lengths against the initial values of the
++        // corresponding properties.
++        // Step 3. Let font family list be the list of font families parsed from font, and font
++        // style be the other font style attributes parsed from font.
++        let global = self.global();
++        let (families, font_style) = parse_font_for_matching(global.as_window(), font)?;
++
++        // Step 2. If text was not explicitly provided, let it be a string containing a single
++        // space character (U+0020 SPACE).
++        // Note: the IDL default value of `text` provides this.
++
++        // Step 4. Let available font faces be the available font faces within source.
++        // Note: faces whose descriptors failed to parse have no family and never match.
++        let available_faces: Vec<_> = self
++            .set_entries
++            .borrow()
++            .iter()
++            .filter_map(|face| {
++                let css_descriptors = face.css_font_face_descriptors()?;
++                let mut descriptor = FontTemplateDescriptor::default();
++                descriptor.override_values_with_css_font_template_descriptors(&css_descriptors);
++                Some((face.as_rooted(), css_descriptors.family_name, descriptor))
++            })
++            .collect();
++
++        // Step 5. Let matched font faces initially be an empty list.
++        let mut matched: Vec<(DomRoot<FontFace>, FontTemplateDescriptor)> = Vec::new();
++        let mut family_names = Vec::new();
++
++        // Step 6. For each family in font family list, use the font matching rules to select the
++        // font faces from available font faces that match the font style, and add them to
++        // matched font faces. The use of the unicode-range descriptor means that this may be more
++        // than just a single font face.
++        for family in families {
++            // Generic families only ever match system fonts.
++            let SingleFontFamily::FamilyName(family) = family else {
++                continue;
++            };
++            let family_name: LowercaseFontFamilyName = family.name.clone().into();
++            let family_faces = || {
++                available_faces
++                    .iter()
++                    .filter(|(_, face_family_name, _)| *face_family_name == family_name)
++            };
++            let best_distance = family_faces()
++                .map(|(_, _, descriptor)| descriptor.distance_from(&font_style))
++                .fold(f32::MAX, f32::min);
++            matched.extend(
++                family_faces()
++                    .filter(|(_, _, descriptor)| {
++                        descriptor.distance_from(&font_style) == best_distance
++                    })
++                    .map(|(face, _, descriptor)| (face.clone(), descriptor.clone())),
++            );
++            family_names.push(family_name);
++        }
++
++        // Step 7. If matched font faces is empty, set the found faces flag to false. Otherwise,
++        // set it to true.
++        // Note: no caller uses the found faces flag.
++
++        // Step 8. For each font face in matched font faces, if its defined unicode-range does not
++        // include the codepoint of at least one character in text, remove it from the list.
++        // Step 9. Return matched font faces and the found faces flag.
++        Ok(MatchingFontFaces {
++            font_faces: matched
++                .into_iter()
++                .filter(|(_, descriptor)| {
++                    text.chars()
++                        .any(|character| descriptor.char_in_unicode_range(character))
++                })
++                .map(|(face, _)| face)
++                .collect(),
++            family_names,
++        })
++    }
++
+     fn contains_face(&self, target: &FontFace) -> bool {
+         self.set_entries
+             .borrow()
+@@ -159,6 +386,9 @@ impl FontFaceSetMethods<crate::DomTypeHolder> for FontFaceSet {
+         // Step 3. Add the font argument to the FontFaceSet’s set entries.
+         self.set_entries.borrow_mut().push(Dom::from_ref(font_face));
+         font_face.set_associated_font_face_set(self);
++        if let Some(window) = DomRoot::downcast::<Window>(self.global()) {
++            font_face.add_to_font_matching(&window);
++        }
+ 
+         // Step 4. If font’s status attribute is "loading":
+         // Step 4.1 If the FontFaceSet’s [[LoadingFonts]] list is empty, switch the FontFaceSet to loading.
+@@ -178,21 +408,27 @@ impl FontFaceSetMethods<crate::DomTypeHolder> for FontFaceSet {
+         // TODO: Step 4. If font is present in the FontFaceSet’s [[LoadingFonts]] list, remove it. If font was the last
+         // item in that list (and so the list is now empty), switch the FontFaceSet to loaded.
+         // Step 5. Return deleted.
+-        self.delete_face(to_delete)
++        let deleted = self.delete_face(to_delete);
++        if deleted {
++            to_delete.remove_from_font_matching();
++        }
++        deleted
+     }
+ 
+     /// <https://drafts.csswg.org/css-font-loading/#dom-fontfaceset-clear>
+     fn Clear(&self) {
+         // Step 1. Remove all non-CSS-connected items from the FontFaceSet’s set entries,
+         // its [[LoadedFonts]] list, and its [[FailedFonts]] list.
+-        self.set_entries.borrow_mut().clear();
++        for face in self.set_entries.borrow_mut().drain(..) {
++            face.remove_from_font_matching();
++        }
+ 
+         // TODO Step 2. If the FontFaceSet’s [[LoadingFonts]] list is non-empty, remove all items from it,
+         // then switch the FontFaceSet to loaded.
+     }
+ 
+     /// <https://drafts.csswg.org/css-font-loading/#dom-fontfaceset-load>
+-    fn Load(&self, cx: &mut JSContext, _font: DOMString, _text: DOMString) -> Rc<Promise> {
++    fn Load(&self, cx: &mut JSContext, font: DOMString, text: DOMString) -> Rc<Promise> {
+         // Step 1. Let font face set be the FontFaceSet object this method was called on. Let
+         // promise be a newly-created promise object.
+         let load_promise = Promise::new(cx, &self.global());
+@@ -201,18 +437,39 @@ impl FontFaceSetMethods<crate::DomTypeHolder> for FontFaceSet {
+         // arguments passed to the function, and let font face list be the return value (ignoring
+         // the found faces flag). If a syntax error was returned, reject promise with a SyntaxError
+         // exception and terminate these steps.
+-        //
+-        // TODO: Implement this.
++        let matching = match self.find_matching_font_faces(&font.str(), &text.str()) {
++            Ok(matching) => matching,
++            Err(error) => {
++                load_promise.reject_error(cx, error);
++                return load_promise;
++            },
++        };
++        let font_faces: Vec<Trusted<FontFace>> = matching
++            .font_faces
++            .iter()
++            .map(|face| Trusted::new(&**face))
++            .collect();
++        let family_names = matching.family_names;
+ 
++        // `@font-face` rules have no FontFace objects here, so their loads cannot be waited on
++        // individually. They are all fetched as soon as their stylesheet is added, so wait for
++        // the set to finish loading instead.
+         #[derive(MallocSizeOf, JSTraceable)]
+-        struct LoadPromiseFulfillmentHandler {
++        struct StylesheetFontsLoadedHandler {
+             #[conditional_malloc_size_of]
+             load_promise: Rc<Promise>,
++            #[conditional_malloc_size_of]
++            status_promises: Vec<Rc<Promise>>,
+         }
+-        impl Callback for LoadPromiseFulfillmentHandler {
++        impl Callback for StylesheetFontsLoadedHandler {
+             fn callback(&self, cx: &mut CurrentRealm, _: Handle<Value>) {
+-                self.load_promise
+-                    .resolve_native(cx, &Vec::<&FontFace>::new());
++                let global = self.load_promise.global();
++                resolve_with_all_status_promises(
++                    cx,
++                    &global,
++                    &self.load_promise,
++                    self.status_promises.clone(),
++                );
+             }
+         }
+ 
+@@ -225,36 +482,70 @@ impl FontFaceSetMethods<crate::DomTypeHolder> for FontFaceSet {
+             .queue(task!(resolve_font_face_set_load_task: move |cx| {
+                 let ready_promise = trusted_ready_promise.root();
+                 let load_promise = trusted_load_promise.root();
++                let global = load_promise.global();
+ 
+                 // Step 4.1. For all of the font faces in the font face list, call their load()
+                 // method.
++                let status_promises: Vec<Rc<Promise>> = font_faces
++                    .iter()
++                    .map(|face| face.root().Load(cx))
++                    .collect();
++
+                 // Step 4.2. Resolve promise with the result of waiting for all of the
+                 // [[FontStatusPromise]]s of each font face in the font face list, in order.
+-                //
+-                // TODO: These steps are not implemented. Instead we wait until all fonts
+-                // are loaded by resolving the returned promise when
+-                // `document.fonts.ready` is resolved. The return list of fonts will not
+-                // be correct, but any code that waits on the promise will have
+-                // conservatively consistent behavior. This is important for preventing
+-                // intermittent results in WPT tests.
+-                let global = ready_promise.global();
+-                let handler = PromiseNativeHandler::new(
+-                    cx,
+-                    &global,
+-                    Some(Box::new(LoadPromiseFulfillmentHandler {
+-                        load_promise,
+-                    })),
+-                    None,
+-                );
+-
++                let font_context = global.as_window().font_context();
++                let stylesheet_fonts_loading = family_names
++                    .iter()
++                    .any(|family_name| font_context.is_loading_stylesheet_web_font(family_name));
+                 let mut realm = enter_auto_realm(cx, &*global);
+-                ready_promise.append_native_handler(&mut realm.current_realm(), &handler);
++                let cx = &mut realm.current_realm();
++                if stylesheet_fonts_loading {
++                    let handler = PromiseNativeHandler::new(
++                        cx,
++                        &global,
++                        Some(Box::new(StylesheetFontsLoadedHandler {
++                            load_promise,
++                            status_promises,
++                        })),
++                        None,
++                    );
++                    ready_promise.append_native_handler(cx, &handler);
++                } else {
++                    resolve_with_all_status_promises(cx, &global, &load_promise, status_promises);
++                }
+             }));
+ 
+         // Step 2. Return promise. Complete the rest of these steps asynchronously.
+         load_promise
+     }
+ 
++    /// <https://drafts.csswg.org/css-font-loading/#dom-fontfaceset-check>
++    fn Check(&self, font: DOMString, text: DOMString) -> Fallible<bool> {
++        // Step 1. Let font face set be the FontFaceSet object this method was called on.
++        // Step 2. Find the matching font faces from font face set using the font and text
++        // arguments passed to the function, and including system fonts, and let font face list
++        // be the returned list of font faces, and found faces be the returned found faces flag.
++        // If a syntax error was returned, throw a SyntaxError exception and terminate these
++        // steps.
++        let matching = self.find_matching_font_faces(&font.str(), &text.str())?;
++
++        // Step 3. If font face list is empty, or all fonts in the font face list either have a
++        // status attribute of "loaded" or are system fonts, return true. Otherwise, return false.
++        //
++        // `@font-face` rules have no FontFace objects here; one of the families still being
++        // fetched stands in for an unloaded face from such a rule.
++        let global = self.global();
++        let font_context = global.as_window().font_context();
++        Ok(matching
++            .font_faces
++            .iter()
++            .all(|face| face.Status() == FontFaceLoadStatus::Loaded) &&
++            !matching
++                .family_names
++                .iter()
++                .any(|family_name| font_context.is_loading_stylesheet_web_font(family_name)))
++    }
++
+     /// <https://html.spec.whatwg.org/multipage/#customstateset>
+     fn Size(&self) -> u32 {
+         self.set_entries.borrow().len() as u32
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index f3f8311b851..fcb2119c056 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -4575,6 +4575,13 @@ impl Document {
+         );
+     }
+ 
++    /// Start loading the `FontFace`s that layout's font matching selected.
++    pub(crate) fn load_font_faces_requested_by_font_matching(&self, cx: &mut JSContext) {
++        if let Some(font_face_set) = self.fonts.get() {
++            font_face_set.load_faces_requested_by_font_matching(cx);
++        }
++    }
++
+     fn switch_font_face_set_to_loading_if_needed(&self, cx: &mut JSContext) {
+         if self.window.font_context().web_fonts_still_loading() != 0 &&
+             let Some(font_face_set) = self.fonts.get()
+diff --git a/components/script/dom/window/window.rs b/components/script/dom/window/window.rs
+index 0f45d0fcc85..754c7834826 100644
+--- a/components/script/dom/window/window.rs
++++ b/components/script/dom/window/window.rs
+@@ -2694,7 +2694,9 @@ impl Window {
+             rooted_nodes_for_accessibility_integrity_check,
+         };
+ 
+-        let Some(reflow_result) = self.layout.borrow_mut().reflow(reflow) else {
++        let reflow_result = self.layout.borrow_mut().reflow(reflow);
++        document.load_font_faces_requested_by_font_matching(cx);
++        let Some(reflow_result) = reflow_result else {
+             return Default::default();
+         };
+ 
+diff --git a/components/script_bindings/codegen/Bindings.conf b/components/script_bindings/codegen/Bindings.conf
+index 369e467b386..e4cb3a618c4 100644
+--- a/components/script_bindings/codegen/Bindings.conf
++++ b/components/script_bindings/codegen/Bindings.conf
+@@ -503,7 +503,7 @@ DOMInterfaces = {
+ },
+ 
+ 'FontFace': {
+-    'cx': ['Load'],
++    'cx': ['Load', 'Loaded'],
+ },
+ 
+ 'FontFaceSet': {
+diff --git a/components/script_bindings/webidls/FontFaceSet.webidl b/components/script_bindings/webidls/FontFaceSet.webidl
+index ce7c75e9947..9a53dc7ad35 100644
+--- a/components/script_bindings/webidls/FontFaceSet.webidl
++++ b/components/script_bindings/webidls/FontFaceSet.webidl
+@@ -44,7 +44,8 @@ interface FontFaceSet : EventTarget {
+ 
+   // return whether all fonts in the fontlist are loaded
+   // (does not initiate load if not available)
+-  // boolean check(DOMString font, optional DOMString text = " ");
++  [Pref="dom_fontface_enabled", Throws]
++  boolean check(DOMString font, optional DOMString text = " ");
+ 
+   // async notification that font loading and layout operations are done
+   readonly attribute Promise<FontFaceSet> ready;
+diff --git a/components/shared/fonts/font_template.rs b/components/shared/fonts/font_template.rs
+index 766625a7f55..a247ccb4a5e 100644
+--- a/components/shared/fonts/font_template.rs
++++ b/components/shared/fonts/font_template.rs
+@@ -87,7 +87,7 @@ impl FontTemplateDescriptor {
+     /// The smaller the score, the better the fonts match. 0 indicates an exact match. This must
+     /// be commutative (distance(A, B) == distance(B, A)).
+     #[inline]
+-    fn distance_from(&self, target: &FontDescriptor) -> f32 {
++    pub fn distance_from(&self, target: &FontDescriptor) -> f32 {
+         let stretch_distance = target.stretch.match_distance(&self.stretch);
+         let style_distance = target.style.match_distance(&self.style);
+         let weight_distance = target.weight.match_distance(&self.weight);
+@@ -115,6 +115,15 @@ impl FontTemplateDescriptor {
+             weight_distance * WEIGHT_FACTOR
+     }
+ 
++    /// Whether or not this character is in the `unicode-range` of the `@font-face` definition
++    /// this descriptor came from, if any.
++    pub fn char_in_unicode_range(&self, character: char) -> bool {
++        let character = character as u32;
++        self.unicode_range
++            .as_ref()
++            .is_none_or(|ranges| ranges.iter().any(|range| range.contains(&character)))
++    }
++
+     fn matches(&self, descriptor_to_match: &FontDescriptor) -> bool {
+         self.weight.0 <= descriptor_to_match.weight &&
+             self.weight.1 >= descriptor_to_match.weight &&
+@@ -318,12 +327,7 @@ impl FontTemplateRefMethods for FontTemplateRef {
+     }
+ 
+     fn char_in_unicode_range(&self, character: char) -> bool {
+-        let character = character as u32;
+-        self.borrow()
+-            .descriptor
+-            .unicode_range
+-            .as_ref()
+-            .is_none_or(|ranges| ranges.iter().any(|range| range.contains(&character)))
++        self.borrow().descriptor.char_in_unicode_range(character)
+     }
+ 
+     fn font_face_rule(&self) -> Option<AtomicRef<'_, FontFaceRuleDescriptors>> {
+-- 
+2.43.0
+

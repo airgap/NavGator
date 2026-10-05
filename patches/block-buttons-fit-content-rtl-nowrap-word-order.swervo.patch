@@ -1,0 +1,134 @@
+From 9be99fa1471114a030ca0299ab7eaa282b33a5df Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 02:53:56 -0400
+Subject: [PATCH] layout: block buttons fit content, RTL nowrap word order,
+ flex border-box floor, fixed control font
+
+- A block-level <button> takes the fit-content automatic inline size like
+  a widget instead of stretching (Photopea's centered button spanned the
+  page).
+- Right-to-left text slices stay separate line items: bidi reordering moves
+  whole items and one item's slices are painted in logical order, which
+  reversed Hebrew and Arabic words in nowrap runs and inputs.
+- A flex item's minimum main size is floored at zero, so a border-box
+  preferred size smaller than the padding no longer collapses the item
+  (Walmart's hero).
+- Form controls use Chrome's fixed 13.333px instead of scaling with the
+  page's font size.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/flexbox/layout.rs           | 19 +++++++++++++------
+ components/layout/flow/inline/line.rs         |  4 ++++
+ components/layout/flow/mod.rs                 |  8 +++++++-
+ .../layout/fragment_tree/base_fragment.rs     |  5 +++++
+ components/layout/stylesheets/servo.css       |  4 +++-
+ 5 files changed, 32 insertions(+), 8 deletions(-)
+
+diff --git a/components/layout/flexbox/layout.rs b/components/layout/flexbox/layout.rs
+index f8346339f74..77092eb163e 100644
+--- a/components/layout/flexbox/layout.rs
++++ b/components/layout/flexbox/layout.rs
+@@ -2291,12 +2291,19 @@ impl FlexItemBox {
+             }
+             .clamp_below_max(content_max_main_size)
+         };
+-        let content_min_main_size = content_main_sizes.min.resolve_for_min(
+-            get_automatic_minimum_size,
+-            stretch_size.main,
+-            &main_content_sizes,
+-            is_table,
+-        );
++        // Floored at zero: a `box-sizing: border-box` preferred size smaller than the padding
++        // (`height: 0; padding-bottom: 56%`, the aspect-ratio trick) is a negative content size,
++        // which reached the automatic minimum as the specified size suggestion and collapsed
++        // the item's border box to nothing (Walmart's hero carousel).
++        let content_min_main_size = content_main_sizes
++            .min
++            .resolve_for_min(
++                get_automatic_minimum_size,
++                stretch_size.main,
++                &main_content_sizes,
++                is_table,
++            )
++            .max(Au::zero());
+ 
+         FlexItem {
+             box_: self,
+diff --git a/components/layout/flow/inline/line.rs b/components/layout/flow/inline/line.rs
+index 2044d10af1e..f8f7687e9c0 100644
+--- a/components/layout/flow/inline/line.rs
++++ b/components/layout/flow/inline/line.rs
+@@ -954,8 +954,12 @@ impl TextRunLineItem {
+         new_offsets: &Option<TextRunOffsets>,
+         new_inline_styles: &SharedInlineStyles,
+     ) -> bool {
++        // Right-to-left slices stay separate items: bidi reordering moves whole line items, and
++        // the slices of one item are painted left to right in logical order, which reversed the
++        // words of Hebrew and Arabic text in `nowrap` runs and text inputs.
+         if !Arc::ptr_eq(&self.info.font, &new_info.font) ||
+             self.info.bidi_level != new_info.bidi_level ||
++            self.info.bidi_level.is_rtl() ||
+             !self.inline_styles.ptr_eq(new_inline_styles)
+         {
+             return false;
+diff --git a/components/layout/flow/mod.rs b/components/layout/flow/mod.rs
+index b84cce7d7f7..7cc686a405e 100644
+--- a/components/layout/flow/mod.rs
++++ b/components/layout/flow/mod.rs
+@@ -1769,7 +1769,13 @@ fn automatic_inline_size<T>(
+                 .base
+                 .base_fragment_info
+                 .flags
+-                .intersects(FragmentFlags::IS_REPLACED | FragmentFlags::IS_WIDGET) ||
++                // A block-level `<button>` shrinks to fit like a widget
++                // (<https://html.spec.whatwg.org/multipage/#button-layout>).
++                .intersects(
++                    FragmentFlags::IS_REPLACED |
++                        FragmentFlags::IS_WIDGET |
++                        FragmentFlags::IS_BUTTON_ELEMENT,
++                ) ||
+                 context.is_table()
+         })
+     };
+diff --git a/components/layout/fragment_tree/base_fragment.rs b/components/layout/fragment_tree/base_fragment.rs
+index 26c133886bf..dfcb1c9b2a9 100644
+--- a/components/layout/fragment_tree/base_fragment.rs
++++ b/components/layout/fragment_tree/base_fragment.rs
+@@ -214,6 +214,9 @@ impl From<ServoLayoutNode<'_>> for BaseFragmentInfo {
+                 &local_name!("input") => {
+                     flags.insert(FragmentFlags::IS_INPUT_ELEMENT);
+                 },
++                &local_name!("button") => {
++                    flags.insert(FragmentFlags::IS_BUTTON_ELEMENT);
++                },
+                 _ => {},
+             }
+         };
+@@ -267,6 +270,8 @@ bitflags! {
+         const IS_COLLAPSED = 1 << 11;
+         /// Whether or not the node that created this Fragment is a `<input>` element.
+         const IS_INPUT_ELEMENT = 1 << 12;
++        /// Whether or not the node that created this Fragment is a `<button>` element.
++        const IS_BUTTON_ELEMENT = 1 << 13;
+ 
+     }
+ }
+diff --git a/components/layout/stylesheets/servo.css b/components/layout/stylesheets/servo.css
+index 8e98c34801a..3fa740baf7a 100644
+--- a/components/layout/stylesheets/servo.css
++++ b/components/layout/stylesheets/servo.css
+@@ -37,7 +37,9 @@ input,
+ select,
+ textarea {
+   font-family: sans-serif;
+-  font-size: 0.8333em;
++  /* Chrome's small-control size, fixed rather than relative: controls don't scale with the
++     page's font size there. */
++  font-size: 13.333px;
+   appearance: auto;
+   letter-spacing: initial;
+   line-height: initial;
+-- 
+2.43.0
+

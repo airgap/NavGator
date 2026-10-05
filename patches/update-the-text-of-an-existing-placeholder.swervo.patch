@@ -1,0 +1,33 @@
+From 0caa90b06f79bbd5160a368e4fd5b6041869bb28 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 06:15:00 -0400
+Subject: [PATCH] script: update the text of an existing placeholder
+
+init_placeholder_container_if_necessary returned
+`placeholder_container.root_element()` for an existing container, which
+resolves to Element::root_element (the topmost element of the UA shadow tree)
+rather than rooting the Dom. Its first child is not a text node, so changing
+an existing placeholder never reached the placeholder text and the old text
+stayed on screen. Root the stored container instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/html/input_element/text_input_widget.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/components/script/dom/html/input_element/text_input_widget.rs b/components/script/dom/html/input_element/text_input_widget.rs
+index 2cd0a686f1c..a0939d3d9ae 100644
+--- a/components/script/dom/html/input_element/text_input_widget.rs
++++ b/components/script/dom/html/input_element/text_input_widget.rs
+@@ -148,7 +148,7 @@ impl TextInputWidgetShadowTree {
+         element: &impl TextControlElement,
+     ) -> Option<DomRoot<Element>> {
+         if let Some(placeholder_container) = &*self.placeholder_container.borrow() {
+-            return Some(placeholder_container.root_element());
++            return Some(placeholder_container.as_rooted());
+         }
+         // If there is no placeholder text and we haven't already created one then it is
+         // not necessary to initialize a new placeholder container.
+-- 
+2.43.0
+

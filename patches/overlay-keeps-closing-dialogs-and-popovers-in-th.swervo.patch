@@ -1,0 +1,91 @@
+From 4cef70cc7019f89b4770d51cf5b1455a0a2ce0b7 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 05:10:15 -0400
+Subject: [PATCH] layout: overlay keeps closing dialogs and popovers in the top
+ layer
+
+Pages animate popovers and dialogs out with transitions on overlay and
+display with transition-behavior: allow-discrete, and Chrome keeps the
+element rendered and in the top layer until those transitions end. The
+user agent stylesheet now puts top layer elements there with
+overlay: auto !important (and pins it to none everywhere else, so pages
+can transition overlay but not set it), and layout treats overlay: auto
+as being in the top layer. A change of overlay rebuilds the box, like
+-servo-top-layer. Needs the stylo change that adds overlay and the
+display/overlay transition behaviour.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/style_ext.rs                         | 10 +++++++---
+ components/layout/stylesheets/user-agent.css           | 10 +++++++---
+ .../script/layout_dom/servo_dangerous_style_element.rs |  3 ++-
+ 3 files changed, 16 insertions(+), 7 deletions(-)
+
+diff --git a/components/layout/style_ext.rs b/components/layout/style_ext.rs
+index 82fbc2c92ff..cb3f4da7991 100644
+--- a/components/layout/style_ext.rs
++++ b/components/layout/style_ext.rs
+@@ -9,6 +9,7 @@ use style::Zero;
+ use style::color::AbsoluteColor;
+ use style::computed_values::_servo_top_layer::T as ServoTopLayer;
+ use style::computed_value_flags::ComputedValueFlags;
++use style::computed_values::overlay::T as Overlay;
+ use style::computed_values::direction::T as Direction;
+ use style::computed_values::isolation::T as ComputedIsolation;
+ use style::computed_values::mix_blend_mode::T as ComputedMixBlendMode;
+@@ -867,10 +868,13 @@ impl ComputedValuesExt for ComputedValues {
+             .establishes_scroll_container()
+     }
+ 
+-    /// Whether the element is in the top layer, which the user agent stylesheet marks with the
+-    /// internal `-servo-top-layer` property.
++    /// Whether the element is in the top layer, which the user agent stylesheet marks with
++    /// `overlay: auto` (or the internal `-servo-top-layer` property for the fullscreen element).
++    /// A transition of `overlay` keeps an element in the top layer while it animates out.
++    /// <https://drafts.csswg.org/css-position-4/#overlay>
+     fn in_top_layer(&self) -> bool {
+-        self.get_box().clone__servo_top_layer() == ServoTopLayer::Top
++        self.get_box().clone__servo_top_layer() == ServoTopLayer::Top ||
++            self.get_box().clone_overlay() == Overlay::Auto
+     }
+ 
+     /// Returns true if this fragment establishes a new stacking context and false otherwise.
+diff --git a/components/layout/stylesheets/user-agent.css b/components/layout/stylesheets/user-agent.css
+index f5a9db971e6..e4fdc3a42cf 100644
+--- a/components/layout/stylesheets/user-agent.css
++++ b/components/layout/stylesheets/user-agent.css
+@@ -98,10 +98,14 @@ dialog::backdrop {
+   background: rgba(0,0,0,0.1);
+ }
+ 
+-/* The internal-only -servo-top-layer property puts elements in
+-   https://drafts.csswg.org/css-position-4/#top-layer, together with their ::backdrop. */
++/* https://drafts.csswg.org/css-position-4/#overlay puts elements in the top layer, together
++   with their ::backdrop. Pages can only transition it, which keeps an element in the top layer
++   while it animates out. */
++*, ::before, ::after, ::marker {
++  overlay: none !important;
++}
+ dialog:modal, :popover-open {
+-  -servo-top-layer: top;
++  overlay: auto !important;
+ }
+ /* https://drafts.csswg.org/css-position-4/#backdrop */
+ ::backdrop {
+diff --git a/components/script/layout_dom/servo_dangerous_style_element.rs b/components/script/layout_dom/servo_dangerous_style_element.rs
+index c3f996bbf62..a7b30409cad 100644
+--- a/components/script/layout_dom/servo_dangerous_style_element.rs
++++ b/components/script/layout_dom/servo_dangerous_style_element.rs
+@@ -539,7 +539,8 @@ impl<'dom> style::dom::TElement for ServoDangerousStyleElement<'dom> {
+             if old_box.display != new_box.display ||
+                 old_box.float != new_box.float ||
+                 old_box.position != new_box.position ||
+-                old_box._servo_top_layer != new_box._servo_top_layer
++                old_box._servo_top_layer != new_box._servo_top_layer ||
++                old_box.overlay != new_box.overlay
+             {
+                 return true;
+             }
+-- 
+2.43.0
+

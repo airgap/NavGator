@@ -1,0 +1,74 @@
+From d8ba8138cb08596eda901352840c62593527e890 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 05:41:40 -0400
+Subject: [PATCH] net: keep a rasterized SVG image while another <svg> still
+ paints it
+
+Inline <svg> elements are painted from a data: URL serialization, so
+identical icons in identical colours (every like button in a feed)
+share one image id in the image cache. When one of them re-serialized
+because its paint properties changed (an MSN card switching to its dark
+theme after first paint), evicting its old raster removed the shared
+vector image and its rasterizations, and every other <svg> mapped to
+that id painted nothing from then on: the like/comment icons vanished
+from cards. Remapping an svg to a new image id at rasterization time had
+the same effect.
+
+Both paths now drop the vector image only when no other svg id maps to
+it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/net/image_cache.rs | 21 +++++++++++++++++----
+ 1 file changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/components/net/image_cache.rs b/components/net/image_cache.rs
+index 7c7eb36135f..4860a640eb8 100644
+--- a/components/net/image_cache.rs
++++ b/components/net/image_cache.rs
+@@ -1050,10 +1050,13 @@ impl ImageCache for ImageCacheImpl {
+             return Some(result.clone());
+         }
+ 
++        let mut svg_id_image_id_map = self.svg_id_image_id_map.lock();
+         if let Some(svg_id) = svg_id &&
+-            let Some(old_mapped_image_id) =
+-                self.svg_id_image_id_map.lock().insert(svg_id, image_id) &&
+-            old_mapped_image_id != image_id
++            let Some(old_mapped_image_id) = svg_id_image_id_map.insert(svg_id, image_id) &&
++            old_mapped_image_id != image_id &&
++            !svg_id_image_id_map
++                .values()
++                .any(|mapped_image_id| *mapped_image_id == old_mapped_image_id)
+         {
+             store.vector_images.remove(&old_mapped_image_id);
+             store
+@@ -1063,6 +1066,7 @@ impl ImageCache for ImageCacheImpl {
+                 .svg_rasterization_task_store
+                 .remove_all_for_id(old_mapped_image_id);
+         }
++        drop(svg_id_image_id_map);
+ 
+         if store
+             .svg_rasterization_task_store
+@@ -1200,7 +1204,16 @@ impl ImageCache for ImageCacheImpl {
+ 
+     fn evict_rasterized_image(&self, svg_id: &str) {
+         let mut store = self.store.lock();
+-        if let Some(mapped_image_id) = self.svg_id_image_id_map.lock().remove(svg_id) {
++        let mut svg_id_image_id_map = self.svg_id_image_id_map.lock();
++        if let Some(mapped_image_id) = svg_id_image_id_map.remove(svg_id) {
++            // `<svg>` elements whose serializations are identical (the same icon in the same
++            // colours) share one image; it stays while another of them still paints it.
++            if svg_id_image_id_map
++                .values()
++                .any(|other_image_id| *other_image_id == mapped_image_id)
++            {
++                return;
++            }
+             store.pending_loads.remove(&mapped_image_id);
+             store.vector_images.remove(&mapped_image_id);
+             let images_to_remove = store
+-- 
+2.43.0
+

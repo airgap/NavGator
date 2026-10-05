@@ -1,0 +1,352 @@
+From 4d9a7e771e2b9ff9b637c4ba94ed74bfd0d35721 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 16:30:41 -0400
+Subject: [PATCH] grid: keep one sparse auto-placement cursor per row in step 2
+
+Step 2 of the placement algorithm places an item with a definite row "past
+any grid items previously placed in this row by this step". The lookup
+used the last auto-placed cell in the row, which also counts cells covered
+by an item placed in an earlier row that spans into this one. With
+`grid-area: 1 / span 2` followed by `1 / span 2 / span 2` and `2 / span 2`
+in four columns, the third item skipped past the second item's cells in
+row 2 and was pushed into new implicit columns, where Chrome puts it under
+the first item. Track a cursor per row start line instead, as Blink does.
+The cell-occupancy lookups this replaces have no other users.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/compute/grid/placement.rs                 | 43 ++++++------
+ src/compute/grid/types/cell_occupancy.rs      | 68 -------------------
+ ...nt_definite_row_sparse_cursor_per_row.html | 19 ++++++
+ ..._sparse_cursor_per_row__border_box_ltr.xml | 17 +++++
+ ..._sparse_cursor_per_row__border_box_rtl.xml | 17 +++++
+ ...sparse_cursor_per_row__content_box_ltr.xml | 17 +++++
+ ...sparse_cursor_per_row__content_box_rtl.xml | 17 +++++
+ tests/xml/mod.rs                              | 24 +++++++
+ 8 files changed, 132 insertions(+), 90 deletions(-)
+ create mode 100644 test_fixtures/grid/grid_placement_definite_row_sparse_cursor_per_row.html
+ create mode 100644 tests/xml/grid/grid_placement_definite_row_sparse_cursor_per_row__border_box_ltr.xml
+ create mode 100644 tests/xml/grid/grid_placement_definite_row_sparse_cursor_per_row__border_box_rtl.xml
+ create mode 100644 tests/xml/grid/grid_placement_definite_row_sparse_cursor_per_row__content_box_ltr.xml
+ create mode 100644 tests/xml/grid/grid_placement_definite_row_sparse_cursor_per_row__content_box_rtl.xml
+
+diff --git a/src/compute/grid/placement.rs b/src/compute/grid/placement.rs
+index ff24a036..8c280b08 100644
+--- a/src/compute/grid/placement.rs
++++ b/src/compute/grid/placement.rs
+@@ -139,6 +139,7 @@ pub(super) fn place_grid_items<'a, S, ChildIter>(
+         });
+ 
+     // 2. Place remaining children with definite secondary axis positions
++    let mut sparse_cursors = Vec::new();
+     let mut idx = 0;
+     children_iter()
+         .map(map_child_style_to_origin_zero_placement)
+@@ -156,6 +157,7 @@ pub(super) fn place_grid_items<'a, S, ChildIter>(
+                 grid_auto_flow,
+                 direction,
+                 explicit_col_count,
++                &mut sparse_cursors,
+             );
+ 
+             record_grid_placement(
+@@ -279,12 +281,16 @@ fn place_definite_grid_item(
+ 
+ /// 8.5. Grid Item Placement Algorithm
+ /// Step 2. Place remaining children with definite secondary axis positions
++///
++/// `sparse_cursors` maps a secondary axis start line to the primary axis position just past the last item that this
++/// step placed with that start line.
+ fn place_definite_secondary_axis_item(
+     cell_occupancy_matrix: &CellOccupancyMatrix,
+     placement: InBothAbsAxis<Line<OriginZeroGridPlacement>>,
+     auto_flow: GridAutoFlow,
+     direction: Direction,
+     explicit_col_count: u16,
++    sparse_cursors: &mut Vec<(OriginZeroLine, OriginZeroLine)>,
+ ) -> (Line<OriginZeroLine>, Line<OriginZeroLine>) {
+     let primary_axis = auto_flow.primary_axis();
+     let secondary_axis = primary_axis.other_axis();
+@@ -298,28 +304,15 @@ fn place_definite_secondary_axis_item(
+         direction,
+         explicit_col_count,
+     );
+-    let starting_position = match auto_flow.is_dense() {
+-        true => search_start_line(primary_axis_grid_start_line, primary_axis_grid_end_line, primary_axis_is_reversed),
+-        false => {
+-            let lookup_result = if primary_axis_is_reversed {
+-                cell_occupancy_matrix.first_of_type(
+-                    primary_axis,
+-                    secondary_axis_placement.start,
+-                    CellOccupancyState::AutoPlaced,
+-                )
+-            } else {
+-                cell_occupancy_matrix.last_of_type(
+-                    primary_axis,
+-                    secondary_axis_placement.start,
+-                    CellOccupancyState::AutoPlaced,
+-                )
+-            };
+-            lookup_result.unwrap_or(search_start_line(
+-                primary_axis_grid_start_line,
+-                primary_axis_grid_end_line,
+-                primary_axis_is_reversed,
+-            ))
+-        }
++    // "Sparse" packing starts past any items previously placed in this row (column for column-flow) by this step.
++    // Items placed in an earlier row by this step do not count, even when they span into this row.
++    // https://www.w3.org/TR/css-grid-2/#auto-placement-algo
++    let cursor_index = sparse_cursors.iter().position(|(line, _)| *line == secondary_axis_placement.start);
++    let grid_start_position =
++        search_start_line(primary_axis_grid_start_line, primary_axis_grid_end_line, primary_axis_is_reversed);
++    let starting_position = match (auto_flow.is_dense(), cursor_index) {
++        (false, Some(index)) => sparse_cursors[index].1,
++        _ => grid_start_position,
+     };
+     let primary_axis_span = placement.get(primary_axis).indefinite_span();
+ 
+@@ -335,6 +328,12 @@ fn place_definite_secondary_axis_item(
+         );
+ 
+         if does_fit {
++            let cursor =
++                if primary_axis_is_reversed { primary_axis_placement.start - 1 } else { primary_axis_placement.end };
++            match cursor_index {
++                Some(index) => sparse_cursors[index].1 = cursor,
++                None => sparse_cursors.push((secondary_axis_placement.start, cursor)),
++            }
+             return (primary_axis_placement, secondary_axis_placement);
+         } else {
+             position = advance_position(position, primary_axis_is_reversed);
+diff --git a/src/compute/grid/types/cell_occupancy.rs b/src/compute/grid/types/cell_occupancy.rs
+index b840871b..8c8cab44 100644
+--- a/src/compute/grid/types/cell_occupancy.rs
++++ b/src/compute/grid/types/cell_occupancy.rs
+@@ -230,72 +230,4 @@ impl CellOccupancyMatrix {
+             AbsoluteAxis::Vertical => &self.rows,
+         }
+     }
+-
+-    /// Given an axis and a track index
+-    /// Search backwards from the end of the track and find the last grid cell matching the specified state (if any)
+-    /// Return the index of that cell or None.
+-    pub fn last_of_type(
+-        &self,
+-        track_type: AbsoluteAxis,
+-        start_at: OriginZeroLine,
+-        kind: CellOccupancyState,
+-    ) -> Option<OriginZeroLine> {
+-        let track_counts = self.track_counts(track_type.other_axis());
+-        let track_computed_index = track_counts.oz_line_to_next_track(start_at);
+-
+-        let maybe_index = match track_type {
+-            AbsoluteAxis::Horizontal => {
+-                if track_computed_index < 0 || track_computed_index >= self.inner.rows() as i16 {
+-                    // Index out of bounds: no tracks to search
+-                    None
+-                } else {
+-                    self.inner.iter_row(track_computed_index as usize).rposition(|item| *item == kind)
+-                }
+-            }
+-            AbsoluteAxis::Vertical => {
+-                if track_computed_index < 0 || track_computed_index >= self.inner.cols() as i16 {
+-                    // Index out of bounds: no tracks to search
+-                    None
+-                } else {
+-                    self.inner.iter_col(track_computed_index as usize).rposition(|item| *item == kind)
+-                }
+-            }
+-        };
+-
+-        maybe_index.map(|idx| track_counts.track_to_prev_oz_line(idx as u16))
+-    }
+-
+-    /// Given an axis and a track index
+-    /// Search forwards from the start of the track and find the first grid cell matching the specified state (if any)
+-    /// Return the index of that cell or None.
+-    pub fn first_of_type(
+-        &self,
+-        track_type: AbsoluteAxis,
+-        start_at: OriginZeroLine,
+-        kind: CellOccupancyState,
+-    ) -> Option<OriginZeroLine> {
+-        let track_counts = self.track_counts(track_type.other_axis());
+-        let track_computed_index = track_counts.oz_line_to_next_track(start_at);
+-
+-        let maybe_index = match track_type {
+-            AbsoluteAxis::Horizontal => {
+-                if track_computed_index < 0 || track_computed_index >= self.inner.rows() as i16 {
+-                    // Index out of bounds: no tracks to search
+-                    None
+-                } else {
+-                    self.inner.iter_row(track_computed_index as usize).position(|item| *item == kind)
+-                }
+-            }
+-            AbsoluteAxis::Vertical => {
+-                if track_computed_index < 0 || track_computed_index >= self.inner.cols() as i16 {
+-                    // Index out of bounds: no tracks to search
+-                    None
+-                } else {
+-                    self.inner.iter_col(track_computed_index as usize).position(|item| *item == kind)
+-                }
+-            }
+-        };
+-
+-        maybe_index.map(|idx| track_counts.track_to_prev_oz_line(idx as u16))
+-    }
+ }
+diff --git a/test_fixtures/grid/grid_placement_definite_row_sparse_cursor_per_row.html b/test_fixtures/grid/grid_placement_definite_row_sparse_cursor_per_row.html
+new file mode 100644
+index 00000000..70ee9013
+--- /dev/null
++++ b/test_fixtures/grid/grid_placement_definite_row_sparse_cursor_per_row.html
+@@ -0,0 +1,19 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <script src="../../scripts/gentest/test_helper.js"></script>
++  <link rel="stylesheet" type="text/css" href="../../scripts/gentest/test_base_style.css">
++  <title>
++    Test description
++  </title>
++</head>
++<body>
++
++<div id="test-root" style="display: grid; grid-template-columns: 40px 40px 40px 40px; grid-template-rows: 20px 20px;">
++  <div style="grid-row: 1; grid-column: span 2;"></div>
++  <div style="grid-row: 1 / span 2; grid-column: span 2;"></div>
++  <div style="grid-row: 2; grid-column: span 2;"></div>
++</div>
++
++</body>
++</html>
+diff --git a/tests/xml/grid/grid_placement_definite_row_sparse_cursor_per_row__border_box_ltr.xml b/tests/xml/grid/grid_placement_definite_row_sparse_cursor_per_row__border_box_ltr.xml
+new file mode 100644
+index 00000000..fd18cb13
+--- /dev/null
++++ b/tests/xml/grid/grid_placement_definite_row_sparse_cursor_per_row__border_box_ltr.xml
+@@ -0,0 +1,17 @@
++<test name="grid_placement_definite_row_sparse_cursor_per_row__border_box_ltr" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="grid" direction="ltr" grid-template-rows="20px 20px" grid-template-columns="40px 40px 40px 40px">
++      <div direction="ltr" grid-row-start="1" grid-column-start="span 2"/>
++      <div direction="ltr" grid-row-start="1" grid-row-end="span 2" grid-column-start="span 2"/>
++      <div direction="ltr" grid-row-start="2" grid-column-start="span 2"/>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="160" height="40">
++      <node x="0" y="0" width="80" height="20"/>
++      <node x="80" y="0" width="80" height="40"/>
++      <node x="0" y="20" width="80" height="20"/>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/grid/grid_placement_definite_row_sparse_cursor_per_row__border_box_rtl.xml b/tests/xml/grid/grid_placement_definite_row_sparse_cursor_per_row__border_box_rtl.xml
+new file mode 100644
+index 00000000..7738b6b5
+--- /dev/null
++++ b/tests/xml/grid/grid_placement_definite_row_sparse_cursor_per_row__border_box_rtl.xml
+@@ -0,0 +1,17 @@
++<test name="grid_placement_definite_row_sparse_cursor_per_row__border_box_rtl" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="grid" direction="rtl" grid-template-rows="20px 20px" grid-template-columns="40px 40px 40px 40px">
++      <div direction="rtl" grid-row-start="1" grid-column-start="span 2"/>
++      <div direction="rtl" grid-row-start="1" grid-row-end="span 2" grid-column-start="span 2"/>
++      <div direction="rtl" grid-row-start="2" grid-column-start="span 2"/>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="160" height="40">
++      <node x="80" y="0" width="80" height="20"/>
++      <node x="0" y="0" width="80" height="40"/>
++      <node x="80" y="20" width="80" height="20"/>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/grid/grid_placement_definite_row_sparse_cursor_per_row__content_box_ltr.xml b/tests/xml/grid/grid_placement_definite_row_sparse_cursor_per_row__content_box_ltr.xml
+new file mode 100644
+index 00000000..58cc2b0e
+--- /dev/null
++++ b/tests/xml/grid/grid_placement_definite_row_sparse_cursor_per_row__content_box_ltr.xml
+@@ -0,0 +1,17 @@
++<test name="grid_placement_definite_row_sparse_cursor_per_row__content_box_ltr" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="grid" box-sizing="content-box" direction="ltr" grid-template-rows="20px 20px" grid-template-columns="40px 40px 40px 40px">
++      <div box-sizing="content-box" direction="ltr" grid-row-start="1" grid-column-start="span 2"/>
++      <div box-sizing="content-box" direction="ltr" grid-row-start="1" grid-row-end="span 2" grid-column-start="span 2"/>
++      <div box-sizing="content-box" direction="ltr" grid-row-start="2" grid-column-start="span 2"/>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="160" height="40">
++      <node x="0" y="0" width="80" height="20"/>
++      <node x="80" y="0" width="80" height="40"/>
++      <node x="0" y="20" width="80" height="20"/>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/grid/grid_placement_definite_row_sparse_cursor_per_row__content_box_rtl.xml b/tests/xml/grid/grid_placement_definite_row_sparse_cursor_per_row__content_box_rtl.xml
+new file mode 100644
+index 00000000..a1ca3fa6
+--- /dev/null
++++ b/tests/xml/grid/grid_placement_definite_row_sparse_cursor_per_row__content_box_rtl.xml
+@@ -0,0 +1,17 @@
++<test name="grid_placement_definite_row_sparse_cursor_per_row__content_box_rtl" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="grid" box-sizing="content-box" direction="rtl" grid-template-rows="20px 20px" grid-template-columns="40px 40px 40px 40px">
++      <div box-sizing="content-box" direction="rtl" grid-row-start="1" grid-column-start="span 2"/>
++      <div box-sizing="content-box" direction="rtl" grid-row-start="1" grid-row-end="span 2" grid-column-start="span 2"/>
++      <div box-sizing="content-box" direction="rtl" grid-row-start="2" grid-column-start="span 2"/>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="160" height="40">
++      <node x="80" y="0" width="80" height="20"/>
++      <node x="0" y="0" width="80" height="40"/>
++      <node x="80" y="20" width="80" height="20"/>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/mod.rs b/tests/xml/mod.rs
+index a70f8203..48cfd09c 100644
+--- a/tests/xml/mod.rs
++++ b/tests/xml/mod.rs
+@@ -22029,6 +22029,30 @@ mod grid {
+         crate::run_xml_test("grid", "grid_placement_definite_primary__content_box_rtl");
+     }
+ 
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_placement_definite_row_sparse_cursor_per_row__border_box_ltr() {
++        crate::run_xml_test("grid", "grid_placement_definite_row_sparse_cursor_per_row__border_box_ltr");
++    }
++
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_placement_definite_row_sparse_cursor_per_row__content_box_ltr() {
++        crate::run_xml_test("grid", "grid_placement_definite_row_sparse_cursor_per_row__content_box_ltr");
++    }
++
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_placement_definite_row_sparse_cursor_per_row__border_box_rtl() {
++        crate::run_xml_test("grid", "grid_placement_definite_row_sparse_cursor_per_row__border_box_rtl");
++    }
++
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_placement_definite_row_sparse_cursor_per_row__content_box_rtl() {
++        crate::run_xml_test("grid", "grid_placement_definite_row_sparse_cursor_per_row__content_box_rtl");
++    }
++
+     #[cfg(feature = "grid")]
+     #[test]
+     fn grid_relative_all_sides__border_box_ltr() {
+-- 
+2.43.0
+

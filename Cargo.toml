@@ -22,17 +22,20 @@ lto = "thin"
 # + fill/stroke and the other SVG paint properties for Servo (inline-SVG serialization copies them in);
 # Cargo honours these workspace-root patches across the entire (swervo-transitive) graph.
 [patch."https://github.com/servo/stylo"]
-selectors            = { git = "https://github.com/airgap/stylo", rev = "759cfb769e142c986e921e663f30c20b16adfe0d" }
-servo_arc            = { git = "https://github.com/airgap/stylo", rev = "759cfb769e142c986e921e663f30c20b16adfe0d" }
-stylo                = { git = "https://github.com/airgap/stylo", rev = "759cfb769e142c986e921e663f30c20b16adfe0d" }
-stylo_atoms          = { git = "https://github.com/airgap/stylo", rev = "759cfb769e142c986e921e663f30c20b16adfe0d" }
-stylo_dom            = { git = "https://github.com/airgap/stylo", rev = "759cfb769e142c986e921e663f30c20b16adfe0d" }
-stylo_malloc_size_of = { git = "https://github.com/airgap/stylo", rev = "759cfb769e142c986e921e663f30c20b16adfe0d" }
-stylo_static_prefs   = { git = "https://github.com/airgap/stylo", rev = "759cfb769e142c986e921e663f30c20b16adfe0d" }
-stylo_traits         = { git = "https://github.com/airgap/stylo", rev = "759cfb769e142c986e921e663f30c20b16adfe0d" }
+selectors            = { git = "https://github.com/airgap/stylo", rev = "cd2ec36a70548eaadd465cf8b84eed422024d410" }
+servo_arc            = { git = "https://github.com/airgap/stylo", rev = "cd2ec36a70548eaadd465cf8b84eed422024d410" }
+stylo                = { git = "https://github.com/airgap/stylo", rev = "cd2ec36a70548eaadd465cf8b84eed422024d410" }
+stylo_atoms          = { git = "https://github.com/airgap/stylo", rev = "cd2ec36a70548eaadd465cf8b84eed422024d410" }
+stylo_dom            = { git = "https://github.com/airgap/stylo", rev = "cd2ec36a70548eaadd465cf8b84eed422024d410" }
+stylo_malloc_size_of = { git = "https://github.com/airgap/stylo", rev = "cd2ec36a70548eaadd465cf8b84eed422024d410" }
+stylo_static_prefs   = { git = "https://github.com/airgap/stylo", rev = "cd2ec36a70548eaadd465cf8b84eed422024d410" }
+stylo_traits         = { git = "https://github.com/airgap/stylo", rev = "cd2ec36a70548eaadd465cf8b84eed422024d410" }
 
-# webrender is consumed from crates.io (0.69 / 0.2.2); redirect to our fork's 0.69-branch HEAD.
+# webrender is consumed from crates.io (0.69 / 0.2.2); redirect to our fork's 0.69 branch plus
+# FreeType text stroking for -webkit-text-stroke (airgap/webrender nicole/text-stroke).
 [patch.crates-io]
-webrender         = { git = "https://github.com/airgap/webrender", rev = "dcfd5424deab751280e34a39220a7e1562263294" }
-webrender_api     = { git = "https://github.com/airgap/webrender", rev = "dcfd5424deab751280e34a39220a7e1562263294" }
-wr_malloc_size_of = { git = "https://github.com/airgap/webrender", rev = "dcfd5424deab751280e34a39220a7e1562263294" }
+webrender         = { git = "https://github.com/airgap/webrender", rev = "363698bd1a7d641fdd88814c460cf280e659b383" }
+webrender_api     = { git = "https://github.com/airgap/webrender", rev = "363698bd1a7d641fdd88814c460cf280e659b383" }
+wr_malloc_size_of = { git = "https://github.com/airgap/webrender", rev = "363698bd1a7d641fdd88814c460cf280e659b383" }
+# taffy (CSS Grid) from crates.io 0.11.0, redirected to our fork's fixes (airgap/taffy nicole/servo-fixes).
+taffy             = { git = "https://github.com/airgap/taffy", rev = "67c4fdd3676944b399d326dc51cf2b38d3e8f3ef" }

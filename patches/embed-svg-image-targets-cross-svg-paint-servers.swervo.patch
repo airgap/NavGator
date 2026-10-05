@@ -1,0 +1,526 @@
+From 7b45b7c021916ea451bb7ac57a72cb83548ffe06 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 04:56:38 -0400
+Subject: [PATCH] svg: embed SVG <image> targets, cross-svg paint servers,
+ per-svg raster cache
+
+Inline SVG is rasterized from a standalone serialization, so everything it
+references has to be carried into that document. Three gaps showed up on
+real sites:
+
+An `<image href>` pointing at an SVG document (target.com's logo) painted
+nothing: only raster targets were re-embedded. The image cache now keeps the
+SVG text and the root's preserveAspectRatio (when it has a viewBox) next to
+the parsed tree, and the serializer embeds the document as a data: URL. The
+<image>'s preserveAspectRatio is replaced to reproduce Chrome, which fits the
+nested viewBox with the referenced root's own preserveAspectRatio, stretches
+a document without a viewBox, and only honours the <image>'s value when it is
+`none`. The href is now substituted through the serializer's attribute
+rewrite instead of inserting a sibling <image> into the DOM: inserting into a
+nested element (an <image> inside a <g>) re-invalidated the svg on every
+serialization, so it re-serialized endlessly and never painted. The rewrite
+also drops `xlink:href` when a plain `href` is present: it serializes without
+its prefix, and the duplicate `href` made the whole document ill-formed
+(blank), which is what Target's markup (both attributes) hit.
+
+Paint servers defined in another <svg> were only pulled in when named by a
+`fill`/`stroke` attribute. A fill/stroke set by a stylesheet rule or inline
+style, and gradients/patterns inheriting from another one through `href`,
+rendered missing. The external-reference pass now also follows the computed
+fill/stroke and gradient/pattern href chains.
+
+Identical inline <svg>s (repeated icons) serialized to the same data: URL and
+shared one image-cache entry, while eviction is per svg element: when one of
+them re-serialized (a hover or class change), it evicted the entry and its
+rasterizations from under the others, which then painted nothing until
+something else damaged them. Each serialization now carries the element's
+id in a leading comment, so every svg owns its entry.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/net/image_cache.rs                |  52 +++-
+ components/script/dom/svg/svgimageelement.rs |   6 -
+ components/script/dom/svg/svgsvgelement.rs   | 245 +++++++++++--------
+ components/shared/net/image_cache.rs         |  15 ++
+ 4 files changed, 207 insertions(+), 111 deletions(-)
+
+diff --git a/components/net/image_cache.rs b/components/net/image_cache.rs
+index c897f38d66a..7c7eb36135f 100644
+--- a/components/net/image_cache.rs
++++ b/components/net/image_cache.rs
+@@ -18,7 +18,7 @@ use mime::Mime;
+ use net_traits::image_cache::{
+     Image, ImageCache, ImageCacheFactory, ImageCacheResponseCallback, ImageCacheResponseMessage,
+     ImageCacheResult, ImageLoadListener, ImageOrMetadataAvailable, ImageResponse, PendingImageId,
+-    RasterizationCompleteResponse, VectorImage,
++    RasterizationCompleteResponse, VectorImage, VectorImageSource,
+ };
+ use net_traits::request::CorsSettings;
+ use net_traits::{FetchMetadata, FetchResponseMsg, FilteredMetadata, NetworkError};
+@@ -67,7 +67,7 @@ const MAX_SVG_PIXMAP_DIMENSION: u32 = 5000;
+ fn parse_svg_document_in_memory(
+     bytes: &[u8],
+     fontdb: Arc<fontdb::Database>,
+-) -> Result<usvg::Tree, &'static str> {
++) -> Result<(usvg::Tree, VectorImageSource), &'static str> {
+     let image_string_href_resolver = Box::new(move |_: &str, _: &usvg::Options| {
+         // Do not try to load `href` in <image> as local file path.
+         None
+@@ -82,11 +82,43 @@ fn parse_svg_document_in_memory(
+         ..usvg::Options::default()
+     };
+ 
+-    usvg::Tree::from_data(bytes, &opt)
++    // The steps of `usvg::Tree::from_data`, unrolled to also keep the text and read the root
++    // element's attributes off the parsed document.
++    let decompressed;
++    let data = if bytes.starts_with(&[0x1f, 0x8b]) {
++        decompressed = usvg::decompress_svgz(bytes).map_err(|error| {
++            warn!("Error when decompressing SVG data: {error}");
++            "Not a valid SVG document"
++        })?;
++        &decompressed[..]
++    } else {
++        bytes
++    };
++    let text = std::str::from_utf8(data).map_err(|_| "Not a valid SVG document")?;
++    let xml_opt = usvg::roxmltree::ParsingOptions {
++        allow_dtd: true,
++        ..Default::default()
++    };
++    let document = usvg::roxmltree::Document::parse_with_options(text, xml_opt).map_err(|error| {
++        warn!("Error when parsing SVG data: {error}");
++        "Not a valid SVG document"
++    })?;
++    let root = document.root_element();
++    let source = VectorImageSource {
++        text: Arc::new(text.to_owned()),
++        root_preserve_aspect_ratio: root.has_attribute("viewBox").then(|| {
++            root.attribute("preserveAspectRatio")
++                .unwrap_or("xMidYMid meet")
++                .to_owned()
++        }),
++    };
++
++    let tree = usvg::Tree::from_xmltree(&document, &opt)
+         .inspect_err(|error| {
+             warn!("Error when parsing SVG data: {error}");
+         })
+-        .map_err(|_| "Not a valid SVG document")
++        .map_err(|_| "Not a valid SVG document")?;
++    Ok((tree, source))
+ }
+ 
+ fn decode_bytes_sync(
+@@ -107,9 +139,10 @@ fn decode_bytes_sync(
+     let image = if is_svg_document {
+         parse_svg_document_in_memory(bytes, fontdb)
+             .ok()
+-            .map(|svg_tree| {
++            .map(|(svg_tree, source)| {
+                 DecodedImage::Vector(VectorImageData {
+                     svg_tree: Arc::new(svg_tree),
++                    source,
+                     cors_status: cors,
+                 })
+             })
+@@ -245,6 +278,7 @@ impl CompletedLoad {
+ struct VectorImageData {
+     #[conditional_malloc_size_of]
+     svg_tree: Arc<usvg::Tree>,
++    source: VectorImageSource,
+     cors_status: CorsStatus,
+ }
+ 
+@@ -948,6 +982,14 @@ impl ImageCache for ImageCacheImpl {
+         }
+     }
+ 
++    fn vector_image_source(&self, image_id: PendingImageId) -> Option<VectorImageSource> {
++        self.store
++            .lock()
++            .vector_images
++            .get(&image_id)
++            .map(|vector_image| vector_image.source.clone())
++    }
++
+     fn add_rasterization_complete_listener(
+         &self,
+         pipeline_id: PipelineId,
+diff --git a/components/script/dom/svg/svgimageelement.rs b/components/script/dom/svg/svgimageelement.rs
+index a72204036bd..2c8d54f27cd 100644
+--- a/components/script/dom/svg/svgimageelement.rs
++++ b/components/script/dom/svg/svgimageelement.rs
+@@ -18,7 +18,6 @@ use net_traits::request::{CredentialsMode, Destination, RequestBuilder, RequestI
+ use net_traits::{
+     CoreResourceThread, FetchMetadata, FetchResponseMsg, NetworkError, ResourceFetchTiming,
+ };
+-use pixels::Snapshot;
+ use script_bindings::cell::DomRefCell;
+ use servo_url::ServoUrl;
+ use style::attr::AttrValue;
+@@ -105,11 +104,6 @@ impl SVGImageElement {
+         self.image.borrow().clone()
+     }
+ 
+-    /// The decoded raster for the current href, if fetched (copy).
+-    pub(crate) fn get_raster_image_data(&self) -> Option<Snapshot> {
+-        Some(self.image_data()?.as_raster_image()?.as_snapshot())
+-    }
+-
+     fn generation_id(&self) -> u32 {
+         self.generation_id.get()
+     }
+diff --git a/components/script/dom/svg/svgsvgelement.rs b/components/script/dom/svg/svgsvgelement.rs
+index 87572d55c99..0fcec857034 100644
+--- a/components/script/dom/svg/svgsvgelement.rs
++++ b/components/script/dom/svg/svgsvgelement.rs
+@@ -11,6 +11,7 @@ use html5ever::{LocalName, Prefix, QualName, local_name, ns};
+ use js::context::JSContext;
+ use js::rust::HandleObject;
+ use layout_api::{SVG_PAINT_PROPERTIES, SVGElementData, parse_view_box, svg_paint_signature};
++use net_traits::image_cache::Image;
+ use percent_encoding::percent_decode_str;
+ use pixels::EncodedImageType;
+ use script_bindings::cell::DomRefCell;
+@@ -44,6 +45,7 @@ use crate::dom::node::{
+     ChildrenMutation, CloneChildrenFlag, Node, NodeDamage, NodeTraits, UnbindContext,
+ };
+ use crate::dom::svg::svggraphicselement::SVGGraphicsElement;
++use crate::dom::svg::svgimageelement::SVGImageElement;
+ 
+ #[dom_struct]
+ pub(crate) struct SVGSVGElement {
+@@ -119,11 +121,10 @@ impl SVGSVGElement {
+ 
+         let mut cloned_nodes =
+             self.process_use_elements(cx, &mut referenced_ids, &mut href_rewrites);
+-        // Order matters: lowering `<foreignObject>` and `<image href>` first means the
+-        // `<image>` elements those passes insert (which carry `mask`/`clip-path`/`filter`
+-        // attributes) are seen by the external-reference pass below.
++        // Order matters: lowering `<foreignObject>` first means the `<image>` elements that
++        // pass inserts (which carry `mask`/`clip-path`/`filter` attributes) are seen by the
++        // external-reference pass below.
+         cloned_nodes.extend(self.process_foreign_objects(cx));
+-        cloned_nodes.extend(self.process_image_elements(cx));
+         cloned_nodes.extend(self.process_external_references(cx, &mut referenced_ids));
+ 
+         let rewrite_attributes = |element: &Element, attributes: &mut Vec<(QualName, AttrValue)>| {
+@@ -146,7 +147,11 @@ impl SVGSVGElement {
+             return;
+         };
+ 
+-        let xml_source: String = xml_source.into();
++        // Tagged with this element's id so that identical subtrees in different `<svg>`s don't
++        // share an image-cache entry: re-serializing one evicts its entry and rasterizations
++        // (see `evict_cached_images`), which left every other `<svg>` with the same markup
++        // painting nothing until something happened to damage it.
++        let xml_source = format!("<!--{}-->{}", self.uuid, String::from(xml_source));
+         let base64_encoded_source = base64::engine::general_purpose::STANDARD.encode(xml_source);
+         let data_url = format!("data:image/svg+xml;base64,{}", base64_encoded_source);
+         match ServoUrl::parse(&data_url) {
+@@ -346,6 +351,41 @@ impl SVGSVGElement {
+                         referenced_ids.push(id);
+                     }
+                 }
++                // Paint servers named by stylesheet rules or inline `style`, which the attribute
++                // scan can't see; the serialization carries them as computed `url(#id)`s.
++                if let Some(style) = element.style_from_last_restyle() {
++                    let inherited_svg = style.get_inherited_svg();
++                    referenced_ids.extend(
++                        [inherited_svg.clone_fill(), inherited_svg.clone_stroke()]
++                            .iter()
++                            .filter_map(paint_server_id),
++                    );
++                }
++                // A gradient or pattern takes its unspecified attributes and its stops or
++                // content from the one its href names:
++                // <https://svgwg.org/svg2-draft/pservers.html#LinearGradientElementHrefAttribute>
++                if matches!(
++                    *element.local_name(),
++                    local_name!("linearGradient") |
++                        local_name!("radialGradient") |
++                        local_name!("pattern")
++                ) {
++                    let href = element.get_string_attribute(&local_name!("href"));
++                    let effective_href = if href.str().is_empty() {
++                        element
++                            .get_attribute_string_value_with_namespace(
++                                &ns!(xlink),
++                                &local_name!("href"),
++                            )
++                            .unwrap_or_default()
++                    } else {
++                        href.to_string()
++                    };
++                    if let Some(id) = effective_href.strip_prefix('#').filter(|id| !id.is_empty())
++                    {
++                        referenced_ids.push(id.to_owned());
++                    }
++                }
+             }
+ 
+             for id in referenced_ids {
+@@ -421,103 +461,66 @@ impl SVGSVGElement {
+         inserted_nodes
+     }
+ 
+-    /// Re-embed each `<image>` element whose href points at a fetched external resource as a
+-    /// sibling `<image>` with the decoded raster as a `data:` href. The rasterized document
+-    /// cannot fetch (no network, no base URL), so external hrefs render nothing without this;
+-    /// `SVGImageElement` fetches its href through the image cache and invalidates this svg's
+-    /// cached serialization when pixels arrive. data: hrefs pass through untouched.
+-    fn process_image_elements(&self, cx: &mut JSContext) -> Vec<DomRoot<Node>> {
+-        use crate::dom::svg::svgimageelement::SVGImageElement;
+-
+-        let root_node = self.upcast::<Node>();
+-        let image_elements: Vec<DomRoot<SVGImageElement>> = root_node
+-            .traverse_preorder(ShadowIncluding::No)
+-            .filter_map(DomRoot::downcast::<SVGImageElement>)
+-            .collect();
+-
+-        let mut inserted_nodes = Vec::new();
+-        for image_element in image_elements {
+-            let element = image_element.upcast::<Element>();
+-            let href = element.get_string_attribute(&local_name!("href"));
+-            let effective_href = if href.str().is_empty() {
+-                element
+-                    .get_attribute_string_value_with_namespace(&ns!(xlink), &local_name!("href"))
+-                    .unwrap_or_default()
+-            } else {
+-                href.to_string()
+-            };
+-            // Nothing to do: no href, or one the rasterizer can already consume.
+-            if effective_href.is_empty() || effective_href.starts_with("data:") {
+-                continue;
+-            }
+-            let Some(snapshot) = image_element.get_raster_image_data() else {
+-                continue;
+-            };
+-            let Some(data_url) = png_data_url(snapshot) else {
+-                continue;
+-            };
+-
+-            let element_node = image_element.upcast::<Node>();
+-            let document = element_node.owner_doc();
+-            let replacement = Element::create(
+-                cx,
+-                QualName::new(None, ns!(svg), LocalName::from("image")),
+-                None,
+-                &document,
+-                ElementCreator::ScriptCreated,
+-                CustomElementCreationMode::Synchronous,
+-                None,
+-            );
+-            for name in [
+-                "x",
+-                "y",
+-                "width",
+-                "height",
+-                "mask",
+-                "clip-path",
+-                "filter",
+-                "transform",
+-                "opacity",
+-                // Case-sensitive SVG name: must go through the namespace-explicit accessor —
+-                // the namespace-less getters debug-assert lowercase ASCII.
+-                "preserveAspectRatio",
+-            ] {
+-                let attr_name = LocalName::from(name);
+-                let Some(value) =
+-                    element.get_attribute_string_value_with_namespace(&ns!(), &attr_name)
+-                else {
+-                    continue;
+-                };
+-                replacement.set_attribute_from_parser(
+-                    cx,
+-                    QualName::new(None, ns!(), attr_name),
+-                    DOMString::from(value),
+-                    None,
++    /// The `href` and `preserveAspectRatio` that `image` is serialized with when its href is an
++    /// external resource that has been fetched: the rasterized document cannot fetch (no
++    /// network, no base URL), so the image is embedded as a `data:` URL instead, a raster as
++    /// PNG and an SVG document as its own source. `SVGImageElement` fetches through the image
++    /// cache and invalidates this svg's cached serialization when the image arrives. `None`
++    /// keeps the element's own attributes: no href, a `data:` href the rasterizer reads itself,
++    /// or an image not loaded (yet).
++    fn embedded_image_attributes(
++        &self,
++        image: &SVGImageElement,
++    ) -> Option<(String, Option<String>)> {
++        let element = image.upcast::<Element>();
++        let href = element.get_string_attribute(&local_name!("href"));
++        let effective_href = if href.str().is_empty() {
++            element
++                .get_attribute_string_value_with_namespace(&ns!(xlink), &local_name!("href"))
++                .unwrap_or_default()
++        } else {
++            href.to_string()
++        };
++        if effective_href.is_empty() || effective_href.starts_with("data:") {
++            return None;
++        }
++        let preserve_aspect_ratio = element.get_attribute_string_value_with_namespace(
++            &ns!(),
++            &local_name!("preserveAspectRatio"),
++        );
++        match image.image_data()? {
++            Image::Raster(raster) => {
++                Some((png_data_url(raster.as_snapshot())?, preserve_aspect_ratio))
++            },
++            // Embedded as SVG rather than pre-rasterized, so that the rasterizer renders the
++            // nested document at the final resolution.
++            Image::Vector(vector) => {
++                let source = self
++                    .owner_window()
++                    .image_cache()
++                    .vector_image_source(vector.id)?;
++                let data_url = format!(
++                    "data:image/svg+xml;base64,{}",
++                    base64::engine::general_purpose::STANDARD.encode(source.text.as_bytes())
+                 );
+-            }
+-            replacement.set_attribute_from_parser(
+-                cx,
+-                QualName::new(None, ns!(), LocalName::from("href")),
+-                DOMString::from(data_url),
+-                None,
+-            );
+-
+-            // Same paint slot; the original's unresolvable href renders nothing there.
+-            let Some(parent) = element_node.GetParentNode() else {
+-                continue;
+-            };
+-            let replacement_node = DomRoot::from_ref(replacement.upcast::<Node>());
+-            if parent
+-                .InsertBefore(cx, &replacement_node, Some(element_node))
+-                .is_ok()
+-            {
+-                inserted_nodes.push(replacement_node);
+-            }
++                // Chrome draws an SVG image into the `<image>` viewport as that document's own
++                // viewport, fitting its viewBox with its root's `preserveAspectRatio`, and
++                // stretches a document without a viewBox; the `<image>`'s attribute only counts
++                // when it is `none`, which stretches as well. The rasterizer fits the nested
++                // document's size with the `<image>`'s attribute instead, so that is replaced by
++                // the value giving Chrome's result.
++                let stretched = preserve_aspect_ratio
++                    .as_deref()
++                    .is_some_and(|value| value.split_whitespace().any(|token| token == "none"));
++                let preserve_aspect_ratio = match source.root_preserve_aspect_ratio {
++                    Some(root_value) if !stretched => root_value,
++                    _ => "none".to_owned(),
++                };
++                Some((data_url, Some(preserve_aspect_ratio)))
++            },
+         }
+-        inserted_nodes
+     }
+ 
+-
+     /// Phase 2 of native foreignObject rendering (LYK-136): for each foreignObject child
+     /// carrying `mask="url(#id)"`, build a standalone SVG document — the referenced mask
+     /// plus a white rect covering the foreignObject's rect with that mask applied — and
+@@ -735,6 +738,39 @@ impl SVGSVGElement {
+             ));
+         }
+ 
++        // `xlink:href` is serialized without its prefix, so next to a plain `href` it duplicates
++        // that attribute: an XML well-formedness error that leaves the whole svg blank. The
++        // plain attribute takes precedence anyway:
++        // <https://svgwg.org/svg2-draft/linking.html#XLinkRefAttrs>
++        if attributes
++            .iter()
++            .any(|(name, _)| name.ns == ns!() && name.local == local_name!("href"))
++        {
++            attributes
++                .retain(|(name, _)| name.ns != ns!(xlink) || name.local != local_name!("href"));
++        }
++        if let Some(image) = element.downcast::<SVGImageElement>() &&
++            let Some((href, preserve_aspect_ratio)) = self.embedded_image_attributes(image)
++        {
++            attributes.retain(|(name, _)| {
++                let is_href =
++                    name.local == local_name!("href") && matches!(name.ns, ns!() | ns!(xlink));
++                let is_preserve_aspect_ratio =
++                    name.ns == ns!() && name.local == local_name!("preserveAspectRatio");
++                !is_href && !is_preserve_aspect_ratio
++            });
++            attributes.push((
++                QualName::new(None, ns!(), local_name!("href")),
++                AttrValue::String(href),
++            ));
++            if let Some(preserve_aspect_ratio) = preserve_aspect_ratio {
++                attributes.push((
++                    QualName::new(None, ns!(), local_name!("preserveAspectRatio")),
++                    AttrValue::String(preserve_aspect_ratio),
++                ));
++            }
++        }
++
+         // With a viewBox, layout sizes the root's box and fits the viewBox into it; the
+         // rasterizer only needs the viewBox's aspect ratio as the image's natural size. Left in,
+         // `width`/`height` made that size wrong whenever CSS overrode one of them: `width="50"`
+@@ -1083,8 +1119,8 @@ fn rasterizer_paint(paint: &SVGPaint, current_color: &AbsoluteColor) -> String {
+         SVGPaintKind::None => "none".to_owned(),
+         SVGPaintKind::Color(color) => rasterizer_paint_color(color, current_color),
+         // Paint servers live in the page; a reference that resolves to no fragment can't.
+-        SVGPaintKind::PaintServer(url) => match url.url().and_then(|url| url.fragment()) {
+-            Some(fragment) => format!("url(#{})", percent_decode_str(fragment).decode_utf8_lossy()),
++        SVGPaintKind::PaintServer(_) => match paint_server_id(paint) {
++            Some(id) => format!("url(#{id})"),
+             None => "none".to_owned(),
+         },
+         SVGPaintKind::ContextFill => "context-fill".to_owned(),
+@@ -1099,6 +1135,15 @@ fn rasterizer_paint(paint: &SVGPaint, current_color: &AbsoluteColor) -> String {
+     }
+ }
+ 
++/// The element id a paint-server `paint` references, if any.
++fn paint_server_id(paint: &SVGPaint) -> Option<String> {
++    let SVGPaintKind::PaintServer(url) = &paint.kind else {
++        return None;
++    };
++    let url = url.url()?;
++    Some(percent_decode_str(url.fragment()?).decode_utf8_lossy().into_owned())
++}
++
+ /// `value` with each `var(--name[, fallback])` replaced by the custom property's computed value
+ /// in `style`, or else its fallback. `None` when a reference has neither, which makes the whole
+ /// value invalid.
+diff --git a/components/shared/net/image_cache.rs b/components/shared/net/image_cache.rs
+index be106a56a4a..faee284b25a 100644
+--- a/components/shared/net/image_cache.rs
++++ b/components/shared/net/image_cache.rs
+@@ -42,6 +42,17 @@ pub struct VectorImage {
+     pub cors_status: CorsStatus,
+ }
+ 
++/// What embedding an SVG image in another SVG document needs from it.
++#[derive(Clone, Debug, MallocSizeOf)]
++pub struct VectorImageSource {
++    /// The document text, decompressed if it was served as svgz.
++    #[conditional_malloc_size_of]
++    pub text: Arc<String>,
++    /// The root element's `preserveAspectRatio` (its initial value when absent), or `None` when
++    /// the root has no `viewBox` for it to apply to.
++    pub root_preserve_aspect_ratio: Option<String>,
++}
++
+ impl Image {
+     pub fn metadata(&self) -> ImageMetadata {
+         match self {
+@@ -216,6 +227,10 @@ pub trait ImageCache: Sync + Send {
+         for_mask: bool,
+     ) -> Option<RasterImage>;
+ 
++    /// The source of the loaded SVG document `image_id`, for embedding it in another SVG
++    /// document. `None` once the image has been evicted.
++    fn vector_image_source(&self, image_id: VectorImageId) -> Option<VectorImageSource>;
++
+     /// Adds a new listener to be notified once the given `image_id` has been rasterized at
+     /// the given `size`. The listener will receive a `VectorImageRasterizationComplete`
+     /// message on the given `sender`, even if the listener is called after rasterization
+-- 
+2.43.0
+

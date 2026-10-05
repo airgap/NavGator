@@ -1,0 +1,752 @@
+From 707f06837a4b77d681a2bf6cbaea2bfeecdcb90f Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 04:24:29 -0400
+Subject: [PATCH] script: adoptedStyleSheets is an observable array
+
+The adoptedStyleSheets getter returned a frozen array, so the common
+pattern shadowRoot.adoptedStyleSheets.push(sheet) threw "can't define
+array index property past the end of an array with non-writable length",
+while Chrome accepts it since the attribute is an ObservableArray.
+
+The bindings generator has no ObservableArray support, so Document and
+ShadowRoot now hand out one cached proxy over a plain backing array. Its
+set, defineProperty and deleteProperty traps validate indexed and length
+changes like the WebIDL observable array handler, adopt the resulting list
+through the existing set_adopted_stylesheet, and only then mirror it into
+the backing array; every other trap forwards to the array, so
+Array.isArray and the Array.prototype methods keep working. Assigning the
+attribute now updates the same array object, as the spec requires.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/document/document.rs    |  41 +-
+ .../dom/document/documentorshadowroot.rs      | 479 +++++++++++++++++-
+ components/script/dom/shadowroot.rs           |  41 +-
+ 3 files changed, 477 insertions(+), 84 deletions(-)
+
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index df23f7328de..8e4cf93e593 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -114,7 +114,6 @@ use crate::dom::bindings::domname::{
+     self, is_valid_attribute_local_name, is_valid_element_local_name, namespace_from_domstring,
+ };
+ use crate::dom::bindings::error::{Error, ErrorInfo, ErrorResult, Fallible};
+-use crate::dom::bindings::frozenarray::CachedFrozenArray;
+ use crate::dom::bindings::inheritance::{Castable, ElementTypeId, HTMLElementTypeId, NodeTypeId};
+ use crate::dom::bindings::num::Finite;
+ use crate::dom::bindings::refcounted::Trusted;
+@@ -142,7 +141,7 @@ use crate::dom::document_embedder_controls::DocumentEmbedderControls;
+ use crate::dom::document_event_handler::DocumentEventHandler;
+ use crate::dom::documentfragment::DocumentFragment;
+ use crate::dom::documentorshadowroot::{
+-    DocumentOrShadowRoot, ServoStylesheetInDocument, StylesheetSource,
++    AdoptedStyleSheets, DocumentOrShadowRoot, ServoStylesheetInDocument, StylesheetSource,
+ };
+ use crate::dom::documenttimeline::DocumentTimeline;
+ use crate::dom::documenttype::DocumentType;
+@@ -663,10 +662,7 @@ pub(crate) struct Document {
+     highlighted_dom_node: MutNullableDom<Node>,
+     /// The constructed stylesheet that is adopted by this [Document].
+     /// <https://drafts.csswg.org/cssom/#dom-documentorshadowroot-adoptedstylesheets>
+-    adopted_stylesheets: DomRefCell<Vec<Dom<CSSStyleSheet>>>,
+-    /// Cached frozen array of [`Self::adopted_stylesheets`]
+-    #[ignore_malloc_size_of = "mozjs"]
+-    adopted_stylesheets_frozen_types: CachedFrozenArray,
++    adopted_stylesheets: AdoptedStyleSheets,
+     /// <https://drafts.csswg.org/cssom-view/#document-pending-scroll-events>
+     /// > Each Document has an associated list of pending scroll events, which stores
+     /// > pairs of (EventTarget, DOMString), initially empty.
+@@ -4159,8 +4155,7 @@ impl Document {
+             intersection_observer_task_queued: Cell::new(false),
+             intersection_observers: Default::default(),
+             highlighted_dom_node: Default::default(),
+-            adopted_stylesheets: Default::default(),
+-            adopted_stylesheets_frozen_types: CachedFrozenArray::new(),
++            adopted_stylesheets: AdoptedStyleSheets::new(),
+             pending_scroll_events: Default::default(),
+             scrolls_awaiting_completion: Default::default(),
+             snap_targets: Default::default(),
+@@ -4797,6 +4792,10 @@ impl Document {
+         self.shadow_roots_styles_changed.set(false);
+     }
+ 
++    pub(crate) fn adopted_stylesheets(&self) -> &AdoptedStyleSheets {
++        &self.adopted_stylesheets
++    }
++
+     pub(crate) fn stylesheet_count(&self) -> usize {
+         self.stylesheets.borrow().len()
+     }
+@@ -7094,35 +7093,17 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
+ 
+     /// <https://drafts.csswg.org/cssom/#dom-documentorshadowroot-adoptedstylesheets>
+     fn AdoptedStyleSheets(&self, cx: &mut JSContext, retval: MutableHandleValue) {
+-        self.adopted_stylesheets_frozen_types.get_or_init(
++        self.adopted_stylesheets.get(
+             cx,
+-            || {
+-                self.adopted_stylesheets
+-                    .borrow()
+-                    .clone()
+-                    .iter()
+-                    .map(|sheet| sheet.as_rooted())
+-                    .collect()
+-            },
++            &StyleSheetListOwner::Document(Dom::from_ref(self)),
+             retval,
+         );
+     }
+ 
+     /// <https://drafts.csswg.org/cssom/#dom-documentorshadowroot-adoptedstylesheets>
+     fn SetAdoptedStyleSheets(&self, cx: &mut JSContext, val: HandleValue) -> ErrorResult {
+-        let result = DocumentOrShadowRoot::set_adopted_stylesheet_from_jsval(
+-            cx,
+-            self.adopted_stylesheets.borrow_mut().as_mut(),
+-            val,
+-            &StyleSheetListOwner::Document(Dom::from_ref(self)),
+-        );
+-
+-        // If update is successful, clear the FrozenArray cache.
+-        if result.is_ok() {
+-            self.adopted_stylesheets_frozen_types.clear()
+-        }
+-
+-        result
++        self.adopted_stylesheets
++            .set(cx, &StyleSheetListOwner::Document(Dom::from_ref(self)), val)
+     }
+ 
+     fn Timeline(&self) -> DomRoot<DocumentTimeline> {
+diff --git a/components/script/dom/document/documentorshadowroot.rs b/components/script/dom/document/documentorshadowroot.rs
+index da19f1d149a..bd314af8145 100644
+--- a/components/script/dom/document/documentorshadowroot.rs
++++ b/components/script/dom/document/documentorshadowroot.rs
+@@ -5,15 +5,32 @@
+ use std::collections::HashSet;
+ use std::ffi::c_void;
+ use std::fmt;
++use std::ptr::{self, NonNull};
++use std::sync::OnceLock;
+ 
+ use embedder_traits::UntrustedNodeAddress;
+ use js::context::JSContext;
+ use js::conversions::FromJSValConvertible;
+-use js::rust::HandleValue;
++use js::glue::{
++    CreateWrapperProxyHandler, GetProxyPrivate, GetProxyReservedSlot, ProxyTraps,
++    SetProxyReservedSlot, WrapperNew,
++};
++use js::jsapi::{
++    Handle as RawHandle, HandleId as RawHandleId, HandleObject as RawHandleObject,
++    HandleValue as RawHandleValue, Heap, JS_DefineElement, JS_DefinePropertyById,
++    JS_DeletePropertyById, JS_ForwardSetPropertyTo, JSContext as RawJSContext, JSErrNum, JSObject,
++    JSPROP_ENUMERATE, ObjectOpResult, PropertyDescriptor, SetArrayLength,
++};
++use js::jsval::{ObjectValue, UndefinedValue};
++use js::rust::{Handle, HandleId, HandleValue, MutableHandleValue, ToNumber};
++use script_bindings::cell::DomRefCell;
+ use script_bindings::codegen::GenericBindings::DocumentBinding::DocumentMethods;
+ use script_bindings::codegen::GenericBindings::ShadowRootBinding::ShadowRootMethods;
+ use script_bindings::codegen::GenericBindings::WindowBinding::WindowMethods;
++use script_bindings::conversions::{SafeToJSValConvertible, jsid_to_string, root_from_handlevalue};
+ use script_bindings::error::{Error, ErrorResult};
++use script_bindings::reflector::DomObject;
++use script_bindings::utils::get_array_index_from_id;
+ use servo_arc::Arc;
+ use servo_config::pref;
+ use style::media_queries::MediaList;
+@@ -25,13 +42,16 @@ use webrender_api::units::LayoutPoint;
+ use crate::dom::Document;
+ use crate::dom::bindings::codegen::Bindings::NodeBinding::GetRootNodeOptions;
+ use crate::dom::bindings::codegen::Bindings::NodeBinding::Node_Binding::NodeMethods;
+-use crate::dom::bindings::conversions::ConversionResult;
++use crate::dom::bindings::conversions::{ConversionResult, root_from_object_static};
++use crate::dom::bindings::error::throw_dom_exception;
+ use crate::dom::bindings::inheritance::Castable;
+ use crate::dom::bindings::num::Finite;
++use crate::dom::bindings::reflector::DomGlobal;
+ use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
+ use crate::dom::css::stylesheetlist::StyleSheetListOwner;
+ use crate::dom::customelementregistry::CustomElementRegistry;
+ use crate::dom::element::Element;
++use crate::dom::globalscope::GlobalScope;
+ use crate::dom::node::{self, Node};
+ use crate::dom::types::{CSSStyleSheet, EventTarget, ShadowRoot};
+ use crate::dom::window::Window;
+@@ -359,10 +379,11 @@ impl DocumentOrShadowRoot {
+         }
+     }
+ 
+-    /// Inner part of adopted stylesheet. We are setting it by, assuming it is a FrozenArray
+-    /// instead of an ObservableArray. Thus, it would have a completely different workflow
+-    /// compared to the spec. The workflow here is actually following Gecko's implementation
+-    /// of AdoptedStylesheet before the implementation of ObservableArray.
++    /// Inner part of adopted stylesheet. This replaces the whole list at once, also for the
++    /// single-element changes of the observable array (see [`AdoptedStyleSheets`]), rather
++    /// than following the spec's per-index set and delete algorithms. The workflow here is
++    /// actually following Gecko's implementation of AdoptedStylesheet before the
++    /// implementation of ObservableArray.
+     ///
+     /// The main purpose from this function is to set the `&mut adopted_stylesheet` to match
+     /// `incoming_stylesheet` and update the corresponding Styleset in a Document or a ShadowRoot.
+@@ -438,33 +459,441 @@ impl DocumentOrShadowRoot {
+ 
+         Ok(())
+     }
++}
++
++/// The `adoptedStyleSheets` list of a Document or ShadowRoot together with the observable
++/// array exotic object that exposes it to script.
++/// <https://webidl.spec.whatwg.org/#es-observable-array>
++///
++/// The bindings generator has no ObservableArray support, so the getter hands out a proxy
++/// wrapping a plain backing array. The proxy's traps run every indexed and `length` mutation
++/// through [`DocumentOrShadowRoot::set_adopted_stylesheet`] and only then mirror the result
++/// into the backing array, so `push()`, `splice()` and index assignment restyle exactly like
++/// assigning a whole new array.
++#[derive(JSTraceable, MallocSizeOf)]
++#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
++pub(crate) struct AdoptedStyleSheets {
++    sheets: DomRefCell<Vec<Dom<CSSStyleSheet>>>,
++    #[ignore_malloc_size_of = "mozjs"]
++    proxy: DomRefCell<Option<Heap<*mut JSObject>>>,
++}
++
++impl AdoptedStyleSheets {
++    pub(crate) fn new() -> Self {
++        Self {
++            sheets: Default::default(),
++            proxy: DomRefCell::new(None),
++        }
++    }
+ 
+-    /// Set adoptedStylesheet given a js value by converting and passing the converted
+-    /// values to the inner [DocumentOrShadowRoot::set_adopted_stylesheet].
+-    pub(crate) fn set_adopted_stylesheet_from_jsval(
++    fn rooted_sheets(&self) -> Vec<DomRoot<CSSStyleSheet>> {
++        self.sheets
++            .borrow()
++            .iter()
++            .map(|sheet| sheet.as_rooted())
++            .collect()
++    }
++
++    /// <https://drafts.csswg.org/cssom/#dom-documentorshadowroot-adoptedstylesheets>
++    #[expect(unsafe_code)]
++    pub(crate) fn get(
++        &self,
+         cx: &mut JSContext,
+-        adopted_stylesheets: &mut Vec<Dom<CSSStyleSheet>>,
+-        incoming_value: HandleValue,
+         owner: &StyleSheetListOwner,
++        mut retval: MutableHandleValue,
++    ) {
++        if let Some(proxy) = &*self.proxy.borrow() {
++            retval.set(ObjectValue(proxy.get()));
++            return;
++        }
++
++        rooted!(&in(cx) let mut backing = UndefinedValue());
++        self.rooted_sheets().safe_to_jsval(cx, backing.handle_mut());
++        rooted!(&in(cx) let backing = backing.to_object());
++        rooted!(&in(cx) let proxy = unsafe {
++            WrapperNew(
++                cx.raw_cx(),
++                backing.handle().into(),
++                AdoptedStyleSheetsHandler::get().0,
++                ptr::null(),
++            )
++        });
++        assert!(!proxy.is_null());
++        let owner_object = match owner {
++            StyleSheetListOwner::Document(document) => document.reflector().get_jsobject().get(),
++            StyleSheetListOwner::ShadowRoot(root) => root.reflector().get_jsobject().get(),
++        };
++        unsafe { SetProxyReservedSlot(proxy.get(), 0, &ObjectValue(owner_object)) };
++
++        // Safety: the Heap has to be in its final memory location before it is set.
++        *self.proxy.borrow_mut() = Some(Heap::default());
++        self.proxy.borrow().as_ref().unwrap().set(proxy.get());
++        retval.set(ObjectValue(proxy.get()));
++    }
++
++    /// <https://drafts.csswg.org/cssom/#dom-documentorshadowroot-adoptedstylesheets>
++    pub(crate) fn set(
++        &self,
++        cx: &mut JSContext,
++        owner: &StyleSheetListOwner,
++        value: HandleValue,
+     ) -> ErrorResult {
+-        let maybe_stylesheets =
+-            Vec::<DomRoot<CSSStyleSheet>>::safe_from_jsval(cx, incoming_value, ());
+-
+-        match maybe_stylesheets {
+-            Ok(ConversionResult::Success(stylesheets)) => {
+-                rooted_vec!(let stylesheets <- stylesheets.iter().map(|s| s.as_traced()));
+-
+-                DocumentOrShadowRoot::set_adopted_stylesheet(
+-                    cx,
+-                    adopted_stylesheets,
+-                    &stylesheets,
+-                    owner,
+-                )
+-            },
++        match Vec::<DomRoot<CSSStyleSheet>>::safe_from_jsval(cx, value, ()) {
++            Ok(ConversionResult::Success(sheets)) => self.replace(cx, owner, sheets),
+             Ok(ConversionResult::Failure(msg)) => Err(Error::Type(msg.into_owned())),
+             Err(_) => Err(Error::Type(
+                 c"The provided value is not a sequence of 'CSSStylesheet'.".to_owned(),
+             )),
+         }
+     }
++
++    /// Adopts `sheets` and mirrors them into the proxy's backing array, if script has seen it.
++    #[expect(unsafe_code)]
++    fn replace(
++        &self,
++        cx: &mut JSContext,
++        owner: &StyleSheetListOwner,
++        sheets: Vec<DomRoot<CSSStyleSheet>>,
++    ) -> ErrorResult {
++        rooted_vec!(let incoming <- sheets.iter().map(|sheet| sheet.as_traced()));
++        DocumentOrShadowRoot::set_adopted_stylesheet(
++            cx,
++            &mut self.sheets.borrow_mut(),
++            &incoming,
++            owner,
++        )?;
++
++        let Some(proxy) = self.proxy.borrow().as_ref().map(|proxy| proxy.get()) else {
++            return Ok(());
++        };
++        let mut slot = UndefinedValue();
++        unsafe { GetProxyPrivate(proxy, &mut slot) };
++        rooted!(&in(cx) let backing = slot.to_object());
++        if !unsafe { SetArrayLength(cx.raw_cx(), backing.handle().into(), 0) } {
++            return Err(Error::JSFailed);
++        }
++        for (index, sheet) in sheets.iter().enumerate() {
++            rooted!(&in(cx) let mut value = UndefinedValue());
++            sheet.safe_to_jsval(cx, value.handle_mut());
++            if !unsafe {
++                JS_DefineElement(
++                    cx.raw_cx(),
++                    backing.handle().into(),
++                    index as u32,
++                    value.handle().into(),
++                    JSPROP_ENUMERATE as u32,
++                )
++            } {
++                return Err(Error::JSFailed);
++            }
++        }
++        Ok(())
++    }
++
++    /// Applies `mutate` to a copy of the adopted sheets and adopts the result. `mutate`
++    /// returning false is the observable array handler returning false: the operation is
++    /// rejected without a change, which throws only in strict mode.
++    #[expect(unsafe_code)]
++    fn mutate(
++        &self,
++        cx: &mut JSContext,
++        owner: &StyleSheetListOwner,
++        global: &GlobalScope,
++        result: *mut ObjectOpResult,
++        rejection: JSErrNum,
++        mutate: impl FnOnce(&mut Vec<DomRoot<CSSStyleSheet>>) -> bool,
++    ) -> bool {
++        let mut sheets = self.rooted_sheets();
++        if !mutate(&mut sheets) {
++            unsafe { (*result).code_ = rejection as ::libc::uintptr_t };
++            return true;
++        }
++        match self.replace(cx, owner, sheets) {
++            Ok(()) => {
++                unsafe {
++                    (*result).code_ = 0 /* OkCode */
++                };
++                true
++            },
++            Err(Error::JSFailed) => false,
++            Err(error) => {
++                throw_dom_exception(cx, global, error);
++                false
++            },
++        }
++    }
++
++    /// <https://webidl.spec.whatwg.org/#observable-array-exotic-object-set-the-indexed-value>
++    fn set_indexed_value(
++        &self,
++        cx: &mut JSContext,
++        owner: &StyleSheetListOwner,
++        global: &GlobalScope,
++        index: u32,
++        value: HandleValue,
++        result: *mut ObjectOpResult,
++        rejection: JSErrNum,
++    ) -> bool {
++        let Ok(sheet) = root_from_handlevalue::<CSSStyleSheet>(cx, value) else {
++            throw_dom_exception(
++                cx,
++                global,
++                Error::Type(c"Value is not of type 'CSSStyleSheet'.".to_owned()),
++            );
++            return false;
++        };
++        let index = index as usize;
++        self.mutate(cx, owner, global, result, rejection, |sheets| {
++            if index > sheets.len() {
++                return false;
++            }
++            if index == sheets.len() {
++                sheets.push(sheet);
++            } else {
++                sheets[index] = sheet;
++            }
++            true
++        })
++    }
++
++    /// <https://webidl.spec.whatwg.org/#observable-array-exotic-object-set-the-length>
++    #[expect(unsafe_code)]
++    fn set_length(
++        &self,
++        cx: &mut JSContext,
++        owner: &StyleSheetListOwner,
++        global: &GlobalScope,
++        value: HandleValue,
++        result: *mut ObjectOpResult,
++        rejection: JSErrNum,
++    ) -> bool {
++        let Ok(number) = (unsafe { ToNumber(cx.raw_cx(), value) }) else {
++            return false;
++        };
++        if number.fract() != 0.0 || !(0.0..=u32::MAX as f64).contains(&number) {
++            throw_dom_exception(cx, global, Error::Range(c"Invalid array length".to_owned()));
++            return false;
++        }
++        let new_length = number as usize;
++        self.mutate(cx, owner, global, result, rejection, |sheets| {
++            if new_length > sheets.len() {
++                return false;
++            }
++            sheets.truncate(new_length);
++            true
++        })
++    }
++}
++
++/// Runs `f` with the Document or ShadowRoot whose `adoptedStyleSheets` proxy is `proxy`.
++#[expect(unsafe_code)]
++fn with_adopted_stylesheets_owner<R>(
++    proxy: *mut JSObject,
++    f: impl FnOnce(&StyleSheetListOwner, &AdoptedStyleSheets, &GlobalScope) -> R,
++) -> R {
++    let mut slot = UndefinedValue();
++    unsafe { GetProxyReservedSlot(proxy, 0, &mut slot) };
++    let object = slot.to_object();
++    if let Ok(document) = root_from_object_static::<Document>(object) {
++        let owner = StyleSheetListOwner::Document(Dom::from_ref(&*document));
++        return f(&owner, document.adopted_stylesheets(), &document.global());
++    }
++    let root = root_from_object_static::<ShadowRoot>(object)
++        .expect("adoptedStyleSheets proxies are owned by a Document or a ShadowRoot");
++    let owner = StyleSheetListOwner::ShadowRoot(Dom::from_ref(&*root));
++    f(&owner, root.adopted_stylesheets(), &root.global())
++}
++
++fn is_length_id(cx: &JSContext, id: HandleId) -> bool {
++    jsid_to_string(cx, id).is_some_and(|name| name == "length")
++}
++
++#[expect(unsafe_code)]
++unsafe extern "C" fn adopted_stylesheets_set(
++    cx: *mut RawJSContext,
++    proxy: RawHandleObject,
++    id: RawHandleId,
++    v: RawHandleValue,
++    receiver: RawHandleValue,
++    res: *mut ObjectOpResult,
++) -> bool {
++    let mut cx = unsafe {
++        // SAFETY: We are in SM hook
++        JSContext::from_ptr(NonNull::new(cx).expect("JSContext should not be null in SM hook"))
++    };
++    let raw_id = id;
++    let id = unsafe { Handle::from_raw(id) };
++    let v = unsafe { Handle::from_raw(v) };
++    let rejection = JSErrNum::JSMSG_PROXY_SET_RETURNED_FALSE;
++    if let Some(index) = get_array_index_from_id(id) {
++        return with_adopted_stylesheets_owner(*proxy, |owner, adopted, global| {
++            adopted.set_indexed_value(&mut cx, owner, global, index, v, res, rejection)
++        });
++    }
++    if is_length_id(&cx, id) {
++        return with_adopted_stylesheets_owner(*proxy, |owner, adopted, global| {
++            adopted.set_length(&mut cx, owner, global, v, res, rejection)
++        });
++    }
++    let mut slot = UndefinedValue();
++    unsafe { GetProxyPrivate(*proxy, &mut slot) };
++    rooted!(&in(cx) let backing = slot.to_object());
++    unsafe {
++        JS_ForwardSetPropertyTo(
++            cx.raw_cx(),
++            backing.handle().into(),
++            raw_id,
++            v.into(),
++            receiver,
++            res,
++        )
++    }
++}
++
++#[expect(unsafe_code)]
++unsafe extern "C" fn adopted_stylesheets_define_property(
++    cx: *mut RawJSContext,
++    proxy: RawHandleObject,
++    id: RawHandleId,
++    desc: RawHandle<PropertyDescriptor>,
++    res: *mut ObjectOpResult,
++) -> bool {
++    let mut cx = unsafe {
++        // SAFETY: We are in SM hook
++        JSContext::from_ptr(NonNull::new(cx).expect("JSContext should not be null in SM hook"))
++    };
++    let raw_id = id;
++    let id = unsafe { Handle::from_raw(id) };
++    let index = get_array_index_from_id(id);
++    let is_length = index.is_none() && is_length_id(&cx, id);
++    if index.is_some() || is_length {
++        let rejection = JSErrNum::JSMSG_PROXY_DEFINE_RETURNED_FALSE;
++        let descriptor = unsafe { &*desc.ptr };
++        // <https://webidl.spec.whatwg.org/#es-observable-array-defineProperty>
++        // Indices and length only take writable, enumerable (for indices), configurable data
++        // properties; anything else is rejected without a change.
++        if descriptor.hasGetter_() ||
++            descriptor.hasSetter_() ||
++            !descriptor.hasValue_() ||
++            (descriptor.hasConfigurable_() && !descriptor.configurable_()) ||
++            (descriptor.hasWritable_() && !descriptor.writable_()) ||
++            (index.is_some() && descriptor.hasEnumerable_() && !descriptor.enumerable_())
++        {
++            unsafe { (*res).code_ = rejection as ::libc::uintptr_t };
++            return true;
++        }
++        rooted!(&in(cx) let value = descriptor.value_);
++        return with_adopted_stylesheets_owner(*proxy, |owner, adopted, global| match index {
++            Some(index) => adopted.set_indexed_value(
++                &mut cx,
++                owner,
++                global,
++                index,
++                value.handle(),
++                res,
++                rejection,
++            ),
++            None => adopted.set_length(&mut cx, owner, global, value.handle(), res, rejection),
++        });
++    }
++    let mut slot = UndefinedValue();
++    unsafe { GetProxyPrivate(*proxy, &mut slot) };
++    rooted!(&in(cx) let backing = slot.to_object());
++    unsafe { JS_DefinePropertyById(cx.raw_cx(), backing.handle().into(), raw_id, desc, res) }
++}
++
++#[expect(unsafe_code)]
++unsafe extern "C" fn adopted_stylesheets_delete(
++    cx: *mut RawJSContext,
++    proxy: RawHandleObject,
++    id: RawHandleId,
++    res: *mut ObjectOpResult,
++) -> bool {
++    let mut cx = unsafe {
++        // SAFETY: We are in SM hook
++        JSContext::from_ptr(NonNull::new(cx).expect("JSContext should not be null in SM hook"))
++    };
++    let raw_id = id;
++    let id = unsafe { Handle::from_raw(id) };
++    let rejection = JSErrNum::JSMSG_PROXY_DELETE_RETURNED_FALSE;
++    // <https://webidl.spec.whatwg.org/#es-observable-array-deleteProperty>
++    if let Some(index) = get_array_index_from_id(id) {
++        let index = index as usize;
++        return with_adopted_stylesheets_owner(*proxy, |owner, adopted, global| {
++            adopted.mutate(&mut cx, owner, global, res, rejection, |sheets| {
++                if index + 1 == sheets.len() {
++                    sheets.pop();
++                    true
++                } else {
++                    index >= sheets.len()
++                }
++            })
++        });
++    }
++    if is_length_id(&cx, id) {
++        unsafe { (*res).code_ = rejection as ::libc::uintptr_t };
++        return true;
++    }
++    let mut slot = UndefinedValue();
++    unsafe { GetProxyPrivate(*proxy, &mut slot) };
++    rooted!(&in(cx) let backing = slot.to_object());
++    unsafe { JS_DeletePropertyById(cx.raw_cx(), backing.handle().into(), raw_id, res) }
++}
++
++static ADOPTED_STYLESHEETS_PROXY_TRAPS: ProxyTraps = ProxyTraps {
++    enter: None,
++    getOwnPropertyDescriptor: None,
++    defineProperty: Some(adopted_stylesheets_define_property),
++    ownPropertyKeys: None,
++    delete_: Some(adopted_stylesheets_delete),
++    enumerate: None,
++    getPrototypeIfOrdinary: None,
++    getPrototype: None,
++    setPrototype: None,
++    setImmutablePrototype: None,
++    preventExtensions: None,
++    isExtensible: None,
++    has: None,
++    get: None,
++    set: Some(adopted_stylesheets_set),
++    call: None,
++    construct: None,
++    hasOwn: None,
++    getOwnEnumerablePropertyKeys: None,
++    nativeCall: None,
++    objectClassIs: None,
++    className: None,
++    fun_toString: None,
++    boxedValue_unbox: None,
++    defaultValue: None,
++    trace: None,
++    finalize: None,
++    objectMoved: None,
++    isCallable: None,
++    isConstructor: None,
++};
++
++/// Wrapper proxy handler for `adoptedStyleSheets` observable arrays; traps left unset forward
++/// to the backing array, which keeps `Array.isArray()` and the Array.prototype methods working.
++struct AdoptedStyleSheetsHandler(*const c_void);
++
++// Safety: the handler is created once and all its C++ methods are const.
++#[expect(unsafe_code)]
++unsafe impl Send for AdoptedStyleSheetsHandler {}
++// Safety: the handler is created once and all its C++ methods are const.
++#[expect(unsafe_code)]
++unsafe impl Sync for AdoptedStyleSheetsHandler {}
++
++impl AdoptedStyleSheetsHandler {
++    /// A single handler shared by every proxy and never freed, since the GC may reach it
++    /// until the very end of the process.
++    #[expect(unsafe_code)]
++    fn get() -> &'static Self {
++        static SINGLETON: OnceLock<AdoptedStyleSheetsHandler> = OnceLock::new();
++        SINGLETON.get_or_init(|| {
++            let handler = unsafe { CreateWrapperProxyHandler(&ADOPTED_STYLESHEETS_PROXY_TRAPS) };
++            assert!(!handler.is_null());
++            AdoptedStyleSheetsHandler(handler)
++        })
++    }
+ }
+diff --git a/components/script/dom/shadowroot.rs b/components/script/dom/shadowroot.rs
+index 42bcd670cb6..fd587589d9b 100644
+--- a/components/script/dom/shadowroot.rs
++++ b/components/script/dom/shadowroot.rs
+@@ -34,7 +34,6 @@ use crate::dom::bindings::codegen::Bindings::ShadowRootBinding::{
+ use crate::dom::bindings::codegen::UnionTypes::{
+     TrustedHTMLOrNullIsEmptyString, TrustedHTMLOrString,
+ };
+-use crate::dom::bindings::frozenarray::CachedFrozenArray;
+ use crate::dom::bindings::inheritance::Castable;
+ use crate::dom::bindings::num::Finite;
+ use crate::dom::bindings::root::{Dom, DomRoot, LayoutDom, MutNullableDom};
+@@ -45,7 +44,7 @@ use crate::dom::customelementregistry::CustomElementRegistry;
+ use crate::dom::document::Document;
+ use crate::dom::documentfragment::DocumentFragment;
+ use crate::dom::documentorshadowroot::{
+-    DocumentOrShadowRoot, ServoStylesheetInDocument, StylesheetSource,
++    AdoptedStyleSheets, DocumentOrShadowRoot, ServoStylesheetInDocument, StylesheetSource,
+ };
+ use crate::dom::element::Element;
+ use crate::dom::html::htmlslotelement::HTMLSlotElement;
+@@ -110,11 +109,7 @@ pub(crate) struct ShadowRoot {
+ 
+     /// The constructed stylesheet that is adopted by this [ShadowRoot].
+     /// <https://drafts.csswg.org/cssom/#dom-documentorshadowroot-adoptedstylesheets>
+-    adopted_stylesheets: DomRefCell<Vec<Dom<CSSStyleSheet>>>,
+-
+-    /// Cached frozen array of [`Self::adopted_stylesheets`]
+-    #[ignore_malloc_size_of = "mozjs"]
+-    adopted_stylesheets_frozen_types: CachedFrozenArray,
++    adopted_stylesheets: AdoptedStyleSheets,
+ 
+     details_name_groups: DomRefCell<Option<DetailsNameGroups>>,
+ }
+@@ -153,8 +148,7 @@ impl ShadowRoot {
+             declarative: Cell::new(false),
+             serializable: Cell::new(false),
+             delegates_focus: Cell::new(false),
+-            adopted_stylesheets: Default::default(),
+-            adopted_stylesheets_frozen_types: CachedFrozenArray::new(),
++            adopted_stylesheets: AdoptedStyleSheets::new(),
+             details_name_groups: Default::default(),
+         }
+     }
+@@ -186,6 +180,10 @@ impl ShadowRoot {
+         &self.document
+     }
+ 
++    pub(crate) fn adopted_stylesheets(&self) -> &AdoptedStyleSheets {
++        &self.adopted_stylesheets
++    }
++
+     pub(crate) fn stylesheet_count(&self) -> usize {
+         self.author_styles.borrow().stylesheets.len()
+     }
+@@ -584,35 +582,20 @@ impl ShadowRootMethods<crate::DomTypeHolder> for ShadowRoot {
+ 
+     /// <https://drafts.csswg.org/cssom/#dom-documentorshadowroot-adoptedstylesheets>
+     fn AdoptedStyleSheets(&self, cx: &mut JSContext, retval: MutableHandleValue) {
+-        self.adopted_stylesheets_frozen_types.get_or_init(
++        self.adopted_stylesheets.get(
+             cx,
+-            || {
+-                self.adopted_stylesheets
+-                    .borrow()
+-                    .clone()
+-                    .iter()
+-                    .map(|sheet| sheet.as_rooted())
+-                    .collect()
+-            },
++            &StyleSheetListOwner::ShadowRoot(Dom::from_ref(self)),
+             retval,
+         );
+     }
+ 
+     /// <https://drafts.csswg.org/cssom/#dom-documentorshadowroot-adoptedstylesheets>
+     fn SetAdoptedStyleSheets(&self, cx: &mut JSContext, val: HandleValue) -> ErrorResult {
+-        let result = DocumentOrShadowRoot::set_adopted_stylesheet_from_jsval(
++        self.adopted_stylesheets.set(
+             cx,
+-            self.adopted_stylesheets.borrow_mut().as_mut(),
+-            val,
+             &StyleSheetListOwner::ShadowRoot(Dom::from_ref(self)),
+-        );
+-
+-        // If update is successful, clear the FrozenArray cache.
+-        if result.is_ok() {
+-            self.adopted_stylesheets_frozen_types.clear();
+-        }
+-
+-        result
++            val,
++        )
+     }
+ 
+     /// <https://fullscreen.spec.whatwg.org/#dom-document-fullscreenelement>
+-- 
+2.43.0
+

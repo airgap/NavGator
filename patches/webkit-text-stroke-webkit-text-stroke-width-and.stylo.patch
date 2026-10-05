@@ -1,0 +1,63 @@
+From 211dbef9089fcb4d5c0c0e08469b5909002d1699 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 06:38:49 -0400
+Subject: [PATCH] servo: -webkit-text-stroke, -webkit-text-stroke-width and
+ -webkit-text-stroke-color
+
+Servo now paints the text stroke (on Linux, through WebRender's FreeType stroker), so the
+properties are enabled for it like Chrome's.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ style/properties/longhands.toml  | 2 --
+ style/properties/shorthands.rs   | 1 -
+ style/properties/shorthands.toml | 1 -
+ 3 files changed, 4 deletions(-)
+
+diff --git a/style/properties/longhands.toml b/style/properties/longhands.toml
+index 7c0da82ea..d07e0fe55 100644
+--- a/style/properties/longhands.toml
++++ b/style/properties/longhands.toml
+@@ -2526,7 +2526,6 @@ affects = "paint"
+ type = "Color"
+ initial = "computed_value::T::currentcolor()"
+ struct = "inherited_text"
+-engine = "gecko"
+ ignored_when_colors_disabled = true
+ spec = "https://compat.spec.whatwg.org/#the-webkit-text-stroke-color"
+ affects = "paint"
+@@ -2535,7 +2534,6 @@ affects = "paint"
+ type = "LineWidth"
+ initial = "app_units::Au(0)"
+ struct = "inherited_text"
+-engine = "gecko"
+ spec = "https://compat.spec.whatwg.org/#the-webkit-text-stroke-width"
+ animation_type = "discrete"
+ affects = "overflow"
+diff --git a/style/properties/shorthands.rs b/style/properties/shorthands.rs
+index b6a010446..b58604d7d 100644
+--- a/style/properties/shorthands.rs
++++ b/style/properties/shorthands.rs
+@@ -1126,7 +1126,6 @@ pub mod white_space {
+     }
+ }
+ 
+-#[cfg(feature = "gecko")]
+ pub mod _webkit_text_stroke {
+     pub use crate::properties::generated::shorthands::_webkit_text_stroke::*;
+ 
+diff --git a/style/properties/shorthands.toml b/style/properties/shorthands.toml
+index 56059ba1d..708b54ad5 100644
+--- a/style/properties/shorthands.toml
++++ b/style/properties/shorthands.toml
+@@ -543,7 +543,6 @@ spec = "https://www.w3.org/TR/css-text-4/#white-space-property"
+ derive_value_info = false
+ 
+ [-webkit-text-stroke]
+-engine = "gecko"
+ sub_properties = ["-webkit-text-stroke-width", "-webkit-text-stroke-color"]
+ spec = "https://compat.spec.whatwg.org/#the-webkit-text-stroke"
+ derive_serialize = true
+-- 
+2.43.0
+

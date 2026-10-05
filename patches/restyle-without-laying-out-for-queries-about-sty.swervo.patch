@@ -1,0 +1,237 @@
+From 4183edc27203a922986a0161330de97e07dcfdb2 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 05:57:39 -0400
+Subject: [PATCH] layout: restyle without laying out for queries about styles
+
+Every reflow for a query laid out the page, including the ones that only
+need styles: getComputedStyle() for properties whose resolved value is
+the computed value (position, display, color, ...), Element::style() and
+canvas font resolution. A script alternating a style change with such a
+getComputedStyle() call laid out the whole page each time; nytimes.com
+stayed blank in one long task doing that, and 100 write/read cycles over
+3000 items took ~600 ms where Chrome only restyles.
+
+Those reflows now stop after styling and report DeferredLayout. The
+restyle damage stays on the elements, as do the dirty descendant bits
+leading to them, and script hands the same dirty root back with a
+LayoutDeferred restyle reason, so the next reflow that needs layout
+processes the damage even when nothing needs restyling by then.
+Properties that resolve to used values (sizes, insets, margins, padding,
+transform, grid templates), viewport changes and documents using
+container queries still lay out.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/layout_impl.rs       | 99 ++++++++++++++++++++++++--
+ components/script/dom/window/window.rs | 17 ++++-
+ components/shared/layout/lib.rs        |  6 ++
+ 3 files changed, 115 insertions(+), 7 deletions(-)
+
+diff --git a/components/layout/layout_impl.rs b/components/layout/layout_impl.rs
+index 896f037d564..80200476954 100644
+--- a/components/layout/layout_impl.rs
++++ b/components/layout/layout_impl.rs
+@@ -25,7 +25,7 @@ use layout_api::{
+     AxesOverflow, BoxAreaType, CSSPixelRectVec, CaretLine, DangerousStyleNode, EditingSelection,
+     IFrameSizes, Layout, LayoutConfig, LayoutDamage, LayoutElement, LayoutFactory, LayoutNode,
+     NodeRenderingType, OffsetParentResponse, PhysicalSides, QueryMsg, ReflowGoal, ReflowPhasesRun,
+-    ReflowRequest, ReflowRequestRestyle, ReflowResult, ReflowStatistics,
++    ReflowRequest, ReflowRequestRestyle, ReflowResult, ReflowStatistics, RestyleReason,
+     ScrollContainerQueryFlags, ScrollContainerResponse, TrustedNodeAddress, with_layout_state,
+ };
+ use log::{debug, warn};
+@@ -1486,13 +1486,32 @@ impl LayoutThread {
+                 RecalcStyle::pre_traverse(original_dirty_root, shared)
+             };
+ 
+-            if !token.should_traverse() {
++            // A deferred layout still has damage to process below the dirty root.
++            let should_traverse = token.should_traverse();
++            if !should_traverse && !restyle.reason.contains(RestyleReason::LayoutDeferred) {
+                 layout_context.style_context.stylist.rule_tree().maybe_gc();
+                 return Default::default();
+             }
+ 
+-            dirty_root = driver::traverse_dom(&recalc_style_traversal, token, rayon_pool).as_node();
+-            self.register_styled_containers(&layout_context);
++            dirty_root = if should_traverse {
++                let dirty_root =
++                    driver::traverse_dom(&recalc_style_traversal, token, rayon_pool).as_node();
++                self.register_styled_containers(&layout_context);
++                dirty_root
++            } else {
++                original_dirty_root.as_node()
++            };
++        }
++
++        // The restyle damage stays on the elements, and the dirty descendant bits leading to
++        // them, until a reflow that needs layout processes it. Styles that query containers
++        // depend on the sizes the containers get from that layout.
++        if !device_has_changed &&
++            !self.uses_container_queries.get() &&
++            !ReflowPhases::needs_layout(&reflow_request.reflow_goal)
++        {
++            layout_context.style_context.stylist.rule_tree().maybe_gc();
++            return (ReflowPhasesRun::DeferredLayout, IFrameSizes::default());
+         }
+ 
+         let root_node = root_element.as_node();
+@@ -2271,9 +2290,25 @@ bitflags! {
+ }
+ 
+ impl ReflowPhases {
++    /// Whether the given [`ReflowGoal`] needs layout, beyond styles. Like other browsers, a
++    /// query about styles alone only restyles, which kept scripts that alternate style changes
++    /// and `getComputedStyle()` from laying out the whole page each time.
++    fn needs_layout(reflow_goal: &ReflowGoal) -> bool {
++        match reflow_goal {
++            ReflowGoal::LayoutQuery(QueryMsg::StyleQuery | QueryMsg::ResolvedFontStyleQuery) => {
++                false
++            },
++            ReflowGoal::LayoutQuery(QueryMsg::ResolvedStyleQuery(property)) => {
++                resolved_value_depends_on_layout(property)
++            },
++            _ => true,
++        }
++    }
++
+     /// Return the necessary phases of layout for the given [`ReflowGoal`]. Note that all
+     /// [`ReflowGoals`] need the basic restyle + box tree layout + fragment tree layout,
+-    /// so [`ReflowPhases::empty()`] implies that.
++    /// unless [`ReflowPhases::needs_layout`] says otherwise, so [`ReflowPhases::empty()`]
++    /// implies that.
+     fn necessary(reflow_goal: &ReflowGoal) -> Self {
+         let is_inset_longhand = |longhand: LonghandId| {
+             matches!(
+@@ -2337,6 +2372,60 @@ impl ReflowPhases {
+     }
+ }
+ 
++/// Whether the resolved value of `property` can be a used value, which needs layout. This
++/// should be kept in sync with `process_resolved_style_request()`.
++/// <https://drafts.csswg.org/cssom/#resolved-values>
++fn resolved_value_depends_on_layout(property: &PropertyId) -> bool {
++    let depends_on_layout = |longhand: LonghandId| {
++        matches!(
++            longhand,
++            LonghandId::Width |
++                LonghandId::Height |
++                LonghandId::InlineSize |
++                LonghandId::BlockSize |
++                LonghandId::MinWidth |
++                LonghandId::MinHeight |
++                LonghandId::MinInlineSize |
++                LonghandId::MinBlockSize |
++                LonghandId::Top |
++                LonghandId::Right |
++                LonghandId::Bottom |
++                LonghandId::Left |
++                LonghandId::InsetBlockStart |
++                LonghandId::InsetBlockEnd |
++                LonghandId::InsetInlineStart |
++                LonghandId::InsetInlineEnd |
++                LonghandId::MarginTop |
++                LonghandId::MarginRight |
++                LonghandId::MarginBottom |
++                LonghandId::MarginLeft |
++                LonghandId::MarginBlockStart |
++                LonghandId::MarginBlockEnd |
++                LonghandId::MarginInlineStart |
++                LonghandId::MarginInlineEnd |
++                LonghandId::PaddingTop |
++                LonghandId::PaddingRight |
++                LonghandId::PaddingBottom |
++                LonghandId::PaddingLeft |
++                LonghandId::PaddingBlockStart |
++                LonghandId::PaddingBlockEnd |
++                LonghandId::PaddingInlineStart |
++                LonghandId::PaddingInlineEnd |
++                LonghandId::Transform |
++                LonghandId::GridTemplateRows |
++                LonghandId::GridTemplateColumns
++        )
++    };
++    match property {
++        PropertyId::NonCustom(property) => match property.longhand_or_shorthand() {
++            Ok(longhand) => depends_on_layout(longhand),
++            Err(ShorthandId::All) => true,
++            Err(shorthand) => shorthand.longhands().any(depends_on_layout),
++        },
++        PropertyId::Custom(_) => false,
++    }
++}
++
+ /// Marks the descendants of the elements in `containers` for restyle, and their ancestors as
+ /// having dirty descendants so the style traversal reaches them. Returns whether any container
+ /// was found under `element`. `unmarked` counts the containers not found yet; the walk stops
+diff --git a/components/script/dom/window/window.rs b/components/script/dom/window/window.rs
+index 8f80ae6b1cf..62cef4dc41a 100644
+--- a/components/script/dom/window/window.rs
++++ b/components/script/dom/window/window.rs
+@@ -2904,6 +2904,7 @@ impl Window {
+ 
+         let restyle_reason = document.restyle_reason();
+         document.clear_restyle_reasons();
++        let mut dirty_root_element = None;
+         let restyle = if restyle_reason.needs_restyle() {
+             debug!("Invalidating layout cache due to reflow condition {restyle_reason:?}",);
+             // Invalidate any existing cached layout values.
+@@ -2913,10 +2914,12 @@ impl Window {
+ 
+             let stylesheets_changed = document.flush_stylesheets_for_reflow();
+             let pending_restyles = document.drain_pending_restyles();
+-            let dirty_root = document
++            dirty_root_element = document
+                 .take_dirty_root()
+                 .filter(|_| !stylesheets_changed)
+-                .or_else(|| document.GetDocumentElement())
++                .or_else(|| document.GetDocumentElement());
++            let dirty_root = dirty_root_element
++                .as_ref()
+                 .map(|root| root.upcast::<Node>().to_trusted_node_address());
+ 
+             Some(ReflowRequestRestyle {
+@@ -2962,6 +2965,16 @@ impl Window {
+         };
+ 
+         debug!("script: layout complete");
++        if reflow_result
++            .reflow_phases_run
++            .contains(ReflowPhasesRun::DeferredLayout)
++        {
++            // Layout left the damage of this restyle below the dirty root for the next reflow.
++            if let Some(dirty_root) = dirty_root_element {
++                document.note_node_with_dirty_descendants(dirty_root.upcast());
++            }
++            document.add_restyle_reason(RestyleReason::LayoutDeferred);
++        }
+         if let Some(marker) = marker {
+             self.emit_timeline_marker(marker.end());
+         }
+diff --git a/components/shared/layout/lib.rs b/components/shared/layout/lib.rs
+index 3576e2e753c..015febfe6ee 100644
+--- a/components/shared/layout/lib.rs
++++ b/components/shared/layout/lib.rs
+@@ -706,6 +706,9 @@ bitflags! {
+         const ViewportChanged = 1 << 5;
+         const PaintWorkletLoaded = 1 << 6;
+         const SelectionChanged = 1 << 7;
++        /// A reflow for a query about styles restyled without laying out, leaving the
++        /// damage of that restyle to the next reflow.
++        const LayoutDeferred = 1 << 8;
+     }
+ }
+ 
+@@ -744,6 +747,9 @@ bitflags! {
+     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+     pub struct ReflowPhasesRun: u8 {
+         const RanLayout = 1 << 0;
++        /// Styles were updated but layout was left for a later reflow, which has to start
++        /// from the same dirty root. See [`RestyleReason::LayoutDeferred`].
++        const DeferredLayout = 1 << 1;
+         const BuiltStackingContextTree = 1 << 2;
+         const BuiltDisplayList = 1 << 3;
+         const UpdatedScrollNodeOffset = 1 << 4;
+-- 
+2.43.0
+

@@ -1,0 +1,160 @@
+From 363698bd1a7d641fdd88814c460cf280e659b383 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 06:38:49 -0400
+Subject: [PATCH] glyph rasterizer: stroke glyph outlines with FreeType on unix
+
+For a font instance with a stroke width, the unix backend replaces the loaded glyph outline
+with the outline of a stroke along it, made by FreeType's stroker (mitered joins with a limit
+of 4, like Skia's text stroking that Chrome uses), with the width scaled to device pixels.
+The freetype crate's bindings lack the stroker API, so it is declared here. The stroked
+outline is owned by the cached font and freed on the next load, since FreeType only zeroes
+the slot's outline. The macOS and Windows backends ignore the stroke width.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ wr_glyph_rasterizer/src/platform/unix/font.rs | 90 ++++++++++++++++++-
+ 1 file changed, 89 insertions(+), 1 deletion(-)
+
+diff --git a/wr_glyph_rasterizer/src/platform/unix/font.rs b/wr_glyph_rasterizer/src/platform/unix/font.rs
+index 586893df..1e9fdd0b 100644
+--- a/wr_glyph_rasterizer/src/platform/unix/font.rs
++++ b/wr_glyph_rasterizer/src/platform/unix/font.rs
+@@ -16,6 +16,7 @@ use freetype::freetype::{FT_Init_FreeType, FT_Load_Glyph, FT_Render_Glyph};
+ use freetype::freetype::{FT_Library, FT_Outline_Get_CBox, FT_Set_Char_Size, FT_Select_Size};
+ use freetype::freetype::{FT_Fixed, FT_Matrix, FT_Set_Transform, FT_String, FT_ULong, FT_Vector};
+ use freetype::freetype::{FT_Err_Unimplemented_Feature, FT_MulFix, FT_Outline_Embolden};
++use freetype::freetype::{FT_Bool, FT_Outline, FT_Outline_Done, FT_Outline_New};
+ use freetype::freetype::{FT_LOAD_COLOR, FT_LOAD_DEFAULT, FT_LOAD_FORCE_AUTOHINT};
+ use freetype::freetype::{FT_LOAD_IGNORE_GLOBAL_ADVANCE_WIDTH, FT_LOAD_NO_AUTOHINT};
+ use freetype::freetype::{FT_LOAD_NO_BITMAP, FT_LOAD_NO_HINTING};
+@@ -28,7 +29,7 @@ use crate::rasterizer::{GlyphRasterError, GlyphRasterResult, RasterizedGlyph};
+ use crate::types::FastHashMap;
+ #[cfg(any(not(target_os = "android"), feature = "dynamic_freetype"))]
+ use libc::{dlsym, RTLD_DEFAULT};
+-use libc::free;
++use libc::{c_uint, c_void, free};
+ use std::{cmp, mem, ptr, slice};
+ use std::cmp::max;
+ use std::ffi::CString;
+@@ -113,6 +114,62 @@ extern "C" {
+     fn FT_GlyphSlot_Embolden(slot: FT_GlyphSlot);
+ }
+ 
++// The stroker API (ftstroke.h), which the freetype crate's bindings leave out.
++#[allow(non_camel_case_types)]
++type FT_Stroker = *mut c_void;
++const FT_STROKER_LINECAP_BUTT: c_uint = 0;
++const FT_STROKER_LINEJOIN_MITER_VARIABLE: c_uint = 2;
++
++extern "C" {
++    fn FT_Stroker_New(library: FT_Library, stroker: *mut FT_Stroker) -> FT_Error;
++    fn FT_Stroker_Set(
++        stroker: FT_Stroker,
++        radius: FT_Fixed,
++        line_cap: c_uint,
++        line_join: c_uint,
++        miter_limit: FT_Fixed,
++    );
++    fn FT_Stroker_ParseOutline(stroker: FT_Stroker, outline: *mut FT_Outline, opened: FT_Bool) -> FT_Error;
++    fn FT_Stroker_GetCounts(stroker: FT_Stroker, anum_points: *mut FT_UInt, anum_contours: *mut FT_UInt) -> FT_Error;
++    fn FT_Stroker_Export(stroker: FT_Stroker, outline: *mut FT_Outline);
++    fn FT_Stroker_Done(stroker: FT_Stroker);
++}
++
++// Replaces the outline in `slot` with the outline of a stroke of the given radius (26.6 pixels)
++// along it, so that rendering the slot paints the stroke. Like Skia's text stroking, which Chrome
++// uses for `-webkit-text-stroke`, joins are mitered with a limit of 4. The new outline is owned
++// by the caller, who must free it with FT_Outline_Done; FreeType only ever zeroes the slot's
++// outline on the next load and never frees it.
++fn stroke_glyph_outline(slot: FT_GlyphSlot, radius: FT_Fixed) -> Result<FT_Outline, FT_Error> {
++    unsafe {
++        let library = (*slot).library;
++        let mut stroker: FT_Stroker = ptr::null_mut();
++        let result = FT_Stroker_New(library, &mut stroker);
++        if !succeeded(result) {
++            return Err(result);
++        }
++        FT_Stroker_Set(stroker, radius, FT_STROKER_LINECAP_BUTT, FT_STROKER_LINEJOIN_MITER_VARIABLE, 4 << 16);
++        let mut stroked: FT_Outline = mem::zeroed();
++        let (mut num_points, mut num_contours) = (0, 0);
++        let mut result = FT_Stroker_ParseOutline(stroker, &mut (*slot).outline, 0);
++        if succeeded(result) {
++            result = FT_Stroker_GetCounts(stroker, &mut num_points, &mut num_contours);
++        }
++        if succeeded(result) {
++            result = FT_Outline_New(library, num_points, num_contours as _, &mut stroked);
++        }
++        if succeeded(result) {
++            // FT_Stroker_Export appends to the outline.
++            stroked.n_points = 0;
++            stroked.n_contours = 0;
++            FT_Stroker_Export(stroker, &mut stroked);
++            (*slot).outline = stroked;
++        }
++        FT_Stroker_Done(stroker);
++        if succeeded(result) { Ok(stroked) } else { Err(result) }
++    }
++}
++
+ // Custom version of FT_GlyphSlot_Embolden to be less aggressive with outline
+ // fonts than the default implementation in FreeType.
+ #[no_mangle]
+@@ -158,10 +215,25 @@ struct CachedFont {
+     face: FT_Face,
+     mm_var: *mut FT_MM_Var,
+     variations: Vec<FontVariation>,
++    // The stroked outline that the face's glyph slot points at after loading a glyph of a font
++    // instance with a stroke width.
++    stroked_outline: Option<FT_Outline>,
++}
++
++impl CachedFont {
++    fn free_stroked_outline(&mut self) {
++        if let Some(mut outline) = self.stroked_outline.take() {
++            unsafe {
++                let result = FT_Outline_Done((*(*self.face).glyph).library, &mut outline);
++                assert!(succeeded(result), "FT_Outline_Done failed: {}", result);
++            }
++        }
++    }
+ }
+ 
+ impl Drop for CachedFont {
+     fn drop(&mut self) {
++        self.free_stroked_outline();
+         unsafe {
+             if !self.mm_var.is_null() &&
+                 unimplemented(FT_Done_MM_Var((*(*self.face).glyph).library, self.mm_var)) {
+@@ -257,6 +329,7 @@ impl FontCache {
+                 face,
+                 mm_var,
+                 variations: Vec::new(),
++                stroked_outline: None,
+             }));
+             self.fonts.insert(template, cached.clone());
+             Ok(cached)
+@@ -589,6 +662,21 @@ impl FontContext {
+         }
+ 
+         let format = unsafe { (*slot).format };
++
++        // Loading the glyph left the slot pointing at FreeType's own outline again.
++        cached.free_stroked_outline();
++        if font.stroke_width != 0 && format == FT_Glyph_Format::FT_GLYPH_FORMAT_OUTLINE {
++            // The stroke width is in 1/64ths of a layout pixel, the outline in 26.6 device pixels.
++            let device_scale = req_size * y_scale / font.base.size.to_f64_px();
++            let radius = (font.stroke_width as f64 * device_scale / 2.0).round() as FT_Fixed;
++            match stroke_glyph_outline(slot, radius) {
++                Ok(outline) => cached.stroked_outline = Some(outline),
++                Err(result) => {
++                    error!("Unable to stroke glyph: {}", result);
++                    return None;
++                }
++            }
++        }
+         match format {
+             FT_Glyph_Format::FT_GLYPH_FORMAT_BITMAP => {
+                 let bitmap_size = unsafe { (*(*(*slot).face).size).metrics.y_ppem };
+-- 
+2.43.0
+

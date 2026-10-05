@@ -1,0 +1,383 @@
+From e8fb7e823032b25fdc218677dbde286ac834c9bf Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 01:23:05 -0400
+Subject: [PATCH] layout: render the top layer and ::backdrop
+
+Modal dialogs and open popovers painted inside their ancestors' stacking
+contexts, so any z-index above theirs covered them, transformed or clipping
+ancestors trapped them, and ::backdrop was never drawn.
+
+The user agent stylesheet now marks dialog:modal, :popover-open and
+::backdrop with the internal -servo-top-layer property and gives popovers
+their HTML rendering rules. Boxes in the top layer:
+- hoist past every containing block to the initial containing block,
+- always establish a stacking context,
+- are collected at their placeholders and built last on the root stacking
+  context, above every other stacking context in top layer order,
+- get a ::backdrop box built right before them, so it paints just below.
+Entering or leaving the top layer rebuilds the parent's boxes, which own
+the ::backdrop sibling. Fullscreen elements, which already used
+-servo-top-layer, get Chrome's black backdrop.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../layout/display_list/stacking_context.rs   | 41 +++++++++++++++++++
+ components/layout/dom.rs                      | 13 ++++++
+ components/layout/dom_traversal.rs            | 32 ++++++++++++++-
+ components/layout/positioned.rs               | 35 +++++++++++-----
+ components/layout/style_ext.rs                | 14 +++++++
+ components/layout/stylesheets/user-agent.css  | 39 ++++++++++++++++--
+ .../servo_dangerous_style_element.rs          |  3 +-
+ 7 files changed, 160 insertions(+), 17 deletions(-)
+
+diff --git a/components/layout/display_list/stacking_context.rs b/components/layout/display_list/stacking_context.rs
+index 979c80d5e7a..3f212e77e8b 100644
+--- a/components/layout/display_list/stacking_context.rs
++++ b/components/layout/display_list/stacking_context.rs
+@@ -126,6 +126,11 @@ pub(crate) struct StackingContextTree {
+     /// for things like `overflow`. More clips may be created later during WebRender
+     /// display list construction, but they are never added here.
+     pub clip_store: StackingContextTreeClipStore,
++
++    /// Hoisted fragments of boxes in the top layer, found at their placeholders and built later
++    /// as children of the root stacking context, above everything else.
++    /// <https://drafts.csswg.org/css-position-4/#painting-order>
++    top_layer_fragments: Vec<Fragment>,
+ }
+ 
+ impl StackingContextTree {
+@@ -190,6 +195,7 @@ impl StackingContextTree {
+             root_stacking_context: StackingContext::root(root_scroll_node_id),
+             paint_info,
+             clip_store: Default::default(),
++            top_layer_fragments: Vec::new(),
+         };
+ 
+         let text_decorations = Default::default();
+@@ -206,6 +212,31 @@ impl StackingContextTree {
+             );
+         }
+ 
++        // Top layer boxes are stacking contexts on the root stacking context, painted after every
++        // other descendant in top layer order. Building one may find further top layer boxes
++        // nested inside of it, which go after it.
++        let mut index = 0;
++        while let Some(fragment) = stacking_context_tree
++            .top_layer_fragments
++            .get(index)
++            .cloned()
++        {
++            let first_child_index = root_stacking_context.children.len();
++            fragment.build_stacking_context_tree(
++                &mut stacking_context_tree,
++                &containing_block_info,
++                &mut root_stacking_context,
++                StackingContextBuildMode::IncludeHoisted,
++                &text_decorations,
++            );
++            for child in &mut root_stacking_context.children[first_child_index..] {
++                child.z_index = i32::MAX;
++            }
++            index += 1;
++        }
++
++        // The sort is stable, so top layer stacking contexts keep their order after every
++        // other stacking context, including those with the maximum z-index.
+         root_stacking_context.sort();
+         stacking_context_tree.root_stacking_context = root_stacking_context;
+ 
+@@ -535,6 +566,16 @@ impl Fragment {
+                     },
+                 };
+ 
++                if fragment_ref
++                    .retrieve_box_fragment()
++                    .is_some_and(|box_fragment| box_fragment.style().in_top_layer())
++                {
++                    stacking_context_tree
++                        .top_layer_fragments
++                        .push(fragment_ref.clone());
++                    return;
++                }
++
+                 fragment_ref.build_stacking_context_tree(
+                     stacking_context_tree,
+                     containing_block_info,
+diff --git a/components/layout/dom.rs b/components/layout/dom.rs
+index 4767e335be4..5d3a7e9068b 100644
+--- a/components/layout/dom.rs
++++ b/components/layout/dom.rs
+@@ -658,6 +658,14 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
+             let Some(mut inner_layout_data) = self.inner_layout_data_mut() else {
+                 return false;
+             };
++            // The ::backdrop box of a top layer element is a sibling built by the parent, which
++            // has to rebuild to drop it.
++            if inner_layout_data
++                .pseudo_layout_data(PseudoElement::Backdrop)
++                .is_some()
++            {
++                return false;
++            }
+             inner_layout_data.pseudo_boxes.clear();
+             inner_layout_data.self_box.clone()
+         };
+@@ -668,6 +676,11 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
+         };
+ 
+         let info = NodeAndStyleInfo::new(*self, self.style(&layout_context.style_context));
++        // Likewise the parent has to build the ::backdrop box of an element entering the top
++        // layer.
++        if info.style.in_top_layer() {
++            return false;
++        }
+         let box_style = info.style.get_box();
+         let Display::GeneratingBox(display) = box_style.display.into() else {
+             return false;
+diff --git a/components/layout/dom_traversal.rs b/components/layout/dom_traversal.rs
+index 95b8aa254d9..bd320c66c3d 100644
+--- a/components/layout/dom_traversal.rs
++++ b/components/layout/dom_traversal.rs
+@@ -22,7 +22,9 @@ use crate::flow::inline::SharedInlineStyles;
+ use crate::lists::{counter_values, generate_counter_representation, list_item_ordinal};
+ use crate::quotes::quotes_for_lang;
+ use crate::replaced::ReplacedContents;
+-use crate::style_ext::{Display, DisplayGeneratingBox, DisplayInside, DisplayOutside};
++use crate::style_ext::{
++    ComputedValuesExt, Display, DisplayGeneratingBox, DisplayInside, DisplayOutside,
++};
+ 
+ /// A data structure used to pass and store related layout information together to
+ /// avoid having to repeat the same arguments in argument lists.
+@@ -200,6 +202,9 @@ fn traverse_element<'dom>(
+             }
+         },
+         Display::GeneratingBox(display) => {
++            if info.style.in_top_layer() {
++                traverse_backdrop_pseudo_element(&info, context, handler);
++            }
+             let contents = Contents::for_element(element, context);
+             let display = display.used_value_for_contents(&contents);
+             let box_slot = element.box_slot();
+@@ -208,6 +213,31 @@ fn traverse_element<'dom>(
+     }
+ }
+ 
++/// Every element in the top layer has a `::backdrop` box, which is in the top layer directly
++/// below it. It is built just before the element's box, so it is hoisted and painted first.
++/// <https://drafts.csswg.org/css-position-4/#backdrop>
++fn traverse_backdrop_pseudo_element<'dom>(
++    node_info: &NodeAndStyleInfo<'dom>,
++    context: &LayoutContext,
++    handler: &mut impl TraversalHandler<'dom>,
++) {
++    let Some(backdrop_info) = node_info.with_pseudo_element(context, PseudoElement::Backdrop)
++    else {
++        return;
++    };
++    let Display::GeneratingBox(display) = Display::from(backdrop_info.style.get_box().display)
++    else {
++        return;
++    };
++    let box_slot = backdrop_info.node.box_slot();
++    handler.handle_element(
++        &backdrop_info,
++        display,
++        Contents::for_pseudo_element(Vec::new()),
++        box_slot,
++    );
++}
++
+ fn traverse_eager_pseudo_element<'dom>(
+     pseudo_element_type: PseudoElement,
+     node_info: &NodeAndStyleInfo<'dom>,
+diff --git a/components/layout/positioned.rs b/components/layout/positioned.rs
+index 8d9d5d896aa..07708faf8b5 100644
+--- a/components/layout/positioned.rs
++++ b/components/layout/positioned.rs
+@@ -224,10 +224,12 @@ impl PositioningContext {
+             style.establishes_containing_block_for_absolute_descendants(fragment.base.flags)
+         );
+         if style.establishes_containing_block_for_all_descendants(fragment.base.flags) {
+-            self.absolutes.clear();
+-        } else {
+             self.absolutes
+-                .retain(|hoisted_box| hoisted_box.position() == Position::Fixed);
++                .retain(HoistedAbsolutelyPositionedBox::in_top_layer);
++        } else {
++            self.absolutes.retain(|hoisted_box| {
++                hoisted_box.position() == Position::Fixed || hoisted_box.in_top_layer()
++            });
+         }
+     }
+ 
+@@ -242,16 +244,16 @@ impl PositioningContext {
+             style.establishes_containing_block_for_absolute_descendants(new_fragment.base.flags)
+         );
+ 
+-        if style.establishes_containing_block_for_all_descendants(new_fragment.base.flags) {
+-            boxes_to_layout_out.append(&mut self.absolutes);
+-            return;
+-        }
++        let establishes_containing_block_for_all_descendants =
++            style.establishes_containing_block_for_all_descendants(new_fragment.base.flags);
+ 
+         // TODO: This could potentially use `extract_if` when that is stabilized.
+-        let (mut boxes_to_layout, mut boxes_to_continue_hoisting) = self
+-            .absolutes
+-            .drain(..)
+-            .partition(|hoisted_box| hoisted_box.position() != Position::Fixed);
++        let (mut boxes_to_layout, mut boxes_to_continue_hoisting) =
++            self.absolutes.drain(..).partition(|hoisted_box| {
++                !hoisted_box.in_top_layer() &&
++                    (establishes_containing_block_for_all_descendants ||
++                        hoisted_box.position() != Position::Fixed)
++            });
+         boxes_to_layout_out.append(&mut boxes_to_layout);
+         boxes_to_continue_hoisting_out.append(&mut boxes_to_continue_hoisting);
+     }
+@@ -393,6 +395,17 @@ impl Zero for PositioningContextLength {
+ }
+ 
+ impl HoistedAbsolutelyPositionedBox {
++    /// Boxes in the top layer escape every containing block: their containing block is the
++    /// initial containing block (or the viewport, for `position: fixed`).
++    /// <https://drafts.csswg.org/css-position-4/#top-styling>
++    fn in_top_layer(&self) -> bool {
++        self.absolutely_positioned_box
++            .borrow()
++            .context
++            .style()
++            .in_top_layer()
++    }
++
+     fn position(&self) -> Position {
+         let position = self
+             .absolutely_positioned_box
+diff --git a/components/layout/style_ext.rs b/components/layout/style_ext.rs
+index 2f7daf753be..68caa1dd933 100644
+--- a/components/layout/style_ext.rs
++++ b/components/layout/style_ext.rs
+@@ -7,6 +7,7 @@ use layout_api::AxesOverflow;
+ use malloc_size_of_derive::MallocSizeOf;
+ use style::Zero;
+ use style::color::AbsoluteColor;
++use style::computed_values::_servo_top_layer::T as ServoTopLayer;
+ use style::computed_values::direction::T as Direction;
+ use style::computed_values::isolation::T as ComputedIsolation;
+ use style::computed_values::mix_blend_mode::T as ComputedMixBlendMode;
+@@ -336,6 +337,7 @@ pub(crate) trait ComputedValuesExt {
+     fn used_transform_style(&self, fragment_flags: FragmentFlags) -> ComputedTransformStyle;
+     fn establishes_block_formatting_context(&self, fragment_flags: FragmentFlags) -> bool;
+     fn establishes_stacking_context(&self, fragment_flags: FragmentFlags) -> bool;
++    fn in_top_layer(&self) -> bool;
+     fn establishes_scroll_container(&self, fragment_flags: FragmentFlags) -> bool;
+     fn establishes_containing_block_for_absolute_descendants(
+         &self,
+@@ -745,8 +747,20 @@ impl ComputedValuesExt for ComputedValues {
+             .establishes_scroll_container()
+     }
+ 
++    /// Whether the element is in the top layer, which the user agent stylesheet marks with the
++    /// internal `-servo-top-layer` property.
++    fn in_top_layer(&self) -> bool {
++        self.get_box().clone__servo_top_layer() == ServoTopLayer::Top
++    }
++
+     /// Returns true if this fragment establishes a new stacking context and false otherwise.
+     fn establishes_stacking_context(&self, fragment_flags: FragmentFlags) -> bool {
++        // From <https://drafts.csswg.org/css-position-4/#top-styling>:
++        // > An element in the top layer ... always forms a stacking context.
++        if self.in_top_layer() {
++            return true;
++        }
++
+         // From <https://www.w3.org/TR/css-will-change/#valdef-will-change-custom-ident>:
+         // > If any non-initial value of a property would create a stacking context on the element,
+         // > specifying that property in will-change must create a stacking context on the element.
+diff --git a/components/layout/stylesheets/user-agent.css b/components/layout/stylesheets/user-agent.css
+index 30a72a8d345..4aada8187bb 100644
+--- a/components/layout/stylesheets/user-agent.css
++++ b/components/layout/stylesheets/user-agent.css
+@@ -57,10 +57,25 @@ listing, plaintext, pre, xmp {
+ }
+ 
+ dialog:not([open]) { display: none; }
+-/* https://html.spec.whatwg.org/multipage/#flow-content-3: closed popovers are hidden. The Popover
+- * API isn't implemented yet, so this keeps them out of the page flow (Notion scrolled its page
+- * to a closed language menu laid out inline). */
++/* https://html.spec.whatwg.org/multipage/#flow-content-3 */
+ [popover]:not(:popover-open):not(dialog[open]) { display: none; }
++dialog:popover-open { display: block; }
++[popover] {
++  position: fixed;
++  inset: 0;
++  width: fit-content;
++  height: fit-content;
++  margin: auto;
++  border: solid;
++  padding: 0.25em;
++  overflow: auto;
++  background-color: white; /* FIXME: should be Canvas */
++  color: black; /* FIXME: should be CanvasText */
++}
++:popover-open::backdrop {
++  pointer-events: none !important;
++  background-color: transparent;
++}
+ dialog {
+   position: absolute;
+   inset-inline-start: 0; inset-inline-end: 0;
+@@ -79,11 +94,23 @@ dialog:modal {
+   max-width: calc(100% - 6px - 2em);
+   max-height: calc(100% - 6px - 2em);
+ }
+-/* FIXME: support ::backdrop */
+ dialog::backdrop {
+   background: rgba(0,0,0,0.1);
+ }
+ 
++/* The internal-only -servo-top-layer property puts elements in
++   https://drafts.csswg.org/css-position-4/#top-layer, together with their ::backdrop. */
++dialog:modal, :popover-open {
++  -servo-top-layer: top;
++}
++/* https://drafts.csswg.org/css-position-4/#backdrop */
++::backdrop {
++  display: block;
++  position: fixed;
++  inset: 0;
++  -servo-top-layer: top;
++}
++
+ cite, dfn, em, i, var { font-style: italic; }
+ b, strong { font-weight: bolder; }
+ code, kbd, samp, tt { font-family: monospace; }
+@@ -401,6 +428,10 @@ textarea { white-space: pre-wrap; }
+   -servo-top-layer: top;
+ }
+ 
++*|*:not(:root):fullscreen::backdrop {
++  background: black;
++}
++
+ iframe:fullscreen {
+   border:none !important;
+   padding:0 !important;
+diff --git a/components/script/layout_dom/servo_dangerous_style_element.rs b/components/script/layout_dom/servo_dangerous_style_element.rs
+index eb68cd4f9b4..006e7f8903f 100644
+--- a/components/script/layout_dom/servo_dangerous_style_element.rs
++++ b/components/script/layout_dom/servo_dangerous_style_element.rs
+@@ -538,7 +538,8 @@ impl<'dom> style::dom::TElement for ServoDangerousStyleElement<'dom> {
+ 
+             if old_box.display != new_box.display ||
+                 old_box.float != new_box.float ||
+-                old_box.position != new_box.position
++                old_box.position != new_box.position ||
++                old_box._servo_top_layer != new_box._servo_top_layer
+             {
+                 return true;
+             }
+-- 
+2.43.0
+

@@ -1,0 +1,55 @@
+From 11b63a92b8c1856ceb5e3c0427e4089cdb68d74f Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Mon, 5 Oct 2026 00:03:21 -0400
+Subject: [PATCH] script: keep incremental GC off by default
+
+Runtime::new_with_parent disables incremental GC because Servo's DOM
+writes Dom<T> edges without pre-barriers, but the prefs block later in
+the same function re-enabled it from js.mem.gc.incremental.enabled,
+which defaulted to true. With incremental marking a node moved from an
+unscanned parent into an already-scanned one (or into a NodeList) is
+never marked and gets swept, leaving a dangling pointer that the next
+GC traces and crashes on (homedepot.com content-process SIGSEGV in
+NodeList tracing during Document::set_activity's GC). Default the pref
+to false and correct the comment that claimed the later call was a
+no-op.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/config/prefs.rs          | 2 +-
+ components/script/script_runtime.rs | 6 +++++-
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/components/config/prefs.rs b/components/config/prefs.rs
+index 9bed5e9404b..8e89b0f13f2 100644
+--- a/components/config/prefs.rs
++++ b/components/config/prefs.rs
+@@ -529,7 +529,7 @@ impl Preferences {
+             js_mem_gc_high_frequency_high_limit_mb: 500,
+             js_mem_gc_high_frequency_low_limit_mb: 100,
+             js_mem_gc_high_frequency_time_limit_ms: 1000,
+-            js_mem_gc_incremental_enabled: true,
++            js_mem_gc_incremental_enabled: false,
+             js_mem_gc_incremental_slice_ms: 10,
+             js_mem_gc_low_frequency_heap_growth: 150,
+             js_mem_gc_per_zone_enabled: false,
+diff --git a/components/script/script_runtime.rs b/components/script/script_runtime.rs
+index 4fbda2aa122..353810a5ca3 100644
+--- a/components/script/script_runtime.rs
++++ b/components/script/script_runtime.rs
+@@ -982,7 +982,11 @@ impl Runtime {
+                     .map(|val| (val * 1024 * 1024) as u32)
+                     .unwrap_or(u32::MAX),
+             );
+-            // NOTE: This is disabled above, so enabling it here will do nothing for now.
++            // This runs after the unconditional disable above and overrides it, so the pref has to
++            // stay off by default: DOM-to-DOM edges (`Dom<T>`, `MutNullableDom<T>`) are written
++            // without pre-barriers, so a node moved from a parent the incremental marker has not
++            // scanned yet into one it already scanned is never marked, is swept, and leaves its
++            // new parent (or a `NodeList` holding it) pointing at freed memory.
+             JS_SetGCParameter(
+                 cx,
+                 JSGCParamKey::JSGC_INCREMENTAL_GC_ENABLED,
+-- 
+2.43.0
+

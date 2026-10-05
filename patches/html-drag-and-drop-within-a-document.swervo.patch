@@ -1,0 +1,1165 @@
+From 83dc003d3cc8a672d4a74c374e79a39ee40b3c90 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 02:55:08 -0400
+Subject: [PATCH] script: HTML drag and drop within a document
+
+DragEvent was undefined, HTMLElement.draggable was missing and pressing and
+moving on a draggable element fired no drag events, so Trello-style boards,
+sortable lists and drop zones built on native drag and drop did nothing.
+
+This adds the DragEvent interface (also creatable through
+document.createEvent), the draggable IDL attribute with its auto state for
+images and links with href, and the drag-and-drop processing model in a new
+DragAndDrop helper owned by DocumentEventHandler. An uncanceled primary
+press on an element whose nearest draggable ancestor exists becomes a drag
+once the pointer moves more than 4 CSS px, Chrome's threshold. dragstart
+fires with a read/write drag data store (links and images pre-populate
+text/uri-list, links also text/plain, as Chrome does); canceling it aborts
+the drag. pointercancel then fires and pointer capture is released.
+
+Each pointer move then fires drag at the source, and dragenter/dragleave
+with related targets when the element under the pointer changes, otherwise
+dragover, in the order Chrome's EventHandler::UpdateDragAndDrop uses.
+Only a canceled dragover whose dropEffect is permitted by effectAllowed
+makes the release fire drop; otherwise the release fires dragleave. dragend
+always follows with the final operation as dropEffect. Every event gets a
+fresh DataTransfer that borrows the store in the mode the spec gives that
+event and is disassociated afterwards. While dragging, mouse and pointer
+events, mouseup and click are suppressed and keys do not reach the page;
+Escape cancels the drag, and leaving the viewport fires dragleave.
+
+DataTransfer's effectAllowed setter wrote dropEffect; it now writes
+effectAllowed, which dragstart handlers rely on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../script/dom/datatransfer/datatransfer.rs   |   9 +-
+ components/script/dom/document/document.rs    |   7 +-
+ .../dom/document/document_event_handler.rs    | 109 ++++
+ .../script/dom/document/drag_and_drop.rs      | 585 ++++++++++++++++++
+ components/script/dom/document/mod.rs         |   1 +
+ components/script/dom/event/dragevent.rs      | 141 +++++
+ components/script/dom/event/mod.rs            |   1 +
+ components/script/dom/html/htmlelement.rs     |  30 +
+ components/script/drag_data_store.rs          |   9 +
+ .../script_bindings/webidls/DragEvent.webidl  |  15 +
+ .../webidls/HTMLElement.webidl                |   2 +-
+ 11 files changed, 906 insertions(+), 3 deletions(-)
+ create mode 100644 components/script/dom/document/drag_and_drop.rs
+ create mode 100644 components/script/dom/event/dragevent.rs
+ create mode 100644 components/script_bindings/webidls/DragEvent.webidl
+
+diff --git a/components/script/dom/datatransfer/datatransfer.rs b/components/script/dom/datatransfer/datatransfer.rs
+index 3f4940b5934..ca284b02629 100644
+--- a/components/script/dom/datatransfer/datatransfer.rs
++++ b/components/script/dom/datatransfer/datatransfer.rs
+@@ -88,6 +88,13 @@ impl DataTransfer {
+         Self::new_with_proto(cx, window, None, data_store)
+     }
+ 
++    /// Set the initial `dropEffect` and `effectAllowed` of the `DataTransfer` of a DND event.
++    /// <https://html.spec.whatwg.org/multipage/#fire-a-dnd-event>
++    pub(crate) fn initialize_effects(&self, drop_effect: DOMString, effect_allowed: DOMString) {
++        *self.drop_effect.borrow_mut() = drop_effect;
++        *self.effect_allowed.borrow_mut() = effect_allowed;
++    }
++
+     pub(crate) fn data_store(&self) -> Option<Ref<'_, DragDataStore>> {
+         Ref::filter_map(self.data_store.borrow(), |data_store| data_store.as_ref()).ok()
+     }
+@@ -134,7 +141,7 @@ impl DataTransferMethods<crate::DomTypeHolder> for DataTransfer {
+             .is_some_and(|data_store| data_store.mode() == Mode::ReadWrite) &&
+             VALID_EFFECTS_ALLOWED.contains(&&*value.str())
+         {
+-            *self.drop_effect.borrow_mut() = value;
++            *self.effect_allowed.borrow_mut() = value;
+         }
+     }
+ 
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index e095e1323e0..0ec1e6afd5e 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -146,6 +146,7 @@ use crate::dom::documentorshadowroot::{
+ use crate::dom::documenttimeline::DocumentTimeline;
+ use crate::dom::documenttype::DocumentType;
+ use crate::dom::domimplementation::DOMImplementation;
++use crate::dom::dragevent::DragEvent;
+ use crate::dom::element::attributes::storage::AttrRef;
+ use crate::dom::element::{CustomElementCreationMode, Element, ElementCreator};
+ use crate::dom::event::{Event, EventBubbles, EventCancelable};
+@@ -5882,7 +5883,11 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
+                 self.window.upcast(),
+             ))),
+             // FIXME(#25136): devicemotionevent, deviceorientationevent
+-            // FIXME(#7529): dragevent
++            "dragevent" => Ok(DomRoot::upcast(DragEvent::new_uninitialized(
++                cx,
++                &self.window,
++                None,
++            ))),
+             "events" | "event" | "htmlevents" | "svgevents" => {
+                 Ok(Event::new_uninitialized(cx, self.window.upcast()))
+             },
+diff --git a/components/script/dom/document/document_event_handler.rs b/components/script/dom/document/document_event_handler.rs
+index d9007b390a6..76f097cbbfa 100644
+--- a/components/script/dom/document/document_event_handler.rs
++++ b/components/script/dom/document/document_event_handler.rs
+@@ -58,6 +58,7 @@ use crate::dom::bindings::root::MutNullableDom;
+ use crate::dom::bindings::trace::NoTrace;
+ use crate::dom::clipboardevent::ClipboardEventType;
+ use crate::dom::document::FireMouseEventType;
++use crate::dom::document::drag_and_drop::{DragAndDrop, PointerState};
+ use crate::dom::document::focus::FocusableArea;
+ use crate::dom::document::top_layer::LightDismissEventType;
+ use crate::dom::event::{EventBubbles, EventCancelable, EventComposed, EventFlags};
+@@ -216,6 +217,8 @@ pub(crate) struct DocumentEventHandler {
+     /// tracking when the cursor leaves the widget. Unlike `setPointerCapture`, this does
+     /// not fire `gotpointercapture`/`lostpointercapture`.
+     widget_mouse_capture_target: MutNullableDom<Element>,
++    /// <https://html.spec.whatwg.org/multipage/#drag-and-drop-processing-model>
++    drag_and_drop: DragAndDrop,
+ }
+ 
+ impl DocumentEventHandler {
+@@ -243,6 +246,7 @@ impl DocumentEventHandler {
+             pending_pointer_capture: Default::default(),
+             pointer_capture_target: Default::default(),
+             widget_mouse_capture_target: Default::default(),
++            drag_and_drop: DragAndDrop::new(),
+         }
+     }
+ 
+@@ -455,6 +459,11 @@ impl DocumentEventHandler {
+         input_event: &ConstellationInputEvent,
+         mouse_leave_event: &MouseLeftViewportEvent,
+     ) {
++        if self.drag_and_drop.is_dragging() {
++            self.drag_and_drop.pointer_left_viewport(cx, &self.window);
++            return;
++        }
++
+         if let Some(current_hover_target) = self.current_hover_target.get() {
+             let current_hover_target = current_hover_target.upcast::<Node>();
+             for element in current_hover_target
+@@ -612,6 +621,31 @@ impl DocumentEventHandler {
+             return;
+         }
+ 
++        // While dragging, the pointer drives the drag-and-drop processing model instead of
++        // firing mouse and pointer events, as in other browsers.
++        if self.drag_and_drop.is_dragging() {
++            let Some(target) = hit_test_result
++                .node
++                .inclusive_ancestors(ShadowIncluding::Yes)
++                .find_map(DomRoot::downcast::<Element>)
++            else {
++                return;
++            };
++            if input_event.pressed_mouse_buttons & 1 == 0 {
++                // The primary button was released where this document did not see it, such as
++                // outside the viewport.
++                self.end_drag_for_primary_button_release(cx);
++                return;
++            }
++            self.drag_and_drop.pointer_moved(
++                cx,
++                &self.window,
++                &target.inclusive_ancestor_element_in_non_ua_shadow_root(),
++                PointerState::new(&hit_test_result, input_event),
++            );
++            return;
++        }
++
+         // Update the cursor when the mouse moves, if it has changed.
+         self.set_cursor(Some(hit_test_result.cursor));
+ 
+@@ -767,6 +801,38 @@ impl DocumentEventHandler {
+         mouse_event.upcast::<Event>().fire(cx, &pointer_target);
+ 
+         self.update_current_hover_target_and_status(Some(new_target));
++
++        if self
++            .drag_and_drop
++            .maybe_start_drag(cx, &self.window, &hit_test_result, input_event)
++        {
++            // <https://w3c.github.io/pointerevents/#the-pointercancel-event>
++            // > The user agent MUST fire a pointer event named pointercancel when ... the
++            // > user agent has determined that a pointer is unlikely to continue to produce
++            // > events, e.g. because a drag-and-drop operation has started.
++            let cancel_event = MouseEvent::new(
++                cx,
++                &self.window,
++                Atom::from("pointercancel"),
++                EventBubbles::Bubbles,
++                EventCancelable::NotCancelable,
++                Some(&self.window),
++                0,
++                hit_test_result.point_in_frame.to_i32(),
++                hit_test_result.point_in_frame.to_i32(),
++                hit_test_result
++                    .point_relative_to_initial_containing_block
++                    .to_i32(),
++                input_event.active_keyboard_modifiers,
++                0,
++                0,
++                None,
++                None,
++            )
++            .to_pointer_event(cx, Atom::from("pointercancel"));
++            cancel_event.upcast::<Event>().fire(cx, &pointer_target);
++            self.implicit_release_pointer_capture(cx, pointer_id, "mouse", true);
++        }
+     }
+ 
+     fn update_current_hover_target_and_status(&self, new_hover_target: Option<DomRoot<Element>>) {
+@@ -877,6 +943,15 @@ impl DocumentEventHandler {
+         event: MouseButtonEvent,
+         input_event: &ConstellationInputEvent,
+     ) {
++        // A drag swallows the button events that happen during it, including the release that
++        // drops, so neither mouseup nor click fire for the press that started the drag.
++        if self.drag_and_drop.is_dragging() {
++            if event.button == MouseButton::Left && event.action == MouseButtonAction::Up {
++                self.end_drag_for_primary_button_release(cx);
++            }
++            return;
++        }
++
+         // Ignore all incoming events without a hit test.
+         let Some(hit_test_result) = self.window.hit_test_from_input_event(input_event) else {
+             return;
+@@ -1019,6 +1094,15 @@ impl DocumentEventHandler {
+                     .upcast::<Event>()
+                     .dispatch(cx, node.upcast(), false);
+ 
++                // Canceling mousedown prevents a drag from starting, as in other browsers.
++                if event.button == MouseButton::Left && result {
++                    self.drag_and_drop.note_primary_button_down(
++                        node,
++                        &hit_test_result,
++                        input_event,
++                    );
++                }
++
+                 // Step 8. If result is true and target is a focusable area
+                 // that is click focusable, then Run the focusing steps at target.
+                 if result {
+@@ -1055,6 +1139,10 @@ impl DocumentEventHandler {
+             },
+             // https://w3c.github.io/pointerevents/#dfn-handle-native-mouse-up
+             MouseButtonAction::Up => {
++                if event.button == MouseButton::Left {
++                    self.drag_and_drop.clear_drag_candidate();
++                }
++
+                 // Step 6. Dispatch pointerup event.
+                 let mouse_buttons_down = self.mouse_buttons_down.get();
+                 let pointer_event_name = if mouse_buttons_down == 1 {
+@@ -1148,6 +1236,16 @@ impl DocumentEventHandler {
+         }
+     }
+ 
++    /// Drop at the end of a drag and reset the button state that the swallowed mouseup would
++    /// have reset.
++    fn end_drag_for_primary_button_release(&self, cx: &mut JSContext) {
++        self.drag_and_drop.pointer_released(cx, &self.window);
++        self.mouse_buttons_down
++            .set(self.mouse_buttons_down.get().saturating_sub(1));
++        self.last_mouse_button_down_point.set(None);
++        self.unset_active_element();
++    }
++
+     /// <https://w3c.github.io/pointerevents/#handle-native-mouse-click>
+     /// <https://w3c.github.io/pointerevents/#handle-native-mouse-double-click>
+     fn maybe_trigger_click_for_mouse_button_down_event(
+@@ -1583,6 +1681,17 @@ impl DocumentEventHandler {
+         cx: &mut JSContext,
+         keyboard_event: EmbedderKeyboardEvent,
+     ) -> InputEventResult {
++        // Like the platform drag sessions other browsers run, a drag takes the keyboard:
++        // Escape cancels it and no key reaches the page.
++        if self.drag_and_drop.is_dragging() {
++            if keyboard_event.event.state == KeyState::Down &&
++                keyboard_event.event.key == Key::Named(NamedKey::Escape)
++            {
++                self.drag_and_drop.cancel(cx, &self.window);
++            }
++            return InputEventResult::default();
++        }
++
+         let target = &self.target_for_events_following_focus();
+         let keyevent = KeyboardEvent::new_with_platform_keyboard_event(
+             cx,
+diff --git a/components/script/dom/document/drag_and_drop.rs b/components/script/dom/document/drag_and_drop.rs
+new file mode 100644
+index 00000000000..08442acc10d
+--- /dev/null
++++ b/components/script/dom/document/drag_and_drop.rs
+@@ -0,0 +1,585 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! The HTML drag-and-drop processing model for drags that start and end inside a document:
++//! <https://html.spec.whatwg.org/multipage/#drag-and-drop-processing-model>
++
++use std::cell::{Cell, RefCell};
++use std::rc::Rc;
++
++use euclid::Point2D;
++use js::context::JSContext;
++use keyboard_types::Modifiers;
++use script_bindings::codegen::GenericBindings::DataTransferBinding::DataTransferMethods;
++use script_bindings::codegen::GenericBindings::HTMLElementBinding::HTMLElementMethods;
++use script_bindings::codegen::GenericBindings::HTMLImageElementBinding::HTMLImageElementMethods;
++use script_bindings::inheritance::Castable;
++use script_bindings::root::DomRoot;
++use script_bindings::str::DOMString;
++use script_traits::ConstellationInputEvent;
++use style::Atom;
++use style_traits::CSSPixel;
++
++use crate::dom::bindings::root::MutNullableDom;
++use crate::dom::datatransfer::DataTransfer;
++use crate::dom::event::{Event, EventBubbles, EventCancelable};
++use crate::dom::inputevent::HitTestResult;
++use crate::dom::iterators::ShadowIncluding;
++use crate::dom::node::Node;
++use crate::dom::types::{
++    DragEvent, Element, HTMLAnchorElement, HTMLElement, HTMLImageElement, Window,
++};
++use crate::drag_data_store::{DragDataStore, Mode};
++
++/// How far, in CSS pixels along either axis, the pointer has to travel with the primary button
++/// held before a press on a draggable element becomes a drag. This is Chrome's threshold on
++/// Linux and Windows.
++const DRAG_THRESHOLD: f32 = 4.0;
++
++/// <https://html.spec.whatwg.org/multipage/#current-drag-operation>
++#[derive(Clone, Copy, MallocSizeOf, PartialEq)]
++enum DragOperation {
++    None,
++    Copy,
++    Link,
++    Move,
++}
++
++impl DragOperation {
++    fn as_str(self) -> &'static str {
++        match self {
++            DragOperation::None => "none",
++            DragOperation::Copy => "copy",
++            DragOperation::Link => "link",
++            DragOperation::Move => "move",
++        }
++    }
++
++    fn from_drop_effect(drop_effect: &str) -> Self {
++        match drop_effect {
++            "copy" => DragOperation::Copy,
++            "link" => DragOperation::Link,
++            "move" => DragOperation::Move,
++            _ => DragOperation::None,
++        }
++    }
++
++    /// The `dropEffect` a `dragenter` or `dragover` event starts with, from the table in
++    /// <https://html.spec.whatwg.org/multipage/#dndevents>. Where the table leaves the choice
++    /// to platform conventions, this picks what Chrome picks: "move" whenever it is allowed,
++    /// and "copy" for "uninitialized" even when dragging a link.
++    fn initial_for(effect_allowed: &str) -> Self {
++        match effect_allowed {
++            "none" => DragOperation::None,
++            "link" => DragOperation::Link,
++            "move" | "copyMove" | "linkMove" => DragOperation::Move,
++            _ => DragOperation::Copy,
++        }
++    }
++
++    /// The operation a canceled `dragover` selects: its `dropEffect`, when `effectAllowed`
++    /// permits it.
++    /// <https://html.spec.whatwg.org/multipage/#drag-and-drop-processing-model>
++    fn allowed_by(self, effect_allowed: &str) -> Self {
++        let allowed = match self {
++            DragOperation::None => false,
++            DragOperation::Copy => matches!(
++                effect_allowed,
++                "uninitialized" | "copy" | "copyLink" | "copyMove" | "all"
++            ),
++            DragOperation::Link => matches!(
++                effect_allowed,
++                "uninitialized" | "link" | "copyLink" | "linkMove" | "all"
++            ),
++            DragOperation::Move => matches!(
++                effect_allowed,
++                "uninitialized" | "move" | "copyMove" | "linkMove" | "all"
++            ),
++        };
++        if allowed { self } else { DragOperation::None }
++    }
++}
++
++/// The pointer and keyboard state that DND events report.
++#[derive(Clone, Copy, MallocSizeOf)]
++pub(crate) struct PointerState {
++    client_point: Point2D<i32, CSSPixel>,
++    page_point: Point2D<i32, CSSPixel>,
++    modifiers: Modifiers,
++    buttons: u16,
++}
++
++impl PointerState {
++    pub(crate) fn new(
++        hit_test_result: &HitTestResult,
++        input_event: &ConstellationInputEvent,
++    ) -> Self {
++        Self {
++            client_point: hit_test_result.point_in_frame.to_i32(),
++            page_point: hit_test_result
++                .point_relative_to_initial_containing_block
++                .to_i32(),
++            modifiers: input_event.active_keyboard_modifiers,
++            buttons: input_event.pressed_mouse_buttons,
++        }
++    }
++}
++
++#[derive(JSTraceable, MallocSizeOf)]
++#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
++pub(crate) struct DragAndDrop {
++    /// The draggable element under a primary button press that has not yet moved far enough
++    /// to start a drag.
++    drag_candidate: MutNullableDom<Element>,
++    /// Where the press on `drag_candidate` happened, in the frame.
++    #[no_trace]
++    drag_candidate_point: Cell<Option<Point2D<f32, CSSPixel>>>,
++    /// The state at the press on `drag_candidate`, which `dragstart` reports.
++    #[no_trace]
++    drag_candidate_state: Cell<Option<PointerState>>,
++    /// <https://html.spec.whatwg.org/multipage/#source-node>, set while a drag is in progress.
++    source_node: MutNullableDom<Element>,
++    /// <https://html.spec.whatwg.org/multipage/#current-target-element>
++    current_target_element: MutNullableDom<Element>,
++    /// The drag data store, which each DND event's `DataTransfer` borrows while it is dispatched.
++    #[no_trace]
++    drag_data_store: RefCell<Option<DragDataStore>>,
++    #[no_trace]
++    current_drag_operation: Cell<DragOperation>,
++    /// Like Chrome, the pointer move that changes the target fires `drag`, `dragenter` and
++    /// `dragleave`, and the next one fires `dragover` alone.
++    target_just_changed: Cell<bool>,
++    /// The most recent pointer state, for ending the drag on a release or Escape.
++    #[no_trace]
++    last_pointer_state: Cell<Option<PointerState>>,
++}
++
++impl DragAndDrop {
++    pub(crate) fn new() -> Self {
++        Self {
++            drag_candidate: Default::default(),
++            drag_candidate_point: Default::default(),
++            drag_candidate_state: Default::default(),
++            source_node: Default::default(),
++            current_target_element: Default::default(),
++            drag_data_store: Default::default(),
++            current_drag_operation: Cell::new(DragOperation::None),
++            target_just_changed: Cell::new(false),
++            last_pointer_state: Default::default(),
++        }
++    }
++
++    pub(crate) fn is_dragging(&self) -> bool {
++        self.source_node.get().is_some()
++    }
++
++    /// Remember the draggable inclusive ancestor of the target of an uncanceled primary button
++    /// press, if there is one, so that moving the pointer far enough starts dragging it.
++    /// <https://html.spec.whatwg.org/multipage/#drag-and-drop-processing-model>
++    pub(crate) fn note_primary_button_down(
++        &self,
++        target: &Node,
++        hit_test_result: &HitTestResult,
++        input_event: &ConstellationInputEvent,
++    ) {
++        // > If the user is attempting to drag an element, the user agent must look for the
++        // > nearest ancestor element (including itself) for which the draggable IDL attribute
++        // > is true.
++        let draggable = target
++            .inclusive_ancestors(ShadowIncluding::Yes)
++            .filter_map(DomRoot::downcast::<HTMLElement>)
++            .find(|element| element.Draggable());
++        self.drag_candidate
++            .set(draggable.as_ref().map(|element| element.upcast()));
++        self.drag_candidate_point
++            .set(Some(hit_test_result.point_in_frame));
++        self.drag_candidate_state
++            .set(Some(PointerState::new(hit_test_result, input_event)));
++    }
++
++    pub(crate) fn clear_drag_candidate(&self) {
++        self.drag_candidate.set(None);
++    }
++
++    /// Start dragging the drag candidate if the pointer has moved past the drag threshold with
++    /// the primary button still held. Returns whether a drag started.
++    pub(crate) fn maybe_start_drag(
++        &self,
++        cx: &mut JSContext,
++        window: &Window,
++        hit_test_result: &HitTestResult,
++        input_event: &ConstellationInputEvent,
++    ) -> bool {
++        let Some(source_node) = self.drag_candidate.get() else {
++            return false;
++        };
++        if input_event.pressed_mouse_buttons & 1 == 0 {
++            self.drag_candidate.set(None);
++            return false;
++        }
++        let press_point = self
++            .drag_candidate_point
++            .get()
++            .expect("a drag candidate always has a press point");
++        let distance = hit_test_result.point_in_frame - press_point;
++        if distance.x.abs() <= DRAG_THRESHOLD && distance.y.abs() <= DRAG_THRESHOLD {
++            return false;
++        }
++        self.drag_candidate.set(None);
++
++        // > Create a drag data store. All the DND events fired subsequently by the steps in
++        // > this section must use this drag data store.
++        let mut drag_data_store = DragDataStore::new();
++        // > If the list of dragged nodes contains an img element, or an a element with an href
++        // > attribute, add to the drag data store item list an item whose kind is text, type
++        // > string is "text/uri-list", and data is the absolute URL of that element.
++        if let Some(anchor) = source_node.downcast::<HTMLAnchorElement>() &&
++            let Some(url) = anchor.full_href_url_for_user_interface()
++        {
++            let url = DOMString::from(url.as_str());
++            drag_data_store.set_data(DOMString::from("text/uri-list"), url.clone());
++            // Chrome also offers a dragged link's URL as text/plain.
++            drag_data_store.set_data(DOMString::from("text/plain"), url);
++        } else if let Some(image) = source_node.downcast::<HTMLImageElement>() {
++            let current_src = image.CurrentSrc();
++            if !current_src.0.is_empty() {
++                drag_data_store.set_data(
++                    DOMString::from("text/uri-list"),
++                    DOMString::from(current_src.0),
++                );
++            }
++        }
++        *self.drag_data_store.borrow_mut() = Some(drag_data_store);
++        self.source_node.set(Some(&source_node));
++        self.current_target_element.set(None);
++        self.current_drag_operation.set(DragOperation::None);
++        self.target_just_changed.set(false);
++        self.last_pointer_state
++            .set(Some(PointerState::new(hit_test_result, input_event)));
++
++        // > Fire a DND event named dragstart at the source node. If the event is canceled,
++        // > then the drag-and-drop operation should not occur; return.
++        let press_state = self
++            .drag_candidate_state
++            .get()
++            .expect("a drag candidate always has a press state");
++        let (canceled, _) = self.fire_dnd_event(
++            cx,
++            window,
++            "dragstart",
++            &source_node,
++            None,
++            DragOperation::None,
++            press_state,
++        );
++        if canceled {
++            self.reset();
++            return false;
++        }
++        true
++    }
++
++    /// Run one iteration of the drag-and-drop processing model for a pointer move to `target`.
++    /// The event order follows Chrome's `EventHandler::UpdateDragAndDrop`, which keeps
++    /// the target element under the pointer even when `dragenter` is not canceled.
++    pub(crate) fn pointer_moved(
++        &self,
++        cx: &mut JSContext,
++        window: &Window,
++        target: &Element,
++        state: PointerState,
++    ) {
++        self.last_pointer_state.set(Some(state));
++        let source_node = self.source_node.get().expect("a drag is in progress");
++        let effect_allowed = self.allowed_effects_state();
++        let initial_drop_effect = DragOperation::initial_for(&effect_allowed);
++
++        let previous_target = self.current_target_element.get();
++        if previous_target.as_deref() != Some(target) {
++            if !self.fire_drag_or_cancel(cx, window, &source_node, state) {
++                return;
++            }
++            self.fire_dnd_event(
++                cx,
++                window,
++                "dragenter",
++                target,
++                previous_target.as_deref(),
++                initial_drop_effect,
++                state,
++            );
++            if let Some(previous_target) = previous_target {
++                self.fire_dnd_event(
++                    cx,
++                    window,
++                    "dragleave",
++                    &previous_target,
++                    Some(target),
++                    DragOperation::None,
++                    state,
++                );
++            }
++            self.current_target_element.set(Some(target));
++            self.current_drag_operation.set(DragOperation::None);
++            self.target_just_changed.set(true);
++            return;
++        }
++
++        if !self.target_just_changed.replace(false) &&
++            !self.fire_drag_or_cancel(cx, window, &source_node, state)
++        {
++            return;
++        }
++
++        // > If the dragover event is not canceled, ... reset the current drag operation to
++        // > "none". Otherwise, set the current drag operation based on the values of the
++        // > effectAllowed and dropEffect attributes of the DragEvent object's dataTransfer.
++        let (canceled, drop_effect) = self.fire_dnd_event(
++            cx,
++            window,
++            "dragover",
++            target,
++            None,
++            initial_drop_effect,
++            state,
++        );
++        let operation = if canceled {
++            DragOperation::from_drop_effect(&drop_effect).allowed_by(&effect_allowed)
++        } else {
++            DragOperation::None
++        };
++        self.current_drag_operation.set(operation);
++    }
++
++    /// The primary button was released: drop on the current target element if the last
++    /// `dragover` accepted the drag, then end the drag.
++    pub(crate) fn pointer_released(&self, cx: &mut JSContext, window: &Window) {
++        let state = self
++            .last_pointer_state
++            .get()
++            .expect("a drag in progress has a pointer state");
++        if let Some(target) = self.current_target_element.get() {
++            if self.current_drag_operation.get() == DragOperation::None {
++                // > If the current drag operation is "none" ... fire a DND event named
++                // > dragleave at it.
++                self.fire_dnd_event(
++                    cx,
++                    window,
++                    "dragleave",
++                    &target,
++                    None,
++                    DragOperation::None,
++                    state,
++                );
++            } else {
++                // > Otherwise, ... fire a DND event named drop at it. If the event is
++                // > canceled, set the current drag operation to the value of the dropEffect
++                // > attribute of the DragEvent object's dataTransfer object as it stood after
++                // > the event dispatch finished. Otherwise, ... reset the current drag operation
++                // > to "none".
++                let (canceled, drop_effect) = self.fire_dnd_event(
++                    cx,
++                    window,
++                    "drop",
++                    &target,
++                    None,
++                    self.current_drag_operation.get(),
++                    state,
++                );
++                self.current_drag_operation.set(if canceled {
++                    DragOperation::from_drop_effect(&drop_effect)
++                } else {
++                    DragOperation::None
++                });
++            }
++        }
++        self.end_drag(cx, window, state);
++    }
++
++    /// The pointer left the viewport: the drag no longer has a target in this document.
++    pub(crate) fn pointer_left_viewport(&self, cx: &mut JSContext, window: &Window) {
++        let state = self
++            .last_pointer_state
++            .get()
++            .expect("a drag in progress has a pointer state");
++        if let Some(target) = self.current_target_element.take() {
++            self.fire_dnd_event(
++                cx,
++                window,
++                "dragleave",
++                &target,
++                None,
++                DragOperation::None,
++                state,
++            );
++        }
++        self.current_drag_operation.set(DragOperation::None);
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#drag-and-drop-processing-model>
++    /// > If the user ends the drag-and-drop operation (e.g. by pressing the Escape key) ...
++    /// > the drag operation was a failure.
++    pub(crate) fn cancel(&self, cx: &mut JSContext, window: &Window) {
++        let state = self
++            .last_pointer_state
++            .get()
++            .expect("a drag in progress has a pointer state");
++        self.current_drag_operation.set(DragOperation::None);
++        if let Some(target) = self.current_target_element.get() {
++            self.fire_dnd_event(
++                cx,
++                window,
++                "dragleave",
++                &target,
++                None,
++                DragOperation::None,
++                state,
++            );
++        }
++        self.end_drag(cx, window, state);
++    }
++
++    /// Fire `drag` at the source node, canceling the whole drag if the event is canceled.
++    /// Returns whether the drag continues.
++    fn fire_drag_or_cancel(
++        &self,
++        cx: &mut JSContext,
++        window: &Window,
++        source_node: &Element,
++        state: PointerState,
++    ) -> bool {
++        let (canceled, _) = self.fire_dnd_event(
++            cx,
++            window,
++            "drag",
++            source_node,
++            None,
++            DragOperation::None,
++            state,
++        );
++        if canceled {
++            self.cancel(cx, window);
++        }
++        !canceled
++    }
++
++    /// > Fire a DND event named dragend at the source node.
++    fn end_drag(&self, cx: &mut JSContext, window: &Window, state: PointerState) {
++        let source_node = self.source_node.get().expect("a drag is in progress");
++        self.fire_dnd_event(
++            cx,
++            window,
++            "dragend",
++            &source_node,
++            None,
++            self.current_drag_operation.get(),
++            state,
++        );
++        self.reset();
++    }
++
++    fn reset(&self) {
++        self.source_node.set(None);
++        self.current_target_element.set(None);
++        self.drag_data_store.borrow_mut().take();
++        self.current_drag_operation.set(DragOperation::None);
++        self.target_just_changed.set(false);
++        self.last_pointer_state.set(None);
++    }
++
++    fn allowed_effects_state(&self) -> String {
++        self.drag_data_store
++            .borrow()
++            .as_ref()
++            .expect("a drag in progress has a drag data store")
++            .allowed_effects_state()
++            .to_owned()
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#fire-a-dnd-event>
++    ///
++    /// Returns whether the event was canceled and the `dropEffect` after dispatch.
++    #[expect(clippy::too_many_arguments)]
++    fn fire_dnd_event(
++        &self,
++        cx: &mut JSContext,
++        window: &Window,
++        event_type: &str,
++        target: &Element,
++        related_target: Option<&Element>,
++        drop_effect: DragOperation,
++        state: PointerState,
++    ) -> (bool, String) {
++        let mut drag_data_store = self
++            .drag_data_store
++            .borrow_mut()
++            .take()
++            .expect("a drag in progress has a drag data store");
++        // > If e is dragstart, then set the drag data store mode to the read/write mode ...
++        // > If e is drop, set the drag data store mode to the read-only mode.
++        drag_data_store.set_mode(match event_type {
++            "dragstart" => Mode::ReadWrite,
++            "drop" => Mode::ReadOnly,
++            _ => Mode::Protected,
++        });
++        let effect_allowed = DOMString::from(drag_data_store.allowed_effects_state());
++
++        // > Let dataTransfer be a newly created DataTransfer object associated with the given
++        // > drag data store.
++        let shared_store = Rc::new(RefCell::new(Some(drag_data_store)));
++        let data_transfer = DataTransfer::new(cx, window, Rc::clone(&shared_store));
++        // > Set the effectAllowed attribute to the drag data store's drag data store allowed
++        // > effects state. Set the dropEffect attribute to "none" if e is dragstart, drag, or
++        // > dragleave; to the value corresponding to the current drag operation if e is drop or
++        // > dragend; and to a value based on the effectAllowed attribute's value and the
++        // > drag-and-drop source, as given by the table in #dndevents, otherwise.
++        data_transfer.initialize_effects(DOMString::from(drop_effect.as_str()), effect_allowed);
++
++        // > Create a DragEvent object and initialize it to have the given name e, to bubble,
++        // > to be cancelable unless e is dragleave or dragend, and to have the detail
++        // > attribute initialized to zero ...
++        let cancelable = if matches!(event_type, "dragleave" | "dragend") {
++            EventCancelable::NotCancelable
++        } else {
++            EventCancelable::Cancelable
++        };
++        let event = DragEvent::new(
++            cx,
++            window,
++            None,
++            Atom::from(event_type),
++            EventBubbles::Bubbles,
++            cancelable,
++            Some(window),
++            0,
++            state.client_point,
++            state.client_point,
++            state.page_point,
++            state.modifiers,
++            0,
++            state.buttons,
++            related_target.map(|element| element.upcast()),
++            Some(&data_transfer),
++        );
++        let event = event.upcast::<Event>();
++        event.set_composed(true);
++        let not_canceled = event.fire(cx, target.upcast());
++
++        let mut drag_data_store = shared_store
++            .borrow_mut()
++            .take()
++            .expect("only the drag-and-drop processing model breaks the association");
++        // > If e is dragstart, ... the drag data store allowed effects state must be set to
++        // > the value of the effectAllowed attribute ...
++        if event_type == "dragstart" {
++            drag_data_store.set_allowed_effects_state(data_transfer.EffectAllowed().to_string());
++        }
++        // > Set the drag data store mode back to the protected mode if it was changed in the
++        // > first step. Break the association between dataTransfer and the drag data store.
++        drag_data_store.set_mode(Mode::Protected);
++        *self.drag_data_store.borrow_mut() = Some(drag_data_store);
++
++        (!not_canceled, data_transfer.DropEffect().to_string())
++    }
++}
+diff --git a/components/script/dom/document/mod.rs b/components/script/dom/document/mod.rs
+index 2f30d767729..9b04915a6ac 100644
+--- a/components/script/dom/document/mod.rs
++++ b/components/script/dom/document/mod.rs
+@@ -10,6 +10,7 @@ pub(crate) mod document_event_handler;
+ pub(crate) mod documentfragment;
+ pub(crate) mod documentorshadowroot;
+ pub(crate) mod documenttype;
++pub(crate) mod drag_and_drop;
+ pub(crate) mod focus;
+ pub(crate) mod top_layer;
+ mod tree_ordered_index_map;
+diff --git a/components/script/dom/event/dragevent.rs b/components/script/dom/event/dragevent.rs
+new file mode 100644
+index 00000000000..a26769e839d
+--- /dev/null
++++ b/components/script/dom/event/dragevent.rs
+@@ -0,0 +1,141 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++use dom_struct::dom_struct;
++use euclid::Point2D;
++use js::context::JSContext;
++use js::rust::HandleObject;
++use keyboard_types::Modifiers;
++use script_bindings::reflector::reflect_dom_object_with_proto_and_cx;
++use style::Atom;
++use style_traits::CSSPixel;
++
++use crate::dom::bindings::codegen::Bindings::DragEventBinding;
++use crate::dom::bindings::codegen::Bindings::DragEventBinding::DragEventMethods;
++use crate::dom::bindings::codegen::Bindings::MouseEventBinding::MouseEventMethods;
++use crate::dom::bindings::inheritance::Castable;
++use crate::dom::bindings::root::{DomRoot, MutNullableDom};
++use crate::dom::bindings::str::DOMString;
++use crate::dom::datatransfer::DataTransfer;
++use crate::dom::event::{Event, EventBubbles, EventCancelable};
++use crate::dom::eventtarget::EventTarget;
++use crate::dom::mouseevent::MouseEvent;
++use crate::dom::window::Window;
++
++/// <https://html.spec.whatwg.org/multipage/#the-dragevent-interface>
++#[dom_struct]
++pub(crate) struct DragEvent {
++    mouseevent: MouseEvent,
++    data_transfer: MutNullableDom<DataTransfer>,
++}
++
++impl DragEvent {
++    fn new_inherited() -> DragEvent {
++        DragEvent {
++            mouseevent: MouseEvent::new_inherited(),
++            data_transfer: MutNullableDom::new(None),
++        }
++    }
++
++    pub(crate) fn new_uninitialized(
++        cx: &mut JSContext,
++        window: &Window,
++        proto: Option<HandleObject>,
++    ) -> DomRoot<DragEvent> {
++        reflect_dom_object_with_proto_and_cx(
++            Box::new(DragEvent::new_inherited()),
++            window,
++            proto,
++            cx,
++        )
++    }
++
++    #[expect(clippy::too_many_arguments)]
++    pub(crate) fn new(
++        cx: &mut JSContext,
++        window: &Window,
++        proto: Option<HandleObject>,
++        event_type: Atom,
++        can_bubble: EventBubbles,
++        cancelable: EventCancelable,
++        view: Option<&Window>,
++        detail: i32,
++        screen_point: Point2D<i32, CSSPixel>,
++        client_point: Point2D<i32, CSSPixel>,
++        page_point: Point2D<i32, CSSPixel>,
++        modifiers: Modifiers,
++        button: i16,
++        buttons: u16,
++        related_target: Option<&EventTarget>,
++        data_transfer: Option<&DataTransfer>,
++    ) -> DomRoot<DragEvent> {
++        let event = DragEvent::new_uninitialized(cx, window, proto);
++        event.mouseevent.initialize_mouse_event(
++            event_type,
++            can_bubble,
++            cancelable,
++            view,
++            detail,
++            screen_point,
++            client_point,
++            page_point,
++            modifiers,
++            button,
++            buttons,
++            related_target,
++            None,
++        );
++        event.data_transfer.set(data_transfer);
++        event
++    }
++}
++
++impl DragEventMethods<crate::DomTypeHolder> for DragEvent {
++    /// <https://html.spec.whatwg.org/multipage/#dom-dragevent-datatransfer>
++    fn Constructor(
++        cx: &mut JSContext,
++        window: &Window,
++        proto: Option<HandleObject>,
++        event_type: DOMString,
++        init: &DragEventBinding::DragEventInit,
++    ) -> DomRoot<DragEvent> {
++        let mouse_init = &init.parent;
++        let event_init = &mouse_init.parent.parent.parent;
++        let scroll_offset = window.scroll_offset();
++        let page_point = Point2D::new(
++            scroll_offset.x as i32 + mouse_init.clientX,
++            scroll_offset.y as i32 + mouse_init.clientY,
++        );
++        let event = DragEvent::new(
++            cx,
++            window,
++            proto,
++            event_type.into(),
++            EventBubbles::from(event_init.bubbles),
++            EventCancelable::from(event_init.cancelable),
++            mouse_init.parent.parent.view.as_deref(),
++            mouse_init.parent.parent.detail,
++            Point2D::new(mouse_init.screenX, mouse_init.screenY),
++            Point2D::new(mouse_init.clientX, mouse_init.clientY),
++            page_point,
++            mouse_init.parent.modifiers(),
++            mouse_init.button,
++            mouse_init.buttons,
++            mouse_init.relatedTarget.as_deref(),
++            init.dataTransfer.as_deref(),
++        );
++        event.upcast::<Event>().set_composed(event_init.composed);
++        event
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-dragevent-datatransfer>
++    fn GetDataTransfer(&self) -> Option<DomRoot<DataTransfer>> {
++        self.data_transfer.get()
++    }
++
++    /// <https://dom.spec.whatwg.org/#dom-event-istrusted>
++    fn IsTrusted(&self) -> bool {
++        self.mouseevent.IsTrusted()
++    }
++}
+diff --git a/components/script/dom/event/mod.rs b/components/script/dom/event/mod.rs
+index 6a94354db63..120f1df6eb5 100644
+--- a/components/script/dom/event/mod.rs
++++ b/components/script/dom/event/mod.rs
+@@ -9,6 +9,7 @@ pub(crate) mod closeevent;
+ pub(crate) mod commandevent;
+ pub(crate) mod compositionevent;
+ pub(crate) mod customevent;
++pub(crate) mod dragevent;
+ pub(crate) mod errorevent;
+ #[allow(clippy::module_inception, reason = "The interface name is Event")]
+ pub(crate) mod event;
+diff --git a/components/script/dom/html/htmlelement.rs b/components/script/dom/html/htmlelement.rs
+index cd3c693cec2..60b1d76ca69 100644
+--- a/components/script/dom/html/htmlelement.rs
++++ b/components/script/dom/html/htmlelement.rs
+@@ -53,11 +53,13 @@ use crate::dom::element::{
+ use crate::dom::elementinternals::ElementInternals;
+ use crate::dom::event::Event;
+ use crate::dom::eventtarget::EventTarget;
++use crate::dom::html::htmlanchorelement::HTMLAnchorElement;
+ use crate::dom::html::htmlbodyelement::HTMLBodyElement;
+ use crate::dom::html::htmldetailselement::HTMLDetailsElement;
+ use crate::dom::html::htmlformelement::{FormControl, HTMLFormElement};
+ use crate::dom::html::htmlframesetelement::HTMLFrameSetElement;
+ use crate::dom::html::htmlhtmlelement::HTMLHtmlElement;
++use crate::dom::html::htmlimageelement::HTMLImageElement;
+ use crate::dom::html::htmllabelelement::HTMLLabelElement;
+ use crate::dom::html::htmltextareaelement::HTMLTextAreaElement;
+ use crate::dom::html::input_element::HTMLInputElement;
+@@ -241,6 +243,34 @@ impl HTMLElementMethods<crate::DomTypeHolder> for HTMLElement {
+     // https://html.spec.whatwg.org/multipage/#dom-hidden
+     make_bool_setter!(cx, SetHidden, "hidden");
+ 
++    /// <https://html.spec.whatwg.org/multipage/#dom-draggable>
++    fn Draggable(&self) -> bool {
++        let draggable = self
++            .as_element()
++            .get_string_attribute(&local_name!("draggable"));
++        if draggable.str().eq_ignore_ascii_case("true") {
++            return true;
++        }
++        if draggable.str().eq_ignore_ascii_case("false") {
++            return false;
++        }
++        // > Otherwise, the element's draggable content attribute has the state Auto. If the
++        // > element is an img element, an object element that represents an image, or an a
++        // > element with an href content attribute, the draggable IDL attribute must return true
++        self.is::<HTMLImageElement>() ||
++            (self.is::<HTMLAnchorElement>() &&
++                self.as_element().has_attribute(&local_name!("href")))
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#dom-draggable>
++    fn SetDraggable(&self, cx: &mut JSContext, draggable: bool) {
++        self.as_element().set_string_attribute(
++            cx,
++            &local_name!("draggable"),
++            DOMString::from(if draggable { "true" } else { "false" }),
++        );
++    }
++
+     // https://html.spec.whatwg.org/multipage/#globaleventhandlers
+     global_event_handlers!(NoOnload);
+ 
+diff --git a/components/script/drag_data_store.rs b/components/script/drag_data_store.rs
+index 2268fd4d25f..4c2cee24b41 100644
+--- a/components/script/drag_data_store.rs
++++ b/components/script/drag_data_store.rs
+@@ -132,6 +132,15 @@ impl DragDataStore {
+         self.mode = mode;
+     }
+ 
++    /// <https://html.spec.whatwg.org/multipage/#drag-data-store-allowed-effects-state>
++    pub(crate) fn allowed_effects_state(&self) -> &str {
++        &self.allowed_effects_state
++    }
++
++    pub(crate) fn set_allowed_effects_state(&mut self, allowed_effects_state: String) {
++        self.allowed_effects_state = allowed_effects_state;
++    }
++
+     pub(crate) fn set_bitmap(&mut self, image: Option<Arc<RasterImage>>, x: i32, y: i32) {
+         self.bitmap = Some(Bitmap { image, x, y });
+     }
+diff --git a/components/script_bindings/webidls/DragEvent.webidl b/components/script_bindings/webidls/DragEvent.webidl
+new file mode 100644
+index 00000000000..09e2f77b2e4
+--- /dev/null
++++ b/components/script_bindings/webidls/DragEvent.webidl
+@@ -0,0 +1,15 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++// https://html.spec.whatwg.org/multipage/#the-dragevent-interface
++[Exposed=Window]
++interface DragEvent : MouseEvent {
++  constructor(DOMString type, optional DragEventInit eventInitDict = {});
++
++  readonly attribute DataTransfer? dataTransfer;
++};
++
++dictionary DragEventInit : MouseEventInit {
++  DataTransfer? dataTransfer = null;
++};
+diff --git a/components/script_bindings/webidls/HTMLElement.webidl b/components/script_bindings/webidls/HTMLElement.webidl
+index 99c8bef0004..dd264ba12c9 100644
+--- a/components/script_bindings/webidls/HTMLElement.webidl
++++ b/components/script_bindings/webidls/HTMLElement.webidl
+@@ -25,7 +25,7 @@ interface HTMLElement : Element {
+   undefined click();
+   [CEReactions] attribute DOMString accessKey;
+   readonly attribute DOMString accessKeyLabel;
+-  // [CEReactions] attribute boolean draggable;
++  [CEReactions] attribute boolean draggable;
+   // [CEReactions] attribute boolean spellcheck;
+   // [CEReactions, ReflectSetter] attribute DOMString writingSuggestions;
+   // [CEReactions, ReflectSetter] attribute DOMString autocapitalize;
+-- 
+2.43.0
+

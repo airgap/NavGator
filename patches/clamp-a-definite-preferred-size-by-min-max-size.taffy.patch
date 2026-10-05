@@ -1,0 +1,217 @@
+From f432fb83f6d84612cf53138ff6cda07a382f3d0f Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 16:28:35 -0400
+Subject: [PATCH] grid: clamp a definite preferred size by min/max size in
+ minimum contributions
+
+When an item has a definite preferred size its minimum contribution is its
+min-content contribution, and that contribution is the preferred size
+clamped by the item's min and max sizes. minimum_contribution() returned
+the raw preferred size instead, so an item with width:1120px and
+max-width:1008px placed in a 1fr column grew the column to 1120px and the
+grid overflowed its container (reddit scrolled sideways because of this).
+
+https://www.w3.org/TR/css-grid-2/#min-size-auto
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/compute/grid/types/grid_item.rs           | 23 ++++++++++++------
+ ...em_preferred_size_clamped_by_max_size.html | 18 ++++++++++++++
+ ...ze_clamped_by_max_size__border_box_ltr.xml | 15 ++++++++++++
+ ...ze_clamped_by_max_size__border_box_rtl.xml | 15 ++++++++++++
+ ...e_clamped_by_max_size__content_box_ltr.xml | 15 ++++++++++++
+ ...e_clamped_by_max_size__content_box_rtl.xml | 15 ++++++++++++
+ tests/xml/mod.rs                              | 24 +++++++++++++++++++
+ 7 files changed, 118 insertions(+), 7 deletions(-)
+ create mode 100644 test_fixtures/grid/grid_fr_item_preferred_size_clamped_by_max_size.html
+ create mode 100644 tests/xml/grid/grid_fr_item_preferred_size_clamped_by_max_size__border_box_ltr.xml
+ create mode 100644 tests/xml/grid/grid_fr_item_preferred_size_clamped_by_max_size__border_box_rtl.xml
+ create mode 100644 tests/xml/grid/grid_fr_item_preferred_size_clamped_by_max_size__content_box_ltr.xml
+ create mode 100644 tests/xml/grid/grid_fr_item_preferred_size_clamped_by_max_size__content_box_rtl.xml
+
+diff --git a/src/compute/grid/types/grid_item.rs b/src/compute/grid/types/grid_item.rs
+index 1ed6e249..704c478c 100644
+--- a/src/compute/grid/types/grid_item.rs
++++ b/src/compute/grid/types/grid_item.rs
+@@ -523,19 +523,28 @@ impl GridItem {
+         let padding_border_size = (padding + border).sum_axes();
+         let box_sizing_adjustment =
+             if self.box_sizing == BoxSizing::ContentBox { padding_border_size } else { Size::ZERO };
++        let min_size = self
++            .min_size
++            .maybe_resolve(grid_area_size, |val, basis| tree.calc(val, basis))
++            .maybe_apply_aspect_ratio(self.aspect_ratio)
++            .maybe_add(box_sizing_adjustment)
++            .get(axis);
++        let max_size = self
++            .max_size
++            .maybe_resolve(grid_area_size, |val, basis| tree.calc(val, basis))
++            .maybe_apply_aspect_ratio(self.aspect_ratio)
++            .maybe_add(box_sizing_adjustment)
++            .get(axis);
+         let size = self
+             .size
+             .maybe_resolve(grid_area_size, |val, basis| tree.calc(val, basis))
+             .maybe_apply_aspect_ratio(self.aspect_ratio)
+             .maybe_add(box_sizing_adjustment)
+             .get(axis)
+-            .or_else(|| {
+-                self.min_size
+-                    .maybe_resolve(grid_area_size, |val, basis| tree.calc(val, basis))
+-                    .maybe_apply_aspect_ratio(self.aspect_ratio)
+-                    .maybe_add(box_sizing_adjustment)
+-                    .get(axis)
+-            })
++            // A definite preferred size makes the minimum contribution the min-content contribution, which is the
++            // preferred size as clamped by the min and max sizes
++            .maybe_clamp(min_size, max_size)
++            .or(min_size)
+             .or_else(|| self.overflow.get(axis).maybe_into_automatic_min_size())
+             .unwrap_or_else(|| {
+                 // Automatic minimum size. See https://www.w3.org/TR/css-grid-1/#min-size-auto
+diff --git a/test_fixtures/grid/grid_fr_item_preferred_size_clamped_by_max_size.html b/test_fixtures/grid/grid_fr_item_preferred_size_clamped_by_max_size.html
+new file mode 100644
+index 00000000..aa48009a
+--- /dev/null
++++ b/test_fixtures/grid/grid_fr_item_preferred_size_clamped_by_max_size.html
+@@ -0,0 +1,18 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <script src="../../scripts/gentest/test_helper.js"></script>
++  <link rel="stylesheet" type="text/css" href="../../scripts/gentest/test_base_style.css">
++  <title>
++    Test description
++  </title>
++</head>
++<body>
++
++<div id="test-root" style="width: 400px; display: grid; grid-template-columns: 100px 1fr;">
++  <div style="height: 20px;"></div>
++  <div style="width: 500px; max-width: 250px; height: 20px; margin: 0 auto;"></div>
++</div>
++
++</body>
++</html>
+diff --git a/tests/xml/grid/grid_fr_item_preferred_size_clamped_by_max_size__border_box_ltr.xml b/tests/xml/grid/grid_fr_item_preferred_size_clamped_by_max_size__border_box_ltr.xml
+new file mode 100644
+index 00000000..1cdf4569
+--- /dev/null
++++ b/tests/xml/grid/grid_fr_item_preferred_size_clamped_by_max_size__border_box_ltr.xml
+@@ -0,0 +1,15 @@
++<test name="grid_fr_item_preferred_size_clamped_by_max_size__border_box_ltr" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="grid" direction="ltr" width="400px" grid-template-columns="100px 1fr">
++      <div direction="ltr" height="20px"/>
++      <div direction="ltr" width="500px" height="20px" max-width="250px" margin-top="0px" margin-left="auto" margin-bottom="0px" margin-right="auto"/>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="400" height="20">
++      <node x="0" y="0" width="100" height="20"/>
++      <node x="125" y="0" width="250" height="20"/>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/grid/grid_fr_item_preferred_size_clamped_by_max_size__border_box_rtl.xml b/tests/xml/grid/grid_fr_item_preferred_size_clamped_by_max_size__border_box_rtl.xml
+new file mode 100644
+index 00000000..8cd43285
+--- /dev/null
++++ b/tests/xml/grid/grid_fr_item_preferred_size_clamped_by_max_size__border_box_rtl.xml
+@@ -0,0 +1,15 @@
++<test name="grid_fr_item_preferred_size_clamped_by_max_size__border_box_rtl" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="grid" direction="rtl" width="400px" grid-template-columns="100px 1fr">
++      <div direction="rtl" height="20px"/>
++      <div direction="rtl" width="500px" height="20px" max-width="250px" margin-top="0px" margin-left="auto" margin-bottom="0px" margin-right="auto"/>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="400" height="20">
++      <node x="300" y="0" width="100" height="20"/>
++      <node x="25" y="0" width="250" height="20"/>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/grid/grid_fr_item_preferred_size_clamped_by_max_size__content_box_ltr.xml b/tests/xml/grid/grid_fr_item_preferred_size_clamped_by_max_size__content_box_ltr.xml
+new file mode 100644
+index 00000000..9b6f4349
+--- /dev/null
++++ b/tests/xml/grid/grid_fr_item_preferred_size_clamped_by_max_size__content_box_ltr.xml
+@@ -0,0 +1,15 @@
++<test name="grid_fr_item_preferred_size_clamped_by_max_size__content_box_ltr" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="grid" box-sizing="content-box" direction="ltr" width="400px" grid-template-columns="100px 1fr">
++      <div box-sizing="content-box" direction="ltr" height="20px"/>
++      <div box-sizing="content-box" direction="ltr" width="500px" height="20px" max-width="250px" margin-top="0px" margin-left="auto" margin-bottom="0px" margin-right="auto"/>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="400" height="20">
++      <node x="0" y="0" width="100" height="20"/>
++      <node x="125" y="0" width="250" height="20"/>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/grid/grid_fr_item_preferred_size_clamped_by_max_size__content_box_rtl.xml b/tests/xml/grid/grid_fr_item_preferred_size_clamped_by_max_size__content_box_rtl.xml
+new file mode 100644
+index 00000000..7b601947
+--- /dev/null
++++ b/tests/xml/grid/grid_fr_item_preferred_size_clamped_by_max_size__content_box_rtl.xml
+@@ -0,0 +1,15 @@
++<test name="grid_fr_item_preferred_size_clamped_by_max_size__content_box_rtl" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="grid" box-sizing="content-box" direction="rtl" width="400px" grid-template-columns="100px 1fr">
++      <div box-sizing="content-box" direction="rtl" height="20px"/>
++      <div box-sizing="content-box" direction="rtl" width="500px" height="20px" max-width="250px" margin-top="0px" margin-left="auto" margin-bottom="0px" margin-right="auto"/>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="400" height="20">
++      <node x="300" y="0" width="100" height="20"/>
++      <node x="25" y="0" width="250" height="20"/>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/mod.rs b/tests/xml/mod.rs
+index f002f3e5..a70f8203 100644
+--- a/tests/xml/mod.rs
++++ b/tests/xml/mod.rs
+@@ -18897,6 +18897,30 @@ mod grid {
+         crate::run_xml_test("grid", "grid_fr_fixed_size_single_item__content_box_rtl");
+     }
+ 
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_fr_item_preferred_size_clamped_by_max_size__border_box_ltr() {
++        crate::run_xml_test("grid", "grid_fr_item_preferred_size_clamped_by_max_size__border_box_ltr");
++    }
++
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_fr_item_preferred_size_clamped_by_max_size__content_box_ltr() {
++        crate::run_xml_test("grid", "grid_fr_item_preferred_size_clamped_by_max_size__content_box_ltr");
++    }
++
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_fr_item_preferred_size_clamped_by_max_size__border_box_rtl() {
++        crate::run_xml_test("grid", "grid_fr_item_preferred_size_clamped_by_max_size__border_box_rtl");
++    }
++
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_fr_item_preferred_size_clamped_by_max_size__content_box_rtl() {
++        crate::run_xml_test("grid", "grid_fr_item_preferred_size_clamped_by_max_size__content_box_rtl");
++    }
++
+     #[cfg(feature = "grid")]
+     #[test]
+     fn grid_fr_no_sized_items_indefinite__border_box_ltr() {
+-- 
+2.43.0
+

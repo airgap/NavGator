@@ -1,0 +1,119 @@
+From 41c29b3aa3bca057d1cbce164fe6a91baa1c75a4 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 05:10:31 -0400
+Subject: [PATCH] servo: text-decoration-thickness, and a thickness in the
+ text-decoration shorthand
+
+The longhand was gecko-only and the servo shorthand parser had no slot for
+a thickness, so a length invalidated the whole declaration:
+docs.python.org's `a[href] { text-decoration: underline 1px }` left every
+link without an underline. The value now parses for Servo and is painted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ style/properties/longhands.toml  |  1 -
+ style/properties/shorthands.rs   | 20 +++-----------------
+ style/properties/shorthands.toml |  3 +--
+ 3 files changed, 4 insertions(+), 20 deletions(-)
+
+diff --git a/style/properties/longhands.toml b/style/properties/longhands.toml
+index 2bc2f3f02..6402feed5 100644
+--- a/style/properties/longhands.toml
++++ b/style/properties/longhands.toml
+@@ -2780,7 +2780,6 @@ affects = "layout"
+ type = "TextDecorationLength"
+ initial = "generics::text::GenericTextDecorationLength::Auto"
+ struct = "text"
+-engine = "gecko"
+ spec = "https://drafts.csswg.org/css-text-decor-4/#text-decoration-width-property"
+ affects = "overflow"
+ 
+diff --git a/style/properties/shorthands.rs b/style/properties/shorthands.rs
+index 7231347eb..b6a010446 100644
+--- a/style/properties/shorthands.rs
++++ b/style/properties/shorthands.rs
+@@ -3246,10 +3246,9 @@ pub mod text_decoration {
+     pub use crate::properties::generated::shorthands::text_decoration::*;
+ 
+     use super::*;
+-    #[cfg(feature = "gecko")]
+-    use crate::properties::longhands::text_decoration_thickness;
+     use crate::properties::longhands::{
+         text_decoration_color, text_decoration_line, text_decoration_style,
++        text_decoration_thickness,
+     };
+ 
+     pub fn parse_value<'i, 't>(
+@@ -3259,7 +3258,6 @@ pub mod text_decoration {
+         let mut line = None;
+         let mut style = None;
+         let mut color = None;
+-        #[cfg(feature = "gecko")]
+         let mut thickness = None;
+ 
+         let mut parsed = 0;
+@@ -3268,7 +3266,6 @@ pub mod text_decoration {
+             try_parse_one!(context, input, line, text_decoration_line::parse);
+             try_parse_one!(context, input, style, text_decoration_style::parse);
+             try_parse_one!(context, input, color, text_decoration_color::parse);
+-            #[cfg(feature = "gecko")]
+             try_parse_one!(context, input, thickness, text_decoration_thickness::parse);
+             parsed -= 1;
+             break;
+@@ -3278,19 +3275,12 @@ pub mod text_decoration {
+             return Err(input.new_custom_error(StyleParseErrorKind::UnspecifiedError));
+         }
+ 
+-        #[cfg(feature = "gecko")]
+-        return Ok(expanded! {
++        Ok(expanded! {
+             text_decoration_line: unwrap_or_initial!(text_decoration_line, line),
+             text_decoration_style: unwrap_or_initial!(text_decoration_style, style),
+             text_decoration_color: unwrap_or_initial!(text_decoration_color, color),
+             text_decoration_thickness: unwrap_or_initial!(text_decoration_thickness, thickness),
+-        });
+-        #[cfg(feature = "servo")]
+-        return Ok(expanded! {
+-            text_decoration_line: unwrap_or_initial!(text_decoration_line, line),
+-            text_decoration_style: unwrap_or_initial!(text_decoration_style, style),
+-            text_decoration_color: unwrap_or_initial!(text_decoration_color, color),
+-        });
++        })
+     }
+ 
+     impl<'a> ToCss for LonghandsToSerialize<'a> {
+@@ -3305,17 +3295,13 @@ pub mod text_decoration {
+             let is_solid_style =
+                 *self.text_decoration_style == text_decoration_style::SpecifiedValue::Solid;
+             let is_current_color = *self.text_decoration_color == Color::CurrentColor;
+-            #[cfg(feature = "gecko")]
+             let is_auto_thickness = self.text_decoration_thickness.is_auto();
+-            #[cfg(feature = "servo")]
+-            let is_auto_thickness = true;
+             let is_none = *self.text_decoration_line == TextDecorationLine::none();
+ 
+             let mut writer = SequenceWriter::new(dest, " ");
+             if (is_solid_style && is_current_color && is_auto_thickness) || !is_none {
+                 writer.item(self.text_decoration_line)?;
+             }
+-            #[cfg(feature = "gecko")]
+             if !is_auto_thickness {
+                 writer.item(self.text_decoration_thickness)?;
+             }
+diff --git a/style/properties/shorthands.toml b/style/properties/shorthands.toml
+index 68097f606..56059ba1d 100644
+--- a/style/properties/shorthands.toml
++++ b/style/properties/shorthands.toml
+@@ -480,8 +480,7 @@ spec = "https://drafts.csswg.org/css-multicol/#propdef-column-rule"
+ derive_serialize = true
+ 
+ [text-decoration]
+-sub_properties = ["text-decoration-color", "text-decoration-line", "text-decoration-style"]
+-extra_gecko_sub_properties = ["text-decoration-thickness"]
++sub_properties = ["text-decoration-color", "text-decoration-line", "text-decoration-style", "text-decoration-thickness"]
+ spec = "https://drafts.csswg.org/css-text-decor/#propdef-text-decoration"
+ 
+ [font]
+-- 
+2.43.0
+

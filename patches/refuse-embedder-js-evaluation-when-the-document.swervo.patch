@@ -1,0 +1,46 @@
+From b45c9dcaea0ab741850a5d0e7e4a9be158d5bfd1 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 05:35:34 -0400
+Subject: [PATCH] script: refuse embedder JS evaluation when the document
+ cannot run script
+
+handle_evaluate_javascript called evaluate_js_on_global, which asserts
+can_run_script(), without checking it first. Evaluating embedder JS in a
+document that is sandboxed without allow-scripts (for example a page served
+with `Content-Security-Policy: sandbox`, where NavGator's find bar evaluates
+JS) or that is no longer fully active panicked the script thread. Reply with
+JavaScriptEvaluationError::WebViewNotReady instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/script_thread.rs | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/components/script/script_thread.rs b/components/script/script_thread.rs
+index 6670f91fb55..badb627f736 100644
+--- a/components/script/script_thread.rs
++++ b/components/script/script_thread.rs
+@@ -4373,6 +4373,20 @@ impl ScriptThread {
+         };
+ 
+         let global_scope = window.as_global_scope();
++        // The constellation can route an evaluation to a pipeline whose document is no longer
++        // fully active (a navigation is replacing it) or is sandboxed without allow-scripts;
++        // evaluation asserts that script may run, so report it as not ready instead.
++        if !global_scope.can_run_script() {
++            let _ = self.senders.pipeline_to_constellation_sender.send((
++                webview_id,
++                pipeline_id,
++                ScriptToConstellationMessage::FinishJavaScriptEvaluation(
++                    evaluation_id,
++                    Err(JavaScriptEvaluationError::WebViewNotReady),
++                ),
++            ));
++            return;
++        }
+         let mut realm = enter_auto_realm(cx, global_scope);
+         let cx = &mut realm.current_realm();
+ 
+-- 
+2.43.0
+

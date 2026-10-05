@@ -1,0 +1,73 @@
+From 7351cace092ff7ee090699d2ee4349e3d924ffcb Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 06:39:00 -0400
+Subject: [PATCH] script: match Chrome on ResizeObserver entry details
+
+Three divergences found by comparing entries against Chrome:
+- device-pixel-content-box rounded the CSS size alone; Chrome snaps both
+  edges, so a 10.4px box at x=0.3px is 11 device pixels wide, not 10.
+- a box-less element (non-replaced inline) reported an empty contentRect
+  offset by its padding; Chrome reports it at 0,0.
+- the loop-limit ErrorEvent had an empty filename; Chrome uses the
+  document URL.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/document/document.rs       |  3 +++
+ .../script/dom/resizeobserver/resizeobserver.rs  | 16 +++++++++++++---
+ 2 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index 9beafbf5d4b..1b78e794057 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -3616,6 +3616,9 @@ impl Document {
+     pub(crate) fn deliver_resize_loop_error_notification(&self, cx: &mut JSContext) {
+         let error_info: ErrorInfo = crate::dom::bindings::error::ErrorInfo {
+             message: "ResizeObserver loop completed with undelivered notifications.".to_string(),
++            // Chrome attributes the error to the document so `onerror` handlers that filter
++            // on filename see the page URL.
++            filename: self.url().to_string(),
+             ..Default::default()
+         };
+         self.window
+diff --git a/components/script/dom/resizeobserver/resizeobserver.rs b/components/script/dom/resizeobserver/resizeobserver.rs
+index b4f97bd5c5f..c46209f6e4a 100644
+--- a/components/script/dom/resizeobserver/resizeobserver.rs
++++ b/components/script/dom/resizeobserver/resizeobserver.rs
+@@ -200,7 +200,13 @@ fn create_and_populate_a_resizeobserverentry(
+     }
+ 
+     // Step 7. If target is not an SVG element or target is an SVG element with an associated CSS layout box do these steps:
+-    let use_padding = *target.namespace() != ns!(svg) || target.has_css_layout_box();
++    // An element without a box of its own (such as a non-replaced inline) reports an empty
++    // content box, and Chrome places that empty rect at the origin rather than at its padding.
++    let use_padding = (*target.namespace() != ns!(svg) || target.has_css_layout_box()) &&
++        target
++            .owner_window()
++            .box_area_query(target.upcast(), BoxAreaType::Content, true)
++            .is_some();
+     let (padding_top, padding_left) = if use_padding {
+         // Step 7.1. Set this.contentRect.top to target.padding top.
+         // Step 7.2. Set this.contentRect.left to target.padding left.
+@@ -415,11 +421,15 @@ fn calculate_box_size(
+                 .unwrap_or_else(Rect::zero);
+ 
+             let to_device_px = |length: Au| (length.to_f64_px() * device_pixel_ratio).round();
++            // The size is snapped from both edges, as painting does, so a fractional position
++            // can grow or shrink it by a pixel (matching Chrome).
++            let snapped_length =
++                |start: Au, length: Au| to_device_px(start + length) - to_device_px(start);
+             Rect::new(
+                 content_box.origin.map(to_device_px),
+                 Size2D::new(
+-                    to_device_px(content_box.size.width),
+-                    to_device_px(content_box.size.height),
++                    snapped_length(content_box.origin.x, content_box.size.width),
++                    snapped_length(content_box.origin.y, content_box.size.height),
+                 ),
+             )
+         },
+-- 
+2.43.0
+

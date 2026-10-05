@@ -1,0 +1,459 @@
+From f7c6252f1b5e1648b8f9c85167bd624fb2ff3e73 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 03:13:20 -0400
+Subject: [PATCH] layout: honour appearance:none on widgets; progress and meter
+ fill; Chrome control defaults
+
+appearance:none was ignored, so custom checkboxes and radios kept swervo's check glyph, ring,
+border and 14px clamps, and custom selects showed the native arrow next to the page's own.
+Widgets now declare -moz-default-appearance, and @appearance-base rules at the end of servo.css
+undo the native look when appearance is none, as Chrome draws no native parts then: checkboxes
+and radios keep only author styling (0x0 when unsized) and author ::before/::after no longer
+inherit UA pseudo styles; the select arrow, now the ::-servo-select-arrow shadow part instead of
+an inline-styled div, is hidden.
+
+<progress> and <meter> never showed their fill because their UA rules used descendant selectors
+from the host into its UA shadow tree. Their shadow parts are now the ::-webkit-progress-bar/
+-value and ::-webkit-meter-bar/-*-value pseudo-elements (the meter value switches pseudo with the
+optimum region, as in Chrome), sized and coloured like Chrome's native bars, with Chrome's
+gray/green and gradient looks under appearance:none.
+
+Form controls use Chrome's fixed 13.333px font size, and textareas use monospace like Chrome.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/stylesheets/servo.css       | 166 +++++++++++++++---
+ .../script/dom/html/htmlmeterelement.rs       |  36 +++-
+ .../script/dom/html/htmlprogresselement.rs    |  29 ++-
+ .../script/dom/html/htmlselectelement.rs      |  22 +--
+ 4 files changed, 204 insertions(+), 49 deletions(-)
+
+diff --git a/components/layout/stylesheets/servo.css b/components/layout/stylesheets/servo.css
+index 3fa740baf7a..e11679aff29 100644
+--- a/components/layout/stylesheets/servo.css
++++ b/components/layout/stylesheets/servo.css
+@@ -50,6 +50,11 @@ textarea {
+   word-spacing: initial;
+ }
+ 
++/* Chrome (and Firefox) set textareas in monospace. */
++textarea {
++  font-family: monospace;
++}
++
+ input:disabled,
+ textarea:disabled {
+   cursor: unset;
+@@ -271,6 +276,23 @@ select optgroup:disabled::before {
+   color: rgb(128, 128, 128);
+ }
+ 
++select {
++  -moz-default-appearance: menulist;
++}
++
++select::-servo-select-arrow {
++  background-image: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="180" height="180" viewBox="0 0 180 180"> <path d="M10 50h160L90 130z" style="fill:currentcolor"/> </svg>');
++  background-size: 100%;
++  background-repeat: no-repeat;
++  background-position: center;
++
++  vertical-align: middle;
++  line-height: 1;
++  display: inline-block;
++  width: 0.75em;
++  height: 0.75em;
++}
++
+ input[type="file"] {
+   cursor: default;
+   display: inline-block;
+@@ -371,6 +393,7 @@ input[type="radio"] {
+ }
+ 
+ input[type="checkbox"] {
++  -moz-default-appearance: checkbox;
+   border: 1px solid grey;
+ }
+ 
+@@ -428,6 +451,7 @@ input[type="checkbox"]:indeterminate::before {
+ }
+ 
+ input[type="radio"] {
++  -moz-default-appearance: radio;
+   display: inline-block;
+ 
+   /* TODO: According to https://wpt.fyi/results/css/css-grid/stretch-grid-item-radio-input.html,
+@@ -591,28 +615,52 @@ details[open]::details-content {
+   display: table;
+ }
+ 
++/* <meter> and <progress> take Chrome's sizes, and their bars imitate its native look; the
++   @appearance-base rules at the end of this sheet hold the look Chrome gives them under
++   `appearance: none`. */
+ meter {
++  appearance: auto;
++  -moz-default-appearance: meter;
++  box-sizing: border-box;
+   display: inline-block;
+-  width: 100px;
+-  height: 12px;
+-  border-radius: 6px;
+-  background: linear-gradient(#e6e6e6, #e6e6e6, #eeeeee 20%, #cccccc 45%, #cccccc 55%);
+-  overflow: clip;
++  block-size: 1em;
++  inline-size: 5em;
++  vertical-align: -0.2em;
+ }
+ 
+-/* FIXME: These should use the ::-moz-meter-bar pseudo element */
+-meter div {
+-  height: 100%;
++meter::-webkit-meter-bar,
++progress::-webkit-progress-bar {
++  display: block;
++  box-sizing: border-box;
++  position: relative;
++  inset-block-start: 25%;
++  block-size: 50%;
++  inline-size: 100%;
++  overflow: hidden;
++  background: #efefef;
++  border: 1px solid rgba(118, 118, 118, 0.3);
++  border-radius: 20px;
++}
++
++meter::-webkit-meter-optimum-value,
++meter::-webkit-meter-suboptimum-value,
++meter::-webkit-meter-even-less-good-value,
++progress::-webkit-progress-value {
++  display: block;
++  box-sizing: border-box;
++  block-size: 100%;
+ }
+ 
+-meter:-moz-meter-optimum div {
+-  background: linear-gradient(#ad7, #ad7, #cea 20%, #7a3 45%, #7a3 55%);
++meter::-webkit-meter-optimum-value {
++  background: #107c10;
+ }
+-meter:-moz-meter-sub-optimum div {
+-  background: linear-gradient(#fe7, #fe7, #ffc 20%, #db3 45%, #db3 55%);
++
++meter::-webkit-meter-suboptimum-value {
++  background: #ffb900;
+ }
+-meter:-moz-meter-sub-sub-optimum div {
+-  background: linear-gradient(#f77, #f77, #fcc 20%, #d44 45%, #d44 55%);
++
++meter::-webkit-meter-even-less-good-value {
++  background: #d83b01;
+ }
+ 
+ /* https://html.spec.whatwg.org/#the-details-and-summary-elements */
+@@ -628,21 +676,91 @@ details[open] > summary:first-of-type {
+   list-style-type: disclosure-open;
+ }
+ 
+-/* Styles for the <progress> element */
+ progress {
++  appearance: auto;
++  -moz-default-appearance: progress-bar;
++  box-sizing: border-box;
+   display: inline-block;
+-  width: 200px;
+-  height: 6px;
+-  border-radius: 3px;
+-  border: 1px solid rgba(0, 0, 0, 0.5);
++  block-size: 1em;
++  inline-size: 10em;
++  vertical-align: -0.2em;
+ }
+-/* FIXME: This should use ::-moz-progress-bar */
+-progress #-servo-progress-bar {
+-  display: block;
+-  height: 100%;
+-  background-color: #7a3;
++
++progress::-webkit-progress-bar {
++  border-color: #b2b2b2;
++}
++
++progress::-webkit-progress-value {
++  background: #0075ff;
+ }
+ 
+ slot {
+   display: contents;
+ }
++
++/* What widgets look like under `appearance: none`: Chrome draws no native parts then, so the
++   widget shows only what CSS gives it. These rules repeat the selectors of the native-look
++   rules above so that they win over them. */
++@appearance-base {
++  input:is([type="checkbox"], [type="radio"]),
++  input:is([type="checkbox"], [type="radio"]):is(:checked, :disabled),
++  input:is([type="checkbox"], [type="radio"]):checked:disabled {
++    box-sizing: border-box;
++    width: auto;
++    height: auto;
++    min-width: auto;
++    min-height: auto;
++    max-width: none;
++    max-height: none;
++    padding: initial;
++    border: initial;
++    border-radius: initial;
++    background: initial;
++    overflow: initial;
++  }
++
++  input:is([type="checkbox"], [type="radio"])::before,
++  input:is([type="checkbox"], [type="radio"])::after,
++  input:is([type="checkbox"], [type="radio"]):is(:checked, :disabled, :indeterminate)::before,
++  input:is([type="checkbox"], [type="radio"]):is(:checked, :disabled, :indeterminate)::after,
++  input:is([type="checkbox"], [type="radio"]):checked:disabled::before,
++  input:is([type="checkbox"], [type="radio"]):checked:disabled::after {
++    all: unset;
++  }
++
++  select::-servo-select-arrow {
++    display: none;
++  }
++
++  progress::-webkit-progress-bar,
++  meter::-webkit-meter-bar {
++    border: initial;
++    border-radius: initial;
++  }
++
++  progress::-webkit-progress-bar {
++    inset-block-start: auto;
++    block-size: 100%;
++    background: gray;
++  }
++
++  progress::-webkit-progress-value {
++    background: green;
++  }
++
++  meter::-webkit-meter-bar {
++    background: linear-gradient(to bottom, #ddd, #eee 20%, #ccc 45%, #ccc 55%, #ddd);
++  }
++
++  meter::-webkit-meter-optimum-value {
++    background: linear-gradient(to bottom, #ad7, #cea 20%, #7a3 45%, #7a3 55%, #ad7);
++  }
++
++  meter::-webkit-meter-suboptimum-value {
++    background: linear-gradient(to bottom, #fe7, #ffc 20%, #db3 45%, #db3 55%, #fe7);
++  }
++
++  meter::-webkit-meter-even-less-good-value {
++    background: linear-gradient(to bottom, #f77, #fcc 20%, #d44 45%, #d44 55%, #f77);
++  }
++}
+diff --git a/components/script/dom/html/htmlmeterelement.rs b/components/script/dom/html/htmlmeterelement.rs
+index ed8eff4719a..b76991e18c7 100644
+--- a/components/script/dom/html/htmlmeterelement.rs
++++ b/components/script/dom/html/htmlmeterelement.rs
+@@ -10,6 +10,7 @@ use html5ever::{LocalName, Prefix, QualName, local_name, ns};
+ use js::context::JSContext;
+ use js::rust::HandleObject;
+ use script_bindings::cell::DomRefCell;
++use style::selector_parser::PseudoElement;
+ use stylo_dom::ElementState;
+ 
+ use crate::dom::bindings::codegen::Bindings::HTMLMeterElementBinding::HTMLMeterElementMethods;
+@@ -23,7 +24,7 @@ use crate::dom::element::attributes::storage::AttrRef;
+ use crate::dom::element::{AttributeMutation, Element};
+ use crate::dom::html::htmlelement::HTMLElement;
+ use crate::dom::node::virtualmethods::VirtualMethods;
+-use crate::dom::node::{BindContext, ChildrenMutation, Node, NodeTraits};
++use crate::dom::node::{BindContext, ChildrenMutation, Node, NodeDamage, NodeTraits};
+ use crate::dom::nodelist::NodeList;
+ use crate::script_runtime::CanGc;
+ 
+@@ -76,6 +77,15 @@ impl HTMLMeterElement {
+         let document = self.owner_document();
+         let root = self.upcast::<Element>().attach_ua_shadow_root(cx, true);
+ 
++        let meter_bar = Element::create(
++            cx,
++            QualName::new(None, ns!(html), local_name!("div")),
++            None,
++            &document,
++            crate::dom::element::ElementCreator::ScriptCreated,
++            crate::dom::element::CustomElementCreationMode::Asynchronous,
++            None,
++        );
+         let meter_value = Element::create(
+             cx,
+             QualName::new(None, ns!(html), local_name!("div")),
+@@ -86,8 +96,18 @@ impl HTMLMeterElement {
+             None,
+         );
+         root.upcast::<Node>()
++            .AppendChild(cx, meter_bar.upcast::<Node>())
++            .unwrap();
++        meter_bar
++            .upcast::<Node>()
+             .AppendChild(cx, meter_value.upcast::<Node>())
+             .unwrap();
++        meter_bar
++            .upcast::<Node>()
++            .set_implemented_pseudo_element(PseudoElement::WebkitMeterBar);
++        meter_value
++            .upcast::<Node>()
++            .set_implemented_pseudo_element(PseudoElement::WebkitMeterOptimumValue);
+ 
+         let _ = self.shadow_tree.borrow_mut().insert(ShadowTree {
+             meter_value: meter_value.as_traced(),
+@@ -154,8 +174,22 @@ impl HTMLMeterElement {
+             .set_state(ElementState::METER_OPTIMUM_STATES, false);
+         self.upcast::<Element>().set_state(element_state, true);
+ 
++        // Chrome tells the value regions apart by which pseudo-element the value bar is.
++        let value_pseudo = if element_state == ElementState::OPTIMUM {
++            PseudoElement::WebkitMeterOptimumValue
++        } else if element_state == ElementState::SUB_OPTIMUM {
++            PseudoElement::WebkitMeterSuboptimumValue
++        } else {
++            PseudoElement::WebkitMeterEvenLessGoodValue
++        };
++
+         // Update the visual width of the meter
+         let shadow_tree = self.shadow_tree(cx);
++        let value_node = shadow_tree.meter_value.upcast::<Node>();
++        if value_node.implemented_pseudo_element() != Some(value_pseudo) {
++            value_node.set_implemented_pseudo_element(value_pseudo);
++            value_node.dirty(NodeDamage::Other);
++        }
+         let position = (value - min) / (max - min) * 100.0;
+         let style = format!("width: {position}%");
+         shadow_tree
+diff --git a/components/script/dom/html/htmlprogresselement.rs b/components/script/dom/html/htmlprogresselement.rs
+index ef759f6a65a..2ef1aba979b 100644
+--- a/components/script/dom/html/htmlprogresselement.rs
++++ b/components/script/dom/html/htmlprogresselement.rs
+@@ -9,8 +9,8 @@ use html5ever::{LocalName, Prefix, QualName, local_name, ns};
+ use js::context::JSContext;
+ use js::rust::HandleObject;
+ use script_bindings::cell::DomRefCell;
++use style::selector_parser::PseudoElement;
+ 
+-use crate::dom::bindings::codegen::Bindings::ElementBinding::Element_Binding::ElementMethods;
+ use crate::dom::bindings::codegen::Bindings::HTMLProgressElementBinding::HTMLProgressElementMethods;
+ use crate::dom::bindings::codegen::Bindings::NodeBinding::Node_Binding::NodeMethods;
+ use crate::dom::bindings::inheritance::Castable;
+@@ -37,7 +37,7 @@ pub(crate) struct HTMLProgressElement {
+ #[derive(Clone, JSTraceable, MallocSizeOf)]
+ #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
+ struct ShadowTree {
+-    progress_bar: Dom<Element>,
++    progress_value: Dom<Element>,
+ }
+ 
+ impl HTMLProgressElement {
+@@ -83,15 +83,32 @@ impl HTMLProgressElement {
+             CustomElementCreationMode::Asynchronous,
+             None,
+         );
++        let progress_value = Element::create(
++            cx,
++            QualName::new(None, ns!(html), local_name!("div")),
++            None,
++            &document,
++            ElementCreator::ScriptCreated,
++            CustomElementCreationMode::Asynchronous,
++            None,
++        );
+ 
+-        // FIXME: This should use ::-moz-progress-bar
+-        progress_bar.SetId(cx, "-servo-progress-bar".into());
+         root.upcast::<Node>()
+             .AppendChild(cx, progress_bar.upcast::<Node>())
+             .unwrap();
++        progress_bar
++            .upcast::<Node>()
++            .AppendChild(cx, progress_value.upcast::<Node>())
++            .unwrap();
++        progress_bar
++            .upcast::<Node>()
++            .set_implemented_pseudo_element(PseudoElement::WebkitProgressBar);
++        progress_value
++            .upcast::<Node>()
++            .set_implemented_pseudo_element(PseudoElement::WebkitProgressValue);
+ 
+         let _ = self.shadow_tree.borrow_mut().insert(ShadowTree {
+-            progress_bar: progress_bar.as_traced(),
++            progress_value: progress_value.as_traced(),
+         });
+         self.upcast::<Node>()
+             .dirty(crate::dom::node::NodeDamage::Other);
+@@ -114,7 +131,7 @@ impl HTMLProgressElement {
+         let style = format!("width: {}%", position);
+ 
+         shadow_tree
+-            .progress_bar
++            .progress_value
+             .set_string_attribute(cx, &local_name!("style"), style.into());
+     }
+ }
+diff --git a/components/script/dom/html/htmlselectelement.rs b/components/script/dom/html/htmlselectelement.rs
+index ae944d0fb79..42d4c59dbee 100644
+--- a/components/script/dom/html/htmlselectelement.rs
++++ b/components/script/dom/html/htmlselectelement.rs
+@@ -60,6 +60,7 @@ use keyboard_types::{Key, Modifiers, NamedKey};
+ use js::context::{JSContext, NoGC};
+ use js::rust::HandleObject;
+ use style::attr::AttrValue;
++use style::selector_parser::PseudoElement;
+ use stylo_dom::ElementState;
+ 
+ const DEFAULT_SELECT_SIZE: u32 = 0;
+@@ -79,19 +80,6 @@ const LIST_BOX_CONTAINER_STYLE: &str = "
+     block-size: 100%;
+ ";
+ 
+-const CHEVRON_CONTAINER_STYLE: &str = "
+-    background-image: url('data:image/svg+xml,<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"180\" height=\"180\" viewBox=\"0 0 180 180\"> <path d=\"M10 50h160L90 130z\" style=\"fill:currentcolor\"/> </svg>');
+-    background-size: 100%;
+-    background-repeat: no-repeat;
+-    background-position: center;
+-
+-    vertical-align: middle;
+-    line-height: 1;
+-    display: inline-block;
+-    width: 0.75em;
+-    height: 0.75em;
+-";
+-
+ #[derive(JSTraceable, MallocSizeOf)]
+ struct OptionsFilter;
+ impl CollectionFilter for OptionsFilter {
+@@ -387,11 +375,6 @@ impl HTMLSelectElement {
+             CustomElementCreationMode::Asynchronous,
+             None,
+         );
+-        chevron_container.set_string_attribute(
+-            cx,
+-            &local_name!("style"),
+-            CHEVRON_CONTAINER_STYLE.into(),
+-        );
+         select_box
+             .upcast::<Node>()
+             .AppendChild(cx, chevron_container.upcast::<Node>())
+@@ -400,6 +383,9 @@ impl HTMLSelectElement {
+         root.upcast::<Node>()
+             .AppendChild(cx, select_box.upcast::<Node>())
+             .unwrap();
++        chevron_container
++            .upcast::<Node>()
++            .set_implemented_pseudo_element(PseudoElement::ServoSelectArrow);
+     }
+ 
+     /// A list box shows `display size` rows of the options themselves, slotted into a
+-- 
+2.43.0
+

@@ -1,0 +1,572 @@
+From 88e5af0764c8aa2c7d0bc8272c9de600ef77e54f Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Mon, 5 Oct 2026 00:10:08 -0400
+Subject: [PATCH] constellation: report content processes that die from a
+ signal
+
+When a content process was killed (SIGSEGV, the OOM killer's SIGKILL) its
+lifeline closed and the constellation merely reaped it, so the webview
+kept its last frame forever. The process exit is now treated as a crash:
+the event loop is retired (its pipelines are removed without waiting for
+an acknowledgement that will never come, its hosts get a fresh process,
+and its session-history documents reload on traversal), the embedder gets
+the new WebViewDelegate::notify_content_process_terminated with the exit
+status, and the crash page replaces the dead document. Send failures to a
+content process are left to the lifeline so a crash is reported once, and
+an embedder navigation now replaces Servo's crash page instead of being
+dropped while that page is still loading.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/constellation/constellation.rs   | 231 +++++++++++++++++++-
+ components/constellation/embedder.rs        |   3 +
+ components/constellation/event_loop.rs      |  16 +-
+ components/constellation/process_manager.rs |  49 +++--
+ components/servo/servo.rs                   |   7 +
+ components/servo/webview_delegate.rs        |   7 +
+ 6 files changed, 287 insertions(+), 26 deletions(-)
+
+diff --git a/components/constellation/constellation.rs b/components/constellation/constellation.rs
+index 541f74123e4..fd39ddf7946 100644
+--- a/components/constellation/constellation.rs
++++ b/components/constellation/constellation.rs
+@@ -1309,7 +1309,12 @@ where
+             Request::BackgroundHangMonitor(message) => {
+                 self.handle_request_from_background_hang_monitor(message);
+             },
+-            Request::RemoveProcess(index) => self.process_manager.remove(index),
++            Request::RemoveProcess(index) => {
++                let exited = self.process_manager.remove(index);
++                if let Some(event_loop_id) = exited.event_loop_id {
++                    self.handle_content_process_exit(event_loop_id, exited.status);
++                }
++            },
+         }
+     }
+ 
+@@ -1409,15 +1414,56 @@ where
+                         return warn!("{}: LoadUrl for unknown browsing context", webview_id);
+                     },
+                 };
++
++                // An embedder that shows its own crash UI, or reloads, after a crash
++                // notification navigates away from Servo's crash page. The new document takes
++                // the crash page's place in session history, whether that page is still
++                // loading (which would otherwise make `load_url` drop this load) or shown.
++                let pending_crash_page = self
++                    .pending_changes
++                    .iter()
++                    .find(|change| {
++                        change.browsing_context_id == ctx_id &&
++                            self.pipelines
++                                .get(&change.new_pipeline_id)
++                                .is_some_and(|pipeline| pipeline.load_data.crash.is_some())
++                    })
++                    .map(|change| (change.new_pipeline_id, change.replace.clone()));
++                let showing_crash_page = self
++                    .pipelines
++                    .get(&pipeline_id)
++                    .is_some_and(|pipeline| pipeline.load_data.crash.is_some());
++                if let Some((crash_page_pipeline_id, _)) = pending_crash_page {
++                    self.close_pipeline(
++                        crash_page_pipeline_id,
++                        DiscardBrowsingContext::No,
++                        ExitPipelineMode::Normal,
++                    );
++                }
++                let history_handling = if showing_crash_page {
++                    NavigationHistoryBehavior::Replace
++                } else {
++                    NavigationHistoryBehavior::Push
++                };
++
+                 // Since this is a top-level load, initiated by the embedder, go straight to load_url,
+                 // bypassing schedule_navigation.
+-                self.load_url(
++                let new_pipeline_id = self.load_url(
+                     webview_id,
+                     pipeline_id,
+                     load_data,
+-                    NavigationHistoryBehavior::Push,
++                    history_handling,
+                     TargetSnapshotParams::default(),
+                 );
++                if let Some((_, crash_page_replace)) = pending_crash_page &&
++                    let Some(new_pipeline_id) = new_pipeline_id &&
++                    let Some(change) = self
++                        .pending_changes
++                        .iter_mut()
++                        .find(|change| change.new_pipeline_id == new_pipeline_id)
++                {
++                    change.replace = crash_page_replace;
++                }
+             },
+             // Create a new top level browsing context. Will use response_chan to return
+             // the browsing context id.
+@@ -2610,7 +2656,7 @@ where
+ 
+                     if let Ok(process) = content.spawn_multiprocess() {
+                         let crossbeam_receiver = receiver.route_preserving_errors();
+-                        self.process_manager.add(crossbeam_receiver, process);
++                        self.process_manager.add(crossbeam_receiver, process, None);
+                     } else {
+                         return warn!("Failed to spawn process for SW manager.");
+                     }
+@@ -2990,6 +3036,12 @@ where
+         let Some(pipeline) = self.pipelines.get(&pipeline_id) else {
+             return;
+         };
++        // A content process whose channel broke has died or is about to (a script thread
++        // panic takes its process down). Its lifeline reports that, with the exit status, so
++        // reporting here too would announce the same crash twice.
++        if opts::get().multiprocess {
++            return;
++        }
+ 
+         // Treat send error the same as receiving a panic message
+         self.handle_panic_in_webview(
+@@ -3018,13 +3070,8 @@ where
+         };
+         debug!("Panic handler for {event_loop_id:?}: {reason:?}",);
+ 
+-        let mut webview_ids = HashSet::new();
+-        for pipeline in self.pipelines.values() {
+-            if pipeline.event_loop.id() == event_loop_id {
+-                webview_ids.insert(pipeline.webview_id);
+-            }
+-        }
+-        for webview_id in webview_ids {
++        // A panic takes a content process down, so its exit needs no second report.
++        for webview_id in self.retire_dead_event_loop(event_loop_id) {
+             self.handle_panic_in_webview(webview_id, &reason, &backtrace);
+         }
+     }
+@@ -3035,14 +3082,145 @@ where
+         reason: &String,
+         backtrace: &Option<String>,
+     ) {
+-        let browsing_context_id = BrowsingContextId::from(webview_id);
+         self.constellation_to_embedder_proxy
+             .send(ConstellationToEmbedderMsg::Panic(
+                 webview_id,
+                 reason.clone(),
+                 backtrace.clone(),
+             ));
++        self.replace_crashed_webview_with_crash_page(webview_id, reason, backtrace);
++    }
++
++    /// A script event loop process exited. If pipelines still live in it, nobody asked it to
++    /// exit: it was killed by a signal (a crash such as SIGSEGV, or the OOM killer's SIGKILL),
++    /// which no in-process panic hook can report. Without this the webviews it rendered keep
++    /// showing their last frame forever while every message to them goes nowhere.
++    fn handle_content_process_exit(
++        &mut self,
++        event_loop_id: ScriptEventLoopId,
++        status: Option<std::process::ExitStatus>,
++    ) {
++        let Some(event_loop) = self
++            .event_loops()
++            .into_iter()
++            .find(|event_loop| event_loop.id() == event_loop_id)
++        else {
++            return;
++        };
++        if event_loop.is_dead() ||
++            !self
++                .pipelines
++                .values()
++                .any(|pipeline| pipeline.event_loop.id() == event_loop_id)
++        {
++            return;
++        }
++
++        let reason = match status {
++            Some(status) => format!("The content process ended unexpectedly ({status})."),
++            None => "The content process ended unexpectedly.".to_owned(),
++        };
++        error!("{event_loop_id:?}: {reason}");
++
++        if self.hard_fail {
++            error!("Pipeline failed in hard-fail mode.  Crashing!");
++            process::exit(1);
++        }
+ 
++        for webview_id in self.retire_dead_event_loop(event_loop_id) {
++            self.constellation_to_embedder_proxy
++                .send(ConstellationToEmbedderMsg::ContentProcessTerminated(
++                    webview_id,
++                    reason.clone(),
++                ));
++            self.replace_crashed_webview_with_crash_page(webview_id, &reason, &None);
++        }
++    }
++
++    /// Stop using an event loop whose script thread is gone: its pipelines are retired without
++    /// waiting for an acknowledgement, new documents for the hosts it served get a fresh
++    /// process, and session history entries it held reload when traversed to. Returns the
++    /// webviews that had pipelines in it.
++    fn retire_dead_event_loop(&mut self, event_loop_id: ScriptEventLoopId) -> HashSet<WebViewId> {
++        let mut webview_ids = HashSet::new();
++        for pipeline in self.pipelines.values() {
++            if pipeline.event_loop.id() == event_loop_id {
++                pipeline.event_loop.mark_dead();
++                webview_ids.insert(pipeline.webview_id);
++            }
++        }
++        for bc_group in self.browsing_context_group_set.values_mut() {
++            bc_group.event_loops.retain(|_, weak_event_loop| {
++                weak_event_loop
++                    .upgrade()
++                    .is_none_or(|event_loop| event_loop.id() != event_loop_id)
++            });
++        }
++        for webview_id in &webview_ids {
++            self.evict_history_pipelines_in_event_loop(*webview_id, event_loop_id);
++        }
++        webview_ids
++    }
++
++    /// Session history keeps documents alive for back/forward traversal. Those that lived in a
++    /// dead event loop are discarded so that traversing to them reloads them, as `trim_history`
++    /// does for entries past the history limit.
++    fn evict_history_pipelines_in_event_loop(
++        &mut self,
++        webview_id: WebViewId,
++        event_loop_id: ScriptEventLoopId,
++    ) {
++        let Some(webview) = self.webviews.get(&webview_id) else {
++            return;
++        };
++        let history_pipelines: Vec<PipelineId> = webview
++            .session_history
++            .past
++            .iter()
++            .filter_map(|diff| diff.alive_old_pipeline())
++            .chain(
++                webview
++                    .session_history
++                    .future
++                    .iter()
++                    .filter_map(|diff| diff.alive_new_pipeline()),
++            )
++            .filter(|pipeline_id| {
++                self.pipelines
++                    .get(pipeline_id)
++                    .is_some_and(|pipeline| pipeline.event_loop.id() == event_loop_id)
++            })
++            .collect();
++
++        let mut dead_pipelines = vec![];
++        for pipeline_id in history_pipelines {
++            let Some(load_data) = self.refresh_load_data(pipeline_id) else {
++                continue;
++            };
++            dead_pipelines.push((pipeline_id, NeedsToReload::Yes(pipeline_id, load_data)));
++            self.close_pipeline(
++                pipeline_id,
++                DiscardBrowsingContext::No,
++                ExitPipelineMode::Force,
++            );
++        }
++
++        if let Some(webview) = self.webviews.get_mut(&webview_id) {
++            for (alive_id, dead) in dead_pipelines {
++                webview
++                    .session_history
++                    .replace_reloader(NeedsToReload::No(alive_id), dead);
++            }
++        }
++    }
++
++    fn replace_crashed_webview_with_crash_page(
++        &mut self,
++        webview_id: WebViewId,
++        reason: &String,
++        backtrace: &Option<String>,
++    ) {
++        let browsing_context_id = BrowsingContextId::from(webview_id);
+         let Some(browsing_context) = self.browsing_contexts.get(&browsing_context_id) else {
+             return warn!("failed browsing context is missing");
+         };
+@@ -4330,6 +4508,7 @@ where
+             };
+ 
+         self.unload_document(old_pipeline_id);
++        self.retire_closed_dead_pipeline(old_pipeline_id);
+ 
+         if let Some(new_pipeline) = self.pipelines.get(&new_pipeline_id) {
+             if let Some(ref chan) = self.devtools_sender {
+@@ -5049,6 +5228,7 @@ where
+ 
+         if let Some(old_pipeline_id) = old_pipeline_id {
+             self.unload_document(old_pipeline_id);
++            self.retire_closed_dead_pipeline(old_pipeline_id);
+         }
+ 
+         let Some(webview) = self.webviews.get_mut(&change.webview_id) else {
+@@ -5646,6 +5826,7 @@ where
+                 .session_history
+                 .remove_entries_for_browsing_context(browsing_context_id);
+         }
++        self.retire_closed_dead_pipeline(browsing_context.pipeline_id);
+ 
+         if let Some(parent_pipeline_id) = browsing_context.parent_pipeline_id {
+             match self.pipelines.get_mut(&parent_pipeline_id) {
+@@ -5820,9 +6001,35 @@ where
+             ScreenshotReadinessResponse::NoLongerActive,
+         );
+ 
++        self.retire_closed_dead_pipeline(pipeline_id);
++
+         debug!("{}: Closed", pipeline_id);
+     }
+ 
++    /// A pipeline whose content process died never acknowledges its exit, to us or to `Paint`,
++    /// so once it is closed it is removed here instead. A browsing context keeps showing its
++    /// current pipeline until a replacement activates, so that one stays until then.
++    fn retire_closed_dead_pipeline(&mut self, pipeline_id: PipelineId) {
++        let Some(pipeline) = self.pipelines.get(&pipeline_id) else {
++            return;
++        };
++        if !pipeline.event_loop.is_dead() {
++            return;
++        }
++        if let Some(browsing_context) = self.browsing_contexts.get(&pipeline.browsing_context_id) &&
++            (browsing_context.pipeline_id == pipeline_id ||
++                browsing_context.pipelines.contains(&pipeline_id))
++        {
++            return;
++        }
++        self.paint_proxy.send(PaintMessage::PipelineExited(
++            pipeline.webview_id,
++            pipeline_id,
++            PipelineExitSource::Script,
++        ));
++        self.handle_pipeline_exited(pipeline_id);
++    }
++
+     // Randomly close a pipeline -if --random-pipeline-closure-probability is set
+     fn maybe_close_random_pipeline(&mut self) {
+         match self.random_pipeline_closure {
+diff --git a/components/constellation/embedder.rs b/components/constellation/embedder.rs
+index f923836c160..18e79e53954 100644
+--- a/components/constellation/embedder.rs
++++ b/components/constellation/embedder.rs
+@@ -27,6 +27,9 @@ pub enum ConstellationToEmbedderMsg {
+     MediaSessionEvent(WebViewId, MediaSessionEvent),
+     /// A pipeline panicked. First string is the reason, second one is the backtrace.
+     Panic(WebViewId, String, Option<String>),
++    /// The content process hosting a pipeline of this `WebView` died without being asked to
++    /// (killed by a signal, the OOM killer, or an unexpected exit). The string describes how.
++    ContentProcessTerminated(WebViewId, String),
+     /// A `WebView` potentially gained focus for keyboard events.
+     /// If the boolean value is false, the `WebView` could not be focused.
+     WebViewFocused(WebViewId, bool),
+diff --git a/components/constellation/event_loop.rs b/components/constellation/event_loop.rs
+index 4776cd827fc..10efc1cff97 100644
+--- a/components/constellation/event_loop.rs
++++ b/components/constellation/event_loop.rs
+@@ -6,6 +6,7 @@
+ //! view of a script thread. When an `EventLoop` is dropped, an `ExitScriptThread`
+ //! message is sent to the script thread, asking it to shut down.
+ 
++use std::cell::Cell;
+ use std::hash::Hash;
+ use std::marker::PhantomData;
+ use std::rc::Rc;
+@@ -35,6 +36,9 @@ pub struct EventLoop {
+     /// on the other side of the process boundary. When running in the same process, the
+     /// BackgroundHangMonitor is shared among all [`EventLoop`]s so this will be `None`.
+     background_hang_monitor_sender: Option<GenericSender<BackgroundHangMonitorControlMsg>>,
++    /// Set once the content process hosting this event loop has died. Its pipelines can no
++    /// longer acknowledge an exit request, so the constellation retires them itself.
++    dead: Cell<bool>,
+     dont_send_or_sync: PhantomData<Rc<()>>,
+ }
+ 
+@@ -146,6 +150,7 @@ impl EventLoop {
+             script_chan,
+             id,
+             background_hang_monitor_sender: None,
++            dead: Cell::new(false),
+             dont_send_or_sync: PhantomData,
+         }
+     }
+@@ -177,12 +182,13 @@ impl EventLoop {
+         let crossbeam_receiver = lifeline_receiver.route_preserving_errors();
+         constellation
+             .process_manager
+-            .add(crossbeam_receiver, process);
++            .add(crossbeam_receiver, process, Some(id));
+ 
+         Ok(Self {
+             script_chan,
+             id,
+             background_hang_monitor_sender: Some(background_hand_monitor_sender),
++            dead: Cell::new(false),
+             dont_send_or_sync: PhantomData,
+         })
+     }
+@@ -191,6 +197,14 @@ impl EventLoop {
+         self.id
+     }
+ 
++    pub(crate) fn is_dead(&self) -> bool {
++        self.dead.get()
++    }
++
++    pub(crate) fn mark_dead(&self) {
++        self.dead.set(true);
++    }
++
+     /// Send a message to the event loop.
+     pub fn send(&self, msg: ScriptThreadMessage) -> Result<(), SendError> {
+         self.script_chan.send(msg)
+diff --git a/components/constellation/process_manager.rs b/components/constellation/process_manager.rs
+index 31801c64a5a..3f0c8b28702 100644
+--- a/components/constellation/process_manager.rs
++++ b/components/constellation/process_manager.rs
+@@ -2,11 +2,12 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+-use std::process::Child;
++use std::process::{Child, ExitStatus};
+ 
+ use crossbeam_channel::{Receiver, Select};
+-use log::{debug, warn};
++use log::{debug, error, warn};
+ use profile_traits::mem::{ProfilerChan, ProfilerMsg};
++use servo_base::id::ScriptEventLoopId;
+ 
+ pub enum Process {
+     Unsandboxed(Child),
+@@ -21,14 +22,19 @@ impl Process {
+         }
+     }
+ 
+-    fn wait(&mut self) {
++    fn wait(&mut self) -> Option<ExitStatus> {
+         match self {
+-            Self::Unsandboxed(child) => {
+-                let _ = child.wait();
++            Self::Unsandboxed(child) => match child.wait() {
++                Ok(status) => Some(status),
++                Err(error) => {
++                    error!("Could not reap process pid={}: {error}", child.id());
++                    None
++                },
+             },
+             Self::Sandboxed(_pid) => {
+                 // TODO: use nix::waitpid() on supported platforms.
+                 warn!("wait() is not yet implemented for sandboxed processes.");
++                None
+             },
+         }
+     }
+@@ -36,8 +42,15 @@ impl Process {
+ 
+ type ProcessReceiver = Receiver<Result<(), ipc_channel::IpcError>>;
+ 
++/// A process that was reaped after its lifeline closed.
++pub(crate) struct ExitedProcess {
++    /// The script event loop the process hosted, or `None` for a service worker process.
++    pub event_loop_id: Option<ScriptEventLoopId>,
++    pub status: Option<ExitStatus>,
++}
++
+ pub(crate) struct ProcessManager {
+-    processes: Vec<(Process, ProcessReceiver)>,
++    processes: Vec<(Process, ProcessReceiver, Option<ScriptEventLoopId>)>,
+     mem_profiler_chan: ProfilerChan,
+ }
+ 
+@@ -49,25 +62,30 @@ impl ProcessManager {
+         }
+     }
+ 
+-    pub fn add(&mut self, receiver: ProcessReceiver, process: Process) {
++    pub fn add(
++        &mut self,
++        receiver: ProcessReceiver,
++        process: Process,
++        event_loop_id: Option<ScriptEventLoopId>,
++    ) {
+         debug!("Adding process pid={}", process.pid());
+-        self.processes.push((process, receiver));
++        self.processes.push((process, receiver, event_loop_id));
+     }
+ 
+     pub fn register<'a>(&'a self, select: &mut Select<'a>) {
+-        for (_, receiver) in &self.processes {
++        for (_, receiver, _) in &self.processes {
+             select.recv(receiver);
+         }
+     }
+ 
+     pub fn receiver_at(&self, index: usize) -> &ProcessReceiver {
+-        let (_, receiver) = &self.processes[index];
++        let (_, receiver, _) = &self.processes[index];
+         receiver
+     }
+ 
+     #[servo_tracing::instrument(skip_all)]
+-    pub fn remove(&mut self, index: usize) {
+-        let (mut process, _) = self.processes.swap_remove(index);
++    pub fn remove(&mut self, index: usize) -> ExitedProcess {
++        let (mut process, _, event_loop_id) = self.processes.swap_remove(index);
+         debug!("Removing process pid={}", process.pid());
+         // Unregister this process system memory profiler
+         self.mem_profiler_chan
+@@ -75,6 +93,11 @@ impl ProcessManager {
+                 "system-content-{}",
+                 process.pid()
+             )));
+-        process.wait();
++        let status = process.wait();
++        debug!("Process pid={} exited: {status:?}", process.pid());
++        ExitedProcess {
++            event_loop_id,
++            status,
++        }
+     }
+ }
+diff --git a/components/servo/servo.rs b/components/servo/servo.rs
+index 4ec438670c2..7eee24472d3 100644
+--- a/components/servo/servo.rs
++++ b/components/servo/servo.rs
+@@ -845,6 +845,13 @@ impl ServoInner {
+                         .notify_crashed(webview, reason, backtrace);
+                 }
+             },
++            ConstellationToEmbedderMsg::ContentProcessTerminated(webview_id, reason) => {
++                if let Some(webview) = self.get_webview_handle(webview_id) {
++                    webview
++                        .delegate()
++                        .notify_content_process_terminated(webview, reason);
++                }
++            },
+             ConstellationToEmbedderMsg::ReportProfile(_items) => {},
+             ConstellationToEmbedderMsg::MediaSessionEvent(webview_id, media_session_event) => {
+                 if let Some(webview) = self.get_webview_handle(webview_id) {
+diff --git a/components/servo/webview_delegate.rs b/components/servo/webview_delegate.rs
+index 3190b23fa1b..f825043cd32 100644
+--- a/components/servo/webview_delegate.rs
++++ b/components/servo/webview_delegate.rs
+@@ -974,6 +974,13 @@ pub trait WebViewDelegate {
+     }
+     /// A pipeline in the webview panicked. First string is the reason, second one is the backtrace.
+     fn notify_crashed(&self, _webview: WebView, _reason: String, _backtrace: Option<String>) {}
++    /// The content process rendering this [`WebView`] died (killed by a signal such as SIGSEGV,
++    /// the OOM killer's SIGKILL, or an unexpected exit), so there is no panic backtrace. Servo
++    /// has already replaced the dead pipeline with its crash page. `reason` describes how the
++    /// process ended. Embedders that do not distinguish this from a panic get [`Self::notify_crashed`].
++    fn notify_content_process_terminated(&self, webview: WebView, reason: String) {
++        self.notify_crashed(webview, reason, None);
++    }
+     /// Notifies the embedder about media session events
+     /// (i.e. when there is metadata for the active media session, playback state changes...).
+     fn notify_media_session_event(&self, _webview: WebView, _event: MediaSessionEvent) {}
+-- 
+2.43.0
+

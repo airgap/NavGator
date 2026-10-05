@@ -1,0 +1,456 @@
+From 726ebbeba258aeb601617bfd5700c3c5ab38a9a9 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 06:13:34 -0400
+Subject: [PATCH] servo: @starting-style, and transitions and animations on
+ ::backdrop
+
+@starting-style rules were parsed and cascaded only for Gecko. Servo now
+enables them and resolves the starting style of an element, or of one of
+its eager pseudo-elements, when it has no previous style or stops being
+display: none, and uses it as the before-change style for transitions
+(https://drafts.csswg.org/css-transitions-2/#defining-before-change-style).
+Popovers and dialogs, newly inserted elements and their ::backdrop can
+then transition in from their @starting-style values as in Chrome.
+
+::backdrop was a lazy pseudo-element, computed afresh by layout every
+time, so it had no previous style to transition from and no animation
+set. It is now eagerly cascaded like ::before and ::after, but only for
+elements in the top layer, and Servo processes its transitions and
+animations. An element whose removal from the top layer is deferred by a
+transition of overlay is matched as out of it before that transition
+applies, so its ::backdrop is resolved again once the transition does,
+letting it animate out with the element.
+
+Also moves a doc comment from the previous commit back onto
+start_transitions_if_applicable.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ style/data.rs                       |  4 +-
+ style/dom.rs                        |  8 ++-
+ style/matching.rs                   | 76 +++++++++++++++++++++++++----
+ style/properties/gecko.mako.rs      | 15 ------
+ style/properties/properties.mako.rs | 24 +++++++++
+ style/servo/animation.rs            |  4 +-
+ style/servo/selector_parser.rs      | 12 +++--
+ style/style_resolver.rs             | 38 ++++++++++++---
+ stylo_static_prefs/preferences.toml |  2 +-
+ 9 files changed, 139 insertions(+), 44 deletions(-)
+
+diff --git a/style/data.rs b/style/data.rs
+index 9f4ea039b..a1bcf6a5c 100644
+--- a/style/data.rs
++++ b/style/data.rs
+@@ -107,9 +107,7 @@ impl fmt::Debug for EagerPseudoArray {
+     }
+ }
+ 
+-// Can't use [None; EAGER_PSEUDO_COUNT] here because it complains
+-// about Copy not being implemented for our Arc type.
+-const EMPTY_PSEUDO_ARRAY: &'static EagerPseudoArrayInner = &[None, None, None, None];
++const EMPTY_PSEUDO_ARRAY: &'static EagerPseudoArrayInner = &[const { None }; EAGER_PSEUDO_COUNT];
+ 
+ impl EagerPseudoStyles {
+     /// Returns whether there are any pseudo styles.
+diff --git a/style/dom.rs b/style/dom.rs
+index 718c644f2..f532e4b2d 100644
+--- a/style/dom.rs
++++ b/style/dom.rs
+@@ -613,7 +613,13 @@ pub trait TElement:
+     /// `::-first-line` or `::-first-letter`, when we know it won't affect us.
+     ///
+     /// TODO(emilio, bz): actually implement the logic for it.
+-    fn may_generate_pseudo(&self, pseudo: &PseudoElement, _primary_style: &ComputedValues) -> bool {
++    fn may_generate_pseudo(&self, pseudo: &PseudoElement, primary_style: &ComputedValues) -> bool {
++        // <https://drafts.csswg.org/css-position-4/#backdrop>
++        #[cfg(feature = "servo")]
++        if *pseudo == PseudoElement::Backdrop {
++            return primary_style.in_top_layer();
++        }
++
+         // ::before/::after are always supported for now, though we could try to
+         // optimize out leaf elements.
+ 
+diff --git a/style/matching.rs b/style/matching.rs
+index d24c0b7ee..50028ef01 100644
+--- a/style/matching.rs
++++ b/style/matching.rs
+@@ -26,7 +26,7 @@ use crate::rule_tree::{CascadeLevel, CascadeOrigin, StrongRuleNode};
+ use crate::selector_parser::{PseudoElement, RestyleDamage};
+ use crate::shared_lock::Locked;
+ use crate::style_resolver::StyleResolverForElement;
+-use crate::style_resolver::{PseudoElementResolution, ResolvedElementStyles};
++use crate::style_resolver::{PrimaryStyle, PseudoElementResolution, ResolvedElementStyles};
+ use crate::stylesheets::layer_rule::LayerOrder;
+ use crate::stylist::RuleInclusion;
+ use crate::traversal_flags::TraversalFlags;
+@@ -344,24 +344,26 @@ trait PrivateMatchMethods: TElement {
+         return true;
+     }
+ 
+-    #[cfg(feature = "gecko")]
++    /// Resolves the starting style of an element, or of one of its pseudo-elements, which is its
++    /// before-change style when it has no previous style or stops being display: none.
++    /// <https://drafts.csswg.org/css-transitions-2/#defining-before-change-style>
+     fn maybe_resolve_starting_style(
+         &self,
+         context: &mut StyleContext<Self>,
+         old_values: Option<&Arc<ComputedValues>>,
+-        new_styles: &ResolvedElementStyles,
++        new_values: &Arc<ComputedValues>,
++        pseudo: Option<(&PseudoElement, &PrimaryStyle)>,
+     ) -> Option<Arc<ComputedValues>> {
+         // For both cases:
+         // If there is no transitions specified we don't have to resolve starting style.
+-        let new_primary = new_styles.primary_style();
+-        if !new_primary.get_ui().specifies_transitions() {
++        if !new_values.get_ui().specifies_transitions() {
+             return None;
+         }
+ 
+         // We resolve starting style only if we don't have before-change-style, or we change from
+         // display:none.
+         if old_values.is_some()
+-            && !new_primary.is_display_property_changed_from_none(old_values.map(|s| &**s))
++            && !new_values.is_display_property_changed_from_none(old_values.map(|s| &**s))
+         {
+             return None;
+         }
+@@ -373,7 +375,7 @@ trait PrivateMatchMethods: TElement {
+             PseudoElementResolution::IfApplicable,
+         );
+ 
+-        let starting_style = resolver.resolve_starting_style(new_primary)?;
++        let starting_style = resolver.resolve_starting_style(new_values, pseudo)?;
+         if starting_style.style().clone_display().is_none() {
+             return None;
+         }
+@@ -394,7 +396,12 @@ trait PrivateMatchMethods: TElement {
+         old_values: Option<&Arc<ComputedValues>>,
+         new_styles: &mut ResolvedElementStyles,
+     ) -> Option<Arc<ComputedValues>> {
+-        let starting_values = self.maybe_resolve_starting_style(context, old_values, new_styles);
++        let starting_values = self.maybe_resolve_starting_style(
++            context,
++            old_values,
++            new_styles.primary_style(),
++            /* pseudo = */ None,
++        );
+         let before_change_or_starting = starting_values.as_ref().or(old_values);
+         let new_values = new_styles.primary_style_mut();
+ 
+@@ -550,9 +557,16 @@ trait PrivateMatchMethods: TElement {
+         use crate::animation::AnimationSetKey;
+         use crate::dom::TDocument;
+ 
++        let starting_values = self.maybe_resolve_starting_style(
++            context,
++            old_styles.primary.as_ref(),
++            new_resolved_styles.primary_style(),
++            /* pseudo = */ None,
++        );
+         let style_changed = self.process_animations_for_style(
+             context,
+             &mut old_styles.primary,
++            starting_values,
+             new_resolved_styles.primary_style_mut(),
+             /* pseudo_element = */ None,
+         );
+@@ -599,6 +613,32 @@ trait PrivateMatchMethods: TElement {
+             }
+         }
+ 
++        // An element whose removal from the top layer is deferred by a transition of `overlay` was
++        // matched as out of it, before that transition applied, so its ::backdrop has to be
++        // resolved now for it to stay and animate out.
++        if new_resolved_styles.primary_style().in_top_layer()
++            && new_resolved_styles
++                .pseudos
++                .get(&PseudoElement::Backdrop)
++                .is_none()
++        {
++            let backdrop_style = StyleResolverForElement::new(
++                *self,
++                context,
++                RuleInclusion::All,
++                PseudoElementResolution::IfApplicable,
++            )
++            .resolve_pseudo_style_with_default_parents(
++                &PseudoElement::Backdrop,
++                &new_resolved_styles.primary,
++            );
++            if let Some(backdrop_style) = backdrop_style {
++                new_resolved_styles
++                    .pseudos
++                    .set(&PseudoElement::Backdrop, backdrop_style.0);
++            }
++        }
++
+         self.process_animations_for_pseudo(
+             context,
+             old_styles,
+@@ -611,6 +651,12 @@ trait PrivateMatchMethods: TElement {
+             new_resolved_styles,
+             PseudoElement::After,
+         );
++        self.process_animations_for_pseudo(
++            context,
++            old_styles,
++            new_resolved_styles,
++            PseudoElement::Backdrop,
++        );
+     }
+ 
+     #[cfg(feature = "servo")]
+@@ -637,9 +683,16 @@ trait PrivateMatchMethods: TElement {
+         };
+ 
+         let old_style = old_styles.pseudos.get(&pseudo_element).cloned();
++        let starting_values = self.maybe_resolve_starting_style(
++            context,
++            old_style.as_ref(),
++            &style,
++            Some((&pseudo_element, &new_resolved_styles.primary)),
++        );
+         self.process_animations_for_style(
+             context,
+             &old_style,
++            starting_values,
+             &style,
+             Some(pseudo_element.clone()),
+         );
+@@ -701,11 +754,14 @@ trait PrivateMatchMethods: TElement {
+         &self,
+         context: &mut StyleContext<Self>,
+         old_values: &Option<Arc<ComputedValues>>,
++        starting_values: Option<Arc<ComputedValues>>,
+         new_values: &Arc<ComputedValues>,
+         pseudo_element: Option<PseudoElement>,
+     ) -> bool {
+         use crate::animation::{AnimationSetKey, AnimationState};
+ 
++        let before_change_style = starting_values.as_ref().or(old_values.as_ref());
++
+         // We need to call this before accessing the `ElementAnimationSet` from the
+         // map because this call will do a RwLock::read().
+         let needs_animations_update = self.needs_animations_update(
+@@ -717,7 +773,7 @@ trait PrivateMatchMethods: TElement {
+ 
+         let might_need_transitions_update = self.might_need_transitions_update(
+             context,
+-            old_values.as_deref(),
++            before_change_style.map(|s| &**s),
+             new_values,
+             pseudo_element,
+         );
+@@ -758,7 +814,7 @@ trait PrivateMatchMethods: TElement {
+         animation_set.update_transitions_for_new_style(
+             might_need_transitions_update,
+             &shared_context,
+-            old_values.as_ref(),
++            before_change_style,
+             after_change_style.as_ref().unwrap_or(new_values),
+         );
+ 
+diff --git a/style/properties/gecko.mako.rs b/style/properties/gecko.mako.rs
+index b6ad09ce5..2cd61cf64 100644
+--- a/style/properties/gecko.mako.rs
++++ b/style/properties/gecko.mako.rs
+@@ -128,21 +128,6 @@ impl ComputedValues {
+         self.pseudo() == Some(PseudoElement::FirstLine)
+     }
+ 
+-    /// Returns true if the display property is changed from 'none' to others.
+-    pub fn is_display_property_changed_from_none(
+-        &self,
+-        old_values: Option<&ComputedValues>
+-    ) -> bool {
+-        use crate::properties::longhands::display::computed_value::T as Display;
+-
+-        old_values.map_or(false, |old| {
+-            let old_display_style = old.get_box().clone_display();
+-            let new_display_style = self.get_box().clone_display();
+-            old_display_style == Display::None &&
+-            new_display_style != Display::None
+-        })
+-    }
+-
+     /// Calls the given function for each cached lazy pseudo-element style.
+     pub fn each_cached_lazy_pseudo<F>(&self, mut f: F)
+     where
+diff --git a/style/properties/properties.mako.rs b/style/properties/properties.mako.rs
+index ff6945bfa..d877ce30d 100644
+--- a/style/properties/properties.mako.rs
++++ b/style/properties/properties.mako.rs
+@@ -1644,6 +1644,30 @@ impl ComputedValues {
+         self.pseudo().is_some()
+     }
+ 
++    /// Whether this style puts its element in the top layer, like StyleBuilder::in_top_layer.
++    #[cfg(feature = "servo")]
++    pub fn in_top_layer(&self) -> bool {
++        matches!(self.get_box().clone__servo_top_layer(),
++                 longhands::_servo_top_layer::computed_value::T::Top) ||
++            matches!(self.get_box().clone_overlay(),
++                     longhands::overlay::computed_value::T::Auto)
++    }
++
++    /// Returns true if the display property is changed from 'none' to others.
++    pub fn is_display_property_changed_from_none(
++        &self,
++        old_values: Option<&ComputedValues>
++    ) -> bool {
++        use crate::properties::longhands::display::computed_value::T as Display;
++
++        old_values.map_or(false, |old| {
++            let old_display_style = old.get_box().clone_display();
++            let new_display_style = self.get_box().clone_display();
++            old_display_style == Display::None &&
++            new_display_style != Display::None
++        })
++    }
++
+     /// Returns whether this style's display value is equal to contents.
+     pub fn is_display_contents(&self) -> bool {
+         self.clone_display().is_contents()
+diff --git a/style/servo/animation.rs b/style/servo/animation.rs
+index 54d1c6398..1497540d4 100644
+--- a/style/servo/animation.rs
++++ b/style/servo/animation.rs
+@@ -1718,8 +1718,6 @@ impl DocumentAnimationSet {
+     }
+ }
+ 
+-/// Kick off any new transitions for this node and return all of the properties that are
+-/// transitioning. This is at the end of calculating style for a single node.
+ /// Whether `display` has a matching transition-property value whose transition-behavior is
+ /// allow-discrete.
+ fn transitions_display_discretely(style: &ComputedValues) -> bool {
+@@ -1730,6 +1728,8 @@ fn transitions_display_discretely(style: &ComputedValues) -> bool {
+     })
+ }
+ 
++/// Kick off any new transitions for this node and return all of the properties that are
++/// transitioning. This is at the end of calculating style for a single node.
+ pub fn start_transitions_if_applicable(
+     context: &SharedStyleContext,
+     old_style: &ComputedValues,
+diff --git a/style/servo/selector_parser.rs b/style/servo/selector_parser.rs
+index dc1b81336..606b37964 100644
+--- a/style/servo/selector_parser.rs
++++ b/style/servo/selector_parser.rs
+@@ -54,9 +54,11 @@ pub enum PseudoElement {
+     // Also, make sure the UA sheet has the !important rules some of the
+     // APPLIES_TO_PLACEHOLDER properties expect!
+     FirstLetter,
++    // Eager so that it can animate like ::before and ::after, but only generated for elements in
++    // the top layer.
++    Backdrop,
+ 
+     // Non-eager pseudos.
+-    Backdrop,
+     DetailsContent,
+     Marker,
+ 
+@@ -180,7 +182,7 @@ impl ::selectors::parser::PseudoElement for PseudoElement {
+ }
+ 
+ /// The number of eager pseudo-elements. Keep this in sync with cascade_type.
+-pub const EAGER_PSEUDO_COUNT: usize = 4;
++pub const EAGER_PSEUDO_COUNT: usize = 5;
+ 
+ impl PseudoElement {
+     /// Gets the canonical index of this eagerly-cascaded pseudo-element.
+@@ -323,9 +325,9 @@ impl PseudoElement {
+             PseudoElement::After
+             | PseudoElement::Before
+             | PseudoElement::FirstLetter
+-            | PseudoElement::Selection => PseudoElementCascadeType::Eager,
+-            PseudoElement::Backdrop
+-            | PseudoElement::ColorSwatch
++            | PseudoElement::Selection
++            | PseudoElement::Backdrop => PseudoElementCascadeType::Eager,
++            PseudoElement::ColorSwatch
+             | PseudoElement::FileSelectorButton
+             | PseudoElement::Marker
+             | PseudoElement::Placeholder
+diff --git a/style/style_resolver.rs b/style/style_resolver.rs
+index b3b3aafba..ea2f09d81 100644
+--- a/style/style_resolver.rs
++++ b/style/style_resolver.rs
+@@ -318,6 +318,20 @@ where
+         })
+     }
+ 
++    /// Match and cascade an eager pseudo-element of an element whose primary style is already
++    /// resolved, using the default parent for inheritance.
++    pub fn resolve_pseudo_style_with_default_parents(
++        &mut self,
++        pseudo: &PseudoElement,
++        primary_style: &PrimaryStyle,
++    ) -> Option<ResolvedStyle> {
++        with_default_parent_styles(self.element, |_, layout_parent_style| {
++            let layout_parent_style_for_pseudo =
++                layout_parent_style_for_pseudo(primary_style, layout_parent_style);
++            self.resolve_pseudo_style(pseudo, primary_style, layout_parent_style_for_pseudo)
++        })
++    }
++
+     /// Cascade a set of rules for pseudo element, using the default parent for inheritance.
+     pub fn cascade_style_and_visited_for_pseudo_with_default_parents(
+         &mut self,
+@@ -578,21 +592,31 @@ where
+     }
+ 
+     /// Resolve the starting style by recascading with @starting-style rules included, similar to
+-    /// how after_change_style works.
++    /// how after_change_style works. `pseudo` is the pseudo-element that `style` belongs to, if
++    /// any, together with the style of its originating element.
+     pub fn resolve_starting_style(
+         &mut self,
+-        primary_style: &Arc<ComputedValues>,
++        style: &Arc<ComputedValues>,
++        pseudo: Option<(&PseudoElement, &PrimaryStyle)>,
+     ) -> Option<ResolvedStyle> {
+-        if !RuleTree::has_starting_style(primary_style.rules()) {
++        if !RuleTree::has_starting_style(style.rules()) {
+             return None;
+         }
+         let inputs = CascadeInputs {
+-            rules: Some(primary_style.rules().clone()),
+-            visited_rules: primary_style.visited_rules().cloned(),
+-            flags: primary_style.flags.for_cascade_inputs(),
++            rules: Some(style.rules().clone()),
++            visited_rules: style.visited_rules().cloned(),
++            flags: style.flags.for_cascade_inputs(),
+             included_cascade_flags: RuleCascadeFlags::STARTING_STYLE,
+         };
+-        Some(self.cascade_style_and_visited_with_default_parents(inputs))
++        Some(match pseudo {
++            Some((pseudo, originating_style)) => self
++                .cascade_style_and_visited_for_pseudo_with_default_parents(
++                    inputs,
++                    pseudo,
++                    originating_style,
++                ),
++            None => self.cascade_style_and_visited_with_default_parents(inputs),
++        })
+     }
+ 
+     /// If there is no transition rule in the ComputedValues, it returns None.
+diff --git a/stylo_static_prefs/preferences.toml b/stylo_static_prefs/preferences.toml
+index e95170d30..1da17c3cd 100644
+--- a/stylo_static_prefs/preferences.toml
++++ b/stylo_static_prefs/preferences.toml
+@@ -26,7 +26,7 @@
+ "layout.css.revert-rule.enabled" = true
+ "layout.css.scroll-driven-animations.enabled" = false
+ "layout.css.scroll-state.enabled" = false
+-"layout.css.starting-style-at-rules.enabled" = false
++"layout.css.starting-style-at-rules.enabled" = true
+ "layout.css.stretch-size-keyword.enabled" = true
+ "layout.css.style-queries.enabled" = false
+ "layout.css.stylo-local-work-queue.in-main-thread" = 32
+-- 
+2.43.0
+

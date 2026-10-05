@@ -1,0 +1,54 @@
+From e17a54160f432bf413232984c7173b5674674573 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 06:38:49 -0400
+Subject: [PATCH] api: add a stroke width to font instance options
+
+A font instance with a stroke width rasterizes its glyphs as the outline of a stroke of that
+width (in 1/64ths of a layout pixel) along the glyph outlines, which is how Servo paints
+-webkit-text-stroke over the filled text.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ webrender_api/src/font.rs             | 6 ++++++
+ wr_glyph_rasterizer/src/rasterizer.rs | 1 +
+ 2 files changed, 7 insertions(+)
+
+diff --git a/webrender_api/src/font.rs b/webrender_api/src/font.rs
+index 6827669e..6b6e455c 100644
+--- a/webrender_api/src/font.rs
++++ b/webrender_api/src/font.rs
+@@ -305,6 +305,11 @@ pub struct FontInstanceOptions {
+     // ParamTraits_TiedFields.
+     // The sizeof(T) must be equal to the sum of the sizeof each field in T.
+     pub _padding: u8,
++    /// When non-zero, glyphs are rasterized as the outline of a stroke of this
++    /// width, in 1/64ths of a layout pixel, centred on the glyph outline. This
++    /// is how `-webkit-text-stroke` is painted:
++    /// <https://compat.spec.whatwg.org/#the-webkit-text-stroke-width>
++    pub stroke_width: u32,
+ }
+ 
+ impl Default for FontInstanceOptions {
+@@ -314,6 +319,7 @@ impl Default for FontInstanceOptions {
+             flags: Default::default(),
+             synthetic_italics: SyntheticItalics::disabled(),
+             _padding: 0,
++            stroke_width: 0,
+         }
+     }
+ }
+diff --git a/wr_glyph_rasterizer/src/rasterizer.rs b/wr_glyph_rasterizer/src/rasterizer.rs
+index 24e67623..d7a1aa7b 100644
+--- a/wr_glyph_rasterizer/src/rasterizer.rs
++++ b/wr_glyph_rasterizer/src/rasterizer.rs
+@@ -788,6 +788,7 @@ impl FontInstanceMap {
+                   flags: instance.flags,
+                   synthetic_italics: instance.synthetic_italics,
+                   _padding: 0,
++                  stroke_width: instance.stroke_width,
+                 }),
+                 platform_options: instance.platform_options,
+                 variations: instance.variations.clone(),
+-- 
+2.43.0
+

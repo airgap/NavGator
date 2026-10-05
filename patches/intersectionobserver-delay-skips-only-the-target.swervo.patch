@@ -1,0 +1,36 @@
+From 870e4856924f583215f838ca9d17c93318a41a50 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 06:38:59 -0400
+Subject: [PATCH] script: IntersectionObserver delay skips only the target, not
+ the observer
+
+When a target's delay had not elapsed since its last update, the update
+loop returned from the observer instead of continuing to the next target,
+so every target registered after it went unprocessed. A target observed
+while an earlier one was still inside its delay window got no initial
+entry until the earlier one became eligible (in Chrome it is reported on
+the next frame). The spec says to skip further processing for that target
+only.
+https://w3c.github.io/IntersectionObserver/#update-intersection-observations-algo
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../script/dom/intersectionobserver/intersectionobserver.rs     | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/components/script/dom/intersectionobserver/intersectionobserver.rs b/components/script/dom/intersectionobserver/intersectionobserver.rs
+index f4d7d466e18..3e01b9b2f1b 100644
+--- a/components/script/dom/intersectionobserver/intersectionobserver.rs
++++ b/components/script/dom/intersectionobserver/intersectionobserver.rs
+@@ -717,7 +717,7 @@ impl IntersectionObserver {
+             if time - registration.last_update_time.get() <
+                 Duration::from_millis(self.delay.get().max(0) as u64)
+             {
+-                return;
++                continue;
+             }
+ 
+             // Step 3
+-- 
+2.43.0
+

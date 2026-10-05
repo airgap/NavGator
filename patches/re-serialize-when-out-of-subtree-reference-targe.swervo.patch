@@ -1,0 +1,314 @@
+From 2d2c584bb30766e0dd2af02ca9e636e787c76417 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 01:20:47 -0400
+Subject: [PATCH] svg: re-serialize when out-of-subtree reference targets
+ change
+
+An inline <svg> renders from a cached standalone serialization into which `<use href="#id">`
+and `url(#id)` targets defined elsewhere in the document are cloned. The cache was only
+invalidated by mutations inside the svg itself, so a target that appeared, disappeared or
+changed after the first serialization never showed up. tumblr inserts its
+<aside id="managed-icon-repository"> of icon <svg>s on demand, after the nav icons that use
+them were first rendered, so the whole nav stayed blank.
+
+Each serialization now records the IDs it looked up, found or not, and registers itself with
+the document under them (mirroring the form-owner id listeners). Registering or unregistering
+an element with such an ID, or a mutation inside an SVG element carrying one, invalidates the
+registered svgs. The temporary clones that serialization inserts register IDs and mutate svg
+subtrees too, so invalidation is suppressed while a serialization runs; otherwise svgs sharing
+a target would keep invalidating each other.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/document/document.rs | 59 +++++++++++++++++++++
+ components/script/dom/svg/svgelement.rs    | 16 ++++++
+ components/script/dom/svg/svgsvgelement.rs | 60 ++++++++++++++++++----
+ 3 files changed, 126 insertions(+), 9 deletions(-)
+
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index 1604672cce3..a925106e421 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -195,6 +195,7 @@ use crate::dom::selection::Selection;
+ use crate::dom::servoparser::ServoParser;
+ use crate::dom::shadowroot::ShadowRoot;
+ use crate::dom::storageevent::StorageEvent;
++use crate::dom::svg::svgsvgelement::SVGSVGElement;
+ use crate::dom::text::Text;
+ use crate::dom::touchevent::TouchEvent as DomTouchEvent;
+ use crate::dom::touchlist::TouchList;
+@@ -511,6 +512,16 @@ pub(crate) struct Document {
+     /// It is safe to use FxBuildHasher here as Atoms are in the string_cache
+     form_id_listener_map:
+         DomRefCell<HashMapTracedValues<Atom, HashSet<Dom<Element>>, FxBuildHasher>>,
++    /// Map from ID to the inline `<svg>` roots whose cached serialization looked that ID up
++    /// (successfully or not) to inline a `<use href>` or `url(#id)` target living outside
++    /// their own subtree. Those serializations are stale as soon as an element with the ID
++    /// enters or leaves the document, or the target's subtree mutates.
++    svg_id_reference_listeners:
++        DomRefCell<HashMapTracedValues<Atom, HashSet<Dom<SVGSVGElement>>, FxBuildHasher>>,
++    /// Set while an svg subtree is being serialized: the temporary clones it inserts and
++    /// removes register IDs and mutate svg subtrees, which must not invalidate other svgs
++    /// (each re-serialization would then invalidate the others, forever).
++    svg_serialization_in_progress: Cell<bool>,
+     #[no_trace]
+     interactive_time: DomRefCell<ProgressiveWebMetrics>,
+     #[no_trace]
+@@ -1179,12 +1190,58 @@ impl Document {
+     pub(crate) fn unregister_element_id(&self, cx: &mut JSContext, id: &Atom) {
+         self.id_map.remove(id);
+         self.reset_form_owner_for_listeners(cx, id);
++        self.invalidate_svgs_referencing_id(id);
+     }
+ 
+     /// Associate an element present in this document with the provided id.
+     pub(crate) fn register_element_id(&self, cx: &mut JSContext, element: &Element, id: &Atom) {
+         self.id_map.add(id, element);
+         self.reset_form_owner_for_listeners(cx, id);
++        self.invalidate_svgs_referencing_id(id);
++    }
++
++    pub(crate) fn register_svg_id_reference_listener(&self, id: Atom, svg: &SVGSVGElement) {
++        self.svg_id_reference_listeners
++            .borrow_mut()
++            .entry(id)
++            .or_default()
++            .insert(Dom::from_ref(svg));
++    }
++
++    pub(crate) fn unregister_svg_id_reference_listener(&self, id: &Atom, svg: &SVGSVGElement) {
++        let mut map = self.svg_id_reference_listeners.borrow_mut();
++        if let Some(listeners) = map.get_mut(id) {
++            listeners.remove(&Dom::from_ref(svg));
++            if listeners.is_empty() {
++                map.remove(id);
++            }
++        }
++    }
++
++    pub(crate) fn has_svg_id_reference_listeners(&self) -> bool {
++        !self.svg_id_reference_listeners.borrow().is_empty()
++    }
++
++    /// Invalidate the serialization of every svg that resolved `id` from outside its subtree.
++    pub(crate) fn invalidate_svgs_referencing_id(&self, id: &Atom) {
++        if self.svg_serialization_in_progress.get() {
++            return;
++        }
++        let listeners: Vec<DomRoot<SVGSVGElement>> = match self
++            .svg_id_reference_listeners
++            .borrow()
++            .get(id)
++        {
++            Some(listeners) => listeners.iter().map(|svg| svg.as_rooted()).collect(),
++            None => return,
++        };
++        for svg in listeners {
++            svg.invalidate_cached_serialized_subtree_and_rasterization_result();
++        }
++    }
++
++    pub(crate) fn set_svg_serialization_in_progress(&self, in_progress: bool) {
++        self.svg_serialization_in_progress.set(in_progress);
+     }
+ 
+     /// Remove any existing association between the provided name and any elements in this document.
+@@ -3807,6 +3864,8 @@ impl Document {
+             spurious_animation_frames: Cell::new(0),
+             fullscreen_element: MutNullableDom::new(None),
+             form_id_listener_map: Default::default(),
++            svg_id_reference_listeners: Default::default(),
++            svg_serialization_in_progress: Cell::new(false),
+             interactive_time: DomRefCell::new(interactive_time),
+             tti_window: DomRefCell::new(InteractiveWindow::default()),
+             canceller,
+diff --git a/components/script/dom/svg/svgelement.rs b/components/script/dom/svg/svgelement.rs
+index 7a0088a50ef..91ea9fe009c 100644
+--- a/components/script/dom/svg/svgelement.rs
++++ b/components/script/dom/svg/svgelement.rs
+@@ -118,6 +118,22 @@ impl SVGElement {
+         {
+             svg_root.invalidate_cached_serialized_subtree_and_rasterization_result();
+         }
++
++        // Other svgs may have inlined an enclosing element by id (`<use href="#icon">`
++        // with the `<symbol id="icon">` defined elsewhere); their copies are stale too.
++        let document = self.owner_document();
++        if !document.has_svg_id_reference_listeners() {
++            return;
++        }
++        for ancestor in self
++            .upcast::<Node>()
++            .inclusive_ancestors(ShadowIncluding::No)
++            .filter_map(DomRoot::downcast::<SVGElement>)
++        {
++            if let Some(id) = ancestor.as_element().get_id() {
++                document.invalidate_svgs_referencing_id(&id);
++            }
++        }
+     }
+ }
+ 
+diff --git a/components/script/dom/svg/svgsvgelement.rs b/components/script/dom/svg/svgsvgelement.rs
+index 2789374a90c..cfcbf01a241 100644
+--- a/components/script/dom/svg/svgsvgelement.rs
++++ b/components/script/dom/svg/svgsvgelement.rs
+@@ -57,6 +57,11 @@ pub(crate) struct SVGSVGElement {
+     /// The `svg_paint_signature` of this element's style that the cached serialization was
+     /// built with; layout re-requests serialization when the current style no longer matches.
+     cached_paint_signature: DomRefCell<Option<String>>,
++    /// The IDs the cached serialization looked up in the document to inline targets defined
++    /// outside this subtree, found or not; registered with the document so that the
++    /// serialization is invalidated when any of them appears, disappears or changes.
++    #[no_trace]
++    referenced_ids: DomRefCell<Vec<Atom>>,
+ }
+ 
+ impl SVGSVGElement {
+@@ -70,6 +75,7 @@ impl SVGSVGElement {
+             uuid: Uuid::new_v4().to_string(),
+             cached_serialized_data_url: Default::default(),
+             cached_paint_signature: Default::default(),
++            referenced_ids: Default::default(),
+         }
+     }
+ 
+@@ -102,13 +108,18 @@ impl SVGSVGElement {
+             .style_from_last_restyle()
+             .map(|style| svg_paint_signature(&style));
+ 
+-        let mut cloned_nodes = self.process_use_elements(cx);
++        let document = self.owner_document();
++        self.unregister_referenced_ids();
++        document.set_svg_serialization_in_progress(true);
++        let mut referenced_ids = HashSet::new();
++
++        let mut cloned_nodes = self.process_use_elements(cx, &mut referenced_ids);
+         // Order matters: lowering `<foreignObject>` and `<image href>` first means the
+         // `<image>` elements those passes insert (which carry `mask`/`clip-path`/`filter`
+         // attributes) are seen by the external-reference pass below.
+         cloned_nodes.extend(self.process_foreign_objects(cx));
+         cloned_nodes.extend(self.process_image_elements(cx));
+-        cloned_nodes.extend(self.process_external_references(cx));
++        cloned_nodes.extend(self.process_external_references(cx, &mut referenced_ids));
+ 
+         let rewrite_attributes = |element: &Element, attributes: &mut Vec<(QualName, AttrValue)>| {
+             self.rewrite_serialized_attributes(element, attributes)
+@@ -118,6 +129,11 @@ impl SVGSVGElement {
+             .xml_serialize_with_attribute_rewrite(TraversalScope::IncludeNode, &rewrite_attributes);
+ 
+         self.cleanup_cloned_nodes(cx, &cloned_nodes);
++        document.set_svg_serialization_in_progress(false);
++        for id in &referenced_ids {
++            document.register_svg_id_reference_listener(id.clone(), self);
++        }
++        *self.referenced_ids.borrow_mut() = referenced_ids.into_iter().collect();
+         *self.cached_paint_signature.borrow_mut() = paint_signature;
+ 
+         let Ok(xml_source) = serialize_result else {
+@@ -134,14 +150,25 @@ impl SVGSVGElement {
+         };
+     }
+ 
+-    fn process_use_elements(&self, cx: &mut JSContext) -> Vec<DomRoot<Node>> {
++    fn unregister_referenced_ids(&self) {
++        let document = self.owner_document();
++        for id in self.referenced_ids.take() {
++            document.unregister_svg_id_reference_listener(&id, self);
++        }
++    }
++
++    fn process_use_elements(
++        &self,
++        cx: &mut JSContext,
++        referenced_ids: &mut HashSet<Atom>,
++    ) -> Vec<DomRoot<Node>> {
+         let mut cloned_nodes = Vec::new();
+         let root_node = self.upcast::<Node>();
+ 
+         for node in root_node.traverse_preorder(ShadowIncluding::No) {
+             if let Some(element) = node.downcast::<Element>() &&
+                 element.local_name() == &local_name!("use") &&
+-                let Some(cloned) = self.process_single_use_element(cx, element)
++                let Some(cloned) = self.process_single_use_element(cx, element, referenced_ids)
+             {
+                 cloned_nodes.push(cloned);
+             }
+@@ -154,6 +181,7 @@ impl SVGSVGElement {
+         &self,
+         cx: &mut JSContext,
+         use_element: &Element,
++        referenced_ids: &mut HashSet<Atom>,
+     ) -> Option<DomRoot<Node>> {
+         let href = use_element.get_string_attribute(&local_name!("href"));
+         let effective_href = if href.str().is_empty() {
+@@ -167,6 +195,7 @@ impl SVGSVGElement {
+         if id_str.is_empty() {
+             return None;
+         }
++        referenced_ids.insert(Atom::from(id_str));
+         let id = DOMString::from(id_str);
+         let document = self.upcast::<Node>().owner_doc();
+         let referenced_element = document.GetElementById(cx, id)?;
+@@ -191,7 +220,14 @@ impl SVGSVGElement {
+             CloneChildrenFlag::CloneChildren,
+             None,
+         );
+-        // Park the clone inside a <defs> wrapper so it is resolvable by id but never paints.
++        Some(self.append_in_defs(cx, &cloned_node))
++    }
++
++    /// Append `node` to this svg inside a `<defs>` wrapper, so that it is resolvable by id but
++    /// never paints, and return the wrapper.
++    fn append_in_defs(&self, cx: &mut JSContext, node: &Node) -> DomRoot<Node> {
++        let document = self.owner_document();
++        let root_node = self.upcast::<Node>();
+         let defs = Element::create(
+             cx,
+             QualName::new(None, ns!(svg), LocalName::from("defs")),
+@@ -202,10 +238,9 @@ impl SVGSVGElement {
+             None,
+         );
+         let defs_node = DomRoot::from_ref(defs.upcast::<Node>());
+-        let _ = defs_node.AppendChild(cx, &cloned_node);
++        let _ = defs_node.AppendChild(cx, node);
+         let _ = root_node.AppendChild(cx, &defs_node);
+-
+-        Some(defs_node)
++        defs_node
+     }
+ 
+     /// Inline elements referenced from this subtree via `url(#id)` in `mask`, `clip-path`,
+@@ -215,7 +250,11 @@ impl SVGSVGElement {
+     /// can't resolve those ids and drops the reference entirely (an unmasked rect renders as a
+     /// square where the page expects a circle). Referenced elements are cloned in, recursively
+     /// (a cloned mask may itself reference a gradient), and removed after serialization.
+-    fn process_external_references(&self, cx: &mut JSContext) -> Vec<DomRoot<Node>> {
++    fn process_external_references(
++        &self,
++        cx: &mut JSContext,
++        resolved_ids: &mut HashSet<Atom>,
++    ) -> Vec<DomRoot<Node>> {
+         let reference_attributes: Vec<LocalName> = [
+             "mask",
+             "clip-path",
+@@ -259,6 +298,7 @@ impl SVGSVGElement {
+                 if !processed_ids.insert(id.clone()) {
+                     continue;
+                 }
++                resolved_ids.insert(Atom::from(&*id));
+                 let Some(referenced_element) = document.GetElementById(cx, DOMString::from(id))
+                 else {
+                     continue;
+@@ -1122,6 +1162,8 @@ impl VirtualMethods for SVGSVGElement {
+             s.unbind_from_tree(cx, context);
+         }
+ 
++        self.unregister_referenced_ids();
++
+         self.invalidate_cached_serialized_subtree_and_rasterization_result();
+     }
+ }
+-- 
+2.43.0
+

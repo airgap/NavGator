@@ -1,0 +1,592 @@
+From 22dc585531964478c78f5853dab92c4869aca72b Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 05:41:43 -0400
+Subject: [PATCH] script: HTMLImageElement.loading and lazy loading of images
+ and iframes
+
+img.loading was undefined and loading=lazy was ignored, so feeds that
+rely on it fetched everything up front, and the HTML parser's
+prefetcher fetched lazy images too.
+
+The loading attribute now reflects as an enumerated attribute (missing
+and invalid default to eager per spec; Chrome returns "auto" there).
+Update the image data defers the fetch of a lazy image: it stops
+delaying the load event, records the lazy load resumption steps and
+starts intersection-observing the element through the document's lazy
+load intersection observer, an internal IntersectionObserver whose
+callback runs the resumption steps of intersecting targets. Switching
+the attribute to eager resumes immediately. iframes get the same for
+src navigations (srcdoc already recorded its resumption steps but never
+observed the element). The prefetcher skips loading=lazy images like
+Chrome's preload scanner.
+
+The observer grows both its root (the viewport) and scroll containers
+by 1250px, Chrome's distance on a fast connection: the spec's scroll
+margin alone never reaches the viewport. A document in a cross-origin
+iframe cannot reach the top-level document from its script thread, so
+its observer uses its own viewport rather than never firing.
+
+IntersectionObserver also never cleared its connected flag when its
+last target was unobserved, so a later observe() left it out of the
+document's observer list for good. Any page that unobserves and then
+observes again (and the lazy load observer after its first load) lost
+all notifications.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/document/document.rs    |  33 ++++++
+ .../script/dom/html/htmliframeelement.rs      |  77 ++++++++++---
+ .../script/dom/html/htmlimageelement.rs       |  81 +++++++++++++
+ .../intersectionobserver.rs                   | 106 ++++++++++++++++--
+ components/script/dom/servoparser/prefetch.rs |   9 ++
+ .../webidls/HTMLImageElement.webidl           |   1 +
+ 6 files changed, 281 insertions(+), 26 deletions(-)
+
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index f50e80e0f30..be5496f0f96 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -660,6 +660,8 @@ pub(crate) struct Document {
+     /// The lifetime of an intersection observer is specified at
+     /// <https://github.com/w3c/IntersectionObserver/issues/525>.
+     intersection_observers: DomRefCell<Vec<Dom<IntersectionObserver>>>,
++    /// <https://html.spec.whatwg.org/multipage/#lazy-load-intersection-observer>
++    lazy_load_intersection_observer: MutNullableDom<IntersectionObserver>,
+     /// The node that is currently highlighted by the devtools
+     highlighted_dom_node: MutNullableDom<Node>,
+     /// The constructed stylesheet that is adopted by this [Document].
+@@ -3639,6 +3641,36 @@ impl Document {
+             .retain(|observer| *observer != intersection_observer)
+     }
+ 
++    /// <https://html.spec.whatwg.org/multipage/#start-intersection-observing-a-lazy-loading-element>
++    pub(crate) fn start_intersection_observing_a_lazy_loading_element(
++        &self,
++        cx: &mut JSContext,
++        element: &Element,
++    ) {
++        // Step 1. Let doc be element's node document.
++        debug_assert!(*element.owner_document() == *self);
++        // Step 2. If doc's lazy load intersection observer is null, set it to a new
++        // IntersectionObserver instance, initialized as follows: ...
++        let observer = self.lazy_load_intersection_observer.or_init(|| {
++            IntersectionObserver::new_lazy_load_observer(cx, &self.window)
++        });
++        // Step 3. Call doc's lazy load intersection observer's observe method with element as
++        // the argument.
++        observer.observe_target_element(element);
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#stop-intersection-observing-a-lazy-loading-element>
++    pub(crate) fn stop_intersection_observing_a_lazy_loading_element(&self, element: &Element) {
++        // Step 1. Let doc be element's node document.
++        // Step 2. Assert: doc's lazy load intersection observer is not null.
++        // Step 3. Call doc's lazy load intersection observer's unobserve method with element as
++        // the argument.
++        self.lazy_load_intersection_observer
++            .get()
++            .expect("an element awaiting lazy load is observed by its document")
++            .unobserve_target_element(element);
++    }
++
+     /// <https://w3c.github.io/IntersectionObserver/#update-intersection-observations-algo>
+     pub(crate) fn update_intersection_observer_steps(
+         &self,
+@@ -4161,6 +4193,7 @@ impl Document {
+             has_trustworthy_ancestor_origin: Cell::new(has_trustworthy_ancestor_origin),
+             intersection_observer_task_queued: Cell::new(false),
+             intersection_observers: Default::default(),
++            lazy_load_intersection_observer: Default::default(),
+             highlighted_dom_node: Default::default(),
+             adopted_stylesheets: AdoptedStyleSheets::new(),
+             pending_scroll_events: Default::default(),
+diff --git a/components/script/dom/html/htmliframeelement.rs b/components/script/dom/html/htmliframeelement.rs
+index 17e3500d1c3..c8322789ac1 100644
+--- a/components/script/dom/html/htmliframeelement.rs
++++ b/components/script/dom/html/htmliframeelement.rs
+@@ -69,11 +69,18 @@ pub(crate) enum ProcessingMode {
+ }
+ 
+ /// <https://html.spec.whatwg.org/multipage/#lazy-load-resumption-steps>
+-#[derive(Clone, Copy, Default, MallocSizeOf, PartialEq)]
++#[derive(Default)]
+ enum LazyLoadResumptionSteps {
+     #[default]
+     None,
+     SrcDoc,
++    /// The step labeled navigate of
++    /// <https://html.spec.whatwg.org/multipage/#process-the-iframe-attributes>.
++    Navigate {
++        load_data: LoadData,
++        history_handling: NavigationHistoryBehavior,
++        mode: ProcessingMode,
++    },
+ }
+ 
+ #[dom_struct]
+@@ -100,7 +107,8 @@ pub(crate) struct HTMLIFrameElement {
+     current_navigation_was_lazy_loaded: Cell<bool>,
+     /// <https://html.spec.whatwg.org/multipage/#lazy-load-resumption-steps>
+     #[no_trace]
+-    lazy_load_resumption_steps: Cell<LazyLoadResumptionSteps>,
++    #[ignore_malloc_size_of = "LoadData has no MallocSizeOf"]
++    lazy_load_resumption_steps: DomRefCell<LazyLoadResumptionSteps>,
+     /// Keeping track of whether the iframe will be navigated
+     /// outside of the processing of it's attribute(for example: form navigation).
+     /// This is necessary to prevent the iframe load event steps
+@@ -424,6 +432,30 @@ impl HTMLIFrameElement {
+         self.navigate_an_iframe_or_frame(cx, load_data, mode);
+     }
+ 
++    /// Takes and runs the <https://html.spec.whatwg.org/multipage/#lazy-load-resumption-steps>.
++    pub(crate) fn invoke_lazy_load_resumption_steps(&self, cx: &mut JSContext) {
++        match self.lazy_load_resumption_steps.take() {
++            LazyLoadResumptionSteps::None => (),
++            LazyLoadResumptionSteps::SrcDoc => {
++                self.navigate_to_the_srcdoc_resource(ProcessingMode::NotFirstTime, cx);
++            },
++            LazyLoadResumptionSteps::Navigate {
++                load_data,
++                history_handling,
++                mode,
++            } => {
++                let target_snapshot_params = snapshot_self(self);
++                self.navigate_or_reload_child_browsing_context(
++                    load_data,
++                    history_handling,
++                    mode,
++                    target_snapshot_params,
++                    cx,
++                );
++            },
++        }
++    }
++
+     /// <https://html.spec.whatwg.org/multipage/#the-iframe-element:potentially-delays-the-load-event>
+     fn mark_navigation_as_lazy_loaded(&self, cx: &mut JSContext) {
+         // > An iframe element whose current navigation was lazy loaded boolean is false potentially delays the load event.
+@@ -446,12 +478,12 @@ impl HTMLIFrameElement {
+             if self.will_lazy_load_element_steps() {
+                 // Step 1.2.1. Set element's lazy load resumption steps to the rest of this algorithm
+                 // starting with the step labeled navigate to the srcdoc resource.
+-                self.lazy_load_resumption_steps
+-                    .set(LazyLoadResumptionSteps::SrcDoc);
++                *self.lazy_load_resumption_steps.borrow_mut() = LazyLoadResumptionSteps::SrcDoc;
+                 // Step 1.2.2. Set element's current navigation was lazy loaded boolean to true.
+                 self.mark_navigation_as_lazy_loaded(cx);
+                 // Step 1.2.3. Start intersection-observing a lazy loading element for element.
+-                // TODO
++                self.owner_document()
++                    .start_intersection_observing_a_lazy_loading_element(cx, self.upcast());
+                 // Step 1.2.4. Return.
+                 return;
+             }
+@@ -569,6 +601,27 @@ impl HTMLIFrameElement {
+             NavigationHistoryBehavior::Push
+         };
+ 
++        // Step 2.5. Set element's current navigation was lazy loaded boolean to false.
++        self.current_navigation_was_lazy_loaded.set(false);
++        // Step 2.6. If the will lazy load element steps given element return true, then:
++        if self.will_lazy_load_element_steps() {
++            // Step 2.6.1. Set element's lazy load resumption steps to the rest of this algorithm
++            // starting with the step labeled navigate.
++            *self.lazy_load_resumption_steps.borrow_mut() = LazyLoadResumptionSteps::Navigate {
++                load_data,
++                history_handling,
++                mode,
++            };
++            // Step 2.6.2. Set element's current navigation was lazy loaded boolean to true.
++            self.mark_navigation_as_lazy_loaded(cx);
++            // Step 2.6.3. Start intersection-observing a lazy loading element for element.
++            self.owner_document()
++                .start_intersection_observing_a_lazy_loading_element(cx, self.upcast());
++            // Step 2.6.4. Return.
++            return;
++        }
++
++        // Step 2.7. Navigate: Navigate an iframe or frame given element, url, and referrerPolicy.
+         let target_snapshot_params = snapshot_self(self);
+         self.navigate_or_reload_child_browsing_context(
+             load_data,
+@@ -1174,18 +1227,10 @@ impl VirtualMethods for HTMLIFrameElement {
+                 }
+ 
+                 // Step 1. Let resumptionSteps be the iframe element's lazy load resumption steps.
++                // Step 2. If resumptionSteps is null, then return.
+                 // Step 3. Set the iframe's lazy load resumption steps to null.
+-                let previous_resumption_steps = self
+-                    .lazy_load_resumption_steps
+-                    .replace(LazyLoadResumptionSteps::None);
+-                match previous_resumption_steps {
+-                    // Step 2. If resumptionSteps is null, then return.
+-                    LazyLoadResumptionSteps::None => (),
+-                    LazyLoadResumptionSteps::SrcDoc => {
+-                        // Step 4. Invoke resumptionSteps.
+-                        self.navigate_to_the_srcdoc_resource(ProcessingMode::NotFirstTime, cx);
+-                    },
+-                }
++                // Step 4. Invoke resumptionSteps.
++                self.invoke_lazy_load_resumption_steps(cx);
+             },
+             _ => {},
+         }
+diff --git a/components/script/dom/html/htmlimageelement.rs b/components/script/dom/html/htmlimageelement.rs
+index 2e003235709..97c369db14d 100644
+--- a/components/script/dom/html/htmlimageelement.rs
++++ b/components/script/dom/html/htmlimageelement.rs
+@@ -188,6 +188,10 @@ pub(crate) struct HTMLImageElement {
+     last_selected_source: DomRefCell<Option<USVString>>,
+     #[conditional_malloc_size_of]
+     image_decode_promises: DomRefCell<Vec<Rc<Promise>>>,
++    /// <https://html.spec.whatwg.org/multipage/#lazy-load-resumption-steps>
++    /// The URL that update the image data deferred fetching, and the generation of that run.
++    #[no_trace]
++    lazy_load_resumption_steps: DomRefCell<Option<(ServoUrl, u32)>>,
+     /// Line number this element was created on
+     line_number: u64,
+ }
+@@ -1001,9 +1005,54 @@ impl HTMLImageElement {
+             },
+         }
+ 
++        // > Let delay load event be true if the img's lazy loading attribute is in the Eager
++        // > state, or if scripting is disabled for the img, and false otherwise.
++        // > If the will lazy load element steps given the img return true, then:
++        if self.will_lazy_load_element_steps() {
++            let request = match self.image_request.get() {
++                ImageRequestPhase::Current => &self.current_request,
++                ImageRequestPhase::Pending => &self.pending_request,
++            };
++            LoadBlocker::terminate(&request.borrow().blocker, cx);
++            // > 1. Set the img's lazy load resumption steps to the rest of this algorithm
++            // >    starting with the step labeled fetch the image.
++            *self.lazy_load_resumption_steps.borrow_mut() =
++                Some((image_url.clone(), self.generation.get()));
++            // > 2. Start intersection-observing a lazy loading element for the img element.
++            self.owner_document()
++                .start_intersection_observing_a_lazy_loading_element(cx, self.upcast());
++            // > 3. Return.
++            return;
++        }
++
++        // > Fetch the image: Fetch request.
+         self.fetch_image(image_url, cx);
+     }
+ 
++    /// <https://html.spec.whatwg.org/multipage/#will-lazy-load-element-steps>
++    fn will_lazy_load_element_steps(&self) -> bool {
++        // Step 1. If scripting is disabled for element, then return false.
++        if !self.owner_document().scripting_enabled() {
++            return false;
++        }
++        // Step 2. If element's lazy loading attribute is in the Lazy state, then return true.
++        // Step 3. Return false.
++        self.Loading() == "lazy"
++    }
++
++    /// Invokes the <https://html.spec.whatwg.org/multipage/#lazy-load-resumption-steps> set by
++    /// update the image data, which continue at the step labeled "fetch the image".
++    pub(crate) fn invoke_lazy_load_resumption_steps(&self, cx: &mut js::context::JSContext) {
++        let Some((image_url, generation)) = self.lazy_load_resumption_steps.take() else {
++            return;
++        };
++        // A later run of update the image data has replaced the deferred request.
++        if generation != self.generation.get() {
++            return;
++        }
++        self.fetch_image(&image_url, cx);
++    }
++
+     /// <https://html.spec.whatwg.org/multipage/#update-the-image-data>
+     fn update_the_image_data_sync_steps(&self, cx: &mut js::context::JSContext) {
+         // Step 10. Let selected source and selected pixel density be the URL and pixel density that
+@@ -1540,6 +1589,7 @@ impl HTMLImageElement {
+             dimension_attribute_source: Default::default(),
+             last_selected_source: DomRefCell::new(None),
+             image_decode_promises: DomRefCell::new(vec![]),
++            lazy_load_resumption_steps: DomRefCell::new(None),
+             line_number: creator.return_line_number(),
+         }
+     }
+@@ -1938,6 +1988,20 @@ impl HTMLImageElementMethods<crate::DomTypeHolder> for HTMLImageElement {
+     // <https://html.spec.whatwg.org/multipage/#dom-img-referrerpolicy>
+     make_setter!(SetReferrerPolicy, "referrerpolicy");
+ 
++    // https://html.spec.whatwg.org/multipage/#dom-img-loading
++    make_enumerated_getter!(
++        Loading,
++        "loading",
++        "lazy" | "eager",
++        // https://html.spec.whatwg.org/multipage/#lazy-loading-attribute
++        // > The attribute's missing value default and invalid value default are both the Eager state.
++        missing => "eager",
++        invalid => "eager"
++    );
++
++    // https://html.spec.whatwg.org/multipage/#dom-img-loading
++    make_setter!(cx, SetLoading, "loading");
++
+     /// <https://html.spec.whatwg.org/multipage/#dom-img-decode>
+     fn Decode(&self, cx: &mut JSContext) -> Rc<Promise> {
+         // Step 1. Let promise be a new promise.
+@@ -1999,6 +2063,11 @@ impl VirtualMethods for HTMLImageElement {
+ 
+     fn adopting_steps(&self, cx: &mut JSContext, old_doc: &Document) {
+         self.super_type().unwrap().adopting_steps(cx, old_doc);
++        // The old document's lazy load observer would keep tracking this element against the
++        // wrong viewport; update the image data defers the fetch again in the new document.
++        if self.lazy_load_resumption_steps.take().is_some() {
++            old_doc.stop_intersection_observing_a_lazy_loading_element(self.upcast());
++        }
+         self.update_the_image_data(cx);
+     }
+ 
+@@ -2055,6 +2124,18 @@ impl VirtualMethods for HTMLImageElement {
+                     self.update_the_image_data(cx);
+                 }
+             },
++            &local_name!("loading") => {
++                // https://html.spec.whatwg.org/multipage/#attr-img-loading
++                // > When the loading attribute's state is changed to the Eager state, the user
++                // > agent must run these steps:
++                // > 1. Let resumptionSteps be the img element's lazy load resumption steps.
++                // > 2. If resumptionSteps is null, then return.
++                // > 3. Set the img's lazy load resumption steps to null.
++                // > 4. Invoke resumptionSteps.
++                if self.Loading() == "eager" {
++                    self.invoke_lazy_load_resumption_steps(cx);
++                }
++            },
+             _ => {},
+         }
+     }
+diff --git a/components/script/dom/intersectionobserver/intersectionobserver.rs b/components/script/dom/intersectionobserver/intersectionobserver.rs
+index 6d072ed5d79..f4d7d466e18 100644
+--- a/components/script/dom/intersectionobserver/intersectionobserver.rs
++++ b/components/script/dom/intersectionobserver/intersectionobserver.rs
+@@ -28,6 +28,7 @@ use crate::dom::bindings::callback::ExceptionHandling;
+ use crate::dom::bindings::codegen::Bindings::IntersectionObserverBinding::{
+     IntersectionObserverCallback, IntersectionObserverInit, IntersectionObserverMethods,
+ };
++use crate::dom::bindings::codegen::Bindings::IntersectionObserverEntryBinding::IntersectionObserverEntryMethods;
+ use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
+ use crate::dom::bindings::codegen::UnionTypes::{DoubleOrDoubleSequence, ElementOrDocument};
+ use crate::dom::bindings::error::{Error, Fallible};
+@@ -39,6 +40,8 @@ use crate::dom::bindings::utils::to_frozen_array;
+ use crate::dom::document::{Document, RenderingUpdateReason};
+ use crate::dom::domrectreadonly::DOMRectReadOnly;
+ use crate::dom::element::Element;
++use crate::dom::html::htmliframeelement::HTMLIFrameElement;
++use crate::dom::html::htmlimageelement::HTMLImageElement;
+ use crate::dom::intersectionobserverentry::IntersectionObserverEntry;
+ use crate::dom::node::{Node, NodeTraits};
+ use crate::dom::window::Window;
+@@ -49,6 +52,24 @@ use crate::dom::window::Window;
+ /// <https://w3c.github.io/IntersectionObserver/#intersectionobserver-intersection-root>
+ pub type IntersectionRoot = Option<ElementOrDocument>;
+ 
++/// <https://html.spec.whatwg.org/multipage/#lazy-load-scroll-margin>
++/// > The lazy load scroll margin is an implementation-defined value.
++///
++/// Chrome's lazy image distance threshold on a fast connection.
++const LAZY_LOAD_MARGIN: &str = "1250px";
++
++#[derive(JSTraceable, MallocSizeOf)]
++enum IntersectionObserverCallbackType {
++    /// <https://w3c.github.io/IntersectionObserver/#intersection-observer-callback>
++    Script {
++        #[conditional_malloc_size_of]
++        callback: Rc<IntersectionObserverCallback>,
++    },
++    /// The callback of a document's
++    /// <https://html.spec.whatwg.org/multipage/#lazy-load-intersection-observer>.
++    LazyLoad,
++}
++
+ /// The Intersection Observer interface
+ ///
+ /// > The IntersectionObserver interface can be used to observe changes in the intersection
+@@ -72,8 +93,7 @@ pub(crate) struct IntersectionObserver {
+     /// > with the intersection root, as per the processing model.
+     ///
+     /// <https://w3c.github.io/IntersectionObserver/#intersection-observer-callback>
+-    #[conditional_malloc_size_of]
+-    callback: Rc<IntersectionObserverCallback>,
++    callback: IntersectionObserverCallbackType,
+ 
+     /// <https://w3c.github.io/IntersectionObserver/#dom-intersectionobserver-queuedentries-slot>
+     queued_entries: DomRefCell<Vec<Dom<IntersectionObserverEntry>>>,
+@@ -107,7 +127,7 @@ pub(crate) struct IntersectionObserver {
+ impl IntersectionObserver {
+     fn new_inherited(
+         window: &Window,
+-        callback: Rc<IntersectionObserverCallback>,
++        callback: IntersectionObserverCallbackType,
+         root: IntersectionRoot,
+         root_margin: IntersectionObserverMargin,
+         scroll_margin: IntersectionObserverMargin,
+@@ -162,7 +182,7 @@ impl IntersectionObserver {
+         let observer = reflect_dom_object_with_proto_and_cx(
+             Box::new(Self::new_inherited(
+                 window,
+-                callback,
++                IntersectionObserverCallbackType::Script { callback },
+                 init.root.clone(),
+                 root_margin,
+                 scroll_margin,
+@@ -178,6 +198,43 @@ impl IntersectionObserver {
+         Ok(observer)
+     }
+ 
++    /// A document's <https://html.spec.whatwg.org/multipage/#lazy-load-intersection-observer>.
++    pub(crate) fn new_lazy_load_observer(cx: &mut JSContext, window: &Window) -> DomRoot<Self> {
++        // > The options is an IntersectionObserverInit dictionary with the following dictionary
++        // > members: «[ "scrollMargin" ⇒ lazy load scroll margin ]»
++        //
++        // The scroll margin only grows scroll containers between the target and the root, never
++        // the viewport, so on its own an image in the main document would only start fetching
++        // once it is already visible. Like Chrome, also grow the viewport by the same distance.
++        let margin = || {
++            parse_a_margin(Some(&DOMString::from(LAZY_LOAD_MARGIN)))
++                .expect("the lazy load margin is a valid margin")
++        };
++
++        // The implicit root is the top-level document, which a document in a cross-origin
++        // iframe cannot reach from this script thread; every observation would be skipped and
++        // its lazy elements would never load. Use the document's own viewport there instead.
++        let root = match window.top_level_document_if_local() {
++            Some(_) => None,
++            None => Some(ElementOrDocument::Document(window.Document())),
++        };
++
++        let observer = reflect_dom_object_with_proto_and_cx(
++            Box::new(Self::new_inherited(
++                window,
++                IntersectionObserverCallbackType::LazyLoad,
++                root,
++                margin(),
++                margin(),
++            )),
++            window,
++            None,
++            cx,
++        );
++        observer.thresholds.replace(vec![Finite::wrap(0.)]);
++        observer
++    }
++
+     /// Step 5-13 of <https://w3c.github.io/IntersectionObserver/#initialize-new-intersection-observer>
+     fn init_observer(&self, init: &IntersectionObserverInit) -> Fallible<()> {
+         // Step 5
+@@ -246,7 +303,7 @@ impl IntersectionObserver {
+     }
+ 
+     /// <https://w3c.github.io/IntersectionObserver/#observe-target-element>
+-    fn observe_target_element(&self, target: &Element) {
++    pub(crate) fn observe_target_element(&self, target: &Element) {
+         // Step 1
+         // > If target is in observer’s internal [[ObservationTargets]] slot, return.
+         let is_present = self
+@@ -285,7 +342,7 @@ impl IntersectionObserver {
+     }
+ 
+     /// <https://w3c.github.io/IntersectionObserver/#unobserve-target-element>
+-    fn unobserve_target_element(&self, target: &Element) {
++    pub(crate) fn unobserve_target_element(&self, target: &Element) {
+         // Step 1
+         // > Remove the IntersectionObserverRegistration record whose observer property is equal to
+         // > this from target’s internal [[RegisteredIntersectionObservers]] slot, if present.
+@@ -372,7 +429,7 @@ impl IntersectionObserver {
+ 
+         // Step 2-3
+         // We trivially moved the entries and root them.
+-        let queued_entries = self
++        let queued_entries: Vec<_> = self
+             .queued_entries
+             .take()
+             .iter_mut()
+@@ -380,9 +437,37 @@ impl IntersectionObserver {
+             .collect();
+ 
+         // Step 4-5
+-        let _ = self
+-            .callback
+-            .Call_(cx, self, queued_entries, self, ExceptionHandling::Report);
++        match &self.callback {
++            IntersectionObserverCallbackType::Script { callback } => {
++                let _ = callback.Call_(cx, self, queued_entries, self, ExceptionHandling::Report);
++            },
++            IntersectionObserverCallbackType::LazyLoad => {
++                // <https://html.spec.whatwg.org/multipage/#lazy-load-intersection-observer>
++                // > The callback is these steps, with arguments entries and observer:
++                // > For each entry in entries:
++                for entry in queued_entries {
++                    // > 1. Let resumptionSteps be null.
++                    // > 2. If entry.isIntersecting is true, then set resumptionSteps to
++                    // >    entry.target's lazy load resumption steps.
++                    if !entry.IsIntersecting() {
++                        continue;
++                    }
++                    let target = entry.Target();
++                    // > 4. Stop intersection-observing a lazy loading element for entry.target.
++                    // Done even when the resumption steps are null (they ran when the loading
++                    // attribute became eager), so the observer does not keep the element.
++                    self.unobserve_target_element(&target);
++                    // > 3. If resumptionSteps is null, then return.
++                    // > 5. Set entry.target's lazy load resumption steps to null.
++                    // > 6. Invoke resumptionSteps.
++                    if let Some(image) = target.downcast::<HTMLImageElement>() {
++                        image.invoke_lazy_load_resumption_steps(cx);
++                    } else if let Some(iframe) = target.downcast::<HTMLIFrameElement>() {
++                        iframe.invoke_lazy_load_resumption_steps(cx);
++                    }
++                }
++            },
++        }
+     }
+ 
+     /// Connect the observer itself into owner doc if it is unconnected.
+@@ -399,6 +484,7 @@ impl IntersectionObserver {
+     fn disconnect_from_owner(&self) {
+         if self.connected_to_document.get() {
+             self.owner_doc.remove_intersection_observer(self);
++            self.connected_to_document.set(false);
+         }
+     }
+ 
+diff --git a/components/script/dom/servoparser/prefetch.rs b/components/script/dom/servoparser/prefetch.rs
+index 99350acf6f0..537136648a5 100644
+--- a/components/script/dom/servoparser/prefetch.rs
++++ b/components/script/dom/servoparser/prefetch.rs
+@@ -158,6 +158,15 @@ impl TokenSink for PrefetchSink {
+                 TokenSinkResult::RawData(RawKind::ScriptData)
+             },
+             (TagKind::StartTag, &local_name!("img")) if self.prefetching.get() => {
++                // A lazy image is fetched only once it nears the viewport, which the element
++                // decides after layout; prefetching it here would defeat that (Chrome's preload
++                // scanner skips these too).
++                let is_lazy = self
++                    .get_attr(tag, local_name!("loading"))
++                    .is_some_and(|attr| attr.value.eq_ignore_ascii_case("lazy"));
++                if is_lazy {
++                    return TokenSinkResult::Continue;
++                }
+                 if let Some(url) = self.get_url(tag, local_name!("src")) {
+                     debug!("Prefetch {} {}", tag.name, url);
+                     let request = create_a_potential_cors_request(
+diff --git a/components/script_bindings/webidls/HTMLImageElement.webidl b/components/script_bindings/webidls/HTMLImageElement.webidl
+index 83b29291084..91861152f36 100644
+--- a/components/script_bindings/webidls/HTMLImageElement.webidl
++++ b/components/script_bindings/webidls/HTMLImageElement.webidl
+@@ -30,6 +30,7 @@ interface HTMLImageElement : HTMLElement {
+   readonly attribute USVString currentSrc;
+   [CEReactions]
+            attribute DOMString referrerPolicy;
++  [CEReactions] attribute DOMString loading;
+ 
+   Promise<undefined> decode();
+ 
+-- 
+2.43.0
+

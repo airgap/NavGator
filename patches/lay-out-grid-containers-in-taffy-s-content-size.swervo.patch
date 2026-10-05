@@ -1,0 +1,55 @@
+From b8f00cde17221335625f2757cece9998964abd30 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 06:14:58 -0400
+Subject: [PATCH] layout: lay out grid containers in Taffy's content-size mode
+
+TaffyContainer passed SizingMode::InherentSize, so Taffy applied the grid
+container's own width/height on top of what the caller had already resolved.
+With an indefinite block size, as in the intrinsic block size pass of a column
+flex item, the container then reported its specified height as its content
+size, so display:grid items with a height never shrank in a column flexbox
+with a max-height (Chrome shrinks them to their content, like block items).
+The same applied to the min/max-content inline sizes. Every caller resolves
+the preferred size into known_dimensions and resolves the final size from the
+content size, as for the other formatting contexts, so ask Taffy for the
+content size.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/taffy/layout.rs | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/components/layout/taffy/layout.rs b/components/layout/taffy/layout.rs
+index a3f001bb472..5f2416fa319 100644
+--- a/components/layout/taffy/layout.rs
++++ b/components/layout/taffy/layout.rs
+@@ -313,9 +313,10 @@ impl ComputeInlineContentSizes for TaffyContainer {
+     ) -> InlineContentSizesResult {
+         let style = &self.style;
+ 
++        // These are content sizes: the container's own sizing properties are applied by the caller.
+         let max_content_inputs = taffy::LayoutInput {
+             run_mode: taffy::RunMode::ComputeSize,
+-            sizing_mode: taffy::SizingMode::InherentSize,
++            sizing_mode: taffy::SizingMode::ContentSize,
+             axis: taffy::RequestedAxis::Horizontal,
+             vertical_margins_are_collapsible: taffy::Line::FALSE,
+ 
+@@ -426,9 +427,13 @@ impl TaffyContainer {
+             height: containing_block.size.block.to_definite().map(Au::to_f32_px),
+         };
+ 
++        // The caller has already resolved the preferred size into `known_dimensions` and resolves
++        // the final block size from our content block size. Letting Taffy apply the container's
++        // own `height` would make an indefinite block size (as in the intrinsic block size pass
++        // of a column flex item) report the specified height as the content size.
+         let layout_input = taffy::LayoutInput {
+             run_mode: taffy::RunMode::PerformLayout,
+-            sizing_mode: taffy::SizingMode::InherentSize,
++            sizing_mode: taffy::SizingMode::ContentSize,
+             axis: taffy::RequestedAxis::Vertical,
+             vertical_margins_are_collapsible: taffy::Line::FALSE,
+ 
+-- 
+2.43.0
+

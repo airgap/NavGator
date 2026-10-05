@@ -1,0 +1,241 @@
+From de3b484d9385442ac9501a6d4855693e68873533 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 06:37:54 -0400
+Subject: [PATCH] net: cap HTTP/1.1 requests at six per host and queue the rest
+
+hyper's client pool has no per-host connection limit, so a page that fans
+out 111 module imports opened 111 sockets at once. Against a server with a
+small accept backlog the excess SYNs were dropped and retried with
+backoff, and the module graph took ~18 s to load instead of under a
+second. Chrome allows six HTTP/1.1 connections per host and queues further
+requests.
+
+Each request now takes a slot from a per-(scheme, authority) semaphore
+before it is sent and holds it until its response body has been read to
+the end or dropped, which is when hyper returns the connection to the
+pool. A host that answers over HTTP/2 multiplexes on one connection, so
+the first HTTP/2 response closes that host's semaphore and releases every
+queued request.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/net/connector.rs       | 83 ++++++++++++++++++++++++++++++-
+ components/net/http_loader.rs     | 22 ++++++--
+ components/net/resource_thread.rs |  2 +
+ components/net/tests/main.rs      |  1 +
+ 4 files changed, 103 insertions(+), 5 deletions(-)
+
+diff --git a/components/net/connector.rs b/components/net/connector.rs
+index 8fc4bd13fc1..e072be5180b 100644
+--- a/components/net/connector.rs
++++ b/components/net/connector.rs
+@@ -10,9 +10,9 @@ use std::{fmt, io};
+ 
+ use futures::task::{Context, Poll};
+ use futures::{Future, TryFutureExt};
+-use http::uri::{Authority, Uri as Destination};
++use http::uri::{Authority, Scheme, Uri as Destination};
+ use http_body_util::combinators::BoxBody;
+-use hyper::body::Bytes;
++use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
+ use hyper::rt::Executor;
+ use hyper_rustls::{HttpsConnector as HyperRustlsHttpsConnector, MaybeHttpsStream};
+ use hyper_util::client::legacy::Client;
+@@ -30,6 +30,7 @@ use rustls::{ClientConfig, ProtocolVersion};
+ use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+ use servo_config::pref;
+ use tokio::net::TcpStream;
++use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+ use tower::Service;
+ 
+ use crate::async_runtime::spawn_task;
+@@ -673,3 +674,81 @@ pub fn create_http_client(tls_config: TlsConfig) -> ServoClient {
+         .http1_title_case_headers(true)
+         .build(InstrumentedConnector::from(connector))
+ }
++
++/// Chrome's cap on concurrent HTTP/1.1 connections to one host
++/// (`kDefaultMaxSocketsPerGroup`); further requests queue until a connection frees up.
++/// hyper's pool has no such cap, so a page that fans out a hundred module requests opens a
++/// hundred sockets, which small servers drop on the floor once their accept backlog fills.
++const MAX_HTTP1_REQUESTS_PER_HOST: usize = 6;
++
++/// Limits in-flight HTTP/1.1 requests (and therefore connections) per scheme and authority,
++/// the same key hyper pools connections under.
++#[derive(Default)]
++pub struct HostConnectionLimiter {
++    hosts: Mutex<HashMap<(Scheme, Authority), Arc<Semaphore>>>,
++}
++
++impl HostConnectionLimiter {
++    fn semaphore(&self, uri: &Destination) -> Option<Arc<Semaphore>> {
++        let key = (uri.scheme()?.clone(), uri.authority()?.clone());
++        Some(
++            self.hosts
++                .lock()
++                .entry(key)
++                .or_insert_with(|| Arc::new(Semaphore::new(MAX_HTTP1_REQUESTS_PER_HOST)))
++                .clone(),
++        )
++    }
++
++    /// Waits for a free slot on the request's host. Returns `None` once the host has been seen
++    /// speaking HTTP/2, whose single connection multiplexes every request and so needs no cap.
++    pub async fn acquire(&self, uri: &Destination) -> Option<OwnedSemaphorePermit> {
++        // A closed semaphore marks a multiplexed host, see `note_multiplexed`; closing it also
++        // releases every request already queued on it.
++        self.semaphore(uri)?.acquire_owned().await.ok()
++    }
++
++    pub fn note_multiplexed(&self, uri: &Destination) {
++        if let Some(semaphore) = self.semaphore(uri) {
++            semaphore.close();
++        }
++    }
++}
++
++/// A response body that holds its host's connection slot until the body has been read to the end
++/// (or dropped), which is when hyper hands the connection back to the pool for the next request.
++pub struct LimitedBody {
++    inner: Incoming,
++    permit: Option<OwnedSemaphorePermit>,
++}
++
++impl LimitedBody {
++    pub fn new(inner: Incoming, permit: Option<OwnedSemaphorePermit>) -> Self {
++        Self { inner, permit }
++    }
++}
++
++impl Body for LimitedBody {
++    type Data = Bytes;
++    type Error = hyper::Error;
++
++    fn poll_frame(
++        self: std::pin::Pin<&mut Self>,
++        cx: &mut Context<'_>,
++    ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
++        let this = self.get_mut();
++        let result = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
++        if matches!(result, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
++            this.permit = None;
++        }
++        result
++    }
++
++    fn is_end_stream(&self) -> bool {
++        self.inner.is_end_stream()
++    }
++
++    fn size_hint(&self) -> SizeHint {
++        self.inner.size_hint()
++    }
++}
+diff --git a/components/net/http_loader.rs b/components/net/http_loader.rs
+index e29a0569154..0efb8935212 100644
+--- a/components/net/http_loader.rs
++++ b/components/net/http_loader.rs
+@@ -24,7 +24,7 @@ use http::header::{
+     CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LOCATION, CONTENT_TYPE, HeaderValue, RANGE,
+     WWW_AUTHENTICATE,
+ };
+-use http::{HeaderMap, Method, Request as HyperRequest, StatusCode};
++use http::{HeaderMap, Method, Request as HyperRequest, StatusCode, Version};
+ use http_body_util::combinators::BoxBody;
+ use http_body_util::{BodyExt, Full};
+ use hyper::Response as HyperResponse;
+@@ -75,7 +75,8 @@ use tracing::Instrument;
+ 
+ use crate::async_runtime::spawn_task;
+ use crate::connector::{
+-    CertificateErrorOverrideManager, ServoClient, TlsHandshakeInfo, create_tls_config,
++    CertificateErrorOverrideManager, HostConnectionLimiter, LimitedBody, ServoClient,
++    TlsHandshakeInfo, create_tls_config,
+ };
+ use crate::cookie::ServoCookie;
+ use crate::cookie_storage::{CookieStorage, SameSiteContext};
+@@ -114,6 +115,7 @@ pub struct HttpState {
+     pub auth_cache: RwLock<AuthCache>,
+     pub history_states: RwLock<FxHashMap<HistoryStateId, Vec<u8>>>,
+     pub client: ServoClient,
++    pub connection_limiter: HostConnectionLimiter,
+     pub override_manager: CertificateErrorOverrideManager,
+     pub embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
+ }
+@@ -670,6 +672,9 @@ async fn obtain_response(
+     let headers = headers.clone();
+     let is_secure_scheme = url.is_secure_scheme();
+ 
++    let uri = request.uri().clone();
++    let permit = context.state.connection_limiter.acquire(&uri).await;
++
+     // Generally, we use a persistent connection, so we will also set other PerformanceResourceTiming
+     //   attributes to this as well (domain_lookup_start, domain_lookup_end, connect_start, connect_end,
+     //   secure_connection_start)
+@@ -677,11 +682,19 @@ async fn obtain_response(
+         .timing
+         .set_attribute(ResourceAttribute::RequestStart);
+ 
++    let state = context.state.clone();
+     let client_future = client
+         .request(request)
+         .and_then(move |res| {
+             let send_end = CrossProcessInstant::now();
+ 
++            let permit = if res.version() == Version::HTTP_2 {
++                state.connection_limiter.note_multiplexed(&uri);
++                None
++            } else {
++                permit
++            };
++
+             // TODO(#21271) response_start: immediately after receiving first byte of response
+ 
+             let msg = if let Some(request_id) = request_id {
+@@ -718,7 +731,10 @@ async fn obtain_response(
+             };
+ 
+             future::ready(Ok((
+-                Decoder::detect(res.map(|r| r.boxed()), is_secure_scheme),
++                Decoder::detect(
++                    res.map(|r| LimitedBody::new(r, permit).boxed()),
++                    is_secure_scheme,
++                ),
+                 msg,
+             )))
+         })
+diff --git a/components/net/resource_thread.rs b/components/net/resource_thread.rs
+index 49037039f16..bca5ff0d51c 100644
+--- a/components/net/resource_thread.rs
++++ b/components/net/resource_thread.rs
+@@ -232,6 +232,7 @@ fn create_http_states(
+             ignore_certificate_errors,
+             override_manager.clone(),
+         )),
++        connection_limiter: Default::default(),
+         override_manager,
+         embedder_proxy: embedder_proxy.clone(),
+     };
+@@ -248,6 +249,7 @@ fn create_http_states(
+             ignore_certificate_errors,
+             override_manager.clone(),
+         )),
++        connection_limiter: Default::default(),
+         override_manager,
+         embedder_proxy,
+     };
+diff --git a/components/net/tests/main.rs b/components/net/tests/main.rs
+index fe1efd291db..6179c38600a 100644
+--- a/components/net/tests/main.rs
++++ b/components/net/tests/main.rs
+@@ -120,6 +120,7 @@ fn create_http_state(fc: Option<GenericEmbedderProxy<NetToEmbedderMsg>>) -> Http
+             false, /* ignore_certificate_errors */
+             override_manager.clone(),
+         )),
++        connection_limiter: Default::default(),
+         override_manager,
+         embedder_proxy: fc.unwrap_or_else(|| create_generic_embedder_proxy()),
+     }
+-- 
+2.43.0
+

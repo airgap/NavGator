@@ -1,0 +1,205 @@
+From f1380a16c6a8afdb3265af4b997b72ad3f6c0b7f Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 06:13:45 -0400
+Subject: [PATCH] cssom: CSSStartingStyleRule
+
+Stylo now parses @starting-style for Servo, and reading cssRules of a
+sheet that has one hit the unimplemented!() for it in CSSRule creation,
+a crash reachable from any page. Implements the grouping rule interface
+(https://drafts.csswg.org/css-transitions-2/#the-cssstartingstylerule-interface).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/css/cssgroupingrule.rs  |  3 +
+ components/script/dom/css/cssrule.rs          | 13 ++-
+ .../script/dom/css/cssstartingstylerule.rs    | 83 +++++++++++++++++++
+ components/script/dom/css/mod.rs              |  1 +
+ .../webidls/CSSStartingStyleRule.webidl       |  8 ++
+ 5 files changed, 106 insertions(+), 2 deletions(-)
+ create mode 100644 components/script/dom/css/cssstartingstylerule.rs
+ create mode 100644 components/script_bindings/webidls/CSSStartingStyleRule.webidl
+
+diff --git a/components/script/dom/css/cssgroupingrule.rs b/components/script/dom/css/cssgroupingrule.rs
+index 7033a570175..a563de79c83 100644
+--- a/components/script/dom/css/cssgroupingrule.rs
++++ b/components/script/dom/css/cssgroupingrule.rs
+@@ -12,6 +12,7 @@ use super::cssconditionrule::CSSConditionRule;
+ use super::csslayerblockrule::CSSLayerBlockRule;
+ use super::cssrule::CSSRule;
+ use super::cssrulelist::{CSSRuleList, RulesSource};
++use super::cssstartingstylerule::CSSStartingStyleRule;
+ use super::cssstylerule::CSSStyleRule;
+ use super::cssstylesheet::CSSStyleSheet;
+ use crate::dom::bindings::codegen::Bindings::CSSGroupingRuleBinding::CSSGroupingRuleMethods;
+@@ -42,6 +43,8 @@ impl CSSGroupingRule {
+                 rule.clone_rules()
+             } else if let Some(rule) = self.downcast::<CSSLayerBlockRule>() {
+                 rule.clone_rules()
++            } else if let Some(rule) = self.downcast::<CSSStartingStyleRule>() {
++                rule.clone_rules()
+             } else if let Some(rule) = self.downcast::<CSSStyleRule>() {
+                 rule.ensure_rules()
+             } else {
+diff --git a/components/script/dom/css/cssrule.rs b/components/script/dom/css/cssrule.rs
+index 890411a037c..7c71d97a6c5 100644
+--- a/components/script/dom/css/cssrule.rs
++++ b/components/script/dom/css/cssrule.rs
+@@ -21,6 +21,7 @@ use super::cssmediarule::CSSMediaRule;
+ use super::cssnamespacerule::CSSNamespaceRule;
+ use super::cssnesteddeclarations::CSSNestedDeclarations;
+ use super::csspropertyrule::CSSPropertyRule;
++use super::cssstartingstylerule::CSSStartingStyleRule;
+ use super::cssstylerule::CSSStyleRule;
+ use super::cssstylesheet::CSSStyleSheet;
+ use super::csssupportsrule::CSSSupportsRule;
+@@ -77,6 +78,8 @@ impl CSSRule {
+             rule as &dyn SpecificCSSRule
+         } else if let Some(rule) = self.downcast::<CSSContainerRule>() {
+             rule as &dyn SpecificCSSRule
++        } else if let Some(rule) = self.downcast::<CSSStartingStyleRule>() {
++            rule as &dyn SpecificCSSRule
+         } else {
+             unreachable!()
+         }
+@@ -132,7 +135,9 @@ impl CSSRule {
+             },
+             StyleCssRule::Margin(_) => unimplemented!(), // TODO
+             StyleCssRule::Scope(_) => unimplemented!(),  // TODO
+-            StyleCssRule::StartingStyle(_) => unimplemented!(), // TODO
++            StyleCssRule::StartingStyle(s) => {
++                DomRoot::upcast(CSSStartingStyleRule::new(cx, window, parent_stylesheet, s))
++            },
+             StyleCssRule::PositionTry(_) => unimplemented!(), // TODO
+             StyleCssRule::CustomMedia(_) => unimplemented!(), // TODO
+             StyleCssRule::NestedDeclarations(s) => {
+@@ -230,7 +235,11 @@ impl CSSRule {
+             },
+             StyleCssRule::Margin(_) => unimplemented!(), // TODO
+             StyleCssRule::Scope(_) => unimplemented!(),  // TODO
+-            StyleCssRule::StartingStyle(_) => unimplemented!(), // TODO
++            StyleCssRule::StartingStyle(s) => {
++                if let Some(rule) = self.downcast::<CSSStartingStyleRule>() {
++                    rule.update_rule(s.clone(), guard);
++                }
++            },
+             StyleCssRule::PositionTry(_) => unimplemented!(), // TODO
+             StyleCssRule::CustomMedia(_) => unimplemented!(), // TODO
+             StyleCssRule::NestedDeclarations(s) => {
+diff --git a/components/script/dom/css/cssstartingstylerule.rs b/components/script/dom/css/cssstartingstylerule.rs
+new file mode 100644
+index 00000000000..3fa2f28f087
+--- /dev/null
++++ b/components/script/dom/css/cssstartingstylerule.rs
+@@ -0,0 +1,83 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++use std::cell::RefCell;
++
++use dom_struct::dom_struct;
++use js::context::JSContext;
++use script_bindings::reflector::reflect_dom_object_with_cx;
++use servo_arc::Arc;
++use style::shared_lock::{Locked, SharedRwLockReadGuard, ToCssWithGuard};
++use style::stylesheets::{CssRuleType, CssRules, StartingStyleRule};
++
++use super::cssgroupingrule::CSSGroupingRule;
++use super::cssrule::SpecificCSSRule;
++use super::cssstylesheet::CSSStyleSheet;
++use crate::dom::bindings::root::DomRoot;
++use crate::dom::bindings::str::DOMString;
++use crate::dom::window::Window;
++
++#[dom_struct]
++pub(crate) struct CSSStartingStyleRule {
++    css_grouping_rule: CSSGroupingRule,
++    #[ignore_malloc_size_of = "Stylo"]
++    #[no_trace]
++    starting_style_rule: RefCell<Arc<StartingStyleRule>>,
++}
++
++impl CSSStartingStyleRule {
++    pub(crate) fn new_inherited(
++        parent_stylesheet: &CSSStyleSheet,
++        starting_style_rule: Arc<StartingStyleRule>,
++    ) -> CSSStartingStyleRule {
++        CSSStartingStyleRule {
++            css_grouping_rule: CSSGroupingRule::new_inherited(parent_stylesheet),
++            starting_style_rule: RefCell::new(starting_style_rule),
++        }
++    }
++
++    pub(crate) fn new(
++        cx: &mut JSContext,
++        window: &Window,
++        parent_stylesheet: &CSSStyleSheet,
++        starting_style_rule: Arc<StartingStyleRule>,
++    ) -> DomRoot<CSSStartingStyleRule> {
++        reflect_dom_object_with_cx(
++            Box::new(CSSStartingStyleRule::new_inherited(
++                parent_stylesheet,
++                starting_style_rule,
++            )),
++            window,
++            cx,
++        )
++    }
++
++    pub(crate) fn clone_rules(&self) -> Arc<Locked<CssRules>> {
++        self.starting_style_rule.borrow().rules.clone()
++    }
++
++    pub(crate) fn update_rule(
++        &self,
++        starting_style_rule: Arc<StartingStyleRule>,
++        guard: &SharedRwLockReadGuard,
++    ) {
++        self.css_grouping_rule
++            .update_rules(&starting_style_rule.rules, guard);
++        *self.starting_style_rule.borrow_mut() = starting_style_rule;
++    }
++}
++
++impl SpecificCSSRule for CSSStartingStyleRule {
++    fn ty(&self) -> CssRuleType {
++        CssRuleType::StartingStyle
++    }
++
++    fn get_css(&self) -> DOMString {
++        let guard = self.css_grouping_rule.shared_lock().read();
++        self.starting_style_rule
++            .borrow()
++            .to_css_string(&guard)
++            .into()
++    }
++}
+diff --git a/components/script/dom/css/mod.rs b/components/script/dom/css/mod.rs
+index 25485b04466..b5d5ec55989 100644
+--- a/components/script/dom/css/mod.rs
++++ b/components/script/dom/css/mod.rs
+@@ -19,6 +19,7 @@ pub(crate) mod cssnesteddeclarations;
+ pub(crate) mod csspropertyrule;
+ pub(crate) mod cssrule;
+ pub(crate) mod cssrulelist;
++pub(crate) mod cssstartingstylerule;
+ pub(crate) mod cssstyledeclaration;
+ pub(crate) mod cssstylerule;
+ pub(crate) mod cssstylesheet;
+diff --git a/components/script_bindings/webidls/CSSStartingStyleRule.webidl b/components/script_bindings/webidls/CSSStartingStyleRule.webidl
+new file mode 100644
+index 00000000000..f0bf5190db1
+--- /dev/null
++++ b/components/script_bindings/webidls/CSSStartingStyleRule.webidl
+@@ -0,0 +1,8 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++// https://drafts.csswg.org/css-transitions-2/#the-cssstartingstylerule-interface
++[Exposed=Window]
++interface CSSStartingStyleRule : CSSGroupingRule {
++};
+-- 
+2.43.0
+

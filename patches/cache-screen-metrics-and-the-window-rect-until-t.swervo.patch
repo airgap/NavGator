@@ -1,0 +1,327 @@
+From 61ff154907bb88d2142ec2e81bb9e491b8b48271 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 01:51:15 -0400
+Subject: [PATCH] script: cache screen metrics and the window rect until they
+ change
+
+Every read of screen.width/height/availWidth/availHeight and of
+window.screenX/screenY/outerWidth/outerHeight sent a synchronous
+GetScreenMetrics or GetWindowRect message to the embedder, and the reply
+waits for the embedder's next event-loop spin. Pages read these in loops
+and timers: 20 reads took 0.2-0.4 s (Chrome: 2000 reads in under a
+millisecond), and ynet.co.il spent seconds of its first minute in them.
+
+Window now keeps the last reply and only asks the embedder again after a
+new ScriptThreadMessage::ScreenGeometryChanged. The constellation sends
+it to every pipeline of a WebView when the embedder calls the new
+WebView::notify_screen_geometry_changed (window moved, resized, or put on
+another screen) and when the WebView's viewport is resized, so iframes
+and outerWidth follow window resizes even if the embedder never calls it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/constellation/constellation.rs | 25 ++++++++++++++
+ components/constellation/tracing.rs       |  1 +
+ components/script/dom/screen.rs           | 22 +++---------
+ components/script/dom/window/window.rs    | 41 +++++++++++++++++++++--
+ components/script/messaging.rs            |  1 +
+ components/script/script_thread.rs        |  6 ++++
+ components/servo/webview.rs               | 12 +++++++
+ components/shared/constellation/lib.rs    |  3 ++
+ components/shared/embedder/lib.rs         |  2 +-
+ components/shared/script/lib.rs           |  3 ++
+ 10 files changed, 95 insertions(+), 21 deletions(-)
+
+diff --git a/components/constellation/constellation.rs b/components/constellation/constellation.rs
+index eca5cd97757..1872745affa 100644
+--- a/components/constellation/constellation.rs
++++ b/components/constellation/constellation.rs
+@@ -1458,6 +1458,9 @@ where
+             EmbedderToConstellationMessage::ThemeChange(webview_id, theme) => {
+                 self.handle_theme_change(webview_id, theme);
+             },
++            EmbedderToConstellationMessage::ScreenGeometryChanged(webview_id) => {
++                self.handle_screen_geometry_change(webview_id);
++            },
+             EmbedderToConstellationMessage::TickAnimation(webview_ids) => {
+                 self.handle_tick_animation(webview_ids)
+             },
+@@ -5322,6 +5325,9 @@ where
+ 
+         let browsing_context_id = BrowsingContextId::from(webview_id);
+         self.resize_browsing_context(new_viewport_details, size_type, browsing_context_id);
++        // A resized WebView usually means a resized window, which changes outerWidth/outerHeight
++        // in every document of the WebView, including its iframes.
++        self.handle_screen_geometry_change(webview_id);
+     }
+ 
+     /// Called when the window exits from fullscreen mode
+@@ -5572,6 +5578,25 @@ where
+         }
+     }
+ 
++    /// Tell every pipeline of a `WebView` to drop its cached screen metrics and window rect.
++    #[servo_tracing::instrument(skip_all)]
++    fn handle_screen_geometry_change(&mut self, webview_id: WebViewId) {
++        for pipeline in self.pipelines.values() {
++            if pipeline.webview_id != webview_id {
++                continue;
++            }
++            if let Err(error) = pipeline
++                .event_loop
++                .send(ScriptThreadMessage::ScreenGeometryChanged(pipeline.id))
++            {
++                warn!(
++                    "{}: Failed to send screen geometry change to pipeline ({error:?}).",
++                    pipeline.id,
++                );
++            }
++        }
++    }
++
+     // Handle switching from fullscreen mode
+     #[servo_tracing::instrument(skip_all)]
+     fn switch_fullscreen_mode(&mut self, browsing_context_id: BrowsingContextId) {
+diff --git a/components/constellation/tracing.rs b/components/constellation/tracing.rs
+index 769b5ea6c4f..d2071cd99d3 100644
+--- a/components/constellation/tracing.rs
++++ b/components/constellation/tracing.rs
+@@ -55,6 +55,7 @@ mod from_embedder {
+                 Self::TraverseHistory(..) => target!("TraverseHistory"),
+                 Self::ChangeViewportDetails(..) => target!("ChangeViewportDetails"),
+                 Self::ThemeChange(..) => target!("ThemeChange"),
++                Self::ScreenGeometryChanged(..) => target!("ScreenGeometryChanged"),
+                 Self::TickAnimation(..) => target!("TickAnimation"),
+                 Self::WebDriverCommand(..) => target!("WebDriverCommand"),
+                 Self::Reload(..) => target!("Reload"),
+diff --git a/components/script/dom/screen.rs b/components/script/dom/screen.rs
+index 814668c924e..fa0a955de5f 100644
+--- a/components/script/dom/screen.rs
++++ b/components/script/dom/screen.rs
+@@ -3,9 +3,7 @@
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+ use dom_struct::dom_struct;
+-use embedder_traits::{EmbedderMsg, ScreenMetrics};
+ use script_bindings::reflector::{Reflector, reflect_dom_object};
+-use servo_base::generic_channel;
+ 
+ use crate::dom::bindings::codegen::Bindings::ScreenBinding::ScreenMethods;
+ use crate::dom::bindings::num::Finite;
+@@ -30,39 +28,27 @@ impl Screen {
+     pub(crate) fn new(window: &Window, can_gc: CanGc) -> DomRoot<Screen> {
+         reflect_dom_object(Box::new(Screen::new_inherited(window)), window, can_gc)
+     }
+-
+-    /// Retrives [`ScreenMetrics`] from the embedder.
+-    fn screen_metrics(&self) -> ScreenMetrics {
+-        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel!");
+-
+-        self.window.send_to_embedder(EmbedderMsg::GetScreenMetrics(
+-            self.window.webview_id(),
+-            sender,
+-        ));
+-
+-        receiver.recv().unwrap_or_default()
+-    }
+ }
+ 
+ impl ScreenMethods<crate::DomTypeHolder> for Screen {
+     /// <https://drafts.csswg.org/cssom-view/#dom-screen-availwidth>
+     fn AvailWidth(&self) -> Finite<f64> {
+-        Finite::wrap(self.screen_metrics().available_size.width as f64)
++        Finite::wrap(self.window.screen_metrics().available_size.width as f64)
+     }
+ 
+     /// <https://drafts.csswg.org/cssom-view/#dom-screen-availheight>
+     fn AvailHeight(&self) -> Finite<f64> {
+-        Finite::wrap(self.screen_metrics().available_size.height as f64)
++        Finite::wrap(self.window.screen_metrics().available_size.height as f64)
+     }
+ 
+     /// <https://drafts.csswg.org/cssom-view/#dom-screen-width>
+     fn Width(&self) -> Finite<f64> {
+-        Finite::wrap(self.screen_metrics().screen_size.width as f64)
++        Finite::wrap(self.window.screen_metrics().screen_size.width as f64)
+     }
+ 
+     /// <https://drafts.csswg.org/cssom-view/#dom-screen-height>
+     fn Height(&self) -> Finite<f64> {
+-        Finite::wrap(self.screen_metrics().screen_size.height as f64)
++        Finite::wrap(self.window.screen_metrics().screen_size.height as f64)
+     }
+ 
+     /// <https://drafts.csswg.org/cssom-view/#dom-screen-colordepth>
+diff --git a/components/script/dom/window/window.rs b/components/script/dom/window/window.rs
+index 3d9ae2afa8e..0f45d0fcc85 100644
+--- a/components/script/dom/window/window.rs
++++ b/components/script/dom/window/window.rs
+@@ -25,7 +25,7 @@ use dom_struct::dom_struct;
+ use embedder_traits::user_contents::UserScript;
+ use embedder_traits::{
+     AlertResponse, ConfirmResponse, EmbedderMsg, JavaScriptEvaluationError, PromptResponse,
+-    ScriptToEmbedderChan, SimpleDialogRequest, Theme, UntrustedNodeAddress, ViewportDetails,
++    ScreenMetrics, ScriptToEmbedderChan, SimpleDialogRequest, Theme, UntrustedNodeAddress, ViewportDetails,
+     WebDriverJSResult, WebDriverLoadStatus,
+ };
+ use euclid::{Point2D, Rect, Scale, Size2D, Vector2D};
+@@ -345,6 +345,17 @@ pub(crate) struct Window {
+     #[no_trace]
+     viewport_details: Cell<ViewportDetails>,
+ 
++    /// What the embedder last reported for `screen.*`, kept until the constellation says the
++    /// screen or window changed. Asking the embedder is a synchronous round trip through the
++    /// embedder's event loop, and pages read these properties in loops.
++    #[no_trace]
++    screen_metrics: Cell<Option<ScreenMetrics>>,
++
++    /// What the embedder last reported as the window rect (`screenX`, `outerWidth`...), cached
++    /// like [`Self::screen_metrics`].
++    #[no_trace]
++    client_window_rect: Cell<Option<DeviceIndependentIntRect>>,
++
+     /// A handle for communicating messages to the bluetooth thread.
+     #[no_trace]
+     #[cfg(feature = "bluetooth")]
+@@ -2551,11 +2562,35 @@ impl Window {
+     }
+ 
+     fn client_window(&self) -> DeviceIndependentIntRect {
++        if let Some(rect) = self.client_window_rect.get() {
++            return rect;
++        }
+         let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel!");
+ 
+         self.send_to_embedder(EmbedderMsg::GetWindowRect(self.webview_id(), sender));
+ 
+-        receiver.recv().unwrap_or_default()
++        let rect = receiver.recv().unwrap_or_default();
++        self.client_window_rect.set(Some(rect));
++        rect
++    }
++
++    /// Retrieves [`ScreenMetrics`] from the embedder, or the cached copy.
++    pub(crate) fn screen_metrics(&self) -> ScreenMetrics {
++        if let Some(metrics) = self.screen_metrics.get() {
++            return metrics;
++        }
++        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel!");
++
++        self.send_to_embedder(EmbedderMsg::GetScreenMetrics(self.webview_id(), sender));
++
++        let metrics = receiver.recv().unwrap_or_default();
++        self.screen_metrics.set(Some(metrics));
++        metrics
++    }
++
++    pub(crate) fn invalidate_screen_geometry(&self) {
++        self.screen_metrics.set(None);
++        self.client_window_rect.set(None);
+     }
+ 
+     /// Prepares to tick animations and then does a reflow which also advances the
+@@ -3832,6 +3867,8 @@ impl Window {
+             bluetooth_extra_permission_data: BluetoothExtraPermissionData::new(),
+             unhandled_resize_event: Default::default(),
+             viewport_details: Cell::new(viewport_details),
++            screen_metrics: Default::default(),
++            client_window_rect: Default::default(),
+             layout_blocker: Cell::new(LayoutBlocker::WaitingForParse),
+             current_state: Cell::new(WindowState::Alive),
+             devtools_marker_sender: Default::default(),
+diff --git a/components/script/messaging.rs b/components/script/messaging.rs
+index e1a0534b978..f69f38194f9 100644
+--- a/components/script/messaging.rs
++++ b/components/script/messaging.rs
+@@ -61,6 +61,7 @@ impl MixedMessage {
+                     .or(Some(new_pipeline_info.new_pipeline_id)),
+                 ScriptThreadMessage::Resize(id, ..) => Some(*id),
+                 ScriptThreadMessage::ThemeChange(id, ..) => Some(*id),
++                ScriptThreadMessage::ScreenGeometryChanged(id) => Some(*id),
+                 ScriptThreadMessage::ResizeInactive(id, ..) => Some(*id),
+                 ScriptThreadMessage::UnloadDocument(id) => Some(*id),
+                 ScriptThreadMessage::ExitPipeline(_webview_id, id, ..) => Some(*id),
+diff --git a/components/script/script_thread.rs b/components/script/script_thread.rs
+index b940f050016..cb17e2304ce 100644
+--- a/components/script/script_thread.rs
++++ b/components/script/script_thread.rs
+@@ -1813,6 +1813,12 @@ impl ScriptThread {
+             ScriptThreadMessage::ThemeChange(_, theme) => {
+                 self.handle_theme_change_msg(theme);
+             },
++            ScriptThreadMessage::ScreenGeometryChanged(pipeline_id) => {
++                // A pipeline still loading has no Window yet, and its Window starts uncached.
++                if let Some(window) = self.documents.borrow().find_window(pipeline_id) {
++                    window.invalidate_screen_geometry();
++                }
++            },
+             ScriptThreadMessage::GetDocumentOrigin(pipeline_id, result_sender) => {
+                 self.handle_get_document_origin(pipeline_id, result_sender);
+             },
+diff --git a/components/servo/webview.rs b/components/servo/webview.rs
+index cf50c2bedb6..a9b266da891 100644
+--- a/components/servo/webview.rs
++++ b/components/servo/webview.rs
+@@ -513,6 +513,18 @@ impl WebView {
+             ))
+     }
+ 
++    /// Notify this [`WebView`] that its window moved or resized, or that the screen it is on
++    /// changed. Script caches what [`WebViewDelegate::screen_geometry`] reports and only asks
++    /// again after this call (or after a viewport resize).
++    pub fn notify_screen_geometry_changed(&self) {
++        self.inner()
++            .servo
++            .constellation_proxy()
++            .send(EmbedderToConstellationMessage::ScreenGeometryChanged(
++                self.id(),
++            ))
++    }
++
+     /// Load the given URL into this [`WebView`] using the default request headers.
+     ///
+     /// This pushes a new entry onto the navigation history, so the user can navigate
+diff --git a/components/shared/constellation/lib.rs b/components/shared/constellation/lib.rs
+index 97f2071df87..5dcb4d52da2 100644
+--- a/components/shared/constellation/lib.rs
++++ b/components/shared/constellation/lib.rs
+@@ -55,6 +55,9 @@ pub enum EmbedderToConstellationMessage {
+     ChangeViewportDetails(WebViewId, ViewportDetails, WindowSizeType),
+     /// Inform the constellation of a theme change.
+     ThemeChange(WebViewId, Theme),
++    /// Inform the constellation that the screen or the window holding a `WebView` changed
++    /// (moved, resized, or switched screens), so script must re-query the screen geometry.
++    ScreenGeometryChanged(WebViewId),
+     /// Requests that the constellation instruct script/layout to try to layout again and tick
+     /// animations.
+     TickAnimation(Vec<WebViewId>),
+diff --git a/components/shared/embedder/lib.rs b/components/shared/embedder/lib.rs
+index 0a43d6e8686..8338a8ff882 100644
+--- a/components/shared/embedder/lib.rs
++++ b/components/shared/embedder/lib.rs
+@@ -355,7 +355,7 @@ impl ViewportDetails {
+ 
+ /// Unlike [`ScreenGeometry`], the data is in device-independent pixels
+ /// to be used by DOM APIs
+-#[derive(Default, Deserialize, Serialize)]
++#[derive(Clone, Copy, Default, Deserialize, MallocSizeOf, Serialize)]
+ pub struct ScreenMetrics {
+     pub screen_size: DeviceIndependentIntSize,
+     pub available_size: DeviceIndependentIntSize,
+diff --git a/components/shared/script/lib.rs b/components/shared/script/lib.rs
+index b8d2dca11c3..9174a228c4c 100644
+--- a/components/shared/script/lib.rs
++++ b/components/shared/script/lib.rs
+@@ -162,6 +162,9 @@ pub enum ScriptThreadMessage {
+     Resize(PipelineId, ViewportDetails, WindowSizeType),
+     /// Theme changed.
+     ThemeChange(PipelineId, Theme),
++    /// The screen or the window holding this pipeline's `WebView` changed; drop the cached
++    /// screen metrics and window rect.
++    ScreenGeometryChanged(PipelineId),
+     /// Notifies script that window has been resized but to not take immediate action.
+     ResizeInactive(PipelineId, ViewportDetails),
+     /// Window switched from fullscreen mode.
+-- 
+2.43.0
+

@@ -1,0 +1,161 @@
+From ce12fe2a619d101f01fead3ffa314b73b78a75a3 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 04:04:44 -0400
+Subject: [PATCH] layout: offsets of inline boxes split across lines
+
+An inline box opening right before a soft wrap opportunity was committed
+to the line before the break, leaving an empty fragment at the end of
+that line. offsetTop/offsetLeft and getClientRects() then reported that
+empty fragment first. The box start and its inline-start padding, border
+and margin now move to the line after the break, as in Chrome and
+Firefox.
+
+offsetWidth/offsetHeight of an inline box now come from the union of
+all its fragments while offsetTop/offsetLeft keep the first fragment's
+origin, which is what Chrome reports.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/flow/inline/mod.rs | 74 ++++++++++++++++++++++++++--
+ components/layout/query.rs           | 29 +++++++----
+ 2 files changed, 91 insertions(+), 12 deletions(-)
+
+diff --git a/components/layout/flow/inline/mod.rs b/components/layout/flow/inline/mod.rs
+index 17d22ded2d3..b4656e37807 100644
+--- a/components/layout/flow/inline/mod.rs
++++ b/components/layout/flow/inline/mod.rs
+@@ -2020,10 +2020,78 @@ impl InlineFormattingContextLayout<'_> {
+         if self.text_wrap_mode == TextWrapMode::Nowrap {
+             return;
+         }
+-        if !self.unbreakable_segment_fits_on_line() {
+-            self.process_line_break(false /* forced_line_break */);
++
++        // Inline boxes that open right before the soft wrap opportunity belong to the line
++        // after it, along with their inline-start padding, border and margin, like in Chrome
++        // and Firefox. Otherwise `foo <a>bar</a>` breaking before "bar" leaves an empty
++        // fragment of the `<a>` at the end of the first line, which then becomes the box that
++        // `offsetTop` and `getClientRects()` report first.
++        let trailing_inline_box_starts = self
++            .current_line_segment
++            .line_items
++            .iter()
++            .rev()
++            .take_while(|item| matches!(item, LineItem::InlineStartBoxPaddingBorderMargin(_)))
++            .count();
++        let split_index = self.current_line_segment.line_items.len() - trailing_inline_box_starts;
++        let inline_box_starts = self.current_line_segment.line_items.split_off(split_index);
++        let inline_box_starts_size = inline_box_starts
++            .iter()
++            .map(|item| {
++                let (padding, border, margin) = self.inline_pbm_of_line_item(item);
++                padding + border + margin
++            })
++            .sum();
++        self.current_line_segment.inline_size -= inline_box_starts_size;
++        self.current_line_segment.has_inline_pbm = self
++            .current_line_segment
++            .line_items
++            .iter()
++            .any(|item| self.line_item_has_inline_pbm(item));
++
++        if !self.current_line_segment.line_items.is_empty() {
++            if !self.unbreakable_segment_fits_on_line() {
++                self.process_line_break(false /* forced_line_break */);
++            }
++            self.commit_current_segment_to_line();
+         }
+-        self.commit_current_segment_to_line();
++
++        for item in inline_box_starts {
++            self.current_line_segment.has_inline_pbm |= self.line_item_has_inline_pbm(&item);
++            self.current_line_segment.line_items.push(item);
++        }
++        self.current_line_segment.inline_size += inline_box_starts_size;
++    }
++
++    /// The inline-axis padding, border and margin that an inline box start or end line item
++    /// adds to its line.
++    fn inline_pbm_of_line_item(&self, item: &LineItem) -> (Au, Au, Au) {
++        let (identifier, is_start) = match item {
++            LineItem::InlineStartBoxPaddingBorderMargin(identifier) => (identifier, true),
++            LineItem::InlineEndBoxPaddingBorderMargin(identifier) => (identifier, false),
++            _ => return (Au::zero(), Au::zero(), Au::zero()),
++        };
++        let pbm = &self.inline_box_states[identifier.index_in_inline_boxes as usize].pbm;
++        if is_start {
++            (
++                pbm.padding.inline_start,
++                pbm.border.inline_start,
++                pbm.margin.inline_start.auto_is(Au::zero),
++            )
++        } else {
++            (
++                pbm.padding.inline_end,
++                pbm.border.inline_end,
++                pbm.margin.inline_end.auto_is(Au::zero),
++            )
++        }
++    }
++
++    /// Mirrors how [`Self::start_inline_box()`] and [`Self::finish_inline_box()`] set
++    /// `has_inline_pbm`: a negative margin counts even if the sum is zero.
++    fn line_item_has_inline_pbm(&self, item: &LineItem) -> bool {
++        let (padding, border, margin) = self.inline_pbm_of_line_item(item);
++        !padding.is_zero() || !border.is_zero() || !margin.is_zero()
+     }
+ 
+     /// Commit the current unbrekable segment to the current line. In addition, this will
+diff --git a/components/layout/query.rs b/components/layout/query.rs
+index c9a070788df..4b2bf2236ff 100644
+--- a/components/layout/query.rs
++++ b/components/layout/query.rs
+@@ -896,25 +896,36 @@ pub fn process_offset_parent_query(
+     scroll_tree: &ScrollTree,
+     node: ServoLayoutNode<'_>,
+ ) -> Option<OffsetParentResponse> {
+-    // Only consider the first fragment of the node found as per a
++    // The position comes from the first fragment of the node as per a
+     // possible interpretation of the specification: "[...] return the
+     // y-coordinate of the top border edge of the first CSS layout box
+     // associated with the element [...]"
+     //
+-    // FIXME: Browsers implement this all differently (e.g., [1]) -
+-    // Firefox does returns the union of all layout elements of some
+-    // sort. Chrome returns the first fragment for a block element (the
+-    // same as ours) or the union of all associated fragments in the
+-    // first containing block fragment for an inline element. We could
+-    // implement Chrome's behavior, but our fragment tree currently
+-    // provides insufficient information.
++    // Browsers implement the size differently (e.g., [1]). Like Chrome, an
++    // inline box split across lines takes its `offsetWidth` and `offsetHeight`
++    // from the union of all its fragments, keeping the origin of the first
++    // one; any other box uses its first fragment.
+     //
+     // [1]: https://github.com/w3c/csswg-drafts/issues/4541
+     // > 1. If the element is the HTML body element or does not have any associated CSS
+     //      layout box return zero and terminate this algorithm.
+-    let fragment = node.fragments_for_pseudo(None).first().cloned()?;
++    let fragments = node.fragments_for_pseudo(None);
++    let fragment = fragments.first().cloned()?;
+     let mut border_box =
+         fragment.cumulative_box_area_rect(BoxAreaType::Border, layout_thread.into())?;
++    if fragment
++        .retrieve_box_fragment()
++        .is_some_and(|box_fragment| box_fragment.with_style().is_inline_box())
++    {
++        border_box.size = fragments
++            .iter()
++            .skip(1)
++            .filter_map(|fragment| {
++                fragment.cumulative_box_area_rect(BoxAreaType::Border, layout_thread.into())
++            })
++            .fold(border_box, |unioned_rect, rect| rect.union(&unioned_rect))
++            .size;
++    }
+     let cumulative_sticky_offsets = fragment
+         .retrieve_box_fragment()
+         .and_then(|box_fragment| box_fragment.spatial_tree_node())
+-- 
+2.43.0
+

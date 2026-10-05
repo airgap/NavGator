@@ -1,0 +1,342 @@
+From e4bb76e7f3a566ccf0ad36480382faa3339fb321 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 05:10:11 -0400
+Subject: [PATCH] inert: the global inert attribute
+
+React modal libraries put inert on everything outside the open modal and
+expect the browser to make it unreachable. HTMLElement.inert now reflects
+the attribute, and Element::is_inert() counts an inert flat tree ancestor
+as well as modal dialog blocking, with the blocking modal dialog escaping
+the inertness of its ancestors as the spec requires. That keeps inert
+content out of focus (focusable areas, sequential navigation and the
+focus fixup rule all go through is_inert()).
+
+Hit testing skips inert nodes through a user agent pointer-events rule,
+so a click on an inert overlay reaches what is beneath it, as in Chrome.
+The accessibility tree leaves out inert subtrees and, while a modal
+dialog is open, everything but the dialog and the ancestors that hold
+it. Layout learns the blocking dialog from the document's top layer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/accessibility_tree.rs       | 33 +++++++++++++++++-
+ components/layout/layout_impl.rs              | 13 +++++--
+ components/layout/stylesheets/user-agent.css  |  7 ++++
+ components/script/dom/document/document.rs    |  4 +++
+ components/script/dom/document/top_layer.rs   | 10 +++++-
+ components/script/dom/element/focus.rs        | 33 ++++++++++++------
+ components/script/dom/html/htmlelement.rs     |  5 +++
+ .../servo_dangerous_style_document.rs         | 34 ++++++++++++++++++-
+ .../webidls/HTMLElement.webidl                |  2 +-
+ 9 files changed, 125 insertions(+), 16 deletions(-)
+
+diff --git a/components/layout/accessibility_tree.rs b/components/layout/accessibility_tree.rs
+index 337b36cb118..cfc89b1801f 100644
+--- a/components/layout/accessibility_tree.rs
++++ b/components/layout/accessibility_tree.rs
+@@ -93,6 +93,9 @@ pub struct AccessibilityTree {
+     /// Maps an element's `id` attribute to its accessibility [`NodeId`], rebuilt each update while
+     /// walking the tree. Used to resolve `aria-labelledby` idrefs to their target nodes (LYK-1378).
+     element_id_to_node_id: FxHashMap<Box<str>, NodeId>,
++    /// The modal dialog that blocks the document followed by its flat tree ancestors, as of the
++    /// current update. Everything else is inert while it is open.
++    modal_dialog_and_ancestors: Vec<OpaqueNode>,
+     /// Sent with each [`accesskit::TreeUpdate`]. This allows this tree to be
+     /// [grafted](https://docs.rs/accesskit/latest/accesskit/struct.Node.html#method.tree_id) into
+     /// an application's tree.
+@@ -149,6 +152,7 @@ impl AccessibilityTree {
+             opaque_node_to_id: FxHashMap::default(),
+             id_to_opaque_node: FxHashMap::default(),
+             element_id_to_node_id: FxHashMap::default(),
++            modal_dialog_and_ancestors: Vec::new(),
+             tree_id,
+             root_node_id: None,
+             embedder_epoch,
+@@ -162,8 +166,10 @@ impl AccessibilityTree {
+         &mut self,
+         root_dom_node: &ServoLayoutNode<'_>,
+         rooted_nodes: Option<FxHashSet<OpaqueNode>>,
++        modal_dialog_and_ancestors: Vec<OpaqueNode>,
+     ) -> Option<accesskit::TreeUpdate> {
+         let mut update = AccessibilityUpdate::new(rooted_nodes);
++        self.modal_dialog_and_ancestors = modal_dialog_and_ancestors;
+         // Rebuilt fresh each walk (ids can be added/removed/changed between reflows).
+         self.element_id_to_node_id.clear();
+         let (root_node_id, root_node) = self.get_or_create_node(root_dom_node, &mut update);
+@@ -275,6 +281,28 @@ impl AccessibilityTree {
+         damage
+     }
+ 
++    /// Whether `dom_child` of `dom_node` is inert, which hides it and its subtree from assistive
++    /// technology. <https://html.spec.whatwg.org/multipage/#inert-subtrees>
++    fn is_inert_child(&self, dom_node: &ServoLayoutNode<'_>, dom_child: &ServoLayoutNode<'_>) -> bool {
++        let leads_to_modal_dialog = self.modal_dialog_and_ancestors.contains(&dom_child.opaque());
++        // Ancestors of the modal dialog are inert themselves, but stay in the tree to hold it.
++        if self
++            .modal_dialog_and_ancestors
++            .get(1..)
++            .is_some_and(|ancestors| ancestors.contains(&dom_node.opaque())) &&
++            !leads_to_modal_dialog
++        {
++            return true;
++        }
++        // The modal dialog escapes the inertness of inert ancestors.
++        !leads_to_modal_dialog &&
++            dom_child.as_html_element().is_some_and(|element| {
++                element
++                    .attribute_as_str(&ns!(), &local_name!("inert"))
++                    .is_some()
++            })
++    }
++
+     fn get_or_create_node(
+         &mut self,
+         dom_node: &ServoLayoutNode<'_>,
+@@ -650,7 +678,10 @@ impl AccessibilityNode {
+     ) -> LocalAccessibilityDamage {
+         let mut damage = LocalAccessibilityDamage::empty();
+ 
+-        let dom_children: Vec<ServoLayoutNode> = dom_node.flat_tree_children().collect();
++        let dom_children: Vec<ServoLayoutNode> = dom_node
++            .flat_tree_children()
++            .filter(|dom_child| !tree.is_inert_child(dom_node, dom_child))
++            .collect();
+ 
+         let mut damage_from_children = LocalAccessibilityDamage::empty();
+         let new_child_ids = dom_children
+diff --git a/components/layout/layout_impl.rs b/components/layout/layout_impl.rs
+index fff8b649067..ad06891ea1a 100644
+--- a/components/layout/layout_impl.rs
++++ b/components/layout/layout_impl.rs
+@@ -1040,6 +1040,7 @@ impl LayoutThread {
+ 
+     fn handle_accessibility_tree_update(
+         &self,
++        document: ServoDangerousStyleDocument,
+         root_element: &ServoLayoutNode,
+         reflow_request: &mut ReflowRequest,
+     ) -> bool {
+@@ -1055,7 +1056,11 @@ impl LayoutThread {
+         let rooted_nodes =
+             std::mem::take(&mut reflow_request.rooted_nodes_for_accessibility_integrity_check);
+ 
+-        if let Some(tree_update) = accessibility_tree.update_tree(root_element, rooted_nodes) {
++        if let Some(tree_update) = accessibility_tree.update_tree(
++            root_element,
++            rooted_nodes,
++            document.blocking_modal_dialog_and_ancestors(),
++        ) {
+             // FIXME: Handle send error. Could have a method on accessibility tree to
+             // finalise after sending, removing accessibility damage? On fail, retain damage
+             // for next reflow, as well as retaining document.needs_accessibility_update.
+@@ -1125,7 +1130,11 @@ impl LayoutThread {
+         if self.handle_update_scroll_node_request(&reflow_request) {
+             reflow_phases_run.insert(ReflowPhasesRun::UpdatedScrollNodeOffset);
+         }
+-        if self.handle_accessibility_tree_update(&root_element.as_node(), &mut reflow_request) {
++        if self.handle_accessibility_tree_update(
++            document,
++            &root_element.as_node(),
++            &mut reflow_request,
++        ) {
+             reflow_phases_run.insert(ReflowPhasesRun::UpdatedAccessibilityTree);
+         }
+ 
+diff --git a/components/layout/stylesheets/user-agent.css b/components/layout/stylesheets/user-agent.css
+index f6de7335ae6..7bf2924fc96 100644
+--- a/components/layout/stylesheets/user-agent.css
++++ b/components/layout/stylesheets/user-agent.css
+@@ -111,6 +111,13 @@ dialog:modal, :popover-open {
+   -servo-top-layer: top;
+ }
+ 
++/* https://html.spec.whatwg.org/multipage/#inert-subtrees: hit testing skips inert nodes, so
++   clicks reach whatever is beneath them, as in Chrome. A modal dialog escapes the inertness of
++   its ancestors. */
++[inert], [inert] :not(dialog:modal, [inert] dialog:modal *) {
++  pointer-events: none !important;
++}
++
+ cite, dfn, em, i, var { font-style: italic; }
+ b, strong { font-weight: bolder; }
+ code, kbd, samp, tt { font-family: monospace; }
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index 8e4cf93e593..99f6ce6b8ca 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -3913,6 +3913,10 @@ impl<'dom> LayoutDom<'dom, Document> {
+     pub(crate) fn elements_with_id(self, id: &Atom) -> &[LayoutDom<'dom, Element>] {
+         self.unsafe_get().id_map.get_all_for_layout(id)
+     }
++
++    pub(crate) fn top_layer_elements(self) -> &'dom [LayoutDom<'dom, Element>] {
++        self.unsafe_get().top_layer.elements_for_layout()
++    }
+ }
+ 
+ // https://html.spec.whatwg.org/multipage/#is-a-registrable-domain-suffix-of-or-is-equal-to
+diff --git a/components/script/dom/document/top_layer.rs b/components/script/dom/document/top_layer.rs
+index 381806e4f58..4cb87ac2c86 100644
+--- a/components/script/dom/document/top_layer.rs
++++ b/components/script/dom/document/top_layer.rs
+@@ -11,7 +11,7 @@ use script_bindings::inheritance::Castable;
+ use script_bindings::root::{Dom, DomRoot};
+ use stylo_dom::ElementState;
+ 
+-use crate::dom::bindings::root::MutNullableDom;
++use crate::dom::bindings::root::{LayoutDom, MutNullableDom};
+ use crate::dom::html::htmldialogelement::ClosedByState;
+ use crate::dom::node::Node;
+ use crate::dom::types::{Element, HTMLDialogElement, HTMLElement, MouseEvent};
+@@ -72,6 +72,14 @@ impl DocumentTopLayer {
+             .any(|item| &**item == element)
+     }
+ 
++    /// The top layer in the order its elements were added, which is the order layout paints and
++    /// hit tests them in.
++    #[expect(unsafe_code)]
++    pub(crate) fn elements_for_layout(&self) -> &[LayoutDom<'_, Element>] {
++        // # Safety: `Dom<Element>` has the same memory layout as `LayoutDom<'_, Element>`.
++        unsafe { LayoutDom::to_layout_slice(self.top_layer.borrow_for_layout()) }
++    }
++
+     /// <https://drafts.csswg.org/css-position-4/#add-an-element-to-the-top-layer>
+     pub(crate) fn add(&self, element: &Element) {
+         // > If el is already contained in top layer, remove it first, then append it.
+diff --git a/components/script/dom/element/focus.rs b/components/script/dom/element/focus.rs
+index dce46add4be..ca8679ba000 100644
+--- a/components/script/dom/element/focus.rs
++++ b/components/script/dom/element/focus.rs
+@@ -17,20 +17,33 @@ use crate::dom::types::{Element, HTMLElement};
+ 
+ impl Element {
+     /// <https://html.spec.whatwg.org/multipage/#inert>
+-    ///
+-    /// Only inertness from <https://html.spec.whatwg.org/multipage/#blocked-by-a-modal-dialog> is
+-    /// supported: the `inert` attribute is not implemented.
+     pub(crate) fn is_inert(&self) -> bool {
++        let blocking_modal_dialog = self.owner_document().top_layer().blocking_modal_dialog();
++        for ancestor in self.upcast::<Node>().inclusive_ancestors_in_flat_tree() {
++            // From <https://html.spec.whatwg.org/multipage/#the-inert-attribute>:
++            // > The inert attribute is a boolean attribute that indicates, by its presence, that
++            // > the element and all its flat tree descendants which don't otherwise escape
++            // > inertness (such as modal dialogs) are to be made inert by the user agent.
++            if ancestor.is::<HTMLElement>() &&
++                ancestor
++                    .downcast::<Element>()
++                    .is_some_and(|element| element.has_attribute(&local_name!("inert")))
++            {
++                return true;
++            }
++            // > subject can additionally become inert via the inert attribute, but only if
++            // > specified on subject itself (i.e., subject escapes inertness of ancestors).
++            if blocking_modal_dialog
++                .as_deref()
++                .is_some_and(|dialog| &*ancestor == dialog.upcast::<Node>())
++            {
++                return false;
++            }
++        }
+         // > While document is blocked by a modal dialog subject, every node that is connected to
+         // > document, with the exception of the subject element and its flat tree descendants,
+         // > must become inert.
+-        let Some(dialog) = self.owner_document().top_layer().blocking_modal_dialog() else {
+-            return false;
+-        };
+-        !self
+-            .upcast::<Node>()
+-            .inclusive_ancestors_in_flat_tree()
+-            .any(|ancestor| &*ancestor == dialog.upcast::<Node>())
++        blocking_modal_dialog.is_some()
+     }
+ 
+     /// <https://html.spec.whatwg.org/multipage/#focusable-area>
+diff --git a/components/script/dom/html/htmlelement.rs b/components/script/dom/html/htmlelement.rs
+index 7430b71e426..42f79356b58 100644
+--- a/components/script/dom/html/htmlelement.rs
++++ b/components/script/dom/html/htmlelement.rs
+@@ -271,6 +271,11 @@ impl HTMLElementMethods<crate::DomTypeHolder> for HTMLElement {
+         );
+     }
+ 
++    // https://html.spec.whatwg.org/multipage/#dom-inert
++    make_bool_getter!(Inert, "inert");
++    // https://html.spec.whatwg.org/multipage/#dom-inert
++    make_bool_setter!(cx, SetInert, "inert");
++
+     // https://html.spec.whatwg.org/multipage/#globaleventhandlers
+     global_event_handlers!(NoOnload);
+ 
+diff --git a/components/script/layout_dom/servo_dangerous_style_document.rs b/components/script/layout_dom/servo_dangerous_style_document.rs
+index c2d82a24ec7..57ca669df60 100644
+--- a/components/script/layout_dom/servo_dangerous_style_document.rs
++++ b/components/script/layout_dom/servo_dangerous_style_document.rs
+@@ -6,12 +6,13 @@
+ 
+ use layout_api::DangerousStyleElement;
+ use selectors::matching::QuirksMode;
+-use style::dom::{TDocument, TNode};
++use style::dom::{OpaqueNode, TDocument, TElement, TNode};
+ use style::shared_lock::{
+     SharedRwLock as StyleSharedRwLock, SharedRwLockReadGuard as StyleSharedRwLockReadGuard,
+ };
+ use style::stylist::Stylist;
+ use style::values::AtomIdent;
++use stylo_dom::ElementState;
+ 
+ use crate::dom::bindings::root::LayoutDom;
+ use crate::dom::document::Document;
+@@ -84,6 +85,37 @@ impl<'dom> ServoDangerousStyleDocument<'dom> {
+             .map(|element| element.layout_element())
+     }
+ 
++    /// The elements in the document's top layer, in the order they were added to it.
++    /// <https://drafts.csswg.org/css-position-4/#document-top-layer>
++    pub fn top_layer_elements(&self) -> impl Iterator<Item = ServoLayoutElement<'dom>> {
++        self.document
++            .top_layer_elements()
++            .iter()
++            .copied()
++            .map(ServoLayoutElement::from)
++    }
++
++    /// The topmost modal dialog in the top layer, which blocks the document, followed by its flat
++    /// tree ancestors, or nothing when no modal dialog is open.
++    /// <https://html.spec.whatwg.org/multipage/#blocked-by-a-modal-dialog>
++    pub fn blocking_modal_dialog_and_ancestors(&self) -> Vec<OpaqueNode> {
++        let Some(dialog) = self
++            .document
++            .top_layer_elements()
++            .iter()
++            .rev()
++            .find(|element| element.get_state_for_layout().contains(ElementState::MODAL))
++        else {
++            return Vec::new();
++        };
++        std::iter::successors(
++            Some(ServoDangerousStyleElement::from(*dialog)),
++            TElement::traversal_parent,
++        )
++        .map(|element| element.as_node().opaque())
++        .collect()
++    }
++
+     /// Get the shared style lock for author stylesheets for this [`ServoDangerousStyleDocument`].
+     pub fn shared_style_locks(&self) -> &SharedRwLocks {
+         self.document.shared_style_locks()
+diff --git a/components/script_bindings/webidls/HTMLElement.webidl b/components/script_bindings/webidls/HTMLElement.webidl
+index dd264ba12c9..547dbb60db0 100644
+--- a/components/script_bindings/webidls/HTMLElement.webidl
++++ b/components/script_bindings/webidls/HTMLElement.webidl
+@@ -21,7 +21,7 @@ interface HTMLElement : Element {
+ 
+   // user interaction
+   [CEReactions] attribute boolean hidden;
+-  // [CEReactions, Reflect] attribute boolean inert;
++  [CEReactions] attribute boolean inert;
+   undefined click();
+   [CEReactions] attribute DOMString accessKey;
+   readonly attribute DOMString accessKeyLabel;
+-- 
+2.43.0
+

@@ -1,0 +1,925 @@
+From 51fd6faec2289033525c7a40a5307caade5bdfe2 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 04:22:18 -0400
+Subject: [PATCH] script: proximity snapping, scroll-snap-stop and re-snapping
+ after layout
+
+Snap containers with `scroll-snap-type: proximity` now snap like Chromium:
+only when the chosen snap position is within a third of the scrollport size
+of where the scroll would otherwise end. Directional scrolls (keyboard,
+wheel, and now scrollBy(), which Chromium also treats as directional) no
+longer pass over a snap area with `scroll-snap-stop: always`; Home and End
+go to the end of the box without stopping, as in Chromium.
+
+Each snap remembers the snap targets it chose, and every rendering update
+re-snaps snap containers that are not being scrolled to those targets, so a
+carousel stays on the same slide when it is resized or content is inserted
+before the slide. When a target goes away the box snaps anew from its
+current position.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/document/document.rs    |  95 ++++-
+ .../dom/document/document_event_handler.rs    |   9 +-
+ components/script/dom/element/element.rs      |  54 ++-
+ components/script/dom/scrolling_box.rs        | 326 ++++++++++++------
+ components/script/dom/window/window.rs        |  47 ++-
+ components/script/script_thread.rs            |   4 +
+ 6 files changed, 396 insertions(+), 139 deletions(-)
+
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index 5d1a5f3326a..df23f7328de 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -344,6 +344,16 @@ struct ScrollAwaitingCompletion {
+     user_scroll_origin: Option<LayoutVector2D>,
+ }
+ 
++/// The snap targets a snap container last snapped to on each axis.
++/// <https://drafts.csswg.org/css-scroll-snap-1/#re-snap>
++#[derive(JSTraceable, MallocSizeOf)]
++#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
++struct SnapTargets {
++    container: Dom<Node>,
++    x: Option<Dom<Element>>,
++    y: Option<Dom<Element>>,
++}
++
+ /// Reasons why a [`Document`] might need a rendering update that is otherwise
+ /// untracked via other [`Document`] properties.
+ #[derive(Clone, Copy, Debug, Default, JSTraceable, MallocSizeOf)]
+@@ -664,6 +674,8 @@ pub(crate) struct Document {
+     /// Scroll event targets whose scrolling box scrolled during the last rendering update and
+     /// whose scroll is not yet considered completed.
+     scrolls_awaiting_completion: DomRefCell<Vec<ScrollAwaitingCompletion>>,
++    /// The snap targets of the snap containers in this document that are snapped.
++    snap_targets: DomRefCell<Vec<SnapTargets>>,
+     /// Other reasons that a rendering update might be required for this [`Document`].
+     rendering_update_reasons: Cell<RenderingUpdateReason>,
+     /// Whether or not this [`Document`] is waiting on canvas image updates. If it is
+@@ -1441,7 +1453,8 @@ impl Document {
+             //
+             // FIXME(stshine): this should be the origin of the stacking context space,
+             // which may differ under the influence of writing mode.
+-            self.window.scroll(cx, 0.0, 0.0, ScrollBehavior::Instant);
++            self.window
++                .scroll(cx, 0.0, 0.0, ScrollBehavior::Instant, None);
+             // Step 2.3. Return.
+             return;
+         }
+@@ -1656,7 +1669,7 @@ impl Document {
+             // continues to the next snap position in the direction the user scrolled, and
+             // completes once it gets there.
+             if let Some(user_scroll_origin) = user_scroll_origin &&
+-                let Some(scrolling_box) = self.mandatory_snap_container_for_scroll_target(&target)
++                let Some(scrolling_box) = self.snap_container_for_scroll_target(&target)
+             {
+                 let position = scrolling_box.scroll_position();
+                 let snapped = scrolling_box.snapped_position(position, Some(user_scroll_origin));
+@@ -1762,23 +1775,82 @@ impl Document {
+         })
+     }
+ 
+-    /// The scrolling box behind a scroll event target, if it is a `mandatory` snap container.
+-    fn mandatory_snap_container_for_scroll_target(
+-        &self,
+-        target: &EventTarget,
+-    ) -> Option<ScrollingBox> {
++    /// The scrolling box behind a scroll event target, if it is a snap container.
++    fn snap_container_for_scroll_target(&self, target: &EventTarget) -> Option<ScrollingBox> {
+         if target.is::<Document>() {
+             let scrolling_box = self.viewport_scrolling_box(ScrollContainerQueryFlags::Inclusive);
+-            return scrolling_box
+-                .is_mandatory_snap_container()
+-                .then_some(scrolling_box);
++            return scrolling_box.is_snap_container().then_some(scrolling_box);
+         }
+         target
+             .downcast::<Element>()
+-            .filter(|element| element.mandatory_scroll_snap_axis().is_some())?
++            .filter(|element| element.scroll_snap_type().is_some())?
+             .scrolling_box(ScrollContainerQueryFlags::Inclusive)
+     }
+ 
++    /// Remembers the snap targets the scrolling box of `container` snapped to on each axis,
++    /// forgetting them when it snapped to none.
++    pub(crate) fn set_snap_targets(
++        &self,
++        container: &Node,
++        x: Option<&Element>,
++        y: Option<&Element>,
++    ) {
++        let mut snap_targets = self.snap_targets.borrow_mut();
++        snap_targets.retain(|snap_targets| *snap_targets.container != *container);
++        if x.is_some() || y.is_some() {
++            snap_targets.push(SnapTargets {
++                container: Dom::from_ref(container),
++                x: x.map(Dom::from_ref),
++                y: y.map(Dom::from_ref),
++            });
++        }
++    }
++
++    /// Keeps every snap container that is not being scrolled snapped to the snap targets it
++    /// last snapped to, whose positions may have moved since with layout changes or resizes.
++    /// <https://drafts.csswg.org/css-scroll-snap-1/#re-snap>
++    pub(crate) fn resnap_snap_containers(&self, cx: &mut JSContext) {
++        let snapped_containers: Vec<_> = self
++            .snap_targets
++            .borrow()
++            .iter()
++            .map(|snap_targets| {
++                (
++                    snap_targets.container.as_rooted(),
++                    snap_targets.x.as_ref().map(|x| x.as_rooted()),
++                    snap_targets.y.as_ref().map(|y| y.as_rooted()),
++                )
++            })
++            .collect();
++        for (container, x, y) in snapped_containers {
++            let target = container.upcast::<EventTarget>();
++            let is_scrolling = self
++                .scrolls_awaiting_completion
++                .borrow()
++                .iter()
++                .any(|awaiting| *awaiting.target == *target) ||
++                self.pending_scroll_events
++                    .borrow()
++                    .iter()
++                    .any(|pending_event| *pending_event.target == *target) ||
++                self.scroll_target_has_ongoing_smooth_scroll(target);
++            if is_scrolling {
++                continue;
++            }
++            let Some(scrolling_box) = self.snap_container_for_scroll_target(target) else {
++                self.set_snap_targets(&container, None, None);
++                continue;
++            };
++            let position = scrolling_box.scroll_position();
++            let resnapped = scrolling_box.resnap_position(x.as_deref(), y.as_deref());
++            // Sub-pixel differences are rounding of the snap area positions.
++            let difference = (resnapped - position).abs();
++            if difference.x > 0.5 || difference.y > 0.5 {
++                scrolling_box.scroll_to(cx, resnapped, ScrollBehavior::Instant);
++            }
++        }
++    }
++
+     /// <https://drafts.csswg.org/cssom-view/#scrolling-events>
+     ///
+     /// > Whenever a viewport gets scrolled (whether in response to user interaction or
+@@ -4091,6 +4163,7 @@ impl Document {
+             adopted_stylesheets_frozen_types: CachedFrozenArray::new(),
+             pending_scroll_events: Default::default(),
+             scrolls_awaiting_completion: Default::default(),
++            snap_targets: Default::default(),
+             rendering_update_reasons: Default::default(),
+             waiting_on_canvas_image_updates: Cell::new(false),
+             root_removal_noted: Cell::new(true),
+diff --git a/components/script/dom/document/document_event_handler.rs b/components/script/dom/document/document_event_handler.rs
+index 6f353cdbe74..8efa0b5f4d8 100644
+--- a/components/script/dom/document/document_event_handler.rs
++++ b/components/script/dom/document/document_event_handler.rs
+@@ -2531,8 +2531,13 @@ impl DocumentEventHandler {
+             };
+             // Keyboard scrolls are directional: in a snap container they move on to the next
+             // snap position in their direction, even one further away than the scroll amount.
+-            let snapped = scrolling_box
+-                .snapped_position(current_scroll_offset + delta, Some(current_scroll_offset));
++            // Home and End instead go to an end of the box, so like in Chromium they do not
++            // stop at `scroll-snap-stop: always` snap areas on the way.
++            let origin = match scroll {
++                KeyboardScroll::Home | KeyboardScroll::End => None,
++                _ => Some(current_scroll_offset),
++            };
++            let snapped = scrolling_box.snapped_position(current_scroll_offset + delta, origin);
+             (current_scroll_offset, snapped - current_scroll_offset)
+         };
+ 
+diff --git a/components/script/dom/element/element.rs b/components/script/dom/element/element.rs
+index 7ff0419e3ec..43610b082a1 100644
+--- a/components/script/dom/element/element.rs
++++ b/components/script/dom/element/element.rs
+@@ -53,7 +53,7 @@ use style::selector_parser::{RestyleDamage, SelectorParser, Snapshot};
+ use style::shared_lock::Locked;
+ use style::stylesheets::layer_rule::LayerOrder;
+ use style::stylesheets::{CssRuleType, UrlExtraData};
+-use style::values::computed::{Overflow, ScrollSnapAxis, ScrollSnapStrictness};
++use style::values::computed::{Overflow, ScrollSnapStrictness, ScrollSnapType};
+ use style::values::generics::NonNegative;
+ use style::values::generics::position::PreferredRatio;
+ use style::values::generics::ratio::Ratio;
+@@ -62,6 +62,7 @@ use style::{ArcSlice, CaseSensitivityExt, dom_apis, thread_state};
+ use style_traits::CSSPixel;
+ use stylo_atoms::Atom;
+ use stylo_dom::ElementState;
++use webrender_api::units::LayoutVector2D;
+ use xml5ever::serialize::TraversalScope::{
+     ChildrenOnly as XmlChildrenOnly, IncludeNode as XmlIncludeNode,
+ };
+@@ -947,12 +948,11 @@ impl Element {
+         )))
+     }
+ 
+-    /// The axis of this element's `scroll-snap-type` when its snapping is `mandatory`. For the
+-    /// root element this is the viewport's snap type. `proximity` snapping is not implemented,
+-    /// so such containers report `None` and scroll freely.
+-    pub(crate) fn mandatory_scroll_snap_axis(&self) -> Option<ScrollSnapAxis> {
++    /// This element's `scroll-snap-type`, or `None` if it does not make it a snap container.
++    /// For the root element this is the viewport's snap type.
++    pub(crate) fn scroll_snap_type(&self) -> Option<ScrollSnapType> {
+         let snap_type = self.style()?.get_box().scroll_snap_type;
+-        (snap_type.strictness == ScrollSnapStrictness::Mandatory).then_some(snap_type.axis)
++        (snap_type.strictness != ScrollSnapStrictness::None).then_some(snap_type)
+     }
+ 
+     /// <https://drafts.csswg.org/cssom-view/#scroll-a-target-into-view>
+@@ -2802,7 +2802,16 @@ impl Element {
+     ///
+     /// TODO(stevennovaryo): Need to update the scroll API to follow the spec since it is
+     /// quite outdated.
+-    pub(crate) fn scroll(&self, cx: &mut JSContext, x: f64, y: f64, behavior: ScrollBehavior) {
++    ///
++    /// `origin` is where the scroll started if it is directional, as `scrollBy()` is.
++    pub(crate) fn scroll(
++        &self,
++        cx: &mut JSContext,
++        x: f64,
++        y: f64,
++        behavior: ScrollBehavior,
++        origin: Option<LayoutVector2D>,
++    ) {
+         // Step 1.2 or 2.3
+         let x = if x.is_finite() { x } else { 0.0 } as f32;
+         let y = if y.is_finite() { y } else { 0.0 } as f32;
+@@ -2826,7 +2835,7 @@ impl Element {
+         // Step 7
+         if *self.root_element() == *self {
+             if doc.quirks_mode() != QuirksMode::Quirks {
+-                win.scroll(cx, x, y, behavior);
++                win.scroll(cx, x, y, behavior, origin);
+             }
+ 
+             return;
+@@ -2837,7 +2846,7 @@ impl Element {
+             doc.quirks_mode() == QuirksMode::Quirks &&
+             !self.is_potentially_scrollable_body()
+         {
+-            win.scroll(cx, x, y, behavior);
++            win.scroll(cx, x, y, behavior, origin);
+             return;
+         }
+ 
+@@ -2847,7 +2856,7 @@ impl Element {
+         }
+ 
+         // Step 11
+-        win.scroll_an_element(cx, self, x, y, behavior);
++        win.scroll_an_element(cx, self, x, y, behavior, origin);
+     }
+ 
+     /// <https://html.spec.whatwg.org/multipage/#fragment-parsing-algorithm-steps>
+@@ -3455,12 +3464,12 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
+         // Step 1
+         let left = options.left.unwrap_or(self.ScrollLeft());
+         let top = options.top.unwrap_or(self.ScrollTop());
+-        self.scroll(cx, left, top, options.parent.behavior);
++        self.scroll(cx, left, top, options.parent.behavior, None);
+     }
+ 
+     /// <https://drafts.csswg.org/cssom-view/#dom-element-scroll>
+     fn Scroll_(&self, cx: &mut JSContext, x: f64, y: f64) {
+-        self.scroll(cx, x, y, ScrollBehavior::Auto);
++        self.scroll(cx, x, y, ScrollBehavior::Auto, None);
+     }
+ 
+     /// <https://drafts.csswg.org/cssom-view/#dom-element-scrollto>
+@@ -3485,6 +3494,7 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
+             left + delta_left,
+             top + delta_top,
+             options.parent.behavior,
++            Some(LayoutVector2D::new(left as f32, top as f32)),
+         );
+     }
+ 
+@@ -3492,7 +3502,13 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
+     fn ScrollBy_(&self, cx: &mut JSContext, x: f64, y: f64) {
+         let left = self.ScrollLeft();
+         let top = self.ScrollTop();
+-        self.scroll(cx, left + x, top + y, ScrollBehavior::Auto);
++        self.scroll(
++            cx,
++            left + x,
++            top + y,
++            ScrollBehavior::Auto,
++            Some(LayoutVector2D::new(left as f32, top as f32)),
++        );
+     }
+ 
+     /// <https://drafts.csswg.org/cssom-view/#dom-element-scrolltop>
+@@ -3568,7 +3584,7 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
+         // Step 7
+         if self.is_document_element() {
+             if doc.quirks_mode() != QuirksMode::Quirks {
+-                win.scroll(cx, win.ScrollX() as f32, y, behavior);
++                win.scroll(cx, win.ScrollX() as f32, y, behavior, None);
+             }
+ 
+             return;
+@@ -3579,7 +3595,7 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
+             doc.quirks_mode() == QuirksMode::Quirks &&
+             !self.is_potentially_scrollable_body()
+         {
+-            win.scroll(cx, win.ScrollX() as f32, y, behavior);
++            win.scroll(cx, win.ScrollX() as f32, y, behavior, None);
+             return;
+         }
+ 
+@@ -3589,7 +3605,7 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
+         }
+ 
+         // Step 11
+-        win.scroll_an_element(cx, self, self.ScrollLeft() as f32, y, behavior);
++        win.scroll_an_element(cx, self, self.ScrollLeft() as f32, y, behavior, None);
+     }
+ 
+     /// <https://drafts.csswg.org/cssom-view/#dom-element-scrollleft>
+@@ -3667,7 +3683,7 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
+                 return;
+             }
+ 
+-            win.scroll(cx, x, win.ScrollY() as f32, behavior);
++            win.scroll(cx, x, win.ScrollY() as f32, behavior, None);
+             return;
+         }
+ 
+@@ -3676,7 +3692,7 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
+             doc.quirks_mode() == QuirksMode::Quirks &&
+             !self.is_potentially_scrollable_body()
+         {
+-            win.scroll(cx, x, win.ScrollY() as f32, behavior);
++            win.scroll(cx, x, win.ScrollY() as f32, behavior, None);
+             return;
+         }
+ 
+@@ -3686,7 +3702,7 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
+         }
+ 
+         // Step 11
+-        win.scroll_an_element(cx, self, x, self.ScrollTop() as f32, behavior);
++        win.scroll_an_element(cx, self, x, self.ScrollTop() as f32, behavior, None);
+     }
+ 
+     /// <https://drafts.csswg.org/cssom-view/#dom-element-scrollintoview>
+diff --git a/components/script/dom/scrolling_box.rs b/components/script/dom/scrolling_box.rs
+index 19696e755c3..2ce63f47839 100644
+--- a/components/script/dom/scrolling_box.rs
++++ b/components/script/dom/scrolling_box.rs
+@@ -12,7 +12,8 @@ use script_bindings::codegen::GenericBindings::WindowBinding::ScrollBehavior;
+ use script_bindings::inheritance::Castable;
+ use script_bindings::root::DomRoot;
+ use style::values::computed::{
+-    Length, NonNegativeLengthPercentageOrAuto, Overflow, ScrollSnapAxis,
++    Length, NonNegativeLengthPercentageOrAuto, Overflow, ScrollSnapAxis, ScrollSnapStop,
++    ScrollSnapStrictness,
+ };
+ use style::values::generics::length::LengthPercentageOrAuto;
+ use style::values::specified::box_::ScrollSnapAlignKeyword;
+@@ -39,6 +40,28 @@ pub(crate) enum ScrollingBoxSource {
+     Viewport(DomRoot<Document>),
+ }
+ 
++/// What choosing a snap position of a snap container depends on.
++struct SnapContext {
++    snaps_x: bool,
++    snaps_y: bool,
++    /// How far from where a scroll would otherwise end a `proximity` snap container still
++    /// snaps, or `None` for a `mandatory` one.
++    proximity_range: Option<LayoutSize>,
++    scroll_padding: SideOffsets2D<f32, LayoutPixel>,
++    size: LayoutSize,
++    max_position: LayoutVector2D,
++    scrolling_area_origin: LayoutVector2D,
++    device_pixel_ratio: f32,
++}
++
++/// A snap area of a snap container and the scroll positions that snap to it.
++struct SnapCandidate {
++    element: DomRoot<Element>,
++    x: Option<f32>,
++    y: Option<f32>,
++    stop_always: bool,
++}
++
+ #[derive(Copy, Clone)]
+ pub(crate) enum ScrollingBoxAxis {
+     X,
+@@ -173,12 +196,12 @@ impl ScrollingBox {
+             ScrollingBoxSource::Element(element) => {
+                 element
+                     .owner_window()
+-                    .scroll_an_element(cx, element, position.x, position.y, behavior);
++                    .scroll_an_element(cx, element, position.x, position.y, behavior, None);
+             },
+             ScrollingBoxSource::Viewport(document) => {
+                 document
+                     .window()
+-                    .scroll(cx, position.x, position.y, behavior);
++                    .scroll(cx, position.x, position.y, behavior, None);
+             },
+         }
+     }
+@@ -304,41 +327,110 @@ impl ScrollingBox {
+         }
+     }
+ 
+-    pub(crate) fn is_mandatory_snap_container(&self) -> bool {
++    pub(crate) fn is_snap_container(&self) -> bool {
+         self.scroll_property_element()
+-            .is_some_and(|element| element.mandatory_scroll_snap_axis().is_some())
++            .is_some_and(|element| element.scroll_snap_type().is_some())
+     }
+ 
+     /// The scroll position a scroll intending to end at `intended` must end at instead so that
+-    /// this box rests on a snap position, or `intended` when this box does not snap. `origin`
+-    /// is where a directional scroll (keyboard, wheel) started: such a scroll moves on to a snap
+-    /// position past `origin` in its direction, the closest one to `intended`, instead of
+-    /// falling back to where it started. Without an origin the closest snap position wins.
++    /// this box rests on a snap position, or `intended` when this box does not snap there.
++    /// `origin` is where a directional scroll (keyboard, wheel, `scrollBy()`) started: such a
++    /// scroll moves on to a snap position past `origin` in its direction, the closest one to
++    /// `intended`, instead of falling back to where it started, and stops at any snap area with
++    /// `scroll-snap-stop: always` on the way. Without an origin the closest snap position wins.
++    /// The chosen snap targets are remembered so that the box can re-snap to them when layout
++    /// changes.
+     /// <https://drafts.csswg.org/css-scroll-snap-1/#choosing>
+     pub(crate) fn snapped_position(
+         &self,
+         intended: LayoutVector2D,
+         origin: Option<LayoutVector2D>,
+     ) -> LayoutVector2D {
+-        let Some(axis) = self
+-            .scroll_property_element()
+-            .and_then(|element| element.mandatory_scroll_snap_axis())
+-        else {
++        let Some(context) = self.snap_context() else {
+             return intended;
+         };
++        let candidates = self.snap_candidates(&context);
++        let x = context
++            .snaps_x
++            .then(|| {
++                Self::choose_snap_target(
++                    &candidates,
++                    |candidate| candidate.x,
++                    intended.x,
++                    origin.map(|origin| origin.x),
++                    context.proximity_range.map(|range| range.width),
++                )
++            })
++            .flatten();
++        let y = context
++            .snaps_y
++            .then(|| {
++                Self::choose_snap_target(
++                    &candidates,
++                    |candidate| candidate.y,
++                    intended.y,
++                    origin.map(|origin| origin.y),
++                    context.proximity_range.map(|range| range.height),
++                )
++            })
++            .flatten();
++
++        self.node().owner_doc().set_snap_targets(
++            self.node(),
++            x.map(|(index, _)| &*candidates[index].element),
++            y.map(|(index, _)| &*candidates[index].element),
++        );
++        Vector2D::new(
++            x.map_or(intended.x, |(_, position)| position),
++            y.map_or(intended.y, |(_, position)| position),
++        )
++    }
++
++    /// The scroll position that keeps this box snapped to the snap targets it last snapped to
++    /// after their layout changed. When one of them is no longer a snap area of this box, the
++    /// box snaps anew from its current position.
++    /// <https://drafts.csswg.org/css-scroll-snap-1/#re-snap>
++    pub(crate) fn resnap_position(
++        &self,
++        x_target: Option<&Element>,
++        y_target: Option<&Element>,
++    ) -> LayoutVector2D {
++        let current = self.scroll_position();
++        let Some(context) = self.snap_context() else {
++            return current;
++        };
++        let target_position =
++            |target: Option<&Element>, axis: fn(&SnapCandidate) -> Option<f32>| {
++                target.map(|target| {
++                    self.snap_candidate(&context, target)
++                        .as_ref()
++                        .and_then(axis)
++                })
++            };
++        match (
++            target_position(x_target, |candidate| candidate.x),
++            target_position(y_target, |candidate| candidate.y),
++        ) {
++            (Some(None), _) | (_, Some(None)) => self.snapped_position(current, None),
++            (x, y) => Vector2D::new(
++                x.flatten().unwrap_or(current.x),
++                y.flatten().unwrap_or(current.y),
++            ),
++        }
++    }
++
++    fn snap_context(&self) -> Option<SnapContext> {
++        let snap_type = self.scroll_property_element()?.scroll_snap_type()?;
+         // TODO: Map the logical axes through the writing mode instead of assuming
+         // horizontal-tb.
+-        let (snaps_x, snaps_y) = match axis {
++        let (snaps_x, snaps_y) = match snap_type.axis {
+             ScrollSnapAxis::X | ScrollSnapAxis::Inline => (true, false),
+             ScrollSnapAxis::Y | ScrollSnapAxis::Block => (false, true),
+             ScrollSnapAxis::Both => (true, true),
+         };
+ 
+         let size = self.size();
+-        let scroll_padding = self.scroll_padding(size);
+         let content_size = self.content_size();
+-        let max_x = (content_size.width - size.width).max(0.);
+-        let max_y = (content_size.height - size.height).max(0.);
+         let scroll_position = self.scroll_position();
+         // Snap areas come in the coordinate space of `getBoundingClientRect()`. Moving them
+         // into this box's scrolling area makes their positions independent of the current
+@@ -357,77 +449,92 @@ impl ScrollingBox {
+                 ) - scroll_position
+             },
+         };
++        Some(SnapContext {
++            snaps_x,
++            snaps_y,
++            // Chromium snaps a `proximity` container when the snap position is within a third
++            // of the scrollport size of where the scroll would otherwise end.
++            proximity_range: (snap_type.strictness == ScrollSnapStrictness::Proximity)
++                .then(|| size / 3.),
++            scroll_padding: self.scroll_padding(size),
++            size,
++            max_position: LayoutVector2D::new(
++                (content_size.width - size.width).max(0.),
++                (content_size.height - size.height).max(0.),
++            ),
++            scrolling_area_origin,
++            device_pixel_ratio: self.node().owner_window().device_pixel_ratio().get(),
++        })
++    }
++
++    fn snap_candidates(&self, context: &SnapContext) -> Vec<SnapCandidate> {
++        self.node()
++            .traverse_preorder(ShadowIncluding::Yes)
++            .skip(1)
++            .filter_map(|node| self.snap_candidate(context, node.downcast::<Element>()?))
++            .collect()
++    }
++
++    /// The snap positions of `element` in this box, or `None` if it is not one of its snap
++    /// areas.
++    fn snap_candidate(&self, context: &SnapContext, element: &Element) -> Option<SnapCandidate> {
++        let style = element.style_from_last_restyle()?;
++        let style_box = style.get_box();
++        let align = style_box.scroll_snap_align;
++        if align.block == ScrollSnapAlignKeyword::None &&
++            align.inline == ScrollSnapAlignKeyword::None
++        {
++            return None;
++        }
++        // Only the nearest scroll container ancestor of a snap area snaps to it.
++        if !element
++            .scrolling_box(ScrollContainerQueryFlags::empty())
++            .is_some_and(|scrolling_box| *scrolling_box.node() == *self.node())
++        {
++            return None;
++        }
++        let area = element.scroll_snap_area()?;
+ 
+         // Snap areas come from boxes positioned at the current, possibly fractional, scroll
+         // position and rounded to app units, so their snap positions carry rounding error.
+         // Scroll positions are aligned to device pixels, as when scrolling into view.
+-        let device_pixel_ratio = self.node().owner_window().device_pixel_ratio().get();
+         let to_scroll_position = |position: f32, max: f32| {
+-            ((position * device_pixel_ratio).round() / device_pixel_ratio).clamp(0., max)
++            ((position * context.device_pixel_ratio).round() / context.device_pixel_ratio)
++                .clamp(0., max)
+         };
+-
+-        let container = self.node();
+-        let mut x_positions = Vec::new();
+-        let mut y_positions = Vec::new();
+-        for node in container.traverse_preorder(ShadowIncluding::Yes).skip(1) {
+-            let Some(element) = node.downcast::<Element>() else {
+-                continue;
+-            };
+-            let Some(align) = element
+-                .style_from_last_restyle()
+-                .map(|style| style.get_box().scroll_snap_align)
+-            else {
+-                continue;
+-            };
+-            if align.block == ScrollSnapAlignKeyword::None &&
+-                align.inline == ScrollSnapAlignKeyword::None
+-            {
+-                continue;
+-            }
+-            // Only the nearest scroll container ancestor of a snap area snaps to it.
+-            if !element
+-                .scrolling_box(ScrollContainerQueryFlags::empty())
+-                .is_some_and(|scrolling_box| *scrolling_box.node() == *container)
+-            {
+-                continue;
+-            }
+-            let Some(area) = element.scroll_snap_area() else {
+-                continue;
+-            };
+-            let area_start_x = area.min_x().to_f32_px() - scrolling_area_origin.x;
+-            let area_end_x = area.max_x().to_f32_px() - scrolling_area_origin.x;
+-            let area_start_y = area.min_y().to_f32_px() - scrolling_area_origin.y;
+-            let area_end_y = area.max_y().to_f32_px() - scrolling_area_origin.y;
+-            if snaps_x {
+-                x_positions.extend(
+-                    Self::snap_position_one_axis(
+-                        align.inline,
+-                        area_start_x,
+-                        area_end_x,
+-                        scroll_padding.left,
+-                        size.width - scroll_padding.right,
+-                    )
+-                    .map(|position| to_scroll_position(position, max_x)),
+-                );
+-            }
+-            if snaps_y {
+-                y_positions.extend(
+-                    Self::snap_position_one_axis(
+-                        align.block,
+-                        area_start_y,
+-                        area_end_y,
+-                        scroll_padding.top,
+-                        size.height - scroll_padding.bottom,
+-                    )
+-                    .map(|position| to_scroll_position(position, max_y)),
+-                );
+-            }
+-        }
+-
+-        Vector2D::new(
+-            Self::choose_snap_position(&x_positions, intended.x, origin.map(|origin| origin.x)),
+-            Self::choose_snap_position(&y_positions, intended.y, origin.map(|origin| origin.y)),
+-        )
++        let origin = context.scrolling_area_origin;
++        let x = context
++            .snaps_x
++            .then(|| {
++                Self::snap_position_one_axis(
++                    align.inline,
++                    area.min_x().to_f32_px() - origin.x,
++                    area.max_x().to_f32_px() - origin.x,
++                    context.scroll_padding.left,
++                    context.size.width - context.scroll_padding.right,
++                )
++            })
++            .flatten()
++            .map(|position| to_scroll_position(position, context.max_position.x));
++        let y = context
++            .snaps_y
++            .then(|| {
++                Self::snap_position_one_axis(
++                    align.block,
++                    area.min_y().to_f32_px() - origin.y,
++                    area.max_y().to_f32_px() - origin.y,
++                    context.scroll_padding.top,
++                    context.size.height - context.scroll_padding.bottom,
++                )
++            })
++            .flatten()
++            .map(|position| to_scroll_position(position, context.max_position.y));
++        Some(SnapCandidate {
++            element: DomRoot::from_ref(element),
++            x,
++            y,
++            stop_always: style_box.scroll_snap_stop == ScrollSnapStop::Always,
++        })
+     }
+ 
+     /// The scroll position that aligns a snap area spanning `area_start..area_end` with the
+@@ -450,26 +557,53 @@ impl ScrollingBox {
+         }
+     }
+ 
+-    fn choose_snap_position(positions: &[f32], intended: f32, origin: Option<f32>) -> f32 {
+-        let closest = |candidates: &mut dyn Iterator<Item = f32>| {
+-            candidates.min_by(|a, b| (a - intended).abs().total_cmp(&(b - intended).abs()))
++    /// The index and snap position of the candidate a scroll along one axis ends at, or `None`
++    /// if it ends at `intended` without snapping.
++    fn choose_snap_target(
++        candidates: &[SnapCandidate],
++        axis: impl Fn(&SnapCandidate) -> Option<f32>,
++        intended: f32,
++        origin: Option<f32>,
++        proximity_range: Option<f32>,
++    ) -> Option<(usize, f32)> {
++        let positions = || {
++            candidates
++                .iter()
++                .enumerate()
++                .filter_map(|(index, candidate)| Some((index, axis(candidate)?)))
++        };
++        let closest_to = |target: f32, candidates: &mut dyn Iterator<Item = (usize, f32)>| {
++            candidates.min_by(|a, b| (a.1 - target).abs().total_cmp(&(b.1 - target).abs()))
+         };
+         // Sub-pixel differences between the origin and a snap position are rounding, not a
+         // snap position to move past.
+         const EPSILON: f32 = 0.5;
+-        let directional = origin.filter(|origin| (intended - origin).abs() > EPSILON);
+-        directional
+-            .and_then(|origin| {
++        let chosen = match origin.filter(|origin| (intended - origin).abs() > EPSILON) {
++            Some(origin) => {
+                 let direction = (intended - origin).signum();
+-                closest(
+-                    &mut positions
+-                        .iter()
+-                        .copied()
+-                        .filter(|position| (position - origin) * direction > EPSILON),
++                let ahead = |position: f32| (position - origin) * direction > EPSILON;
++                let chosen = closest_to(intended, &mut positions().filter(|(_, p)| ahead(*p)))
++                    .or_else(|| closest_to(intended, &mut positions()))?;
++                // A directional scroll must not pass over a snap area that has
++                // `scroll-snap-stop: always`.
++                // <https://drafts.csswg.org/css-scroll-snap-1/#scroll-snap-stop>
++                closest_to(
++                    origin,
++                    &mut positions().filter(|(index, position)| {
++                        candidates[*index].stop_always &&
++                            ahead(*position) &&
++                            (chosen.1 - position) * direction > EPSILON
++                    }),
+                 )
+-            })
+-            .or_else(|| closest(&mut positions.iter().copied()))
+-            .unwrap_or(intended)
++                .unwrap_or(chosen)
++            },
++            None => closest_to(intended, &mut positions())?,
++        };
++        // <https://drafts.csswg.org/css-scroll-snap-1/#valdef-scroll-snap-type-proximity>
++        if proximity_range.is_some_and(|range| (chosen.1 - intended).abs() > range) {
++            return None;
++        }
++        Some(chosen)
+     }
+ 
+     /// Step 10 from <https://drafts.csswg.org/cssom-view/#determine-the-scroll-into-view-position>:
+diff --git a/components/script/dom/window/window.rs b/components/script/dom/window/window.rs
+index 81a916577e0..35927751658 100644
+--- a/components/script/dom/window/window.rs
++++ b/components/script/dom/window/window.rs
+@@ -98,7 +98,7 @@ use style_traits::CSSPixel;
+ use stylo_atoms::Atom;
+ use time::Duration as TimeDuration;
+ use webrender_api::ExternalScrollId;
+-use webrender_api::units::{DeviceIntSize, DevicePixel, LayoutPixel, LayoutPoint};
++use webrender_api::units::{DeviceIntSize, DevicePixel, LayoutPixel, LayoutPoint, LayoutVector2D};
+ 
+ use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
+     DocumentMethods, DocumentReadyState, NamedPropertyValue,
+@@ -2101,7 +2101,7 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
+             .map_or(self.scroll_offset().y, |top| top as f32);
+ 
+         // The rest of the specification continues from `Self::scroll`.
+-        self.scroll(cx, x, y, options.parent.behavior);
++        self.scroll(cx, x, y, options.parent.behavior, None);
+     }
+ 
+     /// <https://drafts.csswg.org/cssom-view/#dom-window-scroll>
+@@ -2109,7 +2109,7 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
+         // Step 2: If invoked with two arguments, follow these substeps:
+         // Step 2.1 Let options be null converted to a ScrollToOptions dictionary. [WEBIDL]
+         // Step 2.2: Let x and y be the arguments, respectively.
+-        self.scroll(cx, x as f32, y as f32, ScrollBehavior::Auto);
++        self.scroll(cx, x as f32, y as f32, ScrollBehavior::Auto, None);
+     }
+ 
+     /// <https://drafts.csswg.org/cssom-view/#dom-window-scrollto>
+@@ -2148,7 +2148,14 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
+         options.top.replace(y + self.ScrollY() as f64);
+ 
+         // Step 5: Act as if the scroll() method was invoked with options as the only argument.
+-        self.Scroll(cx, &options)
++        // Unlike `scroll()`, this scroll has a direction, which snapping follows.
++        self.scroll(
++            cx,
++            options.left.unwrap() as f32,
++            options.top.unwrap() as f32,
++            options.parent.behavior,
++            Some(self.scroll_offset()),
++        )
+     }
+ 
+     /// <https://drafts.csswg.org/cssom-view/#dom-window-scrollby>
+@@ -2532,7 +2539,15 @@ impl Window {
+     }
+ 
+     /// <https://drafts.csswg.org/cssom-view/#dom-window-scroll>
+-    pub(crate) fn scroll(&self, cx: &mut JSContext, x: f32, y: f32, behavior: ScrollBehavior) {
++    /// `origin` is where the scroll started if it is directional, as `scrollBy()` is.
++    pub(crate) fn scroll(
++        &self,
++        cx: &mut JSContext,
++        x: f32,
++        y: f32,
++        behavior: ScrollBehavior,
++        origin: Option<LayoutVector2D>,
++    ) {
+         // Step 3: Normalize non-finite values for x and y.
+         let xfinite = if x.is_finite() { x } else { 0.0 };
+         let yfinite = if y.is_finite() { y } else { 0.0 };
+@@ -2586,7 +2601,15 @@ impl Window {
+         // as the associated element, if there is one, or null otherwise, and the scroll
+         // behavior being the value of the behavior dictionary member of options.
+         let root_element = self.Document().GetDocumentElement();
+-        self.perform_a_scroll(cx, x, y, scroll_id, behavior, root_element.as_deref());
++        self.perform_a_scroll(
++            cx,
++            x,
++            y,
++            scroll_id,
++            behavior,
++            root_element.as_deref(),
++            origin,
++        );
+     }
+ 
+     pub(crate) fn abort_smooth_scroll(&self, scroll_id: ExternalScrollId) {
+@@ -2611,14 +2634,15 @@ impl Window {
+         scroll_id: ExternalScrollId,
+         behavior: ScrollBehavior,
+         element: Option<&Element>,
++        origin: Option<LayoutVector2D>,
+     ) {
+         // Step 1: Abort any ongoing smooth scroll for box.
+         self.abort_smooth_scroll(scroll_id);
+ 
+-        // A programmatic scroll of a snap container ends at the snap position closest to
+-        // the requested one. <https://drafts.csswg.org/css-scroll-snap-1/#choosing>
++        // A programmatic scroll of a snap container ends at a snap position.
++        // <https://drafts.csswg.org/css-scroll-snap-1/#choosing>
+         let (x, y) = match element {
+-            Some(element) if element.mandatory_scroll_snap_axis().is_some() => {
++            Some(element) if element.scroll_snap_type().is_some() => {
+                 let scrolling_box = if scroll_id.is_root() {
+                     Some(
+                         self.Document()
+@@ -2629,7 +2653,7 @@ impl Window {
+                 };
+                 match scrolling_box {
+                     Some(scrolling_box) => {
+-                        let snapped = scrolling_box.snapped_position(Vector2D::new(x, y), None);
++                        let snapped = scrolling_box.snapped_position(Vector2D::new(x, y), origin);
+                         (snapped.x, snapped.y)
+                     },
+                     None => (x, y),
+@@ -3271,13 +3295,14 @@ impl Window {
+         x: f32,
+         y: f32,
+         behavior: ScrollBehavior,
++        origin: Option<LayoutVector2D>,
+     ) {
+         let scroll_id = self.scroll_id_for_element(element);
+ 
+         // Step 6.
+         // > Perform a scroll of box to position, element as the associated element and behavior as
+         // > the scroll behavior.
+-        self.perform_a_scroll(cx, x, y, scroll_id, behavior, Some(element));
++        self.perform_a_scroll(cx, x, y, scroll_id, behavior, Some(element), origin);
+     }
+ 
+     pub(crate) fn resolved_style_query(
+diff --git a/components/script/script_thread.rs b/components/script/script_thread.rs
+index 6c5e6acdd0b..6670f91fb55 100644
+--- a/components/script/script_thread.rs
++++ b/components/script/script_thread.rs
+@@ -1218,6 +1218,10 @@ impl ScriptThread {
+             // this rendering update's scroll steps.
+             document.window().advance_smooth_scrolls(cx);
+ 
++            // Snap containers re-snap to layout changes since the last rendering update here,
++            // so the scroll events that causes are part of this update's scroll steps.
++            document.resnap_snap_containers(cx);
++
+             // > 9. For each doc of docs, run the scroll steps for doc.
+             document.run_the_scroll_steps(cx);
+ 
+-- 
+2.43.0
+

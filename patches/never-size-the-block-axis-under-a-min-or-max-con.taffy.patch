@@ -1,0 +1,927 @@
+From b355d682e8dbb8009a6d37c402d27f67c396d8a7 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 16:34:56 -0400
+Subject: [PATCH] grid: never size the block axis under a min- or max-content
+ constraint
+
+An auto-height grid container is laid out with an indefinite block size,
+which taffy and its embedders (servo included) pass as
+AvailableSpace::MaxContent. The track sizing algorithm read that as "sized
+under a max-content constraint" and applied the constraint-only rules:
+limited min-content contributions in place of minimum contributions, and
+the max-content minimums step. Browsers never size the block axis under a
+content constraint, so a `grid-template-rows: 0fr` row holding an
+overflow:hidden (or min-height:0) item grew to the item's content height
+where Chrome keeps it at 0, which broke the 0fr/1fr accordion pattern.
+
+Restrict those rules to the inline axis, and treat a min-content block
+size as indefinite as well, since a grid container's min-content block
+size is just its laid-out block size (a 1fr row in a shrinking column
+flexbox kept 0 instead of its content height). The new fixtures also cover
+1fr rows and spanning auto rows in auto-height grids, which keep their
+content-based sizes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/compute/grid/mod.rs                       | 10 ++-
+ src/compute/grid/track_sizing.rs              | 14 +++-
+ ...s_spanning_item_auto_height_container.html | 20 ++++++
+ .../grid_fr_rows_auto_height_container.html   | 32 +++++++++
+ ...ows_auto_height_container_min_content.html | 25 +++++++
+ ..._auto_height_container__border_box_ltr.xml | 27 +++++++
+ ..._auto_height_container__border_box_rtl.xml | 27 +++++++
+ ...auto_height_container__content_box_ltr.xml | 27 +++++++
+ ...auto_height_container__content_box_rtl.xml | 27 +++++++
+ ..._auto_height_container__border_box_ltr.xml | 67 +++++++++++++++++
+ ..._auto_height_container__border_box_rtl.xml | 67 +++++++++++++++++
+ ...auto_height_container__content_box_ltr.xml | 67 +++++++++++++++++
+ ...auto_height_container__content_box_rtl.xml | 67 +++++++++++++++++
+ ..._container_min_content__border_box_ltr.xml | 41 +++++++++++
+ ..._container_min_content__border_box_rtl.xml | 41 +++++++++++
+ ...container_min_content__content_box_ltr.xml | 41 +++++++++++
+ ...container_min_content__content_box_rtl.xml | 41 +++++++++++
+ tests/xml/mod.rs                              | 72 +++++++++++++++++++
+ 18 files changed, 707 insertions(+), 6 deletions(-)
+ create mode 100644 test_fixtures/grid/grid_auto_rows_spanning_item_auto_height_container.html
+ create mode 100644 test_fixtures/grid/grid_fr_rows_auto_height_container.html
+ create mode 100644 test_fixtures/grid/grid_fr_rows_auto_height_container_min_content.html
+ create mode 100644 tests/xml/grid/grid_auto_rows_spanning_item_auto_height_container__border_box_ltr.xml
+ create mode 100644 tests/xml/grid/grid_auto_rows_spanning_item_auto_height_container__border_box_rtl.xml
+ create mode 100644 tests/xml/grid/grid_auto_rows_spanning_item_auto_height_container__content_box_ltr.xml
+ create mode 100644 tests/xml/grid/grid_auto_rows_spanning_item_auto_height_container__content_box_rtl.xml
+ create mode 100644 tests/xml/grid/grid_fr_rows_auto_height_container__border_box_ltr.xml
+ create mode 100644 tests/xml/grid/grid_fr_rows_auto_height_container__border_box_rtl.xml
+ create mode 100644 tests/xml/grid/grid_fr_rows_auto_height_container__content_box_ltr.xml
+ create mode 100644 tests/xml/grid/grid_fr_rows_auto_height_container__content_box_rtl.xml
+ create mode 100644 tests/xml/grid/grid_fr_rows_auto_height_container_min_content__border_box_ltr.xml
+ create mode 100644 tests/xml/grid/grid_fr_rows_auto_height_container_min_content__border_box_rtl.xml
+ create mode 100644 tests/xml/grid/grid_fr_rows_auto_height_container_min_content__content_box_ltr.xml
+ create mode 100644 tests/xml/grid/grid_fr_rows_auto_height_container_min_content__content_box_rtl.xml
+
+diff --git a/src/compute/grid/mod.rs b/src/compute/grid/mod.rs
+index 82d7aeb7..ada30559 100644
+--- a/src/compute/grid/mod.rs
++++ b/src/compute/grid/mod.rs
+@@ -118,9 +118,13 @@ pub fn compute_grid_layout<Tree: LayoutGridContainer>(
+         width: constrained_available_space
+             .width
+             .map_definite_value(|space| space - content_box_inset.horizontal_axis_sum()),
+-        height: constrained_available_space
+-            .height
+-            .map_definite_value(|space| space - content_box_inset.vertical_axis_sum()),
++        // Browsers never size a grid container's block axis under a min-content constraint: its min-content block size
++        // is the block size that results from laying it out with an indefinite block size, which is represented here
++        // as AvailableSpace::MaxContent (see resolve_intrinsic_track_sizes).
++        height: match constrained_available_space.height {
++            AvailableSpace::Definite(space) => AvailableSpace::Definite(space - content_box_inset.vertical_axis_sum()),
++            AvailableSpace::MinContent | AvailableSpace::MaxContent => AvailableSpace::MaxContent,
++        },
+     };
+ 
+     let outer_node_size =
+diff --git a/src/compute/grid/track_sizing.rs b/src/compute/grid/track_sizing.rs
+index 1cffc1c5..333a7808 100644
+--- a/src/compute/grid/track_sizing.rs
++++ b/src/compute/grid/track_sizing.rs
+@@ -557,6 +557,13 @@ fn resolve_intrinsic_track_sizes<Tree: LayoutPartialTree>(
+ 
+     let axis_inner_node_size = inner_node_size.get(axis);
+     let flex_factor_sum = axis_tracks.iter().map(|track| track.flex_factor()).sum::<f32>();
++
++    // Browsers never size the block axis of a grid container under a min- or max-content constraint: an indefinite
++    // block size is just the outcome of laying the grid out, and is passed to us as AvailableSpace::MaxContent. Applying
++    // the constraint rules there would grow tracks with an auto minimum (such as `0fr` rows) to their items' content
++    // size where Chrome keeps them at the items' minimum contributions.
++    let axis_may_be_content_constrained = axis == AbstractAxis::Inline;
++
+     let mut item_sizer =
+         IntrinsicSizeMeasurer { tree, other_axis_tracks, axis, inner_node_size, get_track_size_estimate };
+ 
+@@ -598,7 +605,8 @@ fn resolve_intrinsic_track_sizes<Tree: LayoutPartialTree>(
+                             // (note that overflow:hidden counts as a scroll container), giving the automatic minimum size of scroll
+                             // containers (zero) precedence over the min-content contributions.
+                             AvailableSpace::MinContent | AvailableSpace::MaxContent
+-                                if !item.overflow.get(axis).is_scroll_container() =>
++                                if axis_may_be_content_constrained
++                                    && !item.overflow.get(axis).is_scroll_container() =>
+                             {
+                                 let axis_minimum_size = item_sizer.minimum_contribution(item, axis_tracks);
+                                 let axis_min_content_size = item_sizer.min_content_contribution(item, axis_tracks);
+@@ -699,7 +707,7 @@ fn resolve_intrinsic_track_sizes<Tree: LayoutPartialTree>(
+             // a scroll container), giving the automatic minimum size of scroll containers (zero) precedence over the min-content contributions.
+             let space = match axis_available_grid_space {
+                 AvailableSpace::MinContent | AvailableSpace::MaxContent
+-                    if !item.overflow.get(axis).is_scroll_container() =>
++                    if axis_may_be_content_constrained && !item.overflow.get(axis).is_scroll_container() =>
+                 {
+                     let axis_minimum_size = item_sizer.minimum_contribution(item, axis_tracks);
+                     let axis_min_content_size = item_sizer.min_content_contribution(item, axis_tracks);
+@@ -790,7 +798,7 @@ fn resolve_intrinsic_track_sizes<Tree: LayoutPartialTree>(
+         // Define fit_content_limited_growth_limit function. This is passed to the distribute_space_up_to_limits
+         // helper function, and is used to compute the limit to distribute up to for each track.
+         // Wrapping the method on GridTrack is necessary in order to resolve percentage fit-content arguments.
+-        if axis_available_grid_space == AvailableSpace::MaxContent {
++        if axis_may_be_content_constrained && axis_available_grid_space == AvailableSpace::MaxContent {
+             /// Whether a track:
+             ///   - has an Auto MIN track sizing function
+             ///   - Does not have a MinContent MAX track sizing function
+diff --git a/test_fixtures/grid/grid_auto_rows_spanning_item_auto_height_container.html b/test_fixtures/grid/grid_auto_rows_spanning_item_auto_height_container.html
+new file mode 100644
+index 00000000..19a5e388
+--- /dev/null
++++ b/test_fixtures/grid/grid_auto_rows_spanning_item_auto_height_container.html
+@@ -0,0 +1,20 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <script src="../../scripts/gentest/test_helper.js"></script>
++  <link rel="stylesheet" type="text/css" href="../../scripts/gentest/test_base_style.css">
++  <title>
++    Test description
++  </title>
++</head>
++<body>
++
++<div id="test-root" style="display: grid; width: 200px; grid-template-rows: auto auto minmax(auto, 0fr); grid-template-columns: 100px 100px;">
++  <div style="height: 20px;"></div>
++  <div style="grid-row: span 2; height: 100px;"></div>
++  <div style="grid-row: 2; grid-column: 1; min-height: 0px;"><div style="height: 60px;"></div></div>
++  <div style="grid-row: 3; grid-column: span 2; min-height: 0px;"><div style="height: 60px;"></div></div>
++</div>
++
++</body>
++</html>
+diff --git a/test_fixtures/grid/grid_fr_rows_auto_height_container.html b/test_fixtures/grid/grid_fr_rows_auto_height_container.html
+new file mode 100644
+index 00000000..cdc9282a
+--- /dev/null
++++ b/test_fixtures/grid/grid_fr_rows_auto_height_container.html
+@@ -0,0 +1,32 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <script src="../../scripts/gentest/test_helper.js"></script>
++  <link rel="stylesheet" type="text/css" href="../../scripts/gentest/test_base_style.css">
++  <title>
++    Test description
++  </title>
++</head>
++<body>
++
++<div id="test-root" style="display: block; width: 200px;">
++  <div style="display: grid; grid-template-rows: 0fr;">
++    <div style="overflow: hidden;"><div style="height: 60px;"></div></div>
++  </div>
++  <div style="display: grid; grid-template-rows: 0fr;">
++    <div style="min-height: 0px;"><div style="height: 60px;"></div></div>
++  </div>
++  <div style="display: grid; grid-template-rows: 0fr;">
++    <div><div style="height: 60px;"></div></div>
++  </div>
++  <div style="display: grid; grid-template-rows: 1fr;">
++    <div style="overflow: hidden;"><div style="height: 60px;"></div></div>
++  </div>
++  <div style="display: grid; grid-template-rows: 0fr 1fr;">
++    <div style="overflow: hidden;"><div style="height: 60px;"></div></div>
++    <div style="overflow: hidden;"><div style="height: 60px;"></div></div>
++  </div>
++</div>
++
++</body>
++</html>
+diff --git a/test_fixtures/grid/grid_fr_rows_auto_height_container_min_content.html b/test_fixtures/grid/grid_fr_rows_auto_height_container_min_content.html
+new file mode 100644
+index 00000000..8619686e
+--- /dev/null
++++ b/test_fixtures/grid/grid_fr_rows_auto_height_container_min_content.html
+@@ -0,0 +1,25 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <script src="../../scripts/gentest/test_helper.js"></script>
++  <link rel="stylesheet" type="text/css" href="../../scripts/gentest/test_base_style.css">
++  <title>
++    Test description
++  </title>
++</head>
++<body>
++
++<div id="test-root" style="display: flex; flex-direction: column; width: 200px; height: 10px;">
++  <div style="display: grid; grid-template-rows: 0fr;">
++    <div style="min-height: 0px;"><div style="height: 60px;"></div></div>
++  </div>
++  <div style="display: grid; grid-template-rows: 1fr;">
++    <div style="min-height: 0px;"><div style="height: 60px;"></div></div>
++  </div>
++  <div style="display: grid; grid-template-rows: 0fr;">
++    <div><div style="height: 60px;"></div></div>
++  </div>
++</div>
++
++</body>
++</html>
+diff --git a/tests/xml/grid/grid_auto_rows_spanning_item_auto_height_container__border_box_ltr.xml b/tests/xml/grid/grid_auto_rows_spanning_item_auto_height_container__border_box_ltr.xml
+new file mode 100644
+index 00000000..82311c3d
+--- /dev/null
++++ b/tests/xml/grid/grid_auto_rows_spanning_item_auto_height_container__border_box_ltr.xml
+@@ -0,0 +1,27 @@
++<test name="grid_auto_rows_spanning_item_auto_height_container__border_box_ltr" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="grid" direction="ltr" width="200px" grid-template-rows="auto auto minmax(auto,0fr)" grid-template-columns="100px 100px">
++      <div direction="ltr" height="20px"/>
++      <div direction="ltr" height="100px" grid-row-start="span 2"/>
++      <div direction="ltr" min-height="0px" grid-row-start="2" grid-column-start="1">
++        <div direction="ltr" height="60px"/>
++      </div>
++      <div direction="ltr" min-height="0px" grid-row-start="3" grid-column-start="span 2">
++        <div direction="ltr" height="60px"/>
++      </div>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="200" height="100">
++      <node x="0" y="0" width="100" height="20"/>
++      <node x="100" y="0" width="100" height="100"/>
++      <node x="0" y="30" width="100" height="70">
++        <node x="0" y="0" width="0" height="60"/>
++      </node>
++      <node x="0" y="100" width="200" height="0">
++        <node x="0" y="0" width="0" height="60"/>
++      </node>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/grid/grid_auto_rows_spanning_item_auto_height_container__border_box_rtl.xml b/tests/xml/grid/grid_auto_rows_spanning_item_auto_height_container__border_box_rtl.xml
+new file mode 100644
+index 00000000..f50e9d90
+--- /dev/null
++++ b/tests/xml/grid/grid_auto_rows_spanning_item_auto_height_container__border_box_rtl.xml
+@@ -0,0 +1,27 @@
++<test name="grid_auto_rows_spanning_item_auto_height_container__border_box_rtl" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="grid" direction="rtl" width="200px" grid-template-rows="auto auto minmax(auto,0fr)" grid-template-columns="100px 100px">
++      <div direction="rtl" height="20px"/>
++      <div direction="rtl" height="100px" grid-row-start="span 2"/>
++      <div direction="rtl" min-height="0px" grid-row-start="2" grid-column-start="1">
++        <div direction="rtl" height="60px"/>
++      </div>
++      <div direction="rtl" min-height="0px" grid-row-start="3" grid-column-start="span 2">
++        <div direction="rtl" height="60px"/>
++      </div>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="200" height="100">
++      <node x="100" y="0" width="100" height="20"/>
++      <node x="0" y="0" width="100" height="100"/>
++      <node x="100" y="30" width="100" height="70">
++        <node x="100" y="0" width="0" height="60"/>
++      </node>
++      <node x="0" y="100" width="200" height="0">
++        <node x="200" y="0" width="0" height="60"/>
++      </node>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/grid/grid_auto_rows_spanning_item_auto_height_container__content_box_ltr.xml b/tests/xml/grid/grid_auto_rows_spanning_item_auto_height_container__content_box_ltr.xml
+new file mode 100644
+index 00000000..9e2ac809
+--- /dev/null
++++ b/tests/xml/grid/grid_auto_rows_spanning_item_auto_height_container__content_box_ltr.xml
+@@ -0,0 +1,27 @@
++<test name="grid_auto_rows_spanning_item_auto_height_container__content_box_ltr" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="grid" box-sizing="content-box" direction="ltr" width="200px" grid-template-rows="auto auto minmax(auto,0fr)" grid-template-columns="100px 100px">
++      <div box-sizing="content-box" direction="ltr" height="20px"/>
++      <div box-sizing="content-box" direction="ltr" height="100px" grid-row-start="span 2"/>
++      <div box-sizing="content-box" direction="ltr" min-height="0px" grid-row-start="2" grid-column-start="1">
++        <div box-sizing="content-box" direction="ltr" height="60px"/>
++      </div>
++      <div box-sizing="content-box" direction="ltr" min-height="0px" grid-row-start="3" grid-column-start="span 2">
++        <div box-sizing="content-box" direction="ltr" height="60px"/>
++      </div>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="200" height="100">
++      <node x="0" y="0" width="100" height="20"/>
++      <node x="100" y="0" width="100" height="100"/>
++      <node x="0" y="30" width="100" height="70">
++        <node x="0" y="0" width="0" height="60"/>
++      </node>
++      <node x="0" y="100" width="200" height="0">
++        <node x="0" y="0" width="0" height="60"/>
++      </node>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/grid/grid_auto_rows_spanning_item_auto_height_container__content_box_rtl.xml b/tests/xml/grid/grid_auto_rows_spanning_item_auto_height_container__content_box_rtl.xml
+new file mode 100644
+index 00000000..542a9952
+--- /dev/null
++++ b/tests/xml/grid/grid_auto_rows_spanning_item_auto_height_container__content_box_rtl.xml
+@@ -0,0 +1,27 @@
++<test name="grid_auto_rows_spanning_item_auto_height_container__content_box_rtl" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="grid" box-sizing="content-box" direction="rtl" width="200px" grid-template-rows="auto auto minmax(auto,0fr)" grid-template-columns="100px 100px">
++      <div box-sizing="content-box" direction="rtl" height="20px"/>
++      <div box-sizing="content-box" direction="rtl" height="100px" grid-row-start="span 2"/>
++      <div box-sizing="content-box" direction="rtl" min-height="0px" grid-row-start="2" grid-column-start="1">
++        <div box-sizing="content-box" direction="rtl" height="60px"/>
++      </div>
++      <div box-sizing="content-box" direction="rtl" min-height="0px" grid-row-start="3" grid-column-start="span 2">
++        <div box-sizing="content-box" direction="rtl" height="60px"/>
++      </div>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="200" height="100">
++      <node x="100" y="0" width="100" height="20"/>
++      <node x="0" y="0" width="100" height="100"/>
++      <node x="100" y="30" width="100" height="70">
++        <node x="100" y="0" width="0" height="60"/>
++      </node>
++      <node x="0" y="100" width="200" height="0">
++        <node x="200" y="0" width="0" height="60"/>
++      </node>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/grid/grid_fr_rows_auto_height_container__border_box_ltr.xml b/tests/xml/grid/grid_fr_rows_auto_height_container__border_box_ltr.xml
+new file mode 100644
+index 00000000..0f396aac
+--- /dev/null
++++ b/tests/xml/grid/grid_fr_rows_auto_height_container__border_box_ltr.xml
+@@ -0,0 +1,67 @@
++<test name="grid_fr_rows_auto_height_container__border_box_ltr" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="block" direction="ltr" width="200px">
++      <div display="grid" direction="ltr" grid-template-rows="0fr">
++        <div direction="ltr" overflow-x="hidden" overflow-y="hidden" scrollbar-width="15">
++          <div direction="ltr" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" direction="ltr" grid-template-rows="0fr">
++        <div direction="ltr" min-height="0px">
++          <div direction="ltr" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" direction="ltr" grid-template-rows="0fr">
++        <div direction="ltr">
++          <div direction="ltr" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" direction="ltr" grid-template-rows="1fr">
++        <div direction="ltr" overflow-x="hidden" overflow-y="hidden" scrollbar-width="15">
++          <div direction="ltr" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" direction="ltr" grid-template-rows="0fr 1fr">
++        <div direction="ltr" overflow-x="hidden" overflow-y="hidden" scrollbar-width="15">
++          <div direction="ltr" height="60px"/>
++        </div>
++        <div direction="ltr" overflow-x="hidden" overflow-y="hidden" scrollbar-width="15">
++          <div direction="ltr" height="60px"/>
++        </div>
++      </div>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="200" height="180">
++      <node x="0" y="0" width="200" height="0">
++        <node x="0" y="0" width="200" height="0" scroll_width="0" scroll_height="60">
++          <node x="0" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="0" width="200" height="0">
++        <node x="0" y="0" width="200" height="0">
++          <node x="0" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="0" width="200" height="60">
++        <node x="0" y="0" width="200" height="60">
++          <node x="0" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="60" width="200" height="60">
++        <node x="0" y="0" width="200" height="60" scroll_width="0" scroll_height="0">
++          <node x="0" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="120" width="200" height="60">
++        <node x="0" y="0" width="200" height="0" scroll_width="0" scroll_height="60">
++          <node x="0" y="0" width="0" height="60"/>
++        </node>
++        <node x="0" y="0" width="200" height="60" scroll_width="0" scroll_height="0">
++          <node x="0" y="0" width="0" height="60"/>
++        </node>
++      </node>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/grid/grid_fr_rows_auto_height_container__border_box_rtl.xml b/tests/xml/grid/grid_fr_rows_auto_height_container__border_box_rtl.xml
+new file mode 100644
+index 00000000..4c3cf526
+--- /dev/null
++++ b/tests/xml/grid/grid_fr_rows_auto_height_container__border_box_rtl.xml
+@@ -0,0 +1,67 @@
++<test name="grid_fr_rows_auto_height_container__border_box_rtl" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="block" direction="rtl" width="200px">
++      <div display="grid" direction="rtl" grid-template-rows="0fr">
++        <div direction="rtl" overflow-x="hidden" overflow-y="hidden" scrollbar-width="15">
++          <div direction="rtl" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" direction="rtl" grid-template-rows="0fr">
++        <div direction="rtl" min-height="0px">
++          <div direction="rtl" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" direction="rtl" grid-template-rows="0fr">
++        <div direction="rtl">
++          <div direction="rtl" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" direction="rtl" grid-template-rows="1fr">
++        <div direction="rtl" overflow-x="hidden" overflow-y="hidden" scrollbar-width="15">
++          <div direction="rtl" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" direction="rtl" grid-template-rows="0fr 1fr">
++        <div direction="rtl" overflow-x="hidden" overflow-y="hidden" scrollbar-width="15">
++          <div direction="rtl" height="60px"/>
++        </div>
++        <div direction="rtl" overflow-x="hidden" overflow-y="hidden" scrollbar-width="15">
++          <div direction="rtl" height="60px"/>
++        </div>
++      </div>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="200" height="180">
++      <node x="0" y="0" width="200" height="0">
++        <node x="0" y="0" width="200" height="0" scroll_width="0" scroll_height="60">
++          <node x="200" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="0" width="200" height="0">
++        <node x="0" y="0" width="200" height="0">
++          <node x="200" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="0" width="200" height="60">
++        <node x="0" y="0" width="200" height="60">
++          <node x="200" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="60" width="200" height="60">
++        <node x="0" y="0" width="200" height="60" scroll_width="0" scroll_height="0">
++          <node x="200" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="120" width="200" height="60">
++        <node x="0" y="0" width="200" height="0" scroll_width="0" scroll_height="60">
++          <node x="200" y="0" width="0" height="60"/>
++        </node>
++        <node x="0" y="0" width="200" height="60" scroll_width="0" scroll_height="0">
++          <node x="200" y="0" width="0" height="60"/>
++        </node>
++      </node>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/grid/grid_fr_rows_auto_height_container__content_box_ltr.xml b/tests/xml/grid/grid_fr_rows_auto_height_container__content_box_ltr.xml
+new file mode 100644
+index 00000000..5408524a
+--- /dev/null
++++ b/tests/xml/grid/grid_fr_rows_auto_height_container__content_box_ltr.xml
+@@ -0,0 +1,67 @@
++<test name="grid_fr_rows_auto_height_container__content_box_ltr" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="block" box-sizing="content-box" direction="ltr" width="200px">
++      <div display="grid" box-sizing="content-box" direction="ltr" grid-template-rows="0fr">
++        <div box-sizing="content-box" direction="ltr" overflow-x="hidden" overflow-y="hidden" scrollbar-width="15">
++          <div box-sizing="content-box" direction="ltr" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" box-sizing="content-box" direction="ltr" grid-template-rows="0fr">
++        <div box-sizing="content-box" direction="ltr" min-height="0px">
++          <div box-sizing="content-box" direction="ltr" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" box-sizing="content-box" direction="ltr" grid-template-rows="0fr">
++        <div box-sizing="content-box" direction="ltr">
++          <div box-sizing="content-box" direction="ltr" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" box-sizing="content-box" direction="ltr" grid-template-rows="1fr">
++        <div box-sizing="content-box" direction="ltr" overflow-x="hidden" overflow-y="hidden" scrollbar-width="15">
++          <div box-sizing="content-box" direction="ltr" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" box-sizing="content-box" direction="ltr" grid-template-rows="0fr 1fr">
++        <div box-sizing="content-box" direction="ltr" overflow-x="hidden" overflow-y="hidden" scrollbar-width="15">
++          <div box-sizing="content-box" direction="ltr" height="60px"/>
++        </div>
++        <div box-sizing="content-box" direction="ltr" overflow-x="hidden" overflow-y="hidden" scrollbar-width="15">
++          <div box-sizing="content-box" direction="ltr" height="60px"/>
++        </div>
++      </div>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="200" height="180">
++      <node x="0" y="0" width="200" height="0">
++        <node x="0" y="0" width="200" height="0" scroll_width="0" scroll_height="60">
++          <node x="0" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="0" width="200" height="0">
++        <node x="0" y="0" width="200" height="0">
++          <node x="0" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="0" width="200" height="60">
++        <node x="0" y="0" width="200" height="60">
++          <node x="0" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="60" width="200" height="60">
++        <node x="0" y="0" width="200" height="60" scroll_width="0" scroll_height="0">
++          <node x="0" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="120" width="200" height="60">
++        <node x="0" y="0" width="200" height="0" scroll_width="0" scroll_height="60">
++          <node x="0" y="0" width="0" height="60"/>
++        </node>
++        <node x="0" y="0" width="200" height="60" scroll_width="0" scroll_height="0">
++          <node x="0" y="0" width="0" height="60"/>
++        </node>
++      </node>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/grid/grid_fr_rows_auto_height_container__content_box_rtl.xml b/tests/xml/grid/grid_fr_rows_auto_height_container__content_box_rtl.xml
+new file mode 100644
+index 00000000..76114e6e
+--- /dev/null
++++ b/tests/xml/grid/grid_fr_rows_auto_height_container__content_box_rtl.xml
+@@ -0,0 +1,67 @@
++<test name="grid_fr_rows_auto_height_container__content_box_rtl" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="block" box-sizing="content-box" direction="rtl" width="200px">
++      <div display="grid" box-sizing="content-box" direction="rtl" grid-template-rows="0fr">
++        <div box-sizing="content-box" direction="rtl" overflow-x="hidden" overflow-y="hidden" scrollbar-width="15">
++          <div box-sizing="content-box" direction="rtl" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" box-sizing="content-box" direction="rtl" grid-template-rows="0fr">
++        <div box-sizing="content-box" direction="rtl" min-height="0px">
++          <div box-sizing="content-box" direction="rtl" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" box-sizing="content-box" direction="rtl" grid-template-rows="0fr">
++        <div box-sizing="content-box" direction="rtl">
++          <div box-sizing="content-box" direction="rtl" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" box-sizing="content-box" direction="rtl" grid-template-rows="1fr">
++        <div box-sizing="content-box" direction="rtl" overflow-x="hidden" overflow-y="hidden" scrollbar-width="15">
++          <div box-sizing="content-box" direction="rtl" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" box-sizing="content-box" direction="rtl" grid-template-rows="0fr 1fr">
++        <div box-sizing="content-box" direction="rtl" overflow-x="hidden" overflow-y="hidden" scrollbar-width="15">
++          <div box-sizing="content-box" direction="rtl" height="60px"/>
++        </div>
++        <div box-sizing="content-box" direction="rtl" overflow-x="hidden" overflow-y="hidden" scrollbar-width="15">
++          <div box-sizing="content-box" direction="rtl" height="60px"/>
++        </div>
++      </div>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="200" height="180">
++      <node x="0" y="0" width="200" height="0">
++        <node x="0" y="0" width="200" height="0" scroll_width="0" scroll_height="60">
++          <node x="200" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="0" width="200" height="0">
++        <node x="0" y="0" width="200" height="0">
++          <node x="200" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="0" width="200" height="60">
++        <node x="0" y="0" width="200" height="60">
++          <node x="200" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="60" width="200" height="60">
++        <node x="0" y="0" width="200" height="60" scroll_width="0" scroll_height="0">
++          <node x="200" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="120" width="200" height="60">
++        <node x="0" y="0" width="200" height="0" scroll_width="0" scroll_height="60">
++          <node x="200" y="0" width="0" height="60"/>
++        </node>
++        <node x="0" y="0" width="200" height="60" scroll_width="0" scroll_height="0">
++          <node x="200" y="0" width="0" height="60"/>
++        </node>
++      </node>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/grid/grid_fr_rows_auto_height_container_min_content__border_box_ltr.xml b/tests/xml/grid/grid_fr_rows_auto_height_container_min_content__border_box_ltr.xml
+new file mode 100644
+index 00000000..69661dad
+--- /dev/null
++++ b/tests/xml/grid/grid_fr_rows_auto_height_container_min_content__border_box_ltr.xml
+@@ -0,0 +1,41 @@
++<test name="grid_fr_rows_auto_height_container_min_content__border_box_ltr" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="flex" direction="ltr" flex-direction="column" width="200px" height="10px">
++      <div display="grid" direction="ltr" grid-template-rows="0fr">
++        <div direction="ltr" min-height="0px">
++          <div direction="ltr" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" direction="ltr" grid-template-rows="1fr">
++        <div direction="ltr" min-height="0px">
++          <div direction="ltr" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" direction="ltr" grid-template-rows="0fr">
++        <div direction="ltr">
++          <div direction="ltr" height="60px"/>
++        </div>
++      </div>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="200" height="10">
++      <node x="0" y="0" width="200" height="0">
++        <node x="0" y="0" width="200" height="0">
++          <node x="0" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="0" width="200" height="60">
++        <node x="0" y="0" width="200" height="60">
++          <node x="0" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="60" width="200" height="60">
++        <node x="0" y="0" width="200" height="60">
++          <node x="0" y="0" width="0" height="60"/>
++        </node>
++      </node>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/grid/grid_fr_rows_auto_height_container_min_content__border_box_rtl.xml b/tests/xml/grid/grid_fr_rows_auto_height_container_min_content__border_box_rtl.xml
+new file mode 100644
+index 00000000..80cd928a
+--- /dev/null
++++ b/tests/xml/grid/grid_fr_rows_auto_height_container_min_content__border_box_rtl.xml
+@@ -0,0 +1,41 @@
++<test name="grid_fr_rows_auto_height_container_min_content__border_box_rtl" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="flex" direction="rtl" flex-direction="column" width="200px" height="10px">
++      <div display="grid" direction="rtl" grid-template-rows="0fr">
++        <div direction="rtl" min-height="0px">
++          <div direction="rtl" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" direction="rtl" grid-template-rows="1fr">
++        <div direction="rtl" min-height="0px">
++          <div direction="rtl" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" direction="rtl" grid-template-rows="0fr">
++        <div direction="rtl">
++          <div direction="rtl" height="60px"/>
++        </div>
++      </div>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="200" height="10">
++      <node x="0" y="0" width="200" height="0">
++        <node x="0" y="0" width="200" height="0">
++          <node x="200" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="0" width="200" height="60">
++        <node x="0" y="0" width="200" height="60">
++          <node x="200" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="60" width="200" height="60">
++        <node x="0" y="0" width="200" height="60">
++          <node x="200" y="0" width="0" height="60"/>
++        </node>
++      </node>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/grid/grid_fr_rows_auto_height_container_min_content__content_box_ltr.xml b/tests/xml/grid/grid_fr_rows_auto_height_container_min_content__content_box_ltr.xml
+new file mode 100644
+index 00000000..ac859bbe
+--- /dev/null
++++ b/tests/xml/grid/grid_fr_rows_auto_height_container_min_content__content_box_ltr.xml
+@@ -0,0 +1,41 @@
++<test name="grid_fr_rows_auto_height_container_min_content__content_box_ltr" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="flex" box-sizing="content-box" direction="ltr" flex-direction="column" width="200px" height="10px">
++      <div display="grid" box-sizing="content-box" direction="ltr" grid-template-rows="0fr">
++        <div box-sizing="content-box" direction="ltr" min-height="0px">
++          <div box-sizing="content-box" direction="ltr" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" box-sizing="content-box" direction="ltr" grid-template-rows="1fr">
++        <div box-sizing="content-box" direction="ltr" min-height="0px">
++          <div box-sizing="content-box" direction="ltr" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" box-sizing="content-box" direction="ltr" grid-template-rows="0fr">
++        <div box-sizing="content-box" direction="ltr">
++          <div box-sizing="content-box" direction="ltr" height="60px"/>
++        </div>
++      </div>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="200" height="10">
++      <node x="0" y="0" width="200" height="0">
++        <node x="0" y="0" width="200" height="0">
++          <node x="0" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="0" width="200" height="60">
++        <node x="0" y="0" width="200" height="60">
++          <node x="0" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="60" width="200" height="60">
++        <node x="0" y="0" width="200" height="60">
++          <node x="0" y="0" width="0" height="60"/>
++        </node>
++      </node>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/grid/grid_fr_rows_auto_height_container_min_content__content_box_rtl.xml b/tests/xml/grid/grid_fr_rows_auto_height_container_min_content__content_box_rtl.xml
+new file mode 100644
+index 00000000..d9e91160
+--- /dev/null
++++ b/tests/xml/grid/grid_fr_rows_auto_height_container_min_content__content_box_rtl.xml
+@@ -0,0 +1,41 @@
++<test name="grid_fr_rows_auto_height_container_min_content__content_box_rtl" use-rounding="true">
++  <viewport width="max-content" height="max-content"/>
++  <input>
++    <div display="flex" box-sizing="content-box" direction="rtl" flex-direction="column" width="200px" height="10px">
++      <div display="grid" box-sizing="content-box" direction="rtl" grid-template-rows="0fr">
++        <div box-sizing="content-box" direction="rtl" min-height="0px">
++          <div box-sizing="content-box" direction="rtl" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" box-sizing="content-box" direction="rtl" grid-template-rows="1fr">
++        <div box-sizing="content-box" direction="rtl" min-height="0px">
++          <div box-sizing="content-box" direction="rtl" height="60px"/>
++        </div>
++      </div>
++      <div display="grid" box-sizing="content-box" direction="rtl" grid-template-rows="0fr">
++        <div box-sizing="content-box" direction="rtl">
++          <div box-sizing="content-box" direction="rtl" height="60px"/>
++        </div>
++      </div>
++    </div>
++  </input>
++  <expectations>
++    <node x="0" y="0" width="200" height="10">
++      <node x="0" y="0" width="200" height="0">
++        <node x="0" y="0" width="200" height="0">
++          <node x="200" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="0" width="200" height="60">
++        <node x="0" y="0" width="200" height="60">
++          <node x="200" y="0" width="0" height="60"/>
++        </node>
++      </node>
++      <node x="0" y="60" width="200" height="60">
++        <node x="0" y="0" width="200" height="60">
++          <node x="200" y="0" width="0" height="60"/>
++        </node>
++      </node>
++    </node>
++  </expectations>
++</test>
+diff --git a/tests/xml/mod.rs b/tests/xml/mod.rs
+index 48cfd09c..a098457d 100644
+--- a/tests/xml/mod.rs
++++ b/tests/xml/mod.rs
+@@ -18177,6 +18177,30 @@ mod grid {
+         crate::run_xml_test("grid", "grid_auto_rows__content_box_rtl");
+     }
+ 
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_auto_rows_spanning_item_auto_height_container__border_box_ltr() {
++        crate::run_xml_test("grid", "grid_auto_rows_spanning_item_auto_height_container__border_box_ltr");
++    }
++
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_auto_rows_spanning_item_auto_height_container__content_box_ltr() {
++        crate::run_xml_test("grid", "grid_auto_rows_spanning_item_auto_height_container__content_box_ltr");
++    }
++
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_auto_rows_spanning_item_auto_height_container__border_box_rtl() {
++        crate::run_xml_test("grid", "grid_auto_rows_spanning_item_auto_height_container__border_box_rtl");
++    }
++
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_auto_rows_spanning_item_auto_height_container__content_box_rtl() {
++        crate::run_xml_test("grid", "grid_auto_rows_spanning_item_auto_height_container__content_box_rtl");
++    }
++
+     #[cfg(feature = "grid")]
+     #[test]
+     fn grid_auto_single_item__border_box_ltr() {
+@@ -18945,6 +18969,54 @@ mod grid {
+         crate::run_xml_test("grid", "grid_fr_no_sized_items_indefinite__content_box_rtl");
+     }
+ 
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_fr_rows_auto_height_container__border_box_ltr() {
++        crate::run_xml_test("grid", "grid_fr_rows_auto_height_container__border_box_ltr");
++    }
++
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_fr_rows_auto_height_container__content_box_ltr() {
++        crate::run_xml_test("grid", "grid_fr_rows_auto_height_container__content_box_ltr");
++    }
++
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_fr_rows_auto_height_container__border_box_rtl() {
++        crate::run_xml_test("grid", "grid_fr_rows_auto_height_container__border_box_rtl");
++    }
++
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_fr_rows_auto_height_container__content_box_rtl() {
++        crate::run_xml_test("grid", "grid_fr_rows_auto_height_container__content_box_rtl");
++    }
++
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_fr_rows_auto_height_container_min_content__border_box_ltr() {
++        crate::run_xml_test("grid", "grid_fr_rows_auto_height_container_min_content__border_box_ltr");
++    }
++
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_fr_rows_auto_height_container_min_content__content_box_ltr() {
++        crate::run_xml_test("grid", "grid_fr_rows_auto_height_container_min_content__content_box_ltr");
++    }
++
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_fr_rows_auto_height_container_min_content__border_box_rtl() {
++        crate::run_xml_test("grid", "grid_fr_rows_auto_height_container_min_content__border_box_rtl");
++    }
++
++    #[cfg(feature = "grid")]
++    #[test]
++    fn grid_fr_rows_auto_height_container_min_content__content_box_rtl() {
++        crate::run_xml_test("grid", "grid_fr_rows_auto_height_container_min_content__content_box_rtl");
++    }
++
+     #[cfg(feature = "grid")]
+     #[test]
+     fn grid_fr_single_item_indefinite__border_box_ltr() {
+-- 
+2.43.0
+

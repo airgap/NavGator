@@ -1,0 +1,87 @@
+From 7eebbb415e8899f86921678577e68b79475c446f Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 05:58:14 -0400
+Subject: [PATCH] paint: drop image updates that a later message replaces
+
+A video sends every decoded frame as a full update of its image, and
+handling one copies it out of shared memory. When frames arrive faster
+than the main thread handles them, a batch of messages can hold several
+frames of the same image, and all but the newest were copied for
+nothing. Updates tied to an epoch (canvas) are kept, since frames wait
+on them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/paint/paint.rs | 39 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/components/paint/paint.rs b/components/paint/paint.rs
+index c71bc579680..478b9e85e0e 100644
+--- a/components/paint/paint.rs
++++ b/components/paint/paint.rs
+@@ -23,13 +23,14 @@ use ipc_channel::ipc::{self};
+ use log::{debug, warn};
+ use paint_api::rendering_context::RenderingContext;
+ use paint_api::{
+-    PaintMessage, PaintProxy, PainterSurfmanDetails, PainterSurfmanDetailsMap,
++    ImageUpdate, PaintMessage, PaintProxy, PainterSurfmanDetails, PainterSurfmanDetailsMap,
+     WebRenderExternalImageIdManager, WebViewTrait,
+ };
+ use profile_traits::mem::{
+     ProcessReports, ProfilerRegistration, Report, ReportKind, perform_memory_report,
+ };
+ use profile_traits::path;
++use rustc_hash::FxHashSet;
+ use profile_traits::time::{self as profile_time};
+ use servo_base::generic_channel::{GenericSender, RoutedReceiver};
+ use servo_base::id::{PainterId, PipelineId, WebViewId};
+@@ -741,6 +742,7 @@ impl Paint {
+             },
+             _ => true,
+         });
++        drop_superseded_image_updates(&mut messages);
+ 
+         for message in messages {
+             self.handle_browser_message(message);
+@@ -947,3 +949,38 @@ impl Paint {
+         let _ = result_sender.send((font_keys, font_instance_keys));
+     }
+ }
++
++/// Removes the full image updates that a later message in `messages` replaces. A playing video
++/// sends every decoded frame as such an update, and each one is copied out of shared memory when
++/// handled. Once frames arrived faster than they were handled (large videos, several at a time),
++/// the copies of frames nobody would see kept the main thread from catching up.
++fn drop_superseded_image_updates(messages: &mut Vec<PaintMessage>) {
++    let mut replaced = FxHashSet::default();
++    for message in messages.iter_mut().rev() {
++        let PaintMessage::UpdateImages(_, updates) = message else {
++            continue;
++        };
++        let keep: Vec<bool> = updates
++            .iter()
++            .rev()
++            .map(|update| match update {
++                // Updates tied to an epoch are waited on by the frame they belong to.
++                ImageUpdate::UpdateImage(key, _, _, None) => replaced.insert(*key),
++                ImageUpdate::UpdateImage(key, ..) | ImageUpdate::DeleteImage(key) => {
++                    replaced.insert(*key);
++                    true
++                },
++                ImageUpdate::AddImage(key, ..) => {
++                    replaced.remove(key);
++                    true
++                },
++                ImageUpdate::UpdateImageForAnimation(..) => true,
++            })
++            .collect();
++        let mut keep = keep.into_iter().rev();
++        updates.retain(|_| keep.next().expect("one flag per update"));
++    }
++    messages.retain(
++        |message| !matches!(message, PaintMessage::UpdateImages(_, updates) if updates.is_empty()),
++    );
++}
+-- 
+2.43.0
+

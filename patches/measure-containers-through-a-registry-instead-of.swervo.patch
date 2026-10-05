@@ -1,0 +1,278 @@
+From 8b9b289f2f7a7845461b8abb322822fca0fd6539 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 01:51:16 -0400
+Subject: [PATCH] layout: measure containers through a registry instead of a
+ fragment walk
+
+Once a document used a container query, every layout ended with a walk
+of the whole fragment tree (computing containing blocks on the way) to
+find the container-type boxes. On a 20000-node page whose forced
+reflows only touch a contain:strict layout root, that walk added 7-11 ms
+to each reflow.
+
+The style traversal now records every element it styles with a
+container-type, with a weak reference to the layout-data slot that holds
+its box. Layout keeps these per document and measures only them, reading
+the size the way container queries do (the first box fragment of the
+box, including absolutely positioned layout roots). Entries whose
+element was dropped, whose box is gone, or whose box is no longer a
+container are pruned; restyling such an element registers it again.
+Marking the descendants of resized containers still walks the DOM but
+stops once every resized container was found.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/context.rs     |  8 ++++
+ components/layout/dom.rs         | 14 ++++---
+ components/layout/layout_impl.rs | 71 ++++++++++++++++++++++++--------
+ components/layout/traversal.rs   | 15 +++++++
+ 4 files changed, 86 insertions(+), 22 deletions(-)
+
+diff --git a/components/layout/context.rs b/components/layout/context.rs
+index 29b36690507..0746c0df995 100644
+--- a/components/layout/context.rs
++++ b/components/layout/context.rs
+@@ -28,6 +28,9 @@ use style::values::computed::image::{Gradient, Image};
+ use style_traits::DevicePixel;
+ use webrender_api::units::{DeviceIntSize, DeviceSize};
+ 
++use crate::cell::WeakRefCell;
++use crate::dom::LayoutBox;
++
+ pub(crate) type CachedImageOrError = Result<CachedImage, ResolveImageError>;
+ 
+ pub(crate) struct LayoutContext<'a> {
+@@ -60,6 +63,11 @@ pub(crate) struct LayoutContext<'a> {
+ 
+     /// The device dimensions on which this layout is running, in device pixels.
+     pub device_size: Size2D<f32, DevicePixel>,
++
++    /// Elements that styling gave a `container-type` during this layout, with the slots that
++    /// hold their boxes. Layout keeps these to measure containers without walking the
++    /// fragment tree, see `LayoutThread::container_slots`.
++    pub styled_containers: Mutex<Vec<(OpaqueNode, WeakRefCell<Option<LayoutBox>>)>>,
+ }
+ 
+ impl LayoutContext<'_> {
+diff --git a/components/layout/dom.rs b/components/layout/dom.rs
+index 8e96e5bb923..4767e335be4 100644
+--- a/components/layout/dom.rs
++++ b/components/layout/dom.rs
+@@ -272,6 +272,13 @@ impl WeakLayoutBox {
+ #[derive(Default, MallocSizeOf)]
+ pub struct DOMLayoutData(AtomicRefCell<InnerDOMLayoutData>);
+ 
++impl DOMLayoutData {
++    /// The slot holding the box of the node itself (not of its pseudo-elements).
++    pub(crate) fn self_box(&self) -> ArcRefCell<Option<LayoutBox>> {
++        self.0.borrow().self_box.clone()
++    }
++}
++
+ // The implementation of this trait allows the data to be stored in the DOM.
+ impl LayoutDataTrait for DOMLayoutData {}
+ impl GenericLayoutDataTrait for DOMLayoutData {
+@@ -284,11 +291,8 @@ impl GenericLayoutDataTrait for DOMLayoutData {
+             .borrow()
+             .fragments()
+             .iter()
+-            .find_map(|fragment| match fragment {
+-                Fragment::Box(box_fragment) | Fragment::Float(box_fragment) => {
+-                    Some(box_fragment.content_rect().size.to_untyped())
+-                },
+-                _ => None,
++            .find_map(|fragment| {
++                Some(fragment.retrieve_box_fragment()?.content_rect().size.to_untyped())
+             })
+     }
+ }
+diff --git a/components/layout/layout_impl.rs b/components/layout/layout_impl.rs
+index cecbe4312c3..2c87f738818 100644
+--- a/components/layout/layout_impl.rs
++++ b/components/layout/layout_impl.rs
+@@ -89,7 +89,8 @@ use webrender_api::units::{DevicePixel, LayoutVector2D};
+ use crate::accessibility_tree::AccessibilityTree;
+ use crate::context::{CachedImageOrError, ImageResolver, LayoutContext};
+ use crate::display_list::{DisplayListBuilder, HitTest, PaintTimingHandler, StackingContextTree};
+-use crate::dom::NodeExt;
++use crate::cell::WeakRefCell;
++use crate::dom::{LayoutBox, NodeExt};
+ use crate::query::{
+     find_character_offset_in_fragment_descendants, get_the_text_steps, process_box_area_request,
+     process_box_areas_request, process_client_rect_request,
+@@ -187,6 +188,12 @@ pub struct LayoutThread {
+     /// queries were evaluated against these, see [`Self::relayout_if_container_sizes_changed`].
+     container_sizes: RefCell<FxHashMap<OpaqueNode, euclid::default::Size2D<Au>>>,
+ 
++    /// The elements styled with a `container-type`, with weak references to the slots that hold
++    /// their boxes. Measuring these is much cheaper than walking the fragment tree after every
++    /// layout. Entries whose element was dropped, or whose box is gone or no longer a
++    /// container, are pruned when measuring; restyling such an element registers it again.
++    container_slots: RefCell<FxHashMap<OpaqueNode, WeakRefCell<Option<LayoutBox>>>>,
++
+     /// Whether this document's styles have evaluated container queries or units against a
+     /// container. Until then layout doesn't look for containers.
+     uses_container_queries: Cell<bool>,
+@@ -872,6 +879,7 @@ impl LayoutThread {
+             need_containing_block_calculation: Cell::new(false),
+             need_new_display_list: Cell::new(false),
+             container_sizes: Default::default(),
++            container_slots: Default::default(),
+             uses_container_queries: Cell::new(false),
+             need_new_stacking_context_tree: Cell::new(false),
+             box_tree: Default::default(),
+@@ -1226,7 +1234,9 @@ impl LayoutThread {
+                 .collect()
+         };
+         *self.container_sizes.borrow_mut() = sizes;
+-        if changed.is_empty() || !mark_container_descendants_for_restyle(root_element, &changed) {
++        if changed.is_empty() ||
++            !mark_container_descendants_for_restyle(root_element, &changed, &mut changed.len())
++        {
+             return;
+         }
+ 
+@@ -1240,6 +1250,7 @@ impl LayoutThread {
+             return;
+         }
+         let dirty_root = driver::traverse_dom(&traversal, token, rayon_pool).as_node();
++        self.register_styled_containers(layout_context);
+ 
+         let mut box_tree = self.box_tree.borrow_mut();
+         let mut layout_roots = Vec::new();
+@@ -1284,21 +1295,39 @@ impl LayoutThread {
+         *self.container_sizes.borrow_mut() = self.container_box_sizes();
+     }
+ 
+-    /// The content box sizes of the `container-type` boxes in the current fragment tree.
++    fn register_styled_containers(&self, layout_context: &LayoutContext) {
++        self.container_slots
++            .borrow_mut()
++            .extend(layout_context.styled_containers.lock().drain(..));
++    }
++
++    /// The content box sizes of the `container-type` boxes in the last layout, measured like
++    /// container queries measure them (`DOMLayoutData::content_box_size`).
+     fn container_box_sizes(&self) -> FxHashMap<OpaqueNode, euclid::default::Size2D<Au>> {
+         let mut sizes = FxHashMap::default();
+-        if let Some(fragment_tree) = &*self.fragment_tree.borrow() {
+-            fragment_tree.find(|fragment, _, _| {
+-                if let Fragment::Box(box_fragment) | Fragment::Float(box_fragment) = fragment &&
+-                    let Some(tag) = box_fragment.base.tag &&
+-                    tag.pseudo_element_chain.primary.is_none() &&
+-                    box_fragment.style().clone_container_type() != ContainerType::NORMAL
+-                {
+-                    sizes.insert(tag.node, box_fragment.content_rect().size.to_untyped());
+-                }
+-                None::<()>
+-            });
+-        }
++        self.container_slots.borrow_mut().retain(|node, slot| {
++            let Some(slot) = slot.upgrade() else {
++                return false;
++            };
++            let slot = slot.borrow();
++            let Some(layout_box) = &*slot else {
++                return false;
++            };
++            layout_box
++                .with_base(|base| {
++                    if base.style.clone_container_type() == ContainerType::NORMAL {
++                        return false;
++                    }
++                    let size = base.fragments().iter().find_map(|fragment| {
++                        Some(fragment.retrieve_box_fragment()?.content_rect().size.to_untyped())
++                    });
++                    if let Some(size) = size {
++                        sizes.insert(*node, size);
++                    }
++                    true
++                })
++                .unwrap_or(false)
++        });
+         sizes
+     }
+ 
+@@ -1369,6 +1398,7 @@ impl LayoutThread {
+             parallelism_job_count_minimum: pref!(layout_parallelism_job_count_minimum) as usize,
+             parallelism_job_size_minimum: pref!(layout_parallelism_job_size_minimum) as usize,
+             device_size: reflow_request.viewport_details.device_size.cast_unit(),
++            styled_containers: Default::default(),
+         };
+ 
+         let restyle = reflow_request
+@@ -1402,6 +1432,7 @@ impl LayoutThread {
+             }
+ 
+             dirty_root = driver::traverse_dom(&recalc_style_traversal, token, rayon_pool).as_node();
++            self.register_styled_containers(&layout_context);
+         }
+ 
+         let root_node = root_element.as_node();
+@@ -2099,11 +2130,13 @@ impl ReflowPhases {
+ 
+ /// Marks the descendants of the elements in `containers` for restyle, and their ancestors as
+ /// having dirty descendants so the style traversal reaches them. Returns whether any container
+-/// was found under `element`.
++/// was found under `element`. `unmarked` counts the containers not found yet; the walk stops
++/// once it reaches zero.
+ #[expect(unsafe_code)]
+ fn mark_container_descendants_for_restyle(
+     element: ServoDangerousStyleElement<'_>,
+     containers: &FxHashSet<OpaqueNode>,
++    unmarked: &mut usize,
+ ) -> bool {
+     let mut marked = false;
+     if containers.contains(&element.as_node().opaque()) &&
+@@ -2111,10 +2144,14 @@ fn mark_container_descendants_for_restyle(
+     {
+         data.hint.insert(RestyleHint::RESTYLE_DESCENDANTS);
+         marked = true;
++        *unmarked -= 1;
+     }
+     for child in element.traversal_children() {
++        if *unmarked == 0 {
++            break;
++        }
+         if let Some(child) = child.as_element() &&
+-            mark_container_descendants_for_restyle(child, containers)
++            mark_container_descendants_for_restyle(child, containers, unmarked)
+         {
+             unsafe { element.set_dirty_descendants() };
+             marked = true;
+diff --git a/components/layout/traversal.rs b/components/layout/traversal.rs
+index 1b34c0cfef6..a09f22aaa5c 100644
+--- a/components/layout/traversal.rs
++++ b/components/layout/traversal.rs
+@@ -14,6 +14,7 @@ use style::data::ElementData;
+ use style::dom::{NodeInfo, TElement, TNode};
+ use style::selector_parser::RestyleDamage;
+ use style::traversal::{DomTraversal, PerLevelTraversalData, recalc_style_at};
++use style::values::computed::ContainerType;
+ 
+ use crate::BoxTree;
+ use crate::context::LayoutContext;
+@@ -70,6 +71,20 @@ where
+             &mut element_data,
+             note_child,
+         );
++
++        if element_data.styles.primary().clone_container_type() != ContainerType::NORMAL {
++            let layout_data = node
++                .layout_node()
++                .layout_data()
++                .expect("Layout data was initialized above")
++                .as_any()
++                .downcast_ref::<DOMLayoutData>()
++                .unwrap();
++            self.context
++                .styled_containers
++                .lock()
++                .push((node.opaque(), layout_data.self_box().downgrade()));
++        }
+     }
+ 
+     #[inline]
+-- 
+2.43.0
+

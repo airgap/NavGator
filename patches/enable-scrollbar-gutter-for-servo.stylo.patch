@@ -1,0 +1,28 @@
+From 7b5a52ff2d1c586cc224b3998f4ac236e1b46ef9 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 04:04:47 -0400
+Subject: [PATCH] style: enable scrollbar-gutter for Servo
+
+Servo layout now reserves the scrollbar gutter, so parse and compute
+the property instead of dropping it as Gecko-only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ style/properties/longhands.toml | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/style/properties/longhands.toml b/style/properties/longhands.toml
+index 76096f674..b8e4e6745 100644
+--- a/style/properties/longhands.toml
++++ b/style/properties/longhands.toml
+@@ -1898,7 +1898,6 @@ affects = "paint"
+ type = "ScrollbarGutter"
+ initial = "computed::ScrollbarGutter::AUTO"
+ struct = "box"
+-engine = "gecko"
+ animation_type = "discrete"
+ spec = "https://drafts.csswg.org/css-overflow-3/#scrollbar-gutter-property"
+ affects = "layout"
+-- 
+2.43.0
+

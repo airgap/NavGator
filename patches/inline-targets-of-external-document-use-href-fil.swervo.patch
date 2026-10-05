@@ -1,0 +1,450 @@
+From 7ea5d20cb7b6c1692dd910cf98e9a755a2b008d0 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicks@fuckin.email>
+Date: Sun, 4 Oct 2026 01:21:05 -0400
+Subject: [PATCH] svg: inline targets of external-document <use
+ href="file.svg#id">
+
+GitLab (and many design systems) draw every icon as <svg><use href="/assets/icons.svg#name">.
+The inline svg is rasterized from a standalone serialization that cannot fetch anything, so
+these icons were empty.
+
+The first serialization that meets such a reference starts a same-origin fetch of the
+document (once per URL per document, like Chrome, which refuses cross-origin <use>), parses
+it as image/svg+xml the way DOMParser does, and invalidates the waiting svgs when it
+arrives. Later serializations clone the referenced element into the svg's <defs> under an id
+unique to the serialization, since the page may define the same id itself, and rewrite the
+use element's serialized href to point at the copy.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/script/dom/document/document.rs |  60 ++++++++
+ components/script/dom/svg/svgsvgelement.rs |  74 +++++++++-
+ components/script/dom/svg/svguseelement.rs | 162 ++++++++++++++++++++-
+ 3 files changed, 290 insertions(+), 6 deletions(-)
+
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index a925106e421..d41fb1d23ce 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -196,6 +196,7 @@ use crate::dom::servoparser::ServoParser;
+ use crate::dom::shadowroot::ShadowRoot;
+ use crate::dom::storageevent::StorageEvent;
+ use crate::dom::svg::svgsvgelement::SVGSVGElement;
++use crate::dom::svg::svguseelement::{ExternalSvgDocument, fetch_external_svg_document};
+ use crate::dom::text::Text;
+ use crate::dom::touchevent::TouchEvent as DomTouchEvent;
+ use crate::dom::touchlist::TouchList;
+@@ -522,6 +523,10 @@ pub(crate) struct Document {
+     /// removes register IDs and mutate svg subtrees, which must not invalidate other svgs
+     /// (each re-serialization would then invalidate the others, forever).
+     svg_serialization_in_progress: Cell<bool>,
++    /// External documents referenced by `<use href="file.svg#id">`, keyed by URL without
++    /// fragment, fetched once per document.
++    /// <https://svgwg.org/svg2-draft/struct.html#UseElementHrefAttribute>
++    external_svg_documents: DomRefCell<HashMapTracedValues<ServoUrl, ExternalSvgDocument>>,
+     #[no_trace]
+     interactive_time: DomRefCell<ProgressiveWebMetrics>,
+     #[no_trace]
+@@ -1244,6 +1249,60 @@ impl Document {
+         self.svg_serialization_in_progress.set(in_progress);
+     }
+ 
++    /// The parsed external document at `url` (no fragment) for `<use>`, or `None` while it
++    /// is loading or after it failed. The first request starts the fetch; `requester` is
++    /// invalidated when a pending fetch completes so its next serialization inlines the target.
++    pub(crate) fn external_svg_document(
++        &self,
++        url: ServoUrl,
++        requester: &SVGSVGElement,
++    ) -> Option<DomRoot<Document>> {
++        let mut documents = self.external_svg_documents.borrow_mut();
++        match documents.entry(url.clone()) {
++            Occupied(mut entry) => match entry.get_mut() {
++                ExternalSvgDocument::Loaded(document) => Some(document.as_rooted()),
++                ExternalSvgDocument::Pending(requesters) => {
++                    requesters.insert(Dom::from_ref(requester));
++                    None
++                },
++                ExternalSvgDocument::Failed => None,
++            },
++            Vacant(entry) => {
++                entry.insert(ExternalSvgDocument::Pending(HashSet::from([Dom::from_ref(
++                    requester,
++                )])));
++                drop(documents);
++                fetch_external_svg_document(self, url);
++                None
++            },
++        }
++    }
++
++    /// Record the outcome of an external `<use>` document fetch and invalidate the svgs that
++    /// were waiting for it.
++    pub(crate) fn finish_external_svg_document(
++        &self,
++        url: ServoUrl,
++        document: Option<DomRoot<Document>>,
++    ) {
++        let result = match document {
++            Some(document) => ExternalSvgDocument::Loaded(Dom::from_ref(&*document)),
++            None => ExternalSvgDocument::Failed,
++        };
++        let previous = self
++            .external_svg_documents
++            .borrow_mut()
++            .insert(url, result);
++        let Some(ExternalSvgDocument::Pending(requesters)) = previous else {
++            unreachable!("external svg document finished without a pending fetch");
++        };
++        let requesters: Vec<DomRoot<SVGSVGElement>> =
++            requesters.iter().map(|svg| svg.as_rooted()).collect();
++        for svg in requesters {
++            svg.invalidate_cached_serialized_subtree_and_rasterization_result();
++        }
++    }
++
+     /// Remove any existing association between the provided name and any elements in this document.
+     pub(crate) fn unregister_element_name(&self, name: &Atom) {
+         self.name_map.remove(name);
+@@ -3866,6 +3925,7 @@ impl Document {
+             form_id_listener_map: Default::default(),
+             svg_id_reference_listeners: Default::default(),
+             svg_serialization_in_progress: Cell::new(false),
++            external_svg_documents: Default::default(),
+             interactive_time: DomRefCell::new(interactive_time),
+             tti_window: DomRefCell::new(InteractiveWindow::default()),
+             canceller,
+diff --git a/components/script/dom/svg/svgsvgelement.rs b/components/script/dom/svg/svgsvgelement.rs
+index cfcbf01a241..9ac641fc98b 100644
+--- a/components/script/dom/svg/svgsvgelement.rs
++++ b/components/script/dom/svg/svgsvgelement.rs
+@@ -64,6 +64,9 @@ pub(crate) struct SVGSVGElement {
+     referenced_ids: DomRefCell<Vec<Atom>>,
+ }
+ 
++/// `<use>` elements whose href is rewritten in the serialization, with the new value.
++type HrefRewrites = Vec<(DomRoot<Element>, String)>;
++
+ impl SVGSVGElement {
+     fn new_inherited(
+         local_name: LocalName,
+@@ -112,8 +115,10 @@ impl SVGSVGElement {
+         self.unregister_referenced_ids();
+         document.set_svg_serialization_in_progress(true);
+         let mut referenced_ids = HashSet::new();
++        let mut href_rewrites = HrefRewrites::new();
+ 
+-        let mut cloned_nodes = self.process_use_elements(cx, &mut referenced_ids);
++        let mut cloned_nodes =
++            self.process_use_elements(cx, &mut referenced_ids, &mut href_rewrites);
+         // Order matters: lowering `<foreignObject>` and `<image href>` first means the
+         // `<image>` elements those passes insert (which carry `mask`/`clip-path`/`filter`
+         // attributes) are seen by the external-reference pass below.
+@@ -122,7 +127,7 @@ impl SVGSVGElement {
+         cloned_nodes.extend(self.process_external_references(cx, &mut referenced_ids));
+ 
+         let rewrite_attributes = |element: &Element, attributes: &mut Vec<(QualName, AttrValue)>| {
+-            self.rewrite_serialized_attributes(element, attributes)
++            self.rewrite_serialized_attributes(element, attributes, &href_rewrites)
+         };
+         let serialize_result = self
+             .upcast::<Node>()
+@@ -161,6 +166,7 @@ impl SVGSVGElement {
+         &self,
+         cx: &mut JSContext,
+         referenced_ids: &mut HashSet<Atom>,
++        href_rewrites: &mut HrefRewrites,
+     ) -> Vec<DomRoot<Node>> {
+         let mut cloned_nodes = Vec::new();
+         let root_node = self.upcast::<Node>();
+@@ -168,7 +174,8 @@ impl SVGSVGElement {
+         for node in root_node.traverse_preorder(ShadowIncluding::No) {
+             if let Some(element) = node.downcast::<Element>() &&
+                 element.local_name() == &local_name!("use") &&
+-                let Some(cloned) = self.process_single_use_element(cx, element, referenced_ids)
++                let Some(cloned) =
++                    self.process_single_use_element(cx, element, referenced_ids, href_rewrites)
+             {
+                 cloned_nodes.push(cloned);
+             }
+@@ -182,6 +189,7 @@ impl SVGSVGElement {
+         cx: &mut JSContext,
+         use_element: &Element,
+         referenced_ids: &mut HashSet<Atom>,
++        href_rewrites: &mut HrefRewrites,
+     ) -> Option<DomRoot<Node>> {
+         let href = use_element.get_string_attribute(&local_name!("href"));
+         let effective_href = if href.str().is_empty() {
+@@ -191,7 +199,17 @@ impl SVGSVGElement {
+         } else {
+             href.to_string()
+         };
+-        let id_str = effective_href.strip_prefix('#')?;
++        if effective_href.is_empty() {
++            return None;
++        }
++        let Some(id_str) = effective_href.strip_prefix('#') else {
++            return self.process_external_use_element(
++                cx,
++                use_element,
++                &effective_href,
++                href_rewrites,
++            );
++        };
+         if id_str.is_empty() {
+             return None;
+         }
+@@ -223,6 +241,42 @@ impl SVGSVGElement {
+         Some(self.append_in_defs(cx, &cloned_node))
+     }
+ 
++    /// Inline the target of a `<use href="file.svg#id">` from the fetched external document
++    /// under an id unique to this serialization, and point the use's serialized href at it:
++    /// the rasterizer cannot fetch, and the page's own ids may clash with the external one's.
++    /// While the document loads nothing is inlined; its arrival invalidates this svg.
++    fn process_external_use_element(
++        &self,
++        cx: &mut JSContext,
++        use_element: &Element,
++        href: &str,
++        href_rewrites: &mut HrefRewrites,
++    ) -> Option<DomRoot<Node>> {
++        let document = self.owner_document();
++        let mut url = document.encoding_parse_a_url(href).ok()?;
++        let id = percent_decode_str(url.fragment().filter(|fragment| !fragment.is_empty())?)
++            .decode_utf8_lossy()
++            .into_owned();
++        url.set_fragment(None);
++        let external_document = document.external_svg_document(url, self)?;
++        let referenced_element = external_document.GetElementById(cx, DOMString::from(&*id))?;
++        let cloned_node = Node::clone(
++            cx,
++            referenced_element.upcast::<Node>(),
++            Some(&document),
++            CloneChildrenFlag::CloneChildren,
++            None,
++        );
++        let inlined_id = format!("external-use-{}-{id}", href_rewrites.len());
++        cloned_node.downcast::<Element>().unwrap().set_atomic_attribute(
++            cx,
++            &local_name!("id"),
++            DOMString::from(&*inlined_id),
++        );
++        href_rewrites.push((DomRoot::from_ref(use_element), format!("#{inlined_id}")));
++        Some(self.append_in_defs(cx, &cloned_node))
++    }
++
+     /// Append `node` to this svg inside a `<defs>` wrapper, so that it is resolvable by id but
+     /// never paints, and return the wrapper.
+     fn append_in_defs(&self, cx: &mut JSContext, node: &Node) -> DomRoot<Node> {
+@@ -668,7 +722,19 @@ impl SVGSVGElement {
+         &self,
+         element: &Element,
+         attributes: &mut Vec<(QualName, AttrValue)>,
++        href_rewrites: &HrefRewrites,
+     ) {
++        if let Some((_, href)) = href_rewrites
++            .iter()
++            .find(|(use_element, _)| std::ptr::eq(&**use_element, element))
++        {
++            attributes.retain(|(name, _)| name.local != local_name!("href"));
++            attributes.push((
++                QualName::new(None, ns!(), local_name!("href")),
++                AttrValue::String(href.clone()),
++            ));
++        }
++
+         // With a viewBox, layout sizes the root's box and fits the viewBox into it; the
+         // rasterizer only needs the viewBox's aspect ratio as the image's natural size. Left in,
+         // `width`/`height` made that size wrong whenever CSS overrode one of them: `width="50"`
+diff --git a/components/script/dom/svg/svguseelement.rs b/components/script/dom/svg/svguseelement.rs
+index 362d55ac722..2ced8c0f8ee 100644
+--- a/components/script/dom/svg/svguseelement.rs
++++ b/components/script/dom/svg/svguseelement.rs
+@@ -2,19 +2,38 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
++use std::collections::HashSet;
++
+ use dom_struct::dom_struct;
+ use html5ever::{LocalName, Prefix, local_name};
+ use js::context::JSContext;
+ use js::rust::HandleObject;
++use net_traits::request::{CredentialsMode, Destination, RequestBuilder, RequestId, RequestMode};
++use net_traits::{FetchMetadata, NetworkError, ResourceFetchTiming};
++use script_traits::DocumentActivity;
++use servo_url::ServoUrl;
+ 
++use crate::document_loader::DocumentLoader;
++use crate::dom::bindings::codegen::Bindings::DocumentBinding::DocumentReadyState;
+ use crate::dom::bindings::codegen::Bindings::SVGUseElementBinding::SVGUseElementMethods;
+ use crate::dom::bindings::inheritance::Castable;
+-use crate::dom::bindings::root::{DomRoot, MutNullableDom};
+-use crate::dom::document::Document;
++use crate::dom::bindings::refcounted::Trusted;
++use crate::dom::bindings::reflector::DomGlobal;
++use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
++use crate::dom::bindings::str::DOMString;
++use crate::dom::csp::{GlobalCspReporting, Violation};
++use crate::dom::document::{Document, DocumentSource, HasBrowsingContext, IsHTMLDocument};
+ use crate::dom::element::Element;
++use crate::dom::globalscope::GlobalScope;
+ use crate::dom::node::Node;
++use crate::dom::performance::performanceresourcetiming::InitiatorType;
++use crate::dom::servoparser::ServoParser;
+ use crate::dom::svg::svganimatedstring::SVGAnimatedString;
+ use crate::dom::svg::svggraphicselement::SVGGraphicsElement;
++use crate::dom::svg::svgsvgelement::SVGSVGElement;
++use crate::fetch::RequestWithGlobalScope;
++use crate::network_listener::{self, FetchResponseListener, ResourceTimingListener};
++use crate::url::ensure_blob_referenced_by_url_is_kept_alive;
+ 
+ #[dom_struct]
+ pub(crate) struct SVGUseElement {
+@@ -57,3 +76,142 @@ impl SVGUseElementMethods<crate::DomTypeHolder> for SVGUseElement {
+             .or_init(|| SVGAnimatedString::new(cx, self.upcast::<Element>(), local_name!("href")))
+     }
+ }
++
++/// The state of an external resource document referenced by `<use href="file.svg#id">`.
++#[derive(JSTraceable, MallocSizeOf)]
++#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
++pub(crate) enum ExternalSvgDocument {
++    /// Fetching; the svgs whose serialization asked for it, to invalidate on completion.
++    Pending(HashSet<Dom<SVGSVGElement>>),
++    Loaded(Dom<Document>),
++    Failed,
++}
++
++/// Fetch `url` as an external resource document for `<use>`
++/// (<https://svgwg.org/svg2-draft/linking.html#processingURL>). Same-origin only, as in
++/// Chrome and Firefox: a cross-origin sprite renders nothing there.
++pub(crate) fn fetch_external_svg_document(document: &Document, url: ServoUrl) {
++    let global = document.global();
++    let request = RequestBuilder::new(
++        Some(document.webview_id()),
++        ensure_blob_referenced_by_url_is_kept_alive(&global, url.clone()),
++        global.get_referrer(),
++    )
++    .destination(Destination::None)
++    .mode(RequestMode::SameOrigin)
++    .credentials_mode(CredentialsMode::CredentialsSameOrigin)
++    .with_global_scope(&global);
++    let context = ExternalSvgDocumentFetchContext {
++        document: Trusted::new(document),
++        url,
++        body: Vec::new(),
++        ok: false,
++    };
++    document.fetch_background(request, context);
++}
++
++struct ExternalSvgDocumentFetchContext {
++    /// The document whose `<use>` elements reference the resource.
++    document: Trusted<Document>,
++    url: ServoUrl,
++    body: Vec<u8>,
++    /// Whether the response was a success status.
++    ok: bool,
++}
++
++impl ExternalSvgDocumentFetchContext {
++    /// Parse the fetched bytes as an XML document, the way `DOMParser` parses `image/svg+xml`.
++    fn parse(&self, cx: &mut JSContext, owner: &Document) -> DomRoot<Document> {
++        let window = owner.window();
++        let resource = Document::new(
++            cx,
++            window,
++            HasBrowsingContext::No,
++            Some(self.url.clone()),
++            None,
++            owner.origin().clone(),
++            IsHTMLDocument::NonHTMLDocument,
++            Some("image/svg+xml".parse().expect("image/svg+xml is a MIME type")),
++            None,
++            DocumentActivity::Inactive,
++            DocumentSource::FromParser,
++            DocumentLoader::new(&owner.loader()),
++            None,
++            None,
++            Default::default(),
++            false,
++            false,
++            Some(owner.insecure_requests_policy()),
++            owner.has_trustworthy_ancestor_or_current_origin(),
++            owner.custom_element_reaction_stack(),
++            owner.creation_sandboxing_flag_set(),
++            owner.pipeline_id(),
++            owner.image_cache(),
++        );
++        let source = DOMString::from(String::from_utf8_lossy(&self.body).into_owned());
++        ServoParser::parse_xml_document(cx, &resource, Some(source), self.url.clone(), None);
++        resource.set_ready_state(cx, DocumentReadyState::Complete);
++        resource
++    }
++}
++
++impl FetchResponseListener for ExternalSvgDocumentFetchContext {
++    fn process_request_body(&mut self, _: RequestId) {}
++
++    fn process_response(
++        &mut self,
++        _: &mut JSContext,
++        _: RequestId,
++        metadata: Result<FetchMetadata, NetworkError>,
++    ) {
++        self.ok = metadata.is_ok_and(|metadata| {
++            let metadata = match metadata {
++                FetchMetadata::Unfiltered(metadata) => metadata,
++                FetchMetadata::Filtered { unsafe_, .. } => unsafe_,
++            };
++            metadata.status.in_range(200..300)
++        });
++    }
++
++    fn process_response_chunk(&mut self, _: &mut JSContext, _: RequestId, chunk: Vec<u8>) {
++        if self.ok {
++            self.body.extend_from_slice(&chunk);
++        }
++    }
++
++    fn process_response_eof(
++        self,
++        cx: &mut JSContext,
++        _: RequestId,
++        response: Result<(), NetworkError>,
++        timing: ResourceFetchTiming,
++    ) {
++        network_listener::submit_timing(cx, &self, &response, &timing);
++        let owner = self.document.root();
++        let resource = (self.ok && response.is_ok()).then(|| self.parse(cx, &owner));
++        owner.finish_external_svg_document(self.url, resource);
++    }
++
++    fn process_csp_violations(
++        &mut self,
++        cx: &mut JSContext,
++        _: RequestId,
++        violations: Vec<Violation>,
++    ) {
++        self.resource_timing_global()
++            .report_csp_violations(cx, violations, None, None);
++    }
++}
++
++impl ResourceTimingListener for ExternalSvgDocumentFetchContext {
++    fn resource_timing_information(&self) -> (InitiatorType, ServoUrl) {
++        (
++            InitiatorType::LocalName("use".to_owned()),
++            self.url.clone(),
++        )
++    }
++
++    fn resource_timing_global(&self) -> DomRoot<GlobalScope> {
++        self.document.root().global()
++    }
++}
+-- 
+2.43.0
+

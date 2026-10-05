@@ -1,0 +1,48 @@
+From a963d6761581f080ec1d7e8e72eae678f2be70f9 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 17:04:48 -0400
+Subject: [PATCH] layout: propagate inline content size damage through display:
+ contents
+
+A display: contents element (including a <slot>) has no LayoutBoxBase, so
+apply_damage never saw it depend on its content and dropped
+RecomputeInlineContentSizes there. The parent's cached inline content size
+stayed stale, so a flex item inside a slot or a display: contents wrapper
+kept its old width (0px for Lit components that fill in text later, like
+reddit's sort buttons) and its new text did not appear.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/traversal.rs | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/components/layout/traversal.rs b/components/layout/traversal.rs
+index a09f22aaa5c..154649eb92f 100644
+--- a/components/layout/traversal.rs
++++ b/components/layout/traversal.rs
+@@ -6,7 +6,7 @@ use std::sync::Arc;
+ 
+ use layout_api::{
+     DangerousStyleElement, DangerousStyleNode, LayoutDamage, LayoutElement, LayoutNode,
+-    svg_paint_signature,
++    NodeRenderingType, svg_paint_signature,
+ };
+ use script::layout_dom::ServoLayoutNode;
+ use style::context::{SharedStyleContext, StyleContext};
+@@ -595,6 +595,13 @@ impl<'a> ElementDamageSet<'a> {
+         damage_for_parent: &mut LayoutDamage,
+         inline_size_depends_on_content: bool,
+     ) {
++        // A `display: contents` element (including a `<slot>`) has no box of its own, so the
++        // contents of its children contribute directly to the intrinsic size of its parent's box.
++        let inline_size_depends_on_content = inline_size_depends_on_content ||
++            matches!(
++                self.node.rendering_type(),
++                NodeRenderingType::DelegatesRendering
++            );
+         let children_need_inline_content_size_recalculation = self
+             .from_children
+             .contains(LayoutDamage::RecomputeInlineContentSizes) &&
+-- 
+2.43.0
+

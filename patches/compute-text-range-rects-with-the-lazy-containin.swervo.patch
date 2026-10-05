@@ -1,0 +1,39 @@
+From 51f822dd19f4da3f228df33f8abb709a5b000119 Mon Sep 17 00:00:00 2001
+From: Nicole Muzzin <nicole@muzz.in>
+Date: Sun, 4 Oct 2026 16:13:06 -0400
+Subject: [PATCH] layout: compute text range rects with the lazy
+ containing-block calculation
+
+The geometry-query change replaced the LayoutThread conversion with an
+explicit token; the text range rects query was written against the old
+form.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/layout/query.rs | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/components/layout/query.rs b/components/layout/query.rs
+index 15e56637db1..b84bb2b402f 100644
+--- a/components/layout/query.rs
++++ b/components/layout/query.rs
+@@ -205,9 +205,13 @@ pub(crate) fn process_text_range_rects_request(
+ 
+     let mut rects = Vec::new();
+     for fragment in &parent_fragments {
+-        let Some(content_rect) =
+-            fragment.cumulative_box_area_rect(BoxAreaType::Content, layout_thread.into())
+-        else {
++        let Some(content_rect) = fragment.cumulative_box_area_rect(
++            BoxAreaType::Content,
++            ContainingBlockCalculation::Lazy {
++                layout_thread,
++                node,
++            },
++        ) else {
+             continue;
+         };
+         collect_text_range_rects(
+-- 
+2.43.0
+
