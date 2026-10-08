@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Stand up navgator's Jenkins job(s) — job-as-code, mirroring lyku/jenkins/setup-jenkins.sh.
 #
-# Env: JENKINS_URL (default http://localhost:8080), JENKINS_USER (default muzzin),
-#      JENKINS_TOKEN (a Jenkins API token — required).
+# Env: JENKINS_URL (default http://localhost:8080), JENKINS_USER and JENKINS_TOKEN (your
+#      Jenkins user and API token — both required).
 # Needs: java + curl. The job builds https://github.com/airgap/NavGator.git (branch dev)
 # via the root Jenkinsfile (tri-platform matrix; runner labels: linux, macos, windows).
 set -euo pipefail
 
 JENKINS_URL="${JENKINS_URL:-http://localhost:8080}"
-JENKINS_USER="${JENKINS_USER:-muzzin}"
+JENKINS_USER="${JENKINS_USER:?set JENKINS_USER (your Jenkins user name)}"
 : "${JENKINS_TOKEN:?set JENKINS_TOKEN (a Jenkins API token)}"
 
 CLI="/tmp/jenkins-cli.jar"
