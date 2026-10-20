@@ -3,8 +3,9 @@
 //! Pushes/pulls bookmarks + history to a Lyku platform (`api.lyku.org` consumer, `api.lyku.co`
 //! business) over HTTPS+JSON. Auth is either a legacy `lyk_` API key or an OAuth access token
 //! (`lyt_`) obtained by binding the profile to an account ([`crate::oauth`]); a profile syncs to
-//! exactly one account/platform. Bookmark/history payloads are plaintext JSON; `passwords` are
-//! E2EE (encrypted on the UI thread — only ciphertext reaches this module). The network runs on a
+//! exactly one account/platform. Bookmark/history payloads are plaintext JSON. Legacy password
+//! sync is disabled (GATO-121): its item ids disclose sites/usernames, and its ciphertext has no
+//! rollback protection. Only the explicit migration helper can read old password rows. The network runs on a
 //! background thread, so `run_sync` takes a plain `Send` snapshot (no NavGator/egui types) and
 //! returns a `SyncOutcome` the UI thread merges into the `Profile`. Conflicts resolve
 //! last-write-wins by each item's `updated` (ms): items are pushed with their *stored* mtime, so
@@ -101,13 +102,8 @@ pub struct SyncSnapshot {
     pub sync_history: bool,
     pub bookmarks: Vec<(String, String, i64)>, // (url, title, updated)
     pub history: Vec<(String, String, u32, i64)>, // (url, title, visits, updated)
-    pub sync_passwords: bool,
-    /// Pre-encrypted on the UI thread: (itemId, hex ciphertext, updated). The sync thread only
-    /// moves opaque ciphertext — the passphrase + plaintext never leave the UI thread.
-    pub passwords: Vec<(String, String, i64)>,
     pub cursor_bookmarks: i64,
     pub cursor_history: i64,
-    pub cursor_passwords: i64,
 }
 
 #[derive(Debug)]
@@ -142,10 +138,8 @@ pub struct SyncOutcome {
     pub pushed: usize,
     pub bookmarks: Vec<PulledBookmark>,
     pub history: Vec<PulledHistory>,
-    pub passwords: Vec<PulledPassword>,
     pub cursor_bookmarks: i64,
     pub cursor_history: i64,
-    pub cursor_passwords: i64,
     /// Present iff the sync thread refreshed OAuth tokens; the UI thread must persist them.
     pub refreshed: Option<RefreshedTokens>,
 }
@@ -260,22 +254,24 @@ fn now_ms() -> i64 {
 /// Run a full push+pull for the opted-in collections. Never panics; failures come back as
 /// `ok: false` with a message. Runs on a background thread.
 pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
+    let plat = oauth::platform(&snap.platform);
+    let push_url = format!("{}{}", plat.api_base, plat.sync_push_path);
+    let pull_url = format!("{}{}", plat.api_base, plat.sync_pull_path);
+    run_sync_at(snap, &push_url, &pull_url)
+}
+
+fn run_sync_at(snap: SyncSnapshot, push_url: &str, pull_url: &str) -> SyncOutcome {
     let mut out = SyncOutcome {
         ok: true,
         message: String::new(),
         pushed: 0,
         bookmarks: Vec::new(),
         history: Vec::new(),
-        passwords: Vec::new(),
         cursor_bookmarks: snap.cursor_bookmarks,
         cursor_history: snap.cursor_history,
-        cursor_passwords: snap.cursor_passwords,
         refreshed: None,
     };
 
-    let plat = oauth::platform(&snap.platform);
-    let push_url = format!("{}{}", plat.api_base, plat.sync_push_path);
-    let pull_url = format!("{}{}", plat.api_base, plat.sync_pull_path);
     let tenant = snap.tenant.clone();
 
     // Resolve the Bearer credential. OAuth access tokens are refreshed first when within 60s of
@@ -346,7 +342,7 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
                 updated: *updated,
             })
             .collect();
-        match push(&push_url, &bearer, tenant.as_deref(), items) {
+        match push(push_url, &bearer, tenant.as_deref(), items) {
             Ok(n) => out.pushed += n,
             Err(e) => {
                 return SyncOutcome {
@@ -356,7 +352,13 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
                 };
             }
         }
-        match pull(&pull_url, &bearer, tenant.as_deref(), "bookmarks", snap.cursor_bookmarks) {
+        match pull(
+            pull_url,
+            &bearer,
+            tenant.as_deref(),
+            "bookmarks",
+            snap.cursor_bookmarks,
+        ) {
             Ok(items) => {
                 for it in items {
                     if it.updated > out.cursor_bookmarks {
@@ -406,7 +408,7 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
                 updated: *updated,
             })
             .collect();
-        match push(&push_url, &bearer, tenant.as_deref(), items) {
+        match push(push_url, &bearer, tenant.as_deref(), items) {
             Ok(n) => out.pushed += n,
             Err(e) => {
                 return SyncOutcome {
@@ -416,7 +418,13 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
                 };
             }
         }
-        match pull(&pull_url, &bearer, tenant.as_deref(), "history", snap.cursor_history) {
+        match pull(
+            pull_url,
+            &bearer,
+            tenant.as_deref(),
+            "history",
+            snap.cursor_history,
+        ) {
             Ok(items) => {
                 for it in items {
                     if it.updated > out.cursor_history {
@@ -443,58 +451,11 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
         }
     }
 
-    if snap.sync_passwords {
-        let items = snap
-            .passwords
-            .iter()
-            .map(|(id, payload, updated)| WireItem {
-                collection: "passwords".into(),
-                item_id: id.clone(),
-                payload: payload.clone(),
-                deleted: false,
-                updated: *updated,
-            })
-            .collect();
-        match push(&push_url, &bearer, tenant.as_deref(), items) {
-            Ok(n) => out.pushed += n,
-            Err(e) => {
-                return SyncOutcome {
-                    ok: false,
-                    message: format!("push passwords: {e}"),
-                    ..out
-                };
-            }
-        }
-        match pull(&pull_url, &bearer, tenant.as_deref(), "passwords", snap.cursor_passwords) {
-            Ok(items) => {
-                for it in items {
-                    if it.updated > out.cursor_passwords {
-                        out.cursor_passwords = it.updated;
-                    }
-                    out.passwords.push(PulledPassword {
-                        item_id: it.item_id,
-                        payload: it.payload,
-                        updated: it.updated,
-                        deleted: it.deleted,
-                    });
-                }
-            }
-            Err(e) => {
-                return SyncOutcome {
-                    ok: false,
-                    message: format!("pull passwords: {e}"),
-                    ..out
-                };
-            }
-        }
-    }
-
     out.message = format!(
-        "Synced — pushed {}, pulled {} bookmark(s), {} history, {} password(s).",
+        "Synced — pushed {}, pulled {} bookmark(s), {} history.",
         out.pushed,
         out.bookmarks.len(),
         out.history.len(),
-        out.passwords.len(),
     );
     out
 }
@@ -502,6 +463,87 @@ pub fn run_sync(snap: SyncSnapshot) -> SyncOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_sync_only_exchanges_bookmarks_and_history() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut requests = Vec::new();
+            while std::time::Instant::now() < deadline {
+                let (mut stream, _) = match server.accept() {
+                    Ok(client) => client,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(e) => panic!("{e}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let is_push = line.starts_with("POST /push ");
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0, "truncated request headers");
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((key, value)) = line.split_once(':') {
+                        if key.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                requests.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
+                let response = if is_push {
+                    r#"{"accepted":1}"#
+                } else {
+                    r#"{"items":[]}"#
+                };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+                if requests.len() == 4 {
+                    break;
+                }
+            }
+            requests
+        });
+        let outcome = run_sync_at(
+            SyncSnapshot {
+                platform: "lyku.org".into(),
+                tenant: None,
+                auth: SyncAuth::ApiKey("test-only".into()),
+                sync_bookmarks: true,
+                sync_history: true,
+                bookmarks: vec![("https://example.com/".into(), "Example".into(), 1)],
+                history: vec![("https://example.com/".into(), "Example".into(), 2, 1)],
+                cursor_bookmarks: 0,
+                cursor_history: 0,
+            },
+            &format!("{base}/push"),
+            &format!("{base}/pull"),
+        );
+        let requests = worker.join().unwrap();
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(outcome.pushed, 2);
+        assert_eq!(requests.len(), 4);
+        for (pair, collection) in requests.chunks_exact(2).zip(["bookmarks", "history"]) {
+            assert_eq!(pair[0]["items"][0]["collection"], collection);
+            assert_eq!(pair[1]["collections"], serde_json::json!([collection]));
+        }
+    }
 
     fn row(id: usize, updated: i64) -> WireItemIn {
         WireItemIn {
