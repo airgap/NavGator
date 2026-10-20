@@ -10,11 +10,11 @@
 //!    files and the remembered passphrase ([`destroy`]).
 //! 5. Ask the server to hard-delete the old rows: LYK-617, below.
 //!
-//! **Not wired yet.** NavGator cannot link `lyku-vault-core`: the engine (swervo) pins
-//! `p256 =0.14.0-rc.14` and `argon2 =0.6.0-rc.8`, the core pins the 0.14.0 and 0.6.0 releases,
-//! and Cargo cannot hold a pre-release and its release of one crate in a single graph. Until the
-//! engine moves to the releases (GATO-122), steps 1 and 5 have no code here and nothing calls this
-//! module.
+//! **Not wired yet.** GATO-122 moved the engine's crypto pins to the releases, but
+//! NavGator still has no vault-core dependency, runtime enrolment/import flow or caller
+//! for this module. GATO-121 disables legacy password sync while that integration is
+//! unfinished. Steps 1 and 5 have no code here; local stores must not be destroyed
+//! until a real vault import has been verified and the server retirement path exists.
 //! [`Vault`] is the part of `SyncEngine` steps 3 and 4 use, so the tests can run them against a
 //! fake; `SyncEngine::create_item` and `SyncEngine::get` fill it once the core links.
 #![allow(dead_code)]

@@ -621,7 +621,6 @@ struct Settings {
     sync_api_key: String,
     sync_bookmarks: bool,
     sync_history: bool,
-    sync_passwords: bool,
     /// Per-profile Lyku account binding (OAuth). `sync_platform` selects the platform
     /// (`lyku.org` | `lyku.co`); the tokens + account identity come from an OAuth connect. A
     /// non-empty `sync_refresh_token` means "connected via OAuth" and takes precedence over the
@@ -685,7 +684,6 @@ impl Default for Settings {
             sync_api_key: String::new(),
             sync_bookmarks: false,
             sync_history: false,
-            sync_passwords: false,
             sync_platform: "lyku.org".to_string(),
             sync_account_id: String::new(),
             sync_account_name: String::new(),
@@ -1226,7 +1224,6 @@ fn load_settings() -> Settings {
                     "sync_api_key" => s.sync_api_key = v.trim().to_string(),
                     "sync_bookmarks" => s.sync_bookmarks = v.trim() == "true",
                     "sync_history" => s.sync_history = v.trim() == "true",
-                    "sync_passwords" => s.sync_passwords = v.trim() == "true",
                     "sync_platform" => s.sync_platform = v.trim().to_string(),
                     "sync_account_id" => s.sync_account_id = v.trim().to_string(),
                     "sync_account_name" => s.sync_account_name = v.trim().to_string(),
@@ -1332,14 +1329,13 @@ fn save_settings(s: &Settings) {
         let _ = std::fs::write(
             &path,
             format!(
-                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_passwords={}\nsync_platform={}\nsync_account_id={}\nsync_account_name={}\nsync_workspace={}\nsync_access_token={}\nsync_refresh_token={}\nsync_token_expiry={}\nremember_passphrase={}\nblock_ads={}\nforce_dark={}\nwallpaper={}\nth_base={}\nth_accent={}\nth_density={}\nth_font={}\nth_tabpos={}\nth_wallpaper={}\nth_tabfit={}\nth_radius={}\nth_glass={}\nth_tabmaxw={}\nth_base_explicit={}\nmod_clock={}\nmod_search={}\nmod_sites={}\nmod_notes={}\nmod_feed={}\nupdate_freq={}\nonboarded={}\nlocale={}\n",
+                "search={}\naccent={}\ndark={}\nsync_api_key={}\nsync_bookmarks={}\nsync_history={}\nsync_platform={}\nsync_account_id={}\nsync_account_name={}\nsync_workspace={}\nsync_access_token={}\nsync_refresh_token={}\nsync_token_expiry={}\nremember_passphrase={}\nblock_ads={}\nforce_dark={}\nwallpaper={}\nth_base={}\nth_accent={}\nth_density={}\nth_font={}\nth_tabpos={}\nth_wallpaper={}\nth_tabfit={}\nth_radius={}\nth_glass={}\nth_tabmaxw={}\nth_base_explicit={}\nmod_clock={}\nmod_search={}\nmod_sites={}\nmod_notes={}\nmod_feed={}\nupdate_freq={}\nonboarded={}\nlocale={}\n",
                 s.search,
                 s.accent,
                 s.dark,
                 s.sync_api_key,
                 s.sync_bookmarks,
                 s.sync_history,
-                s.sync_passwords,
                 s.sync_platform,
                 s.sync_account_id,
                 s.sync_account_name,
@@ -2248,7 +2244,6 @@ enum SettingsApply {
     BlockAds(bool),
     SyncBookmarks(bool),
     SyncHistory(bool),
-    SyncPasswords(bool),
     /// A rich-theme change from the Appearance section: (key, value), applied to `Settings::theme`
     /// (key ∈ base/accentk/density/font/tabpos/tabfit/wallpaper/preset/radius/glass/tabmaxw/module).
     ThemeSet(String, String),
@@ -5282,10 +5277,6 @@ impl AppState {
                     s.sync_history = b;
                     changed = true;
                 }
-                SettingsApply::SyncPasswords(b) => {
-                    s.sync_passwords = b;
-                    changed = true;
-                }
                 SettingsApply::ThemeSet(key, value) => {
                     let ok = match key.as_str() {
                         "base" => theme::Base::from_key(&value)
@@ -5466,7 +5457,6 @@ impl AppState {
             .collect();
         let sync_bookmarks = toggle_link("sync_bookmarks", s.sync_bookmarks, "sync");
         let sync_history = toggle_link("sync_history", s.sync_history, "sync");
-        let sync_passwords = toggle_link("sync_passwords", s.sync_passwords, "sync");
         // Account binding: connected via OAuth ⇒ show who + a Disconnect; legacy key ⇒ note it +
         // still offer Connect; otherwise a Connect button per platform (lyku.co disabled for now).
         let connect_buttons: String = oauth::PLATFORMS
@@ -5671,7 +5661,6 @@ impl AppState {
             .replace("__CURRENT_VERSION__", &build_version())
             .replace("__SYNC_BOOKMARKS__", &sync_bookmarks)
             .replace("__SYNC_HISTORY__", &sync_history)
-            .replace("__SYNC_PASSWORDS__", &sync_passwords)
             .replace("__SYNC_ACCOUNT__", &sync_account)
             .replace("__IMPORT_MSG__", &html_escape(&import_msg))
             .replace("__SYNC_STATUS__", &html_escape(&sync_status))
@@ -9734,7 +9723,7 @@ impl AppState {
         if self.browser.syncing.get() {
             return;
         }
-        let (platform, tenant, auth, sync_bookmarks, sync_history, sync_passwords) = {
+        let (platform, tenant, auth, sync_bookmarks, sync_history) = {
             let s = self.browser.settings.borrow();
             // OAuth binding wins over the legacy pasted key; neither ⇒ not connected. The presence
             // of an access token marks "connected" (lyku.co issues no refresh token).
@@ -9765,7 +9754,6 @@ impl AppState {
                 auth,
                 s.sync_bookmarks,
                 s.sync_history,
-                s.sync_passwords,
             )
         };
         let Some(auth) = auth else {
@@ -9773,40 +9761,18 @@ impl AppState {
                 "Connect a Lyku account (or set an API key) first.".into();
             return;
         };
-        if !sync_bookmarks && !sync_history && !sync_passwords {
+        if !sync_bookmarks && !sync_history {
             *self.browser.sync_status.borrow_mut() = "Enable a collection to sync first.".into();
             return;
         }
         let snap = {
             let p = self.browser.profile.borrow();
-            // Passwords are encrypted HERE (UI thread) — the sync thread only sees ciphertext,
-            // and only when the store is unlocked.
-            let store = self.browser.password_store.borrow();
-            let sync_passwords = sync_passwords && store.is_unlocked();
-            let passwords = if sync_passwords {
-                store
-                    .all()
-                    .iter()
-                    .filter_map(|c| {
-                        let blob = store.encrypt_credential(c)?;
-                        Some((
-                            format!("{}\u{1f}{}", c.origin, c.username),
-                            hex_encode(&blob),
-                            c.updated,
-                        ))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
             sync::SyncSnapshot {
                 platform,
                 tenant,
                 auth,
                 sync_bookmarks,
                 sync_history,
-                sync_passwords,
-                passwords,
                 bookmarks: p
                     .bookmarks
                     .iter()
@@ -9819,7 +9785,6 @@ impl AppState {
                     .collect(),
                 cursor_bookmarks: self.browser.sync_cursor_bookmarks.get(),
                 cursor_history: self.browser.sync_cursor_history.get(),
-                cursor_passwords: self.browser.sync_cursor_passwords.get(),
             }
         };
         self.browser.syncing.set(true);
@@ -9887,32 +9852,12 @@ impl AppState {
                 save_bookmarks(&p);
                 save_history(&p);
             }
-            // Decrypt + merge pulled passwords into the store (only while unlocked).
-            if self.browser.password_store.borrow().is_unlocked() {
-                let mut changed = false;
-                for pw in &outcome.passwords {
-                    if pw.deleted {
-                        continue;
-                    }
-                    if let Some(blob) = hex_decode(&pw.payload) {
-                        let cred = self.browser.password_store.borrow().decrypt_credential(&blob);
-                        if let Some(cred) = cred {
-                            self.browser.password_store.borrow_mut().upsert(cred);
-                            changed = true;
-                        }
-                    }
-                }
-                if changed {
-                    let _ = self.browser.password_store.borrow().save();
-                }
-            }
             self.browser.sync_cursor_bookmarks.set(outcome.cursor_bookmarks);
             self.browser.sync_cursor_history.set(outcome.cursor_history);
-            self.browser.sync_cursor_passwords.set(outcome.cursor_passwords);
             save_sync_cursors(
                 outcome.cursor_bookmarks,
                 outcome.cursor_history,
-                outcome.cursor_passwords,
+                self.browser.sync_cursor_passwords.get(),
             );
         }
         self.window.request_redraw();
@@ -11212,7 +11157,6 @@ impl WebViewDelegate for AppState {
                         "block_ads" => SettingsApply::BlockAds(v == "on"),
                         "sync_bookmarks" => SettingsApply::SyncBookmarks(v == "on"),
                         "sync_history" => SettingsApply::SyncHistory(v == "on"),
-                        "sync_passwords" => SettingsApply::SyncPasswords(v == "on"),
                         "update_freq" => SettingsApply::UpdateFreq(v.into_owned()),
                         "locale" => SettingsApply::Locale(v.into_owned()),
                         "connect" => SettingsApply::Connect(v.into_owned()),
