@@ -485,6 +485,9 @@ mod tests {
                     }
                     Err(e) => panic!("{e}"),
                 };
+                // BSD/macOS can inherit O_NONBLOCK from the listener; the
+                // request reader needs blocking reads with a bounded timeout.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
