@@ -356,3 +356,5 @@ autofill-h-address = Address
 autofill-h-payment = Payment card
 autofill-cvc-hint = — the security code (CVC) is never stored
 autofill-save = Save profile
+
+settings-sync-passwords-disabled = Password sync is disabled for security. Saved passwords remain on this device.

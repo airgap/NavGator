@@ -47,7 +47,7 @@ fontdb = "0.23"
 url = "2.5"
 
 # Servo does TLS through rustls; a crypto provider is installed at startup.
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+rustls = { version = "0.23.46", default-features = false, features = ["aws-lc-rs"] }
 
 # Native chrome: egui drawn over the page (same versions servoshell uses, so the lock
 # resolves cleanly against the engine's glow/winit/raw-window-handle).

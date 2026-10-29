@@ -83,11 +83,15 @@ All of the following are implemented in `main.rs` and verified in the running ap
   Servo-fork patch** (a `Content-Disposition`→disk streaming path + a `Download`
   EmbedderMsg/delegate, `airgap/swervo` @ `33abd9`), since libservo has no download
   delegate — closing the old §2.2 gap.
-- **E2EE password manager** — an Argon2id + XChaCha20-Poly1305 credential store
-  (`passwords.enc`, zero-knowledge); unlock in Settings; **fill** and **save**
+- **Local encrypted password manager** — an Argon2id + XChaCha20-Poly1305 credential store
+  (`passwords.enc`); unlock in Settings; **fill** and **save**
   via toolbar buttons, fill only on a click (both through `evaluate_javascript`, so the credential never
-  touches page-readable storage); a `gator://passwords` manager; opt-in E2EE sync to Lyku's
-  `passwords` collection (ciphertext only, encrypted on the UI thread).
+  touches page-readable storage); a `gator://passwords` manager. **2026-10-19 security
+  update (GATO-121): legacy password sync is disabled.** It exposed site/username item
+  identifiers and accepted replayed ciphertext. Saved credentials remain local;
+  previously synced server rows have not been purged (LYK-617). The tested migration
+  adapter is still disconnected from the browser runtime (LYK-616); linking vault-core,
+  enrolment, verified import and server retirement remain open.
 - **Ad / tracker blocking** — Brave's `adblock-rust` checked in `load_web_resource`:
   **network blocking** (matches intercepted with an empty 204), the **full EasyList +
   EasyPrivacy** (~137k rules, fetched + cached in the background with a weekly refresh and a

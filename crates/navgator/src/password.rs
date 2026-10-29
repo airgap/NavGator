@@ -1,10 +1,10 @@
 //! E2EE password store (security-critical core).
 //!
-//! Credentials are encrypted — at rest on disk AND for Lyku sync — with XChaCha20-Poly1305
-//! under a 256-bit key derived from the user's **sync passphrase** via Argon2id. Neither the
-//! disk file nor the Lyku server ever sees plaintext (zero-knowledge): the passphrase is never
-//! stored and never leaves the device. While the store is *unlocked*, the passphrase and the
-//! decrypted credentials live in memory (required to autofill); `lock()` clears them.
+//! Credentials are encrypted at rest with XChaCha20-Poly1305 under a 256-bit key derived
+//! from the user's passphrase via Argon2id. Legacy password sync is disabled (GATO-121):
+//! although it encrypted payloads, it exposed site/username metadata and accepted replays.
+//! The passphrase never leaves the device; the optional OS keyring can remember it locally.
+//! While unlocked, the passphrase and decrypted credentials live in memory; `lock()` clears them.
 //!
 //! Blob format: `[salt(16)][nonce(24)][ciphertext+tag]`. The salt is per-store (stable);
 //! every encryption uses a fresh random nonce. Wrong passphrase or any tampering fails the
